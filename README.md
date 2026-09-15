@@ -3,7 +3,7 @@
 A harness for driving AI agents against real machines: remote hosts, isolated sandboxes, model
 pools with enforced ceilings, and one HTTP API that every front end talks to.
 
-This repository is the working foundation — six crates of tested logic, a runnable daemon, and a
+This repository is the working foundation — seven crates of tested logic, a runnable daemon, and a
 CLI. It is **not** a finished harness; `ROADMAP.md` says exactly what is missing.
 
 ---
@@ -53,8 +53,8 @@ $ curl -s localhost:7717/v1/status | jq .pools
 | Encrypted secret vault (Argon2id + XChaCha20), outbound redaction | **Done**, tested |
 | Model pools, per-credential rate/token/budget limits, role routing | **Done**, tested |
 | Web search: SearXNG + keyless DuckDuckGo, RRF fusion, failure reporting | **Done**, tested |
-| Remote hosts: local + SSH (real `russh`), Windows/macOS/Linux capability detection | **Done**, tested |
-| Sandboxes: L1/L2/L3 isolation ladder, Docker lifecycle, TTL reaper | **Done**, tested |
+| Remote hosts: local + SSH (real `russh`), Windows/macOS/Linux capability detection | **Built** — parsing tested, handshake unverified |
+| Sandboxes: L1/L2/L3 isolation ladder, Docker lifecycle, TTL reaper | **Built** — spec→config tested, lifecycle unverified |
 | Daemon (`hxd`) + HTTP API + CLI (`hx`) | **Done**, runnable |
 | Web UI, Tauri desktop/mobile, chat connectors | **Not started** |
 | MCP client, browser-automation pool | **Not started** |
@@ -123,7 +123,7 @@ $ ./target/release/hxd --bind 127.0.0.1:7717
 ```
 
 ```console
-$ cargo test --workspace         # 324 tests
+$ cargo test --workspace         # 347 unit tests, no external dependencies
 ```
 
 Rust 1.85+ (edition 2024). Verified on 1.98.1.
@@ -131,11 +131,16 @@ Rust 1.85+ (edition 2024). Verified on 1.98.1.
 ## What is deliberately not done yet
 
 - **The agent loop.** The provider router, tool plumbing, search, sandboxes, approvals and hosts
-  are all live and tested, but nothing yet ties them into a model-calling loop. `/v1/chat` returns
-  `501` and says so rather than pretending.
+  all build and are unit-tested, but nothing yet ties them into a model-calling loop. `/v1/chat`
+  returns `501` and says so rather than pretending.
+- **Nothing has ever connected to anything under CI.** Every test is an in-process unit test and
+  there are zero integration tests, so a green suite proves the logic, not the connectivity. The
+  SSH handshake and the Docker container lifecycle compile but have **never been executed**. Read
+  **[TESTING.md](TESTING.md)** — it separates "executed and observed" from "unit-tested" from
+  "merely compiles", and lists the six empty crates the green suite says nothing about.
 - **SSH host key verification.** `check_server_key` accepts any key unless `strict` was
   requested, in which case it refuses to connect. The fix is `~/.ssh/known_hosts` plus
   trust-on-first-use. Until then, treat the SSH transport as suitable for trusted networks only.
-  This is a real gap, documented in `crates/hx-remote/src/ssh.rs`.
+  This is the one place the harness is *less* safe than the `ssh` it replaces.
 - **Web UI, desktop/mobile apps, chat connectors, MCP, browser pool.** Designed in
   `ARCHITECTURE.md`, not built.

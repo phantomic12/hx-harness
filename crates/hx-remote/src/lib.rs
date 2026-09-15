@@ -19,19 +19,26 @@
 //!
 //! ## What is landed, and what is not
 //!
-//! Landed: the trait, the platform capability probing, and the local host — the parts that can be
-//! verified without a second machine to connect to.
+//! Landed: the trait, the platform capability probing, the local host, the SSH transport over
+//! `russh`, and the approval-gated command runner.
 //!
 //! Not landed, and deliberately not stubbed with a type that pretends to work:
 //!
-//! - `SshHost` — over `russh`, with key material sourced from the vault. M4.
 //! - `WinRMHost` — for the Hyper-V boxes that cannot do SSH (NTLM via a jump host). M4.
-//! - `runner` — executes an agent's shell commands against a host with approval checks and
-//!   capability-aware command construction. This depends on the approval engine reaching tool
-//!   dispatch (M1), so it cannot be built before then.
+//!
+//! ## What the tests here do and do not prove
+//!
+//! They prove the pure logic: capability parsing, path translation, command wrapping, risk
+//! classification, output bounding, and an approval round-trip driven against the local host.
+//!
+//! They do **not** prove that an SSH connection to a second machine works. That needs a real key
+//! and a real host. `SshHost` compiles and its parsing logic is tested, but its handshake has
+//! never been executed against a server — it is listed as unverified in `TESTING.md`.
 
 pub mod host;
 pub mod local;
+pub mod runner;
+pub mod ssh;
 
 pub use host::{
     powershell_quote, shell_quote, ExecOutput, Host, HostCaps, RemoteEntry, RemoteOs, ShellKind,

@@ -15,10 +15,9 @@
 
 use crate::host::{truncate_middle, ExecOutput, Host};
 use chrono::{DateTime, Utc};
-use hx_core::approval::{
-    ActionRequest, ApprovalId, ApprovalOption, ApprovalSession, Verdict,
-};
-use hx_core::error::{HxError, Result};
+use hx_core::approval::{ActionRequest, ApprovalOption, ApprovalSession, Verdict};
+use hx_core::error::Result;
+use hx_core::ids::ApprovalId;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -67,19 +66,32 @@ impl RunOutcome {
     }
 }
 
+/// The approval session plus the request currently awaiting a human answer.
+///
+/// `ApprovalSession::resolve` needs the original request handed back to it, so an outstanding
+/// prompt has to be remembered somewhere. Keeping it beside the session (rather than behind a
+/// second lock) means the two can never disagree about which request is pending.
+struct ApprovalState {
+    session: ApprovalSession,
+    pending: Option<ActionRequest>,
+}
+
 /// Wraps a [`Host`] with the approval policy and output bounds.
 pub struct HostRunner {
     host: Arc<dyn Host>,
-    approvals: Mutex<ApprovalSession>,
+    approvals: Mutex<ApprovalState>,
     max_output_chars: usize,
     default_timeout: Duration,
 }
 
 impl HostRunner {
-    pub fn new(host: Arc<dyn Host>, approvals: ApprovalSession) -> Self {
+    pub fn new(host: Arc<dyn Host>, session: ApprovalSession) -> Self {
         Self {
             host,
-            approvals: Mutex::new(approvals),
+            approvals: Mutex::new(ApprovalState {
+                session,
+                pending: None,
+            }),
             max_output_chars: 8_000,
             default_timeout: Duration::from_secs(120),
         }
@@ -111,22 +123,35 @@ impl HostRunner {
     }
 
     /// Run a command past the policy without executing it.
+    ///
+    /// When the verdict is `Ask`, the request is remembered so [`Self::resolve`] can hand it back
+    /// to the session.
     pub async fn authorize(&self, command: &str, now: DateTime<Utc>) -> Verdict {
         let request = ActionRequest::shell(command);
-        self.approvals.lock().await.decide(&request, now)
+        let mut state = self.approvals.lock().await;
+        let verdict = state.session.decide(&request, now);
+        if verdict.is_asking() {
+            state.pending = Some(request);
+        }
+        verdict
     }
 
-    /// Answer an outstanding approval prompt.
-    pub async fn resolve(
-        &self,
-        id: &ApprovalId,
-        option: ApprovalOption,
-        now: DateTime<Utc>,
-    ) -> Result<Verdict> {
-        let mut session = self.approvals.lock().await;
-        session
-            .resolve(id, option, now)
-            .map_err(|e| HxError::Denied(format!("could not resolve approval {id}: {e}")))
+    /// Answer an outstanding approval prompt, returning the policy's verdict on the answer.
+    ///
+    /// There must be an outstanding request, and the id must be the one that was issued. A guessed
+    /// id is refused by the session, and an already-answered id cannot be replayed — an approval
+    /// prompt that can be forged or replayed is worse than no prompt at all.
+    pub async fn resolve(&self, id: &ApprovalId, option: ApprovalOption) -> Verdict {
+        let mut state = self.approvals.lock().await;
+        let request = match state.pending.as_ref() {
+            Some(request) => request.clone(),
+            None => {
+                return Verdict::Deny {
+                    why: "no approval request is outstanding".to_string(),
+                }
+            }
+        };
+        state.session.resolve(id, option, &request)
     }
 
     /// Authorise, and if allowed, run.
@@ -205,7 +230,9 @@ mod tests {
     fn permissive() -> HostRunner {
         HostRunner::new(
             local(),
-            ApprovalSession::new(ApprovalPolicy::yolo_until(t0() + chrono::Duration::hours(1))),
+            ApprovalSession::new(ApprovalPolicy::yolo_until(
+                t0() + chrono::Duration::hours(1),
+            )),
         )
     }
 
@@ -230,9 +257,13 @@ mod tests {
             .unwrap();
 
         assert!(outcome.verdict.is_allowed(), "{:?}", outcome.verdict);
-        let output = outcome.output.expect("should have run");
+        assert_eq!(
+            outcome.display(1000),
+            "from-the-agent\n",
+            "stdout must pass through verbatim when it fits; truncation is the only transformation"
+        );
+        let output = outcome.output.as_ref().expect("should have run");
         assert_eq!(output.stdout.trim(), "from-the-agent");
-        assert_eq!(outcome.display(1000), "from-the-agent");
     }
 
     #[tokio::test]
@@ -283,8 +314,8 @@ mod tests {
         // The policy consults this; exposing it lets a UI show the risk level on the prompt.
         let classification = classify_command("rm -rf /");
         assert!(
-            classification.risk != RiskClass::Safe,
-            "rm -rf / must not be classified as safe"
+            !matches!(classification.risk, RiskClass::Read),
+            "rm -rf / must not be classified as a read"
         );
     }
 
@@ -312,9 +343,9 @@ mod tests {
             .await
             .unwrap();
 
-        let output = outcome.output.unwrap();
-        assert_eq!(output.exit_code, Some(7));
         assert!(outcome.display(1000).contains("[exit status 7]"));
+        let output = outcome.output.as_ref().unwrap();
+        assert_eq!(output.exit_code, Some(7));
     }
 
     #[tokio::test]
@@ -337,16 +368,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolving_an_unknown_approval_id_is_an_error() {
-        let err = permissive()
-            .resolve(
-                &ApprovalId::from("nope"),
-                ApprovalOption::AllowOnce,
-                t0(),
-            )
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("could not resolve"), "{err}");
+    async fn an_approval_cannot_be_forged_with_a_guessed_id() {
+        // Nothing is outstanding here, so *any* id — guessed or not — must be refused. There is no
+        // path from "no prompt was raised" to "an action was approved".
+        let verdict = permissive()
+            .resolve(&ApprovalId::new(), ApprovalOption::AllowOnce)
+            .await;
+        assert!(
+            verdict.is_denied(),
+            "an approval with nothing outstanding must be denied: {verdict:?}"
+        );
+        assert!(
+            verdict.why().contains("no approval request is outstanding"),
+            "{}",
+            verdict.why()
+        );
     }
 
     #[tokio::test]

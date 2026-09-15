@@ -253,9 +253,7 @@ impl SshHost {
                             stderr.extend_from_slice(data.as_ref());
                         }
                     }
-                    ChannelMsg::ExitStatus { exit_status } => {
-                        exit_code = Some(exit_status as i32)
-                    }
+                    ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status as i32),
                     _ => {}
                 }
             }
@@ -361,7 +359,10 @@ impl Host for SshHost {
         }
 
         let output = self
-            .exec(&format!("base64 < {}", shell_quote(path)), Duration::from_secs(60))
+            .exec(
+                &format!("base64 < {}", shell_quote(path)),
+                Duration::from_secs(60),
+            )
             .await?;
 
         if !output.success() {
@@ -414,7 +415,9 @@ impl Host for SshHost {
             )));
         }
 
-        let output = self.exec(&list_script(path), Duration::from_secs(60)).await?;
+        let output = self
+            .exec(&list_script(path), Duration::from_secs(60))
+            .await?;
         if output.exit_code == Some(9) {
             return Err(HxError::Remote(format!("no such directory: {path}")));
         }
