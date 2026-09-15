@@ -1,0 +1,23 @@
+[package]
+name = "hx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hx"
+path = "src/main.rs"
+
+[dependencies]
+hx-core.workspace = true
+hx-provider.workspace = true
+hx-search.workspace = true
+hx-sandbox.workspace = true
+hx-secrets.workspace = true
+hx-remote.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+reqwest.workspace = true

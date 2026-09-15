@@ -1,0 +1,22 @@
+[package]
+name = "hxd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hxd"
+path = "src/main.rs"
+
+[dependencies]
+hx-core.workspace = true
+hx-server.workspace = true
+hx-sandbox.workspace = true
+axum.workspace = true
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "hx-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hx-core.workspace = true
+hx-provider.workspace = true
+hx-search.workspace = true
+hx-sandbox.workspace = true
+hx-remote.workspace = true
+hx-secrets.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+indexmap.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

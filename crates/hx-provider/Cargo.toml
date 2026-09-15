@@ -1,0 +1,19 @@
+[package]
+name = "hx-provider"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hx-core.workspace = true
+hx-secrets.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+indexmap.workspace = true
