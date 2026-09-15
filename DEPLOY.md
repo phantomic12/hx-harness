@@ -33,13 +33,14 @@ $ curl -fsSL https://raw.githubusercontent.com/phantomic12/hx-harness/main/insta
 ```
 
 That detects your platform, downloads the matching build, **verifies its SHA-256 against the
-released `SHA256SUMS`**, and installs `hx` and `hxd` to `~/.local/bin`. It never calls `sudo`
-and never writes outside that directory.
+released `SHA256SUMS`**, and installs `hx` and `hxd` to `~/.local/bin`. It never calls `sudo`,
+and the only things it writes are the two binaries and a temporary download directory it
+cleans up on exit.
 
 Options, via environment:
 
 ```console
-$ HX_VERSION=0.1.0 sh install.sh                 # pin a version instead of latest
+$ HX_VERSION=0.0.1 sh install.sh                 # pin a version instead of latest
 $ HX_INSTALL_DIR=/usr/local/bin sh install.sh    # install elsewhere (may need sudo)
 ```
 
@@ -76,10 +77,10 @@ Every release publishes static binaries for five targets. Grab what you need fro
 | Windows x64 | `x86_64-pc-windows-msvc` | `.zip` |
 
 ```console
-$ curl -fsSLO https://github.com/phantomic12/hx-harness/releases/download/v0.1.0/hx-0.1.0-x86_64-unknown-linux-musl.tar.gz
-$ curl -fsSLO https://github.com/phantomic12/hx-harness/releases/download/v0.1.0/SHA256SUMS
+$ curl -fsSLO https://github.com/phantomic12/hx-harness/releases/download/v0.0.1/hx-0.0.1-x86_64-unknown-linux-musl.tar.gz
+$ curl -fsSLO https://github.com/phantomic12/hx-harness/releases/download/v0.0.1/SHA256SUMS
 $ sha256sum -c --ignore-missing SHA256SUMS
-$ tar xzf hx-0.1.0-x86_64-unknown-linux-musl.tar.gz
+$ tar xzf hx-0.0.1-x86_64-unknown-linux-musl.tar.gz
 $ install -m755 hx hxd ~/.local/bin/
 ```
 
@@ -103,7 +104,7 @@ as the binary, it proves the download wasn't corrupted or truncated — it does 
 provenance. For that, check the build attestation:
 
 ```console
-$ gh attestation verify hx-0.1.0-x86_64-unknown-linux-musl.tar.gz --repo phantomic12/hx-harness
+$ gh attestation verify hx-0.0.1-x86_64-unknown-linux-musl.tar.gz --repo phantomic12/hx-harness
 ```
 
 ---
@@ -264,7 +265,7 @@ $ curl -fsSL https://raw.githubusercontent.com/phantomic12/hx-harness/main/insta
 ```
 
 For containers, `docker compose pull && docker compose up -d`. To pin a version, use the
-install script's `HX_VERSION` or a specific image tag (`:0.1`, `:0.1.0`).
+install script's `HX_VERSION` or a specific image tag (`:0.0`, `:0.0.1`).
 
 ## Portability summary
 

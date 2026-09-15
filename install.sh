@@ -50,7 +50,7 @@ Environment:
 
 Examples:
   sh install.sh                        # latest release, into ~/.local/bin
-  HX_VERSION=0.1.0 sh install.sh       # a specific version
+  HX_VERSION=0.0.1 sh install.sh       # a specific version
   HX_INSTALL_DIR=/usr/local/bin sh install.sh   # system-wide (needs write access)
 EOF
 }
@@ -133,7 +133,7 @@ else
     if [ -z "$version" ]; then
         fail "could not determine the latest release of $REPO.
 There may be no release published yet. Pin one explicitly:
-  HX_VERSION=0.1.0 sh install.sh
+  HX_VERSION=0.0.1 sh install.sh
 Or build from source: cargo build --release"
     fi
     step "Latest release is $version"
