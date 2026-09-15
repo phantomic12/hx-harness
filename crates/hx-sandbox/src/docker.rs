@@ -13,12 +13,12 @@ use async_trait::async_trait;
 // rename — but the deprecated versions emit one warning *per field*, which is exactly the kind
 // of noise that hides a real warning.
 use bollard::container::LogOutput;
+use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
+use bollard::models::{ContainerCreateBody, HostConfig};
 use bollard::query_parameters::{
     CreateContainerOptions, LogsOptions, RemoveContainerOptions, StartContainerOptions,
     StopContainerOptions,
 };
-use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
-use bollard::models::{ContainerCreateBody, HostConfig};
 use bollard::Docker;
 use futures::StreamExt;
 use hx_core::error::{HxError, Result};
