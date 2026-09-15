@@ -487,7 +487,11 @@ mod tests {
 
     #[test]
     fn container_names_are_namespaced_and_greppable() {
-        let runtime = DockerRuntime::from_client(Docker::connect_with_local_defaults().unwrap());
+        // Deliberately not `connect_with_local_defaults()`: that constructor stats
+        // /var/run/docker.sock and fails on any machine without Docker (macOS CI runners,
+        // for one). Naming is pure string logic, so the client is irrelevant — building the
+        // runtime must not smuggle in a dependency on a live daemon.
+        let runtime = DockerRuntime::from_client(Docker::connect_with_http_defaults().unwrap());
         let name = runtime.container_name(&SandboxId::from_raw("sbx_abc123"));
         assert_eq!(name, "hx-sbx_abc123");
         assert!(name.starts_with("hx-"), "so `docker ps` can find ours");

@@ -7,7 +7,7 @@ Four ways to get it running, in the order most people should consider them.
 | [Install script](#1-install-script-recommended) | You just want the binaries | No |
 | [Prebuilt binary](#2-prebuilt-binaries-manual) | You pin versions, or script installs | No |
 | [Container](#3-container) | You already run Docker and want it supervised | No — Docker only |
-| [From source](#4-from-source) | You're developing or auditing | Rust 1.82+ |
+| [From source](#4-from-source) | You're developing or auditing | Rust 1.89+ |
 
 ---
 
@@ -168,7 +168,9 @@ release workflow over emulation.
 
 ## 4. From source
 
-Requires Rust 1.82 or newer (the workspace declares `edition = "2021"`, `rust-version = "1.82"`).
+Requires Rust 1.89 or newer (the workspace declares `edition = "2021"`, `rust-version = "1.89"`).
+The floor is set by `russh`, not by hx itself — see the MSRV job in `.github/workflows/ci.yml`,
+which reads the value out of `Cargo.toml` and checks against it so the two cannot disagree.
 
 ```console
 $ git clone https://github.com/phantomic12/hx-harness
@@ -180,8 +182,8 @@ $ install -m755 target/release/{hx,hxd} ~/.local/bin/
 Straight from git without cloning, if you have a toolchain:
 
 ```console
-$ cargo install --git https://github.com/phantomic12/hx-harness --locked --package hxd
-$ cargo install --git https://github.com/phantomic12/hx-harness --locked --package hx
+$ cargo install --git https://github.com/phantomic12/hx-harness --locked hxd
+$ cargo install --git https://github.com/phantomic12/hx-harness --locked hx
 ```
 
 These are **not** on crates.io, so plain `cargo install hxd` will not find them.

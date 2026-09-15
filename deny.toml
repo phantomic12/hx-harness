@@ -11,6 +11,27 @@ version = 2
 # would block unrelated work. Warn, so it gets seen and fixed deliberately.
 yanked = "warn"
 
+# Deliberate, documented exceptions. Keep this list short and keep the reasoning inline —
+# a bare ID here is indistinguishable from someone silencing a real problem.
+ignore = [
+    # Marvin Attack — non-constant-time RSA private-key operations expose key material
+    # through timing observable over the network.
+    #
+    # Not fixable on our side: upstream has no patch. RUSTSEC lists `patched = []` on
+    # purpose, and both the latest stable (0.9.10) and the 0.10 release candidate are
+    # affected. It reaches us via russh -> ssh-key, and russh is how hx-remote speaks SSH,
+    # so the dependency is load-bearing rather than incidental.
+    #
+    # Exposure is real but narrow: it concerns RSA key operations observable by the remote
+    # peer, i.e. an untrusted SSH *server* attacking an hx client that authenticates with an
+    # RSA key. Ed25519 keys do not take the affected path at all. Since hx is an SSH client
+    # talking to hosts the operator names, the practical risk is a host you already chose to
+    # trust turning hostile.
+    #
+    # Revisit when RustCrypto/RSA#626 lands constant-time padding.
+    "RUSTSEC-2023-0071",
+]
+
 [licenses]
 version = 2
 # Permissive-only. Anything copyleft (GPL/AGPL/LGPL) is absent on purpose: hx ships as a

@@ -153,7 +153,7 @@ $ ./target/release/hxd --bind 127.0.0.1:7717
 $ cargo test --workspace         # 347 unit tests, no external dependencies
 ```
 
-Rust 1.82+ (edition 2021). Verified on 1.98.1.
+Rust 1.89+ (edition 2021). Verified on 1.98.1.
 
 ## What is deliberately not done yet
 

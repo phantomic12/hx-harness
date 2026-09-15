@@ -67,22 +67,37 @@ jobs:
       # an un-updated lockfile is a real bug, and better caught here than by a user.
       - run: cargo test --workspace --locked
 
-  # The manifest claims `rust-version = "1.82"`. This job is what makes that claim true or
-  # false. If it fails, the fix is to raise the declared version, not to delete the job —
-  # a wrong MSRV sends contributors to a toolchain that cannot build the project.
+  # Verifies the `rust-version` in Cargo.toml is honest.
+  #
+  # The floor is read out of the manifest instead of being repeated here, so the declared
+  # value and the tested value cannot drift apart. This job is what makes the claim true or
+  # false — if it fails, raise the declared version; don't delete the job. It earned its keep
+  # on the first run: the manifest claimed 1.82 while `russh` had required 1.89 for a while,
+  # so anyone trusting the old number would have landed on a toolchain that cannot build this.
   msrv:
-    name: msrv (${{ matrix.msrv }})
+    name: msrv
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        msrv: ["1.82.0"]
     steps:
       - uses: actions/checkout@v7
+
+      - name: Read declared MSRV from Cargo.toml
+        id: msrv
+        run: |
+          v=$(grep -m1 '^rust-version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          if [ -z "$v" ]; then
+            echo "::error::workspace manifest declares no rust-version"
+            exit 1
+          fi
+          echo "Declared MSRV: $v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.msrv }}
+          toolchain: ${{ steps.msrv.outputs.version }}
+
       - uses: Swatinem/rust-cache@v2
+      # Printed so the log records which toolchain actually ran, not just which was asked for.
+      - run: rustc --version
       - run: cargo check --workspace --all-targets --locked
 
   deny:
