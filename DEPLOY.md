@@ -268,7 +268,13 @@ install script's `HX_VERSION` or a specific image tag (`:0.1`, `:0.1.0`).
 
 ## Portability summary
 
-- **No runtime dependencies.** Static musl on Linux; nothing to install on macOS or Windows.
+- **No runtime dependencies, with one caveat.** Static musl on Linux, so no libc or shared
+  objects to install; nothing extra on macOS or Windows. The exception is TLS trust: as of
+  reqwest 0.13 the binaries verify certificates against the **platform trust store** instead
+  of roots compiled into the binary, so HTTPS needs a CA bundle on the host
+  (`ca-certificates` on Linux). Every mainstream distro ships one — a scratch or distroless
+  container does not, which is why the Dockerfile installs it explicitly and this is worth
+  remembering if you copy the binaries into a minimal image.
 - **No root required** for the client or the daemon. The install script writes to `~/.local/bin` and never escalates.
 - **No Docker required** unless you want sandboxes.
 - **No credentials required** to run it today.

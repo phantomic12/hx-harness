@@ -89,12 +89,19 @@ subtle = "2"
 axum = { version = "0.8", features = ["ws", "macros"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "trace", "cors", "compression-gzip"] }
-# reqwest 0.13 split the old `rustls-tls` feature. That name meant "rustls backed by
-# bundled webpki roots", so it maps to `rustls` + `webpki-roots` rather than
-# `rustls-native-certs`: the bundled roots are what let the static musl binary do TLS with
-# no system CA store present. Switching to native certs would quietly make the release
-# artifacts depend on ca-certificates being installed on the host.
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "webpki-roots", "gzip"] }
+# reqwest 0.13 dropped the `rustls-tls` feature; `rustls` replaces it.
+#
+# The mechanism changed underneath the name, which is worth knowing before trusting the old
+# behaviour: 0.12's `rustls-tls` bundled Mozilla's roots via webpki, so HTTPS worked with no
+# CA store on the host. 0.13 verifies through rustls-platform-verifier — the OS trust store.
+# The practical consequence is that the release binaries now need a system CA bundle
+# (ca-certificates) at runtime, which is why the Dockerfile installs it and DEPLOY.md calls
+# it out. macOS and Windows use their native stores and need nothing extra.
+#
+# 0.13.1 still declares an optional `webpki-roots` dependency, but no code in the crate reads
+# it — enabling it only adds an unused crate to the graph. Omitted rather than kept as
+# cargo-cult.
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "gzip"] }
 
 # storage
 rusqlite = { version = "0.32", features = ["bundled", "chrono", "serde_json"] }
