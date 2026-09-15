@@ -23,6 +23,14 @@ version = "0.0.1"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
+# Distributed as binaries (GitHub Releases, ghcr.io) — not published to crates.io.
+#
+# Declaring that is what lets cargo-deny's `wildcards` lint pass honestly rather than being
+# switched off: the lint exists because crates.io refuses path dependencies, and that cannot
+# happen to a crate that is never uploaded. It also stops a stray `cargo publish` from
+# pushing a half-configured crate. `cargo install --git` is unaffected — `publish` only
+# gates the registry.
+publish = false
 
 [workspace.dependencies]
 # internal

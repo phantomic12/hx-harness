@@ -51,13 +51,14 @@ allow = [
     "ISC",
     "MIT",
     "MIT-0",
-    "MPL-2.0",
-    "OpenSSL",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
     "Unlicense",
     "Zlib",
 ]
+# Every entry above is justified by an actual dependency — cargo-deny flags allowances that
+# match nothing ("license-not-encountered"), which is how MPL-2.0, OpenSSL and
+# Unicode-DFS-2016 were found to be dead here. If a dependency update introduces a new
+# license, this check fails naming it, and adding a line is the deliberate review step.
 # Some crates ship no license field or a non-SPDX string. Fail loudly rather than
 # silently accepting a license we never reviewed.
 confidence-threshold = 0.93

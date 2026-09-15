@@ -1,6 +1,27 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": [
-    "config:recommended"
+  "extends": ["config:recommended"],
+  "lockFileMaintenance": {
+    "description": "Periodic `cargo update` to pick up semver-compatible bumps the per-crate rules would miss.",
+    "enabled": true
+  },
+  "packageRules": [
+    {
+      "description": "One PR for all non-major Rust updates. Un-grouped, this is a few hundred separate PRs for a 395-crate tree, which nobody reviews.",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "rust non-major"
+    },
+    {
+      "description": "Majors stay separate and ungrouped: each one is a breaking change that needs code edits and a green CI run before merging.",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["major"],
+      "groupName": null
+    },
+    {
+      "description": "GitHub Actions versions move together; one PR is enough.",
+      "matchManagers": ["github-actions"],
+      "groupName": "github actions"
+    }
   ]
 }
