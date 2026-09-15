@@ -70,8 +70,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # ids / time / misc
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-getrandom = "0.2"
-base64 = "0.22"
+getrandom = "0.4"
+base64 = "0.23"
 hex = "0.4"
 bytes = "1"
 indexmap = { version = "2", features = ["serde"] }
@@ -80,8 +80,8 @@ regex = "1"
 url = "2"
 
 # crypto / secrets
-argon2 = "0.5"
-chacha20poly1305 = "0.10"
+argon2 = "0.6"
+chacha20poly1305 = "0.11"
 zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
 
@@ -89,7 +89,12 @@ subtle = "2"
 axum = { version = "0.8", features = ["ws", "macros"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "trace", "cors", "compression-gzip"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip"] }
+# reqwest 0.13 split the old `rustls-tls` feature. That name meant "rustls backed by
+# bundled webpki roots", so it maps to `rustls` + `webpki-roots` rather than
+# `rustls-native-certs`: the bundled roots are what let the static musl binary do TLS with
+# no system CA store present. Switching to native certs would quietly make the release
+# artifacts depend on ca-certificates being installed on the host.
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "webpki-roots", "gzip"] }
 
 # storage
 rusqlite = { version = "0.32", features = ["bundled", "chrono", "serde_json"] }
@@ -97,7 +102,7 @@ rusqlite = { version = "0.32", features = ["bundled", "chrono", "serde_json"] }
 # remote / sandbox
 russh = "0.63"
 russh-keys = "0.45"
-bollard = "0.19"
+bollard = "0.21"
 
 # mcp
 rmcp = { version = "3.3", features = ["client", "server", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest", "transport-streamable-http-server", "schemars"] }

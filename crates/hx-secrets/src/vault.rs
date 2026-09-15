@@ -194,6 +194,12 @@ impl Vault {
 
         let mut salt = [0u8; SALT_LEN];
         salt.copy_from_slice(&salt_vec);
+        // Same treatment as `salt` above: the length is already validated, so copy into a
+        // fixed array and let `XNonce::from` be infallible. The old `XNonce::from_slice` is
+        // deprecated in aead 0.6 (hybrid-array) in favour of TryFrom, which would force a
+        // pointless second error path for a case that cannot fail.
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce.copy_from_slice(&nonce_vec);
 
         let key = derive_key(passphrase, &salt, &env.kdf)?;
 
@@ -201,7 +207,7 @@ impl Vault {
             .map_err(|e| VaultError::Kdf(e.to_string()))?;
         let plaintext = cipher
             .decrypt(
-                XNonce::from_slice(&nonce_vec),
+                &XNonce::from(nonce),
                 Payload {
                     msg: &ciphertext,
                     aad: AAD,
@@ -246,7 +252,7 @@ impl Vault {
             .map_err(|e| VaultError::Kdf(e.to_string()))?;
         let ciphertext = cipher
             .encrypt(
-                XNonce::from_slice(&nonce),
+                &XNonce::from(nonce),
                 Payload {
                     msg: &plaintext,
                     aad: AAD,
@@ -322,7 +328,9 @@ fn derive_key(passphrase: &str, salt: &[u8], kdf: &KdfParams) -> Result<[u8; KEY
 }
 
 fn fill_random(buf: &mut [u8]) -> Result<(), VaultError> {
-    getrandom::getrandom(buf).map_err(|e| VaultError::Rng(e.to_string()))
+    // getrandom 0.3 renamed `getrandom` to `fill`; the old name was ambiguous about which
+    // buffer was being filled.
+    getrandom::fill(buf).map_err(|e| VaultError::Rng(e.to_string()))
 }
 
 #[cfg(test)]
