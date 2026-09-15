@@ -1386,7 +1386,7 @@ name = "hx-remote"
 version = "0.0.1"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "hx-core",
  "hx-secrets",
@@ -1436,7 +1436,7 @@ name = "hx-secrets"
 version = "0.0.1"
 dependencies = [
  "argon2 0.5.3",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chacha20poly1305",
  "getrandom 0.2.17",
  "hx-core",
