@@ -1,0 +1,260 @@
+name: Release
+
+# Produces the portable artifacts users actually install: static binaries per platform,
+# plus a checksum file the installer verifies against.
+#
+# The reason these are static (musl, not glibc) is that a glibc binary is only portable to
+# machines with a glibc at least as new as the build runner's. A musl binary has no libc
+# dependency at all, so it runs on Alpine, on distroless images, and on old LTS distros
+# alike. See DEPLOY.md.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, without the leading v. Defaults to the workspace version."
+        required: false
+        type: string
+      publish:
+        description: "Create a GitHub Release from these artifacts."
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # Decide what version we are building and whether this run publishes. Keeping this in one
+  # place means a manual dry run and a real tag push share every other job.
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # Tag push: v1.2.3 -> 1.2.3
+            version="${GITHUB_REF_NAME#v}"
+            publish=true
+          else
+            version="${{ inputs.version }}"
+            if [ -z "$version" ]; then
+              version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+            fi
+            publish="${{ inputs.publish }}"
+          fi
+          if [ -z "$version" ]; then
+            echo "::error::could not determine a version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "Building version $version (publish=$publish)"
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: plan
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: musl for a dependency-free static binary. `cross` supplies the musl
+          # toolchain (and cmake, which aws-lc-sys needs to build its C sources) in a
+          # container, so the runner stays clean.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+          # macOS: built on an arm64 runner; Apple's toolchain cross-compiles to x86_64
+          # natively, so both targets come from one runner image.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          # Windows: MSVC toolchain, which is what users expect to run.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      # `--locked` everywhere: a release must be built from exactly the locked dependency
+      # set, not from whatever resolved today.
+      - name: Build (cross)
+        if: matrix.use_cross
+        shell: bash
+        run: cross build --release --locked --target ${{ matrix.target }} --bin hx --bin hxd
+
+      - name: Build (native toolchain)
+        if: ${{ !matrix.use_cross }}
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin hx --bin hxd
+
+      - name: Stage binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="${{ matrix.target }}"
+          mkdir -p "staging/$out"
+          for bin in hx hxd; do
+            if [ -f "target/$out/release/$bin.exe" ]; then
+              cp "target/$out/release/$bin.exe" "staging/$out/"
+            elif [ -f "target/$out/release/$bin" ]; then
+              cp "target/$out/release/$bin" "staging/$out/"
+            else
+              echo "::error::expected binary $bin for $out was not produced"
+              ls -la "target/$out/release/" || true
+              exit 1
+            fi
+          done
+          ls -la "staging/$out"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bin-${{ matrix.target }}
+          path: staging/${{ matrix.target }}/*
+          if-no-files-found: error
+
+  # One job does all the packaging so the archive logic exists in exactly one shell. Doing
+  # this per-OS would mean three implementations of the same thing, and the Windows one
+  # would be the one nobody tests.
+  package:
+    name: package
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: bins
+          pattern: bin-*
+          merge-multiple: false
+
+      - name: Package archives + checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.plan.outputs.version }}"
+          mkdir -p dist
+          for dir in bins/bin-*; do
+            target="${dir#bins/bin-}"
+            name="hx-${version}-${target}"
+
+            # Do not trust the artifact name to match the binaries inside it.
+            if [ ! -f "$dir/hx" ] && [ ! -f "$dir/hx.exe" ]; then
+              echo "::error::no hx binary in $dir"
+              exit 1
+            fi
+
+            if ls "$dir"/*.exe >/dev/null 2>&1; then
+              ( cd "$dir" && zip -q -r "../../dist/${name}.zip" . )
+            else
+              # --owner/--group make the archive reproducible byte-for-byte across runs.
+              tar -czf "dist/${name}.tar.gz" \
+                --owner=0 --group=0 --numeric-owner \
+                -C "$dir" .
+            fi
+          done
+
+          cd dist
+          sha256sum ./* > SHA256SUMS
+          cat SHA256SUMS
+          echo "--- produced ---"
+          ls -la
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: "dist/*"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: [plan, package]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ needs.plan.outputs.version }}
+          name: v${{ needs.plan.outputs.version }}
+          files: dist/*
+          draft: false
+          # Generated release notes from merged PRs. Overwritten by hand later if wanted.
+          generate_release_notes: true
+          body: |
+            Portable binaries for hx ${{ needs.plan.outputs.version }}.
+
+            Install with the one-liner (verifies the checksum before installing anything):
+
+            ```sh
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
+            ```
+
+            Or on Windows, in PowerShell:
+
+            ```powershell
+            irm https://raw.githubusercontent.com/${{ github.repository }}/main/install.ps1 | iex
+            ```
+
+            Verify what you downloaded against `SHA256SUMS`, and see
+            [DEPLOY.md](https://github.com/${{ github.repository }}/blob/main/DEPLOY.md) for the
+            container and build-from-source routes.
+
+            The Linux binaries are static (musl), so they have no libc dependency and run on
+            Alpine, distroless images, and old LTS releases alike.

@@ -1,0 +1,36 @@
+# Build context exclusions.
+#
+# The payload here is a Rust workspace whose target/ directory is routinely several GB.
+# Excluding it is the difference between a ~40 MB context and a multi-GB one.
+
+# Build output — always rebuilt inside the image.
+target/
+
+# VCS metadata. Also a safety measure: `COPY . .` would otherwise bake .git/config,
+# which is where a token ends up if someone ever clones with a credential in the URL.
+.git/
+.gitignore
+
+# CI definitions aren't needed to build the binary.
+.github/
+
+# Local runtime state and secrets. hx.yaml is gitignored precisely because it holds
+# operator config; the image ships hx.example.yaml instead.
+hx.yaml
+.env
+.env.*
+*.pem
+*.key
+
+# Release artifacts, if someone builds them locally.
+dist/
+*.tar.gz
+*.zip
+SHA256SUMS
+
+# Docs and editor cruft.
+*.md
+!README.md
+.vscode/
+.idea/
+.DS_Store

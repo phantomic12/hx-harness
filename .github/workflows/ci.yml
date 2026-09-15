@@ -1,0 +1,98 @@
+name: CI
+
+# The three checks that gate every change: formatting, lints, and the test suite.
+#
+# `cargo test` here runs 347 in-process unit tests with no external dependencies. Read
+# TESTING.md before trusting a green badge: it separates "executed against a real service"
+# from "unit-tested" from "merely compiles", and nothing in this file reaches tier A.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to a PR makes the previous run obsolete. Cancel it rather than paying for
+# a result nobody will read.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts are worthless in CI (every run starts cold) and cost cache space.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # No cache: this is seconds of work, and a cache restore would cost more.
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # --all-targets so test code is linted too — a warning in a test is still a warning.
+      # -D warnings makes the build fail rather than printing advice into a log nobody reads.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing must not hide whether the other two pass.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # --locked fails if Cargo.lock is out of date with the manifests. That is deliberate:
+      # an un-updated lockfile is a real bug, and better caught here than by a user.
+      - run: cargo test --workspace --locked
+
+  # The manifest claims `rust-version = "1.82"`. This job is what makes that claim true or
+  # false. If it fails, the fix is to raise the declared version, not to delete the job —
+  # a wrong MSRV sends contributors to a toolchain that cannot build the project.
+  msrv:
+    name: msrv (${{ matrix.msrv }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        msrv: ["1.82.0"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.msrv }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      # Advisories (known CVEs), license compliance, and dependency provenance.
+      # Config in deny.toml.
+      - run: cargo deny check

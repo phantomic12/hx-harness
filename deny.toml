@@ -1,0 +1,60 @@
+# cargo-deny configuration — run by the `deny` job in .github/workflows/ci.yml.
+#
+# Three questions, in order of how likely they are to be interesting:
+#   1. advisories — does any dependency have a known CVE?
+#   2. licenses   — is everything in the tree redistributable under our MIT license?
+#   3. bans/sources — did anything arrive from an unexpected registry or git remote?
+
+[advisories]
+version = 2
+# A yanked crate still resolves for anyone with a lockfile; failing the build over one
+# would block unrelated work. Warn, so it gets seen and fixed deliberately.
+yanked = "warn"
+
+[licenses]
+version = 2
+# Permissive-only. Anything copyleft (GPL/AGPL/LGPL) is absent on purpose: hx ships as a
+# binary, so a copyleft dependency would impose obligations on the distributed artifact.
+#
+# `OpenSSL` and `ISC` are here for aws-lc-rs/ring, which carry the OpenSSL exception and
+# ISC respectively rather than a bare Apache/MIT.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Unlicense",
+    "Zlib",
+]
+# Some crates ship no license field or a non-SPDX string. Fail loudly rather than
+# silently accepting a license we never reviewed.
+confidence-threshold = 0.93
+
+[bans]
+# 395 crates in the tree, so duplicates are a fact of life, not an incident.
+multiple-versions = "warn"
+# A wildcard version requirement means the build is not reproducible. Path dependencies
+# (`hx-core = { path = "crates/hx-core" }`) declare no version and would trip this, so
+# they are exempted explicitly.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# A crate from an unknown registry is a supply-chain problem worth stopping for.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Nothing is pulled from git today. If that changes, add the specific remote here — never
+# a wildcard, which would make this section decorative.
+allow-git = []

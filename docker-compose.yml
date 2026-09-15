@@ -1,0 +1,46 @@
+# Portable hxd deployment.
+#
+#   docker compose up -d
+#   curl -s localhost:7717/healthz
+#
+# Mount the config from the host rather than baking credentials into an image. This file
+# expects ./hx.yaml next to it — `cp hx.example.yaml hx.yaml` first.
+
+services:
+  hxd:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/phantomic12/hx-harness:latest
+    container_name: hxd
+    restart: unless-stopped
+
+    ports:
+      # Bound to loopback on the host on purpose. hxd has no authentication of its own —
+      # anything that can reach the port can drive your model spend and your sandboxes.
+      # Put it behind a reverse proxy or an SSH tunnel instead of exposing it.
+      - "127.0.0.1:7717:7717"
+
+    volumes:
+      # Operator config, read-only. Change to :ro after you're done editing.
+      - ./hx.yaml:/etc/hx/hx.yaml:ro
+
+      # Required for sandboxes. This is root-equivalent host access — see the Dockerfile.
+      # Omit this line if you only need the HTTP API.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+      # Where the daemon keeps its data dir (~/.hx).
+      - hxd-data:/root/.hx
+
+    environment:
+      RUST_LOG: info
+      # There is deliberately no credential env var here. hx.yaml's `vault:` references are
+      # parsed and validated at startup, but they are not yet resolved to real values —
+      # nothing in the daemon holds a secret (see "Credential handling" in DEPLOY.md).
+      # Running this image today requires no credentials at all.
+
+    # A daemon that talks to the Docker socket wants to be able to see its own containers.
+    # Nothing else here needs extra privileges.
+
+volumes:
+  hxd-data:

@@ -1,5 +1,9 @@
 # hx — an agent harness in Rust
 
+[![CI](https://github.com/phantomic12/hx-harness/actions/workflows/ci.yml/badge.svg)](https://github.com/phantomic12/hx-harness/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/phantomic12/hx-harness)](https://github.com/phantomic12/hx-harness/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A harness for driving AI agents against real machines: remote hosts, isolated sandboxes, model
 pools with enforced ceilings, and one HTTP API that every front end talks to.
 
@@ -113,11 +117,34 @@ apps/
 Empty placeholder crates (`hx-agent`, `hx-tools`, `hx-store`, `hx-gateway`, `hx-mcp`,
 `hx-browser`) are reserved for the milestones that need them.
 
+## Installing
+
+Prebuilt static binaries. No toolchain, no Docker, no sudo:
+
+```console
+$ curl -fsSL https://raw.githubusercontent.com/phantomic12/hx-harness/main/install.sh | sh
+```
+
+Windows PowerShell: `iwr -useb https://raw.githubusercontent.com/phantomic12/hx-harness/main/install.ps1 | iex`
+
+Container: `docker pull ghcr.io/phantomic12/hx-harness:latest`
+
+**[DEPLOY.md](DEPLOY.md)** covers all four paths, version pinning, checksum and attestation
+verification, and the two things that bite people — the Docker socket, and the fact that `hxd`
+has no authentication of its own.
+
 ## Running it
 
 ```console
 $ cp hx.example.yaml hx.yaml     # then edit
-$ cargo build --release
+$ hx doctor                      # validate the config
+$ hxd --config hx.yaml --bind 127.0.0.1:7717
+```
+
+From a clone:
+
+```console
+$ cargo build --release --locked
 $ ./target/release/hx doctor
 $ ./target/release/hxd --bind 127.0.0.1:7717
 ```
@@ -126,7 +153,7 @@ $ ./target/release/hxd --bind 127.0.0.1:7717
 $ cargo test --workspace         # 347 unit tests, no external dependencies
 ```
 
-Rust 1.85+ (edition 2024). Verified on 1.98.1.
+Rust 1.82+ (edition 2021). Verified on 1.98.1.
 
 ## What is deliberately not done yet
 
