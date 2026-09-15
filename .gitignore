@@ -1,3 +1,13 @@
 /target
 **/*.rs.bk
-*.pdb
+
+# Local configuration and secrets — never commit these.
+/hx.yaml
+/hx.local.yaml
+*.vault.json
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -23,8 +23,8 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use hx_core::config::SandboxProfile;
 use hx_core::error::HxError;
-use hx_search::{Recency, SearchQuery};
 use hx_sandbox::SandboxSpec;
+use hx_search::{Recency, SearchQuery};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -342,12 +342,7 @@ search:
 
     async fn get(state: Arc<AppState>, uri: &str) -> (StatusCode, serde_json::Value) {
         let response = app(state)
-            .oneshot(
-                Request::builder()
-                    .uri(uri)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
 

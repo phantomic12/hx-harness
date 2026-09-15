@@ -26,11 +26,7 @@ pub fn render_pools(router: &ModelRouter) -> String {
         );
         for (index, route) in pool.routes.iter().enumerate() {
             let marker = if index == 0 { "->" } else { "  " };
-            let _ = writeln!(
-                out,
-                "  {marker} {}/{}",
-                route.provider, route.model
-            );
+            let _ = writeln!(out, "  {marker} {}/{}", route.provider, route.model);
         }
     }
 
@@ -82,11 +78,7 @@ pub fn render_sandbox_spec(name: &str, profile: &SandboxProfile, workspace: &str
     let settings = spec.host_settings();
 
     let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "profile {name}  (isolation {:?})",
-        spec.isolation
-    );
+    let _ = writeln!(out, "profile {name}  (isolation {:?})", spec.isolation);
 
     let _ = writeln!(out, "  image             {}", spec.image);
     let _ = writeln!(out, "  cpus              {}", spec.cpus);
@@ -110,7 +102,11 @@ pub fn render_sandbox_spec(name: &str, profile: &SandboxProfile, workspace: &str
     let _ = writeln!(
         out,
         "  readonly rootfs   {}",
-        if settings.readonly_rootfs { "yes" } else { "no" }
+        if settings.readonly_rootfs {
+            "yes"
+        } else {
+            "no"
+        }
     );
     let _ = writeln!(out, "  user              {}", settings.user);
 
@@ -124,14 +120,15 @@ pub fn render_sandbox_spec(name: &str, profile: &SandboxProfile, workspace: &str
         "  capabilities      {caps}  [dropped: {}]",
         settings.cap_drop.join(", ")
     );
-    let _ = writeln!(out, "  security opts     {}", settings.security_opt.join(", "));
+    let _ = writeln!(
+        out,
+        "  security opts     {}",
+        settings.security_opt.join(", ")
+    );
     let _ = writeln!(
         out,
         "  runtime           {}",
-        settings
-            .runtime
-            .as_deref()
-            .unwrap_or("(engine default)")
+        settings.runtime.as_deref().unwrap_or("(engine default)")
     );
 
     if settings.tmpfs.is_empty() {
@@ -217,7 +214,10 @@ pub fn static_checks(config: &Config) -> Vec<DoctorCheck> {
         } else {
             checks.push(DoctorCheck::pass(
                 "provider credentials",
-                format!("{credentials} across {} provider(s)", config.providers.len()),
+                format!(
+                    "{credentials} across {} provider(s)",
+                    config.providers.len()
+                ),
             ));
         }
     }
@@ -226,7 +226,11 @@ pub fn static_checks(config: &Config) -> Vec<DoctorCheck> {
     match ModelRouter::from_config(config, Utc::now()) {
         Ok(router) => checks.push(DoctorCheck::pass(
             "routing table",
-            format!("{} pool(s), {} role binding(s)", router.pool_names().len(), router.roles().len()),
+            format!(
+                "{} pool(s), {} role binding(s)",
+                router.pool_names().len(),
+                router.roles().len()
+            ),
         )),
         Err(err) => checks.push(DoctorCheck::fail("routing table", err.to_string())),
     }
@@ -431,13 +435,19 @@ sandbox_profiles:
         assert!(rendered.contains("network           none"), "{rendered}");
         assert!(rendered.contains("privileged        no"), "{rendered}");
         assert!(rendered.contains("readonly rootfs   yes"), "{rendered}");
-        assert!(rendered.contains("capabilities      (none granted)"), "{rendered}");
+        assert!(
+            rendered.contains("capabilities      (none granted)"),
+            "{rendered}"
+        );
         assert!(rendered.contains("dropped: ALL"), "{rendered}");
         assert!(rendered.contains("no-new-privileges:true"), "{rendered}");
         assert!(rendered.contains("tmpfs             /tmp"), "{rendered}");
         assert!(rendered.contains("noexec"), "{rendered}");
         assert!(rendered.contains("/tmp/ws -> /workspace"), "{rendered}");
-        assert!(!rendered.contains("WARNING"), "a valid profile must not warn: {rendered}");
+        assert!(
+            !rendered.contains("WARNING"),
+            "a valid profile must not warn: {rendered}"
+        );
     }
 
     #[test]
@@ -499,12 +509,7 @@ search: { backends: [] }
             .map(|c| c.name.as_str())
             .collect();
 
-        for expected in [
-            "providers",
-            "roles",
-            "search backends",
-            "sandbox profiles",
-        ] {
+        for expected in ["providers", "roles", "search backends", "sandbox profiles"] {
             assert!(
                 names.contains(&expected),
                 "doctor missed '{expected}': {names:?}"
@@ -539,7 +544,10 @@ roles: { builder: ghost }
     fn hosts_render_includes_local_and_notes_when_empty() {
         let rendered = render_hosts(&config());
         assert!(rendered.contains("local"), "{rendered}");
-        assert!(rendered.contains("no remote hosts configured"), "{rendered}");
+        assert!(
+            rendered.contains("no remote hosts configured"),
+            "{rendered}"
+        );
     }
 
     #[test]

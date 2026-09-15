@@ -48,14 +48,17 @@ impl AppState {
             .map_err(|e| HxError::Config(format!("could not build the HTTP client: {e}")))?;
         let search = BackendRegistry::from_config(&config.search, client)?;
 
-        let (sandboxes, sandbox_unavailable_reason) =
-            match hx_sandbox::docker_manager(config.agent.max_concurrent_subagents as usize).await {
-                Ok(manager) => (Some(Arc::new(manager)), None),
-                Err(err) => {
-                    tracing::warn!(error = %err, "sandboxes are unavailable");
-                    (None, Some(err.to_string()))
-                }
-            };
+        let (sandboxes, sandbox_unavailable_reason) = match hx_sandbox::docker_manager(
+            config.agent.max_concurrent_subagents as usize,
+        )
+        .await
+        {
+            Ok(manager) => (Some(Arc::new(manager)), None),
+            Err(err) => {
+                tracing::warn!(error = %err, "sandboxes are unavailable");
+                (None, Some(err.to_string()))
+            }
+        };
 
         Ok(Arc::new(Self {
             config,
@@ -93,7 +96,9 @@ impl AppState {
 
     /// Build the local host handle.
     pub async fn local_host(&self) -> Result<Arc<LocalHost>> {
-        Ok(Arc::new(LocalHost::detect(HostId::from_raw("local")).await?))
+        Ok(Arc::new(
+            LocalHost::detect(HostId::from_raw("local")).await?,
+        ))
     }
 
     /// One combined snapshot for `/v1/status` and `hx status`.
@@ -147,13 +152,10 @@ pub struct HostSummary {
 
 impl HostSummary {
     fn from_config(name: &str, host: &HostConfig) -> Self {
-        let address = host
-            .address
-            .as_ref()
-            .map(|addr| match host.port {
-                Some(port) => format!("{addr}:{port}"),
-                None => addr.clone(),
-            });
+        let address = host.address.as_ref().map(|addr| match host.port {
+            Some(port) => format!("{addr}:{port}"),
+            None => addr.clone(),
+        });
 
         let description = match (&host.user, &address) {
             (Some(user), Some(addr)) => format!("{user}@{addr}"),

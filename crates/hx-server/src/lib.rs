@@ -11,5 +11,5 @@
 pub mod routes;
 pub mod state;
 
-pub use routes::{app, ApiError, status_for};
+pub use routes::{app, status_for, ApiError};
 pub use state::{AppState, HostSummary, SandboxSummary, StatusReport};
