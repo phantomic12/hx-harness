@@ -139,3 +139,7 @@ Rust 1.85+ (edition 2024). Verified on 1.98.1.
   This is a real gap, documented in `crates/hx-remote/src/ssh.rs`.
 - **Web UI, desktop/mobile apps, chat connectors, MCP, browser pool.** Designed in
   `ARCHITECTURE.md`, not built.
+- **20 deprecation warnings from `bollard` 0.19.** It deprecated the legacy
+  `bollard::container::*Options` structs in favour of `bollard::query_parameters::*` and their
+  builders. The sandbox runtime still uses the legacy ones. Functionally correct and covered by
+  tests — the migration is mechanical and is the obvious first cleanup commit.

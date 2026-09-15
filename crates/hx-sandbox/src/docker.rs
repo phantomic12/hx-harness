@@ -8,8 +8,13 @@
 use crate::runtime::{SandboxExecOutput, SandboxRuntime};
 use crate::spec::{HostSettings, SandboxSpec};
 use async_trait::async_trait;
-use bollard::container::{
-    CreateContainerOptions, LogOutput, LogsOptions, RemoveContainerOptions, StartContainerOptions,
+// `bollard` 0.19 deprecated the hand-written `container::*Options` structs in favour of the
+// OpenAPI-generated `query_parameters` ones. The fields are the same names, so this is a
+// rename — but the deprecated versions emit one warning *per field*, which is exactly the kind
+// of noise that hides a real warning.
+use bollard::container::LogOutput;
+use bollard::query_parameters::{
+    CreateContainerOptions, LogsOptions, RemoveContainerOptions, StartContainerOptions,
     StopContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
@@ -151,9 +156,11 @@ impl SandboxRuntime for DockerRuntime {
         let response = self
             .docker
             .create_container(
+                // In the generated API `name` is `Option<String>` and `platform` is a plain
+                // `String` where empty means "let the daemon decide".
                 Some(CreateContainerOptions {
-                    name: name.clone(),
-                    platform: None,
+                    name: Some(name.clone()),
+                    ..Default::default()
                 }),
                 body,
             )
@@ -182,18 +189,22 @@ impl SandboxRuntime for DockerRuntime {
 
     async fn start(&self, runtime_id: &str) -> Result<()> {
         self.docker
-            .start_container(runtime_id, None::<StartContainerOptions<String>>)
+            .start_container(runtime_id, None::<StartContainerOptions>)
             .await
             .map_err(|e| HxError::Sandbox(format!("could not start {runtime_id}: {e}")))
     }
 
     async fn stop(&self, runtime_id: &str, grace_secs: i64) -> Result<()> {
+        let grace = if grace_secs > 0 {
+            grace_secs
+        } else {
+            STOP_GRACE_SECS
+        };
+        // `t` is `Option<i32>` in the generated API, so "no explicit signal, just wait" is
+        // `None` rather than a sentinel value.
         let options = StopContainerOptions {
-            t: if grace_secs > 0 {
-                grace_secs
-            } else {
-                STOP_GRACE_SECS
-            },
+            t: Some(grace as i32),
+            ..Default::default()
         };
         self.docker
             .stop_container(runtime_id, Some(options))
@@ -294,7 +305,7 @@ impl SandboxRuntime for DockerRuntime {
 pub async fn logs(docker: &Docker, runtime_id: &str, tail: &str) -> Result<Vec<String>> {
     let mut stream = docker.logs(
         runtime_id,
-        Some(LogsOptions::<String> {
+        Some(LogsOptions {
             stdout: true,
             stderr: true,
             tail: tail.to_string(),
