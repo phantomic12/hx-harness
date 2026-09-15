@@ -7,7 +7,7 @@
 A harness for driving AI agents against real machines: remote hosts, isolated sandboxes, model
 pools with enforced ceilings, and one HTTP API that every front end talks to.
 
-This repository is the working foundation — seven crates of tested logic, a runnable daemon, and a
+This repository is the working foundation — thirteen crates of tested logic, a runnable daemon, and a
 CLI. It is **not** a finished harness; `ROADMAP.md` says exactly what is missing.
 
 ---
