@@ -59,7 +59,7 @@ $ curl -s localhost:7717/v1/status | jq .pools
 | Model pools, per-credential rate/token/budget limits, role routing | **Done**, tested |
 | Web search: self-hosted SearXNG + keyless DuckDuckGo, RRF fusion, per-backend failure reporting | **Built** — SearXNG verified end to end against a live instance; DuckDuckGo is bot-walled for a non-browser client and *says so* rather than returning nothing |
 | Remote hosts: local + SSH (real `russh`), host key verification, Windows/macOS/Linux capability detection | **Built** — connect, auth, exec and file transfer run against a real host (`crates/hx-remote/tests/ssh_live.rs`) |
-| Sandboxes: L1/L2 isolation ladder, Docker lifecycle, TTL reaper | **Built** — created, confined and reaped against a real daemon (`crates/hx-sandbox/tests/docker_live.rs`), running as the workspace's owner so the bind mount is writable; L3 (`runsc`) unexecuted |
+| Sandboxes: L1/L2/L3 isolation ladder, Docker lifecycle, TTL reaper | **Built** — created, confined and reaped against a real daemon (`crates/hx-sandbox/tests/docker_live.rs`), running as the workspace's owner so the bind mount is writable; L3 verified inside gVisor, where the sandbox sees `4.19.0-gvisor` and not the host kernel |
 | Daemon (`hxd`) + HTTP API + CLI (`hx`) | **Done**, runnable |
 | Web UI, Tauri desktop/mobile, chat connectors | **Not started** |
 | MCP client, browser-automation pool | **Not started** |
@@ -151,7 +151,7 @@ $ ./target/release/hxd --bind 127.0.0.1:7717
 ```
 
 ```console
-$ cargo test --workspace         # 390 unit tests + 17 ignored integration tests
+$ cargo test --workspace         # 390 unit tests + 18 ignored integration tests
 $ cargo test -p hx-sandbox --test docker_live -- --ignored   # needs a container engine
 $ cargo test -p hx-remote --test ssh_live -- --ignored       # needs an SSH server
 $ HX_SEARXNG_URL=... HX_SEARCH_EXPECT_RESULTS=searxng \
@@ -172,9 +172,10 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
 - **Nothing in `ci.yml` reaches another machine.** That file is in-process unit tests; the tests
   that open a socket — a real Docker daemon, a real `sshd` — live in
   `.github/workflows/integration.yml` and are `#[ignore]`d by default, so a local `cargo test` stays
-  green on a laptop without Docker while still reporting `17 ignored` rather than implying coverage.
-  Even so, **L3 has never run**: `runtime: runsc` is passed to the engine and asserted, but nothing
-  installs gVisor, so the strongest claim in the ladder is unexecuted.
+  green on a laptop without Docker while still reporting `18 ignored` rather than implying coverage.
+  L3 is verified where gVisor is installed — the CI job installs it, and `HX_DOCKER_REQUIRE_L3`
+  turns a skip into a failure so the strongest claim in the ladder cannot quietly stop being
+  tested.
 - **Egress filtering.** A sandbox has a network or it does not. There is no proxy and no firewall
   rule behind `egress`, so an allowlist is *refused* (`SpecError::EgressNotEnforced`) rather than
   silently ignored — a profile that says four hostnames must not mean the whole internet.
