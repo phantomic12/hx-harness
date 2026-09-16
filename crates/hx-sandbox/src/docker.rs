@@ -84,6 +84,10 @@ pub fn to_host_config(settings: &HostSettings) -> HostConfig {
         runtime: settings.runtime.clone(),
         auto_remove: Some(settings.auto_remove),
         init: Some(settings.init),
+        // User-namespace remapping lives here, not in `security_opt`: `userns=keep-id` as a
+        // security option is rejected by the daemon at create time, which made every L2/L3
+        // sandbox impossible to start. See `spec::USERNS_REMAPPED`.
+        userns_mode: settings.userns_mode.clone(),
         // Note: the sandbox user is set on the container body, not here — `HostConfig` has no
         // `user` field in the current API, and setting it in the wrong place would silently
         // leave the sandbox running as root.
@@ -407,6 +411,24 @@ mod tests {
     fn l3_runtime_is_passed_to_the_engine() {
         let engine = to_host_config(&spec(IsolationLevel::L3).host_settings());
         assert_eq!(engine.runtime.as_deref(), Some("runsc"));
+    }
+
+    #[test]
+    fn user_namespace_remapping_reaches_the_engine_field_not_the_security_options() {
+        // The engine's field, because the security-option spelling is refused at create time:
+        //   invalid --security-opt 2: "userns=keep-id"
+        let engine = to_host_config(&spec(IsolationLevel::L2).host_settings());
+        assert_eq!(engine.userns_mode.as_deref(), Some("private"));
+
+        let options = engine.security_opt.unwrap_or_default();
+        assert!(
+            !options.iter().any(|o| o.starts_with("userns=")),
+            "a rejected option means no sandbox at all: {options:?}"
+        );
+
+        // L1 is a development container; it asks for no remapping and must send none.
+        let l1 = to_host_config(&spec(IsolationLevel::L1).host_settings());
+        assert_eq!(l1.userns_mode, None);
     }
 
     #[test]

@@ -92,7 +92,9 @@ hosts:
 # Sandbox profiles: what "isolated" means, per level.
 #
 #   l1  shared kernel, dropped capabilities, read-only root, no network
-#   l2  l1 + seccomp, user-namespace remapping, no capabilities at all
+#   l2  l1 + no capabilities at all, forced read-only root, non-root, user-namespace remapping
+#       (the engine's default seccomp profile applies at every level; a stronger one would have to
+#        be a shipped profile, and `seccomp=default` is not a value the engine accepts)
 #   l3  l2 inside a VM-backed runtime (runsc / kata) — a kernel exploit hits the guest
 #
 # Inspect the concrete settings with: hx sandbox spec dev
@@ -107,7 +109,10 @@ sandbox_profiles:
     workspace_mb: 32768
     ttl_secs: 14400
     network: true
-    egress: ["crates.io", "static.crates.io", "registry.npmjs.org", "github.com"]
+    # No egress allowlist: a sandbox cannot enforce one yet, and an unenforceable constraint is
+    # refused rather than silently ignored. An L1 build container needs the network, so this one
+    # accepts an unrestricted one — knowingly, in writing.
+    # egress: ["crates.io", "static.crates.io", "registry.npmjs.org", "github.com"]
 
   untrusted:
     isolation: l2

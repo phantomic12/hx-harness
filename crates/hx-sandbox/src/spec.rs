@@ -8,7 +8,7 @@
 //! | Level | Mechanism | Stops | Cost |
 //! |---|---|---|---|
 //! | [`IsolationLevel::L1`] | Shared kernel, dropped capabilities, no-new-privileges, read-only root | Misconfiguration, accidental damage, most supply-chain footguns | ~0 |
-//! | [`IsolationLevel::L2`] | L1 + seccomp filter, user-namespace remapping, non-root, proxy-only egress | A process probing the kernel for a known CVE | Small |
+//! | [`IsolationLevel::L2`] | L1 + no capabilities at all, forced read-only root, non-root, user-namespace remapping | A process probing the kernel for a known CVE | Small |
 //! | [`IsolationLevel::L3`] | L2 settings inside a VM-backed runtime (`runsc`, `kata`) | A kernel exploit, fully — it lands in the guest | Noticeable |
 //!
 //! The mapping from level to concrete container settings lives in [`SandboxSpec::host_settings`]
@@ -31,6 +31,13 @@ pub use hx_core::config::{IsolationLevel, SandboxProfile};
 /// to the host than one from an unprivileged user.
 pub const SANDBOX_UID: &str = "1000:1000";
 
+/// What to ask the engine for when a level wants user-namespace remapping.
+///
+/// `"private"` is the Docker API's spelling (`HostConfig.UsernsMode`). Podman's `keep-id` is a
+/// *different mode* with different semantics, and it is not a valid `security_opt` for Docker —
+/// see [`SandboxSpec::host_settings`].
+pub const USERNS_REMAPPED: &str = "private";
+
 /// Where the working tree is mounted inside the sandbox.
 pub const DEFAULT_WORKSPACE_PATH: &str = "/workspace";
 
@@ -51,6 +58,11 @@ pub struct SandboxSpec {
     /// Hard lifetime. A sandbox that nobody reaps is a resource leak with a nice name.
     pub ttl_secs: u64,
     /// Egress allowlist — hostnames or CIDRs. Empty means no egress.
+    ///
+    /// **Not enforceable yet.** There is no proxy and no netfilter rule behind it, so a sandbox
+    /// either has a network or does not; an allowlist would be a promise nothing keeps. Setting one
+    /// is therefore refused by [`SandboxSpec::validate`] rather than quietly ignored — see
+    /// [`SpecError::EgressNotEnforced`].
     pub egress_allow: Vec<String>,
     pub network: bool,
     pub readonly_rootfs: bool,
@@ -128,6 +140,12 @@ impl SandboxSpec {
         if !self.network && !self.egress_allow.is_empty() {
             return Err(SpecError::EgressWithoutNetwork(self.egress_allow.clone()));
         }
+        // And with networking *on* it is worse than a mistake: nothing enforces the list. Refusing
+        // is the only honest answer, because the alternative is a sandbox that reaches the whole
+        // internet while its profile says four hostnames — and the profile is what gets reviewed.
+        if self.network && !self.egress_allow.is_empty() {
+            return Err(SpecError::EgressNotEnforced(self.egress_allow.clone()));
+        }
         Ok(())
     }
 
@@ -153,6 +171,7 @@ impl SandboxSpec {
             readonly_rootfs: self.readonly_rootfs,
             auto_remove: false,
             init: true,
+            userns_mode: None,
             tmpfs: Vec::new(),
             binds: Vec::new(),
         };
@@ -178,17 +197,28 @@ impl SandboxSpec {
                 // A read-only root is non-negotiable here; a writable root is how you persist a
                 // foothold across a reaped container.
                 settings.readonly_rootfs = true;
-                settings.security_opt.push("seccomp=default".to_string());
-                // User-namespace remapping: uid 0 inside maps to an unprivileged uid outside,
-                // so even a successful uid-0 escape is not uid 0 on the host.
-                settings.security_opt.push("userns=keep-id".to_string());
+                // No seccomp option is sent, and that is deliberate: an engine applies its default
+                // seccomp profile to every container it starts. The option only exists to *change*
+                // that — `seccomp=<path>`, or `seccomp=unconfined` — and `seccomp=default` is not
+                // a value a Docker daemon accepts. It parses the value as a profile and fails:
+                //   Decoding seccomp profile failed: invalid character 'd' looking for beginning
+                // which made every L2 sandbox fail to start. The default filter is already applied;
+                // a *stronger* one would have to be a shipped profile, not a keyword.
+                //
+                // User-namespace remapping, by contrast, does have a real field. Podman spells it
+                // `--userns=keep-id` and putting that in `security_opt` is what a Docker daemon
+                // rejects outright:
+                //   invalid --security-opt 2: "userns=keep-id"
+                // Docker's API takes the intent as `HostConfig.UsernsMode = "private"`: accepted on
+                // a daemon with no remap configured (where it is a no-op), and honoured on one that
+                // has it. So the request is always expressible and never fatal.
+                settings.userns_mode = Some(USERNS_REMAPPED.to_string());
                 settings.user.clone_from(&SANDBOX_UID.to_string());
             }
             IsolationLevel::L3 => {
                 settings.cap_add.clear();
                 settings.readonly_rootfs = true;
-                settings.security_opt.push("seccomp=default".to_string());
-                settings.security_opt.push("userns=keep-id".to_string());
+                settings.userns_mode = Some(USERNS_REMAPPED.to_string());
                 // The whole point of L3: the kernel inside is not the host's kernel. A container
                 // escape is then a guest escape, which is a different and much harder problem.
                 settings.runtime = Some("runsc".to_string());
@@ -236,6 +266,9 @@ pub struct HostSettings {
     pub readonly_rootfs: bool,
     pub auto_remove: bool,
     pub init: bool,
+    /// `HostConfig.UsernsMode`: `"private"` asks for remapping, `None` leaves the engine default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub userns_mode: Option<String>,
     pub tmpfs: Vec<(String, String)>,
     pub binds: Vec<String>,
 }
@@ -255,6 +288,15 @@ impl HostSettings {
         self.security_opt
             .iter()
             .any(|o| o.starts_with("no-new-privileges"))
+    }
+
+    /// Whether user-namespace remapping was requested.
+    ///
+    /// A *request*, not a guarantee: the engine applies it only when its daemon is configured for
+    /// remapping. Reading this as "uid 0 inside is definitely not uid 0 outside" would be reading
+    /// more into the setting than it says, which is why the name does not claim enforcement.
+    pub fn requests_userns_remapping(&self) -> bool {
+        self.userns_mode.as_deref() == Some(USERNS_REMAPPED)
     }
 
     pub fn is_networked(&self) -> bool {
@@ -292,6 +334,13 @@ pub enum SpecError {
          drop the allowlist"
     )]
     EgressWithoutNetwork(Vec<String>),
+
+    #[error(
+        "egress allowlist {0:?} cannot be enforced: this build has no egress proxy or firewall \
+         rule, so the sandbox would reach the whole internet while the profile claims {0:?}. Set \
+         `network: false` for no egress, or drop the allowlist to accept an unrestricted one."
+    )]
+    EgressNotEnforced(Vec<String>),
 }
 
 #[cfg(test)]
@@ -459,12 +508,62 @@ mod tests {
     fn l2_remaps_user_namespaces_and_does_not_run_as_root() {
         let settings = spec(IsolationLevel::L2).host_settings();
         assert!(
-            settings.security_opt.iter().any(|o| o.contains("userns")),
-            "L2 needs user-namespace remapping: {:?}",
-            settings.security_opt
+            settings.requests_userns_remapping(),
+            "L2 asks for user-namespace remapping: {:?}",
+            settings.userns_mode
         );
         assert_ne!(settings.user, "0:0");
         assert_ne!(settings.user, "root");
+    }
+
+    #[test]
+    fn no_engine_rejected_security_option_is_ever_sent() {
+        // Two regressions are guarded here, both of the same kind: a container-engine keyword that
+        // is not a keyword. Both were sent as `security_opt`, both made the daemon refuse to run
+        // the container, and neither was visible to a test that only asserted the struct:
+        //
+        //   userns=keep-id   invalid --security-opt 2: "userns=keep-id"     (podman spelling)
+        //   seccomp=default  Decoding seccomp profile failed: invalid character 'd' …
+        //
+        // The second is the subtler one: an engine already applies its default seccomp profile to
+        // every container, so the *option* only exists to change it, and "default" is not a value
+        // it accepts.
+        for level in [IsolationLevel::L1, IsolationLevel::L2, IsolationLevel::L3] {
+            let settings = spec(level).host_settings();
+            for option in &settings.security_opt {
+                assert!(
+                    !option.starts_with("userns="),
+                    "{level:?} sends the security option {option:?}, which the engine rejects"
+                );
+                assert!(
+                    !option.starts_with("seccomp=default"),
+                    "{level:?} sends the security option {option:?}, which the engine rejects"
+                );
+            }
+        }
+
+        // The confinement those two options were standing in for still reaches the engine, through
+        // the mechanisms that express it: a read-only root, no capabilities, non-root, and the
+        // user-namespace field.
+        let l2 = spec(IsolationLevel::L2).host_settings();
+        assert!(l2.readonly_rootfs);
+        assert!(l2.cap_add.is_empty());
+        assert!(l2.drops_all_capabilities());
+        assert_eq!(l2.userns_mode.as_deref(), Some(USERNS_REMAPPED));
+        assert_ne!(l2.user, "0:0");
+    }
+
+    #[test]
+    fn remapping_is_only_requested_by_the_levels_that_need_it() {
+        assert!(!spec(IsolationLevel::L1)
+            .host_settings()
+            .requests_userns_remapping());
+        assert!(spec(IsolationLevel::L2)
+            .host_settings()
+            .requests_userns_remapping());
+        assert!(spec(IsolationLevel::L3)
+            .host_settings()
+            .requests_userns_remapping());
     }
 
     #[test]
@@ -489,6 +588,10 @@ mod tests {
         assert!(l2.security_opt.len() >= l1.security_opt.len());
         assert!(l3.has_kernel_isolation() && !l1.has_kernel_isolation());
         assert!(l2.readonly_rootfs && l3.readonly_rootfs);
+        assert!(
+            l2.requests_userns_remapping() && l3.requests_userns_remapping(),
+            "the levels that hold hostile code ask for remapping; L1 is a dev container and does not"
+        );
     }
 
     #[test]
@@ -590,6 +693,36 @@ mod tests {
             s.validate(),
             Err(SpecError::EgressWithoutNetwork(vec!["crates.io".into()]))
         );
+    }
+
+    #[test]
+    fn an_egress_allowlist_that_cannot_be_enforced_is_refused() {
+        // The setting had no enforcement behind it: the container got a full bridge network while
+        // the profile — the thing a reviewer reads — claimed four hostnames. Refusing is the only
+        // honest option until an egress proxy exists.
+        let mut s = spec(IsolationLevel::L1);
+        s.network = true;
+        s.egress_allow = vec!["crates.io".into(), "github.com".into()];
+
+        let err = s.validate().unwrap_err();
+        assert_eq!(
+            err,
+            SpecError::EgressNotEnforced(vec!["crates.io".into(), "github.com".into()])
+        );
+        let message = err.to_string();
+        assert!(message.contains("cannot be enforced"), "{message}");
+        assert!(
+            message.contains("network: false") && message.contains("drop the allowlist"),
+            "the error has to say what to do instead: {message}"
+        );
+    }
+
+    #[test]
+    fn networking_without_an_allowlist_is_still_allowed() {
+        // The other way to have a networked sandbox: say so, and mean it.
+        let mut s = spec(IsolationLevel::L1);
+        s.network = true;
+        assert_eq!(s.validate(), Ok(()));
     }
 
     #[test]
