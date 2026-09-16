@@ -1,0 +1,160 @@
+# Allowlists, from least to most risky
+
+`ARCHITECTURE.md` §3.11 explains how an action is *classified*. This is the other half: given a
+classification, what is allowed without asking, what always asks, what can never be answered, and what
+a "yes, don't ask again" is allowed to mean. The question it exists to answer is the operator's, not
+the engineer's: *what can this thing do to my machine while I am not looking?*
+
+Prior art worth copying, and what each teaches:
+
+| System | Its shape | What is worth taking |
+|---|---|---|
+| Claude Code (`/permissions`) | `allow` / `ask` / `deny` rule lists per tool, evaluated **deny → ask → allow**; four permission modes; a built-in read-only Bash set and preapproved documentation domains; `Bash(git diff:*)`, `WebFetch(domain:…)` specifiers | The three outcomes and their order; shipped defaults rather than "write your own"; a *tiered* answer to "don't ask again" — a Bash command is remembered permanently per repository, a file edit only until the session ends, a domain forever |
+| OpenCode (`permission`) | `allow` / `ask` / `deny` per tool, with granular object syntax (`bash: { "git push": "ask", "*": "allow" }`), wildcards, `~` expansion | Per-command granularity in config, per-agent overrides, an explicit "what does *ask* do" definition |
+| Codex CLI | `approval_policy` (untrusted / on-failure / on-request / never) × `sandbox_mode` (read-only / workspace-write / full access) | Risk and *confinement* are two axes, not one: the same command is a different proposition inside a sandbox |
+| Claude Code sandbox, Codex sandbox | the confinement axis | An action may be auto-allowed *because* it is confined, and confirmed when it is not |
+
+## 1. The ladder
+
+`RiskClass` already orders these (`Read < Mutate < External < Destructive < Privileged`). Here is what
+each tier should mean to an allowlist, least risky first:
+
+| # | Tier | Examples | Default | May a "don't ask again" outlive the chat? |
+|---|---|---|---|---|
+| 0 | **Observe** — `Read` | `ls`, `cat`, `rg`, `git status/log/diff/show`, `wc`, `file`, `du`, `docker ps`, web search, reading any file the token covers | **allowed** at every level above `paranoid`, no prompt | N/A — nothing to remember |
+| 1 | **Local, reversible** — `Mutate` | `write_file`/`patch` **inside the workspace**, `mkdir`, `touch`, `cp` within the workspace, `git add/commit`, formatters, `npm install` into the project | **allowed** at `balanced` and above | Yes, but by **command signature** — `git add` covers `git add -A`, `git commit` never covers `git commit --amend` on pushed history |
+| 2 | **Leaves the machine** — `External` | `curl`, `ssh`, `scp`, `git push`, `npm publish`, any fetch whose destination is not local | **asks** at `balanced`; allowed at `trusting` | **No.** Chat-scoped at most: `git push origin main` is not `git push origin main --tags` |
+| 3 | **Cannot be undone** — `Destructive` | `rm -rf`, `truncate`, `dd`, `git reset --hard`, `git clean -f`, `git branch -D`, force-push, `DROP TABLE`, `curl … \| sh` | **asks** at every level including `trusting`; allowed at `yolo` only as a *once* answer | **Never.** A once-answer, and the request must name its targets (see §3) |
+| 4 | **Privilege or credentials** — `Privileged` | `sudo …` (escalates whatever it wraps), `mount`, `chmod -R` on system paths, `systemctl`, `gpg`/`op`/`bw`, reading a vault file | **asks** at every level; `ceiling: destructive` (recommended default) means even `yolo` asks | **Never**, under any policy |
+
+Two absolutes fall out of the table, and they are the ones worth defending:
+
+- **A deny rule and the ceiling sit above the dial.** A per-request `--autonomy yolo` can lower the
+  level. It can never remove a `deny` rule or raise the `ceiling`. That is what makes a per-request
+  grant worth offering at all.
+- **`Destructive` and `Privileged` are never remembered.** Not per repository, not per chat. The cost
+  of the extra prompt is a second; the cost of a remembered `rm -rf` is the thing you forgot about.
+
+## 2. The three outcomes, in one order
+
+`ApprovalPolicy` today has `allow` and `deny`; the level threshold supplies the implicit *ask*. That
+loses one thing the prior art has: the ability to force a prompt for something that is *below* the
+threshold — a project that wants to look at every `write_file` even at `trusting`, or an operator who
+wants a prompt for `shell` regardless of its class because the classifier might be wrong about a
+command it has never seen.
+
+So: **`deny` → `ask` → `allow` → level threshold**, in that order, matching both Claude Code and
+OpenCode. `ask` and `allow` are both subject to the ceiling: a rule cannot allow what the ceiling
+forbids, and an `ask` rule cannot be answered by an allow rule that comes after it.
+
+```yaml
+agent:
+  approval:
+    level: balanced
+    ceiling: destructive          # sudo always asks, even under --autonomy yolo
+    unattended_budget: 25         # check in after 25 consecutive auto-approvals
+    deny:
+      - { tool: shell, command: "*rm -rf /*",   note: "recursive delete from the root" }
+      - { tool: shell, command: "*curl * | sh", note: "remote code execution" }
+      - { tool: shell, command: "*rm -rf $*",   note: "the target set cannot be enumerated" }
+    ask:
+      - { tool: write_file, note: "this project reviews every write" }
+      - { tool: shell, risk: destructive, note: "explain the blast radius first" }
+    allow:
+      - { tool: shell, command: "git status*" }        # a signature-shaped allow
+      - { tool: shell, command: "git log*" }
+      - { tool: shell, command: "rg *" }
+      - { tool: read_file, command: "/home/yoav/projects/hx-harness/*" }   # path-scoped
+```
+
+Rules match `tool` (glob) and, optionally, `command` — which for filesystem tools is the **resolved
+absolute path**, now that `ToolContext::resolve` exists. That is what makes a path-scoped allow
+meaningful rather than decorative: `read_file` under this workspace, never under `/etc`.
+
+## 3. The delete rule: say what will be gone
+
+The user-facing complaint this section exists for: *"always clarify what you delete."* An approval
+prompt that says `<command> rm -rf build` is not a prompt — it does not say what is inside `build`, and
+"the agent told me it was cleaning up" is how a directory nobody backed up disappears. A destructive
+request must therefore carry:
+
+1. **The resolved targets**, each one absolute: `/home/yoav/projects/x/build`, not `build`.
+2. **What each target is and how big**: directory, 1 342 entries, 480 MB — with a **bounded** count, so
+   a scan of `/home` cannot become the prompt.
+3. **The plain sentence**: "This cannot be undone." Not an icon, not a colour.
+4. **What is *not* covered**: if a glob or a variable is involved, the prompt says the target set is
+   not enumerable — and the request is refused rather than guessed at (see below).
+
+And the tooling should make the destructive case rare, in this order:
+
+- **Prefer reversible.** Ship a `delete` tool that moves to the XDG trash (or `git rm` for tracked
+  files) instead of a shell `rm`. `rm` remains available through `shell`, classified, promptable.
+- **Refuse wildcards and variables on irreversible operations.** `rm -rf $DIR` and `rm -rf build*`
+  cannot be answered honestly, because the person answering cannot know what they cover. The refusal
+  says so and offers the enumerable form. A `deny` rule matching `*$*` and `*\**` on destructive
+  classifications is a reasonable default to ship.
+- **Prefer the dry run.** Where a command has one, ask for it first: `git clean -n` before `git clean
+  -f`, `rsync --dry-run`, `terraform plan`. The classifier already knows `-n`/`--dry-run`; a request
+  that contains one is `Read`, and that is a real convenience: exploring a destructive operation is
+  free and performing it is not.
+- **Refuse the specific catastrophe set outright**, as a shipped `deny` list rather than a config
+  suggestion: `rm -rf /`, `rm -rf ~`, `rm -rf $HOME`, `rm -rf .` from a workspace root, `dd` to a
+  block device, `mkfs`, `> /dev/sd*`, `chmod -R 777 /`, `curl … | sh`, `git push --force` to a shared
+  branch, `DROP DATABASE`. These are not "ask" — the answer is no, and saying so in advance is what
+  makes an unattended run safe by construction rather than by attention.
+
+## 4. Confinement is a second axis
+
+The same command is not the same action on the host and inside an L2 sandbox with only the workspace
+mounted. The classifier runs before a sandbox is chosen, so `ActionRequest` should carry the
+*confinement* of the call, and rules should be able to require it:
+
+```yaml
+allow:
+  - { tool: shell, command: "npm test", confined: true }    # fine in the sandbox
+ask:
+  - { tool: shell, command: "npm test", confined: false }   # on the host, run it by me
+```
+
+That is Codex's insight applied to hx's existing isolation ladder: allow-by-confinement lets an agent
+run untrusted build steps unattended, which is the main reason to have a sandbox at all.
+
+## 5. Where "remember" lives, and for how long
+
+`RememberedDecision` today is `Allow`/`Deny` with `AllowOnce`/`AllowForChat` decision variants. The tier
+decides which of those a client may even offer — the prompt should not show a button the policy will
+ignore:
+
+| Tier | `once` | `for this chat` | `for this project` | `for this machine` |
+|---|---|---|---|---|
+| Observe | n/a | n/a | n/a | n/a |
+| Local, reversible | yes | yes | **yes** (command signature, written to `.hx/allow.toml`) | no |
+| Leaves the machine | yes | **yes** | no | no |
+| Cannot be undone | **yes** | no | no | no |
+| Privilege | yes | no | no | no |
+
+Project-scoped grants are files in the repository (reviewable, diffable, and shareable) rather than
+rows in a database — and they apply to one repository, matching what Claude Code learned the hard way
+(an approval in a worktree must not become an approval everywhere).
+
+## 6. Being able to see it
+
+`hx policy` should print the effective ladder for the current configuration: for each tier, whether it
+auto-allows, asks, or is denied; which rules fire in which order; and the ceiling. Prior art has a
+`/permissions` panel for the same reason: a policy nobody can read is a policy nobody will check, and
+the first question after "why did it do that?" is "what did I allow?".
+
+## 7. What is missing in the code, and in what order
+
+| Step | Change | Where | Size |
+|---|---|---|---|
+| 1 | `ask: Vec<Rule>` and the `deny → ask → allow` precedence | `hx-core/src/approval.rs`, `ApprovalSession::decide` | small, ~20 tests |
+| 2 | Shipped default `deny` set for the catastrophe list (§3) | `ApprovalPolicy::default`, `hx.example.yaml` | small |
+| 3 | Remember-scoping by tier: which options a request may offer | `hx-core/src/approval.rs` + the event that renders the prompt | medium |
+| 4 | `delete` tool that trashes, and the enumerable-target requirement for `Destructive` | `hx-tools`, `hx-core` prompt text | medium |
+| 5 | `confined` on `ActionRequest` and in rules | `hx-core`, `hx-agent` (sandbox-aware dispatch) | medium |
+| 6 | `hx policy` renderer | `apps/hx` | small |
+
+Steps 1–2 are the upgrade that makes an *unattended* daemon useful: today the choice is prompt-for-
+everything or `--autonomy yolo`, and an allowlist is what splits that into a real third option. Steps
+3–4 are the safety half, and 4 is the one the user asked for by name.

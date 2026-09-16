@@ -54,8 +54,11 @@ Those get real tests in M1 against a live endpoint.
   resource and action it needs; none decides whether it is allowed
 - ◐ **Approval wired into dispatch** — done in the loop: every tool call is classified against the
   capability token and then the approval policy, in that order, and every refusal comes back to the
-  model as a tool result (`crates/hx-agent/tests/loop.rs`). Still to come: `/approval <level>` and
-  `/yolo [duration]` as chat commands, and the prompt UI, which need a client to render them (§3.11)
+  model as a tool result (`crates/hx-agent/tests/loop.rs`). Still to come, in the order
+  `docs/approvals.md` §7 sets out: `ask` rules and the `deny → ask → allow` precedence, a shipped
+  default deny set for the catastrophe cases, remember-scoping by tier, a `delete` tool that trashes
+  and a destructive request that names its targets, `confined` as a second axis, `hx policy` to show
+  the effective ladder, and the approval channel a client answers over
 - Context builder + compaction at a token threshold
 - ✅ `hxd` runs, `hx` connects to it: `hx chat` sends the prompt to the daemon over the configured
   HTTP address and prints the run's report (over HTTP rather than the unix socket, which the config
