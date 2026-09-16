@@ -364,6 +364,7 @@ mod tests {
             readonly_rootfs: true,
             workspace_host_path: "/tmp/hx/ws".into(),
             workspace_path: DEFAULT_WORKSPACE_PATH.into(),
+            user: None,
             env: vec![("RUST_LOG".into(), "info".into())],
         }
     }

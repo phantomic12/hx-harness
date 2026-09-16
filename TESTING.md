@@ -4,7 +4,7 @@ Status: 2026-09-15. Companion to `ROADMAP.md` (which tracks features); this file
 
 ```console
 $ cargo test --workspace
-386 passed; 0 failed; 13 ignored         # 8 crates with code
+390 passed; 0 failed; 13 ignored         # 8 crates with code
 
 # The 13 that need a real server, run by `.github/workflows/integration.yml`:
 $ cargo test -p hx-sandbox --test docker_live -- --ignored --test-threads=1
@@ -39,7 +39,7 @@ intent, not that the engine accepts it.
 
 | What ran | Observed |
 |---|---|
-| L2 create, and the daemon's own record of it | `inspect_container` reports `network_mode: none`, `readonly_rootfs: true`, `pids_limit: 128`, `cap_drop: ["ALL"]`, `privileged: false`, `userns_mode: private`, `memory == memory_swap`, and `config.user == 1000:1000` |
+| L2 create, and the daemon's own record of it | `inspect_container` reports `network_mode: none`, `readonly_rootfs: true`, `pids_limit: 128`, `cap_drop: ["ALL"]`, `privileged: false`, `userns_mode: private`, `memory == memory_swap`, and `config.user` equal to the workspace's owner — never root |
 | It is a working container, not just an accepted one | `id -u` → `1000`; `echo alive` → `alive` |
 | `network=none` really blocks egress | TCP to `1.1.1.1:80` → `BLOCKED`; `getent hosts example.com` → `NO_DNS`; `ip -o link` → **0** interfaces |
 | Read-only root, usable scratch space | `touch /definitely-not-allowed` → non-zero; `touch /tmp/ok` → succeeds; a binary copied to `/tmp` → `Permission denied`, `exit=126` (the `noexec` mount) |
@@ -50,7 +50,7 @@ intent, not that the engine accepts it.
 | The concurrency cap | The N+1th spawn fails with `1 of 1` and the daemon's container count is unchanged — refused, not created-then-cleaned |
 | A missing image | Fails naming the image, tracks nothing, consumes no slot, leaves no container |
 
-**Three defects the live runs found, none of them visible to 384 green unit tests:**
+**Four defects the live runs found, none of them visible to the unit suite:**
 
 1. `security_opt: userns=keep-id` — podman's spelling. Docker: `invalid --security-opt 2:
    "userns=keep-id"`. Every L2 and L3 sandbox failed at create — exactly the levels meant to hold
@@ -61,8 +61,15 @@ intent, not that the engine accepts it.
    the option could only ever *change* it, and this spelling changed it into a failure.
 3. **An egress allowlist that nothing enforced.** `network: true` plus four hostnames produced a
    container with a full bridge network. `hx.example.yaml` shipped that combination.
+4. **A hardcoded sandbox uid.** `SANDBOX_UID = "1000:1000"` cannot write a bind-mounted workspace
+   owned by anybody else, so on a host whose user is not uid 1000 — GitHub's runner is 1001 — the
+   sandbox started, the mount succeeded, and every write into the workspace failed with
+   `Permission denied`. The first CI run of this suite is what caught it; on the development host
+   the uid happened to match. `SandboxSpec::user` is now overridable and
+   `SandboxSpec::adopt_workspace_owner()` is the supported way to set it, so the sandbox runs as
+   whoever owns the mount.
 
-The first two are fixed and expressed through mechanisms that exist (`HostConfig.UsernsMode`, and
+All four are fixed and expressed through mechanisms that exist (`HostConfig.UsernsMode`, and
 nothing at all for the engine's default seccomp), with a unit test that fails if either string comes
 back. The third is now *refused* — `SpecError::EgressNotEnforced`, which says what to do instead —
 rather than accepted and ignored, and the example config no longer claims a constraint it cannot
@@ -105,7 +112,7 @@ returning an empty list.
 | `hx-core` | 83 | 4092 | ID monotonicity, error taxonomy, **capability path grants** (incl. the empty-grant-means-root regression), approval policy incl. unattended budgets, message/event round-trips, config parsing and rejection of unknown keys |
 | `hx-provider` | 61 | 2820 | Token-bucket timing, **budget fail-closed on a zero estimate**, credential pool round-robin, shared-limiter identity across pools, routing and fallthrough |
 | `hx-remote` | 90 | 3108 | Platform caps parsing (`uname`/`ver`), path translation, shell quoting incl. injection attempts, risky-command classification, mid-truncation, approval round-trip against the local host, and **`known_hosts`**: hashed host fields (HMAC-SHA1), globs, negation, `@revoked` beating trust regardless of line order, a different key type reading as first use rather than substitution, plus the policy's fail-closed behaviour and the wording of every refusal |
-| `hx-sandbox` | 58 | 1948 | Isolation ladder ordering and monotonicity, spec↔YAML round-trip, `SandboxSpec`→`HostConfig` mapping field by field, **no engine-rejected security option** (`userns=`, `seccomp=default`), an egress allowlist that cannot be enforced, registry/TTL bookkeeping, the concurrency cap, and rollback on a failed start |
+| `hx-sandbox` | 62 | 2057 | Isolation ladder ordering and monotonicity, spec↔YAML round-trip, `SandboxSpec`→`HostConfig` mapping field by field, **no engine-rejected security option** (`userns=`, `seccomp=default`), an egress allowlist that cannot be enforced, registry/TTL bookkeeping, the concurrency cap, and rollback on a failed start |
 | `hx-search` | 45 | 1732 | RRF rank fusion, HTML extraction, entity decoding, per-backend failure isolation (with **fake** backends) |
 | `hx-secrets` | 27 | 901 | Argon2id+XChaCha20 round-trip, tamper detection, redaction patterns |
 | `hx-server` | 11 | 739 | Route dispatch via `oneshot`, `HxError`→HTTP status mapping |
@@ -204,8 +211,8 @@ shell wrapping and the POSIX-only file-transfer guards have never met a real ser
 ## Running the suite
 
 ```bash
-cargo test --workspace          # 386 unit tests + 13 ignored integration tests
-cargo test -p hx-sandbox        # 58 — includes the ladder and the rollback invariants
+cargo test --workspace          # 390 unit tests + 13 ignored integration tests
+cargo test -p hx-sandbox        # 62 — includes the ladder and the rollback invariants
 cargo test -p hx-remote         # 90 — includes known_hosts parsing and the host key policy
 cargo build --workspace         # clean: 0 warnings, 0 deprecations
 cargo clippy --workspace        # clean
@@ -225,8 +232,9 @@ HX_SSH_TEST_HOST=<host> HX_SSH_TEST_USER=<user> HX_SSH_TEST_KEY=~/.ssh/id_ed2551
 - **The SSH transport and the sandbox lifecycle are tier A, and regress loudly**: host key refusals
   observed against a real server, and a container whose egress, pid ceiling, read-only root, bind
   mount and reaper were each verified against the daemon rather than against our own bookkeeping.
-- **Running them found three defects** that 384 unit tests had not seen: two security options the
-  engine rejects (so every L2/L3 sandbox failed to start) and an egress allowlist that was accepted
-  and ignored. Two are fixed and pinned by tests; the third is now refused instead of pretended.
+- **Running them found four defects** the unit suite could not see: two security options the engine
+  rejects (so every L2/L3 sandbox failed to start), an egress allowlist that was accepted and
+  ignored, and a hardcoded sandbox uid that made the workspace unwritable on any host whose user is
+  not uid 1000. All four are fixed and pinned by tests.
 - **What is still tier C is the sandbox's strongest claim**: L3 has never run, because nothing
   installs gVisor. That is next, with the egress proxy behind it.

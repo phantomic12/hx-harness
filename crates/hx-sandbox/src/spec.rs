@@ -70,6 +70,15 @@ pub struct SandboxSpec {
     pub workspace_host_path: String,
     /// Where it appears inside the sandbox.
     pub workspace_path: String,
+    /// The user the sandbox runs as, as `uid:gid`.
+    ///
+    /// `None` means [`SANDBOX_UID`]. It is overridable because a hardcoded uid cannot write a
+    /// bind-mounted workspace that belongs to somebody else: on a host whose user is not uid 1000
+    /// — a CI runner, a Mac, most shared boxes — the sandbox runs, the mount works, and every write
+    /// into it fails with `Permission denied`. [`SandboxSpec::adopt_workspace_owner`] is the
+    /// supported way to set this; matching the workspace's owner is what keeps it writable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
     pub env: Vec<(String, String)>,
 }
 
@@ -110,8 +119,45 @@ impl SandboxSpec {
             readonly_rootfs: profile.readonly_rootfs,
             workspace_host_path: String::new(),
             workspace_path: DEFAULT_WORKSPACE_PATH.to_string(),
+            user: None,
             env: Vec::new(),
         }
+    }
+
+    /// Run the sandbox as whoever owns the workspace, so it can actually write there.
+    ///
+    /// A container whose uid does not match the bind-mounted directory's owner gets a read-only
+    /// workspace in practice, whatever the mount options say. The workspace is also the only place
+    /// the agent's work is expected to survive, so a mismatch breaks the sandbox's whole purpose
+    /// with an error that looks like a filesystem problem.
+    ///
+    /// Callers that know the workspace owner should use this instead of setting [`SANDBOX_UID`]:
+    /// it is I/O (a `stat`), which is why it is a builder step here and not a `host_settings`
+    /// decision — that function stays pure and testable.
+    pub fn adopt_workspace_owner(&mut self) -> Result<(), SpecError> {
+        let path = self.workspace_host_path.clone();
+        let metadata = std::fs::metadata(&path).map_err(|err| SpecError::WorkspaceOwner {
+            path: path.clone(),
+            reason: err.to_string(),
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // The numeric ids, not the names: the container's /etc/passwd has nothing to do with
+            // the host's, and a name that means something on the host means nothing inside.
+            self.user = Some(format!("{}:{}", metadata.uid(), metadata.gid()));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            return Err(SpecError::WorkspaceOwner {
+                path: path.clone(),
+                reason: "this platform has no uid/gid to match; set `user` explicitly".to_string(),
+            });
+        }
+
+        Ok(())
     }
 
     /// Reject specs that would produce an unsafe or unusable sandbox.
@@ -156,8 +202,10 @@ impl SandboxSpec {
     pub fn host_settings(&self) -> HostSettings {
         let mut settings = HostSettings {
             privileged: false,
-            // Non-root by default at every level.
-            user: SANDBOX_UID.to_string(),
+            // Non-root by default at every level, and overridable only by an explicit `user`:
+            // whoever mounts a workspace for the agent has to be able to match its owner, or the
+            // agent gets a read-only workspace and a permission error instead of a build.
+            user: self.user.clone().unwrap_or_else(|| SANDBOX_UID.to_string()),
             cap_drop: vec!["ALL".to_string()],
             cap_add: Vec::new(),
             security_opt: vec!["no-new-privileges:true".to_string()],
@@ -213,7 +261,6 @@ impl SandboxSpec {
                 // a daemon with no remap configured (where it is a no-op), and honoured on one that
                 // has it. So the request is always expressible and never fatal.
                 settings.userns_mode = Some(USERNS_REMAPPED.to_string());
-                settings.user.clone_from(&SANDBOX_UID.to_string());
             }
             IsolationLevel::L3 => {
                 settings.cap_add.clear();
@@ -341,6 +388,9 @@ pub enum SpecError {
          `network: false` for no egress, or drop the allowlist to accept an unrestricted one."
     )]
     EgressNotEnforced(Vec<String>),
+
+    #[error("could not determine the owner of the workspace {path}: {reason}")]
+    WorkspaceOwner { path: String, reason: String },
 }
 
 #[cfg(test)]
@@ -362,6 +412,7 @@ mod tests {
             readonly_rootfs: false,
             workspace_host_path: "/tmp/hx/ws".into(),
             workspace_path: DEFAULT_WORKSPACE_PATH.into(),
+            user: None,
             env: Vec::new(),
         }
     }
@@ -714,6 +765,62 @@ mod tests {
         assert!(
             message.contains("network: false") && message.contains("drop the allowlist"),
             "the error has to say what to do instead: {message}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_user_overrides_the_default_at_every_level() {
+        // A hardcoded uid is why this exists: the workspace is bind-mounted from the host, and the
+        // container has to run as someone who can write it.
+        for level in [IsolationLevel::L1, IsolationLevel::L2, IsolationLevel::L3] {
+            let mut s = spec(level);
+            s.user = Some("4242:4242".to_string());
+            assert_eq!(s.host_settings().user, "4242:4242", "{level:?}");
+        }
+    }
+
+    #[test]
+    fn the_default_user_is_not_root() {
+        assert_eq!(spec(IsolationLevel::L2).host_settings().user, SANDBOX_UID);
+        assert_ne!(SANDBOX_UID, "0:0");
+    }
+
+    #[test]
+    fn the_sandbox_can_be_told_to_run_as_the_workspace_owner() {
+        // The defect this closes: on a host whose user is not uid 1000 — a CI runner, a Mac, most
+        // shared boxes — the sandbox started, the bind mount succeeded, and every write into the
+        // workspace failed with `Permission denied`.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = spec(IsolationLevel::L2);
+        s.workspace_host_path = dir.path().to_string_lossy().into_owned();
+
+        s.adopt_workspace_owner().unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let owner = std::fs::metadata(dir.path()).unwrap();
+            assert_eq!(
+                s.host_settings().user,
+                format!("{}:{}", owner.uid(), owner.gid()),
+                "the sandbox has to run as whoever owns the mount"
+            );
+        }
+    }
+
+    #[test]
+    fn adopting_a_workspace_that_does_not_exist_says_so_and_changes_nothing() {
+        let mut s = spec(IsolationLevel::L2);
+        s.workspace_host_path = "/definitely/not/here".into();
+
+        let err = s.adopt_workspace_owner().unwrap_err();
+        assert!(
+            err.to_string().contains("could not determine the owner"),
+            "{err}"
+        );
+        assert!(
+            s.user.is_none(),
+            "a failed stat must not half-configure the sandbox"
         );
     }
 

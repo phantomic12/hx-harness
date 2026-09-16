@@ -59,7 +59,7 @@ $ curl -s localhost:7717/v1/status | jq .pools
 | Model pools, per-credential rate/token/budget limits, role routing | **Done**, tested |
 | Web search: SearXNG + keyless DuckDuckGo, RRF fusion, failure reporting | **Done**, tested |
 | Remote hosts: local + SSH (real `russh`), host key verification, Windows/macOS/Linux capability detection | **Built** — connect, auth, exec and file transfer run against a real host (`crates/hx-remote/tests/ssh_live.rs`) |
-| Sandboxes: L1/L2 isolation ladder, Docker lifecycle, TTL reaper | **Built** — created, confined and reaped against a real daemon (`crates/hx-sandbox/tests/docker_live.rs`); L3 (`runsc`) unexecuted |
+| Sandboxes: L1/L2 isolation ladder, Docker lifecycle, TTL reaper | **Built** — created, confined and reaped against a real daemon (`crates/hx-sandbox/tests/docker_live.rs`), running as the workspace's owner so the bind mount is writable; L3 (`runsc`) unexecuted |
 | Daemon (`hxd`) + HTTP API + CLI (`hx`) | **Done**, runnable |
 | Web UI, Tauri desktop/mobile, chat connectors | **Not started** |
 | MCP client, browser-automation pool | **Not started** |
@@ -151,7 +151,7 @@ $ ./target/release/hxd --bind 127.0.0.1:7717
 ```
 
 ```console
-$ cargo test --workspace         # 386 unit tests + 13 ignored integration tests
+$ cargo test --workspace         # 390 unit tests + 13 ignored integration tests
 $ cargo test -p hx-sandbox --test docker_live -- --ignored   # needs a container engine
 $ cargo test -p hx-remote --test ssh_live -- --ignored       # needs an SSH server
 ```

@@ -88,8 +88,24 @@ fn spec(live: &Live, isolation: IsolationLevel, ttl_secs: u64, pids_max: i64) ->
         readonly_rootfs: false,
         workspace_host_path: live.workspace_path.clone(),
         workspace_path: DEFAULT_WORKSPACE_PATH.to_string(),
+        // Left as `None` here; `spec()`'s caller adopts the workspace owner, which is what makes
+        // the write below work on a host whose uid is not 1000 (a CI runner, for one).
+        user: None,
         env: Vec::new(),
     }
+}
+
+/// A spec that will actually be able to write its workspace.
+fn writable_spec(
+    live: &Live,
+    isolation: IsolationLevel,
+    ttl_secs: u64,
+    pids_max: i64,
+) -> SandboxSpec {
+    let mut spec = spec(live, isolation, ttl_secs, pids_max);
+    spec.adopt_workspace_owner()
+        .expect("the temp workspace is statable");
+    spec
 }
 
 /// Whether the engine still has this container.
@@ -131,7 +147,7 @@ async fn exec(manager: &SandboxManager, id: &str, command: &str) -> SandboxExecO
 async fn an_l2_sandbox_is_created_by_a_real_daemon_and_carries_its_settings() {
     let Some(live) = live(4).await else { return };
 
-    let spec = spec(&live, IsolationLevel::L2, 3600, 128);
+    let spec = writable_spec(&live, IsolationLevel::L2, 3600, 128);
     // This is the assertion that would have failed before: the create call itself.
     let handle = live
         .manager
@@ -175,11 +191,15 @@ async fn an_l2_sandbox_is_created_by_a_real_daemon_and_carries_its_settings() {
     );
 
     let config = inspected.config.expect("a container config");
+    // Whoever owns the workspace, and never root: on a host whose user is not uid 1000 the
+    // hardcoded default left every write into the mount failing with `Permission denied`.
+    let expected_user = spec.user.clone().expect("the workspace owner was adopted");
     assert_eq!(
         config.user.as_deref(),
-        Some("1000:1000"),
-        "the sandbox must not run as root"
+        Some(expected_user.as_str()),
+        "the sandbox must run as the workspace owner, not as root"
     );
+    assert_ne!(expected_user, "0:0");
 
     // And it is a working container, not just an accepted one.
     let out = exec(&live.manager, handle.id.as_str(), "id -u; echo alive").await;
@@ -199,7 +219,10 @@ async fn network_none_really_blocks_egress() {
     let Some(live) = live(4).await else { return };
     let handle = live
         .manager
-        .spawn(&spec(&live, IsolationLevel::L2, 3600, 128), Utc::now())
+        .spawn(
+            &writable_spec(&live, IsolationLevel::L2, 3600, 128),
+            Utc::now(),
+        )
         .await
         .expect("spawn");
 
@@ -248,7 +271,10 @@ async fn a_read_only_root_rejects_writes_while_the_workspace_stays_writable() {
     let Some(live) = live(4).await else { return };
     let handle = live
         .manager
-        .spawn(&spec(&live, IsolationLevel::L2, 3600, 128), Utc::now())
+        .spawn(
+            &writable_spec(&live, IsolationLevel::L2, 3600, 128),
+            Utc::now(),
+        )
         .await
         .expect("spawn");
 
@@ -314,7 +340,10 @@ async fn the_pid_ceiling_is_applied_by_the_kernel_and_stops_a_fork_bomb() {
     // A ceiling low enough that 200 processes cannot fit, high enough for the container's own init.
     let handle = live
         .manager
-        .spawn(&spec(&live, IsolationLevel::L2, 3600, 64), Utc::now())
+        .spawn(
+            &writable_spec(&live, IsolationLevel::L2, 3600, 64),
+            Utc::now(),
+        )
         .await
         .expect("spawn");
 
@@ -374,7 +403,7 @@ async fn the_ttl_reaper_actually_removes_the_container() {
     let Some(live) = live(4).await else { return };
     let handle = live
         .manager
-        .spawn(&spec(&live, IsolationLevel::L2, 1, 64), Utc::now())
+        .spawn(&writable_spec(&live, IsolationLevel::L2, 1, 64), Utc::now())
         .await
         .expect("spawn");
 
@@ -399,7 +428,10 @@ async fn destroying_a_sandbox_stops_and_removes_it_and_is_idempotent() {
     let Some(live) = live(4).await else { return };
     let handle = live
         .manager
-        .spawn(&spec(&live, IsolationLevel::L2, 3600, 64), Utc::now())
+        .spawn(
+            &writable_spec(&live, IsolationLevel::L2, 3600, 64),
+            Utc::now(),
+        )
         .await
         .expect("spawn");
 
@@ -419,13 +451,19 @@ async fn the_concurrency_cap_refuses_the_n_plus_first_container() {
 
     let first = live
         .manager
-        .spawn(&spec(&live, IsolationLevel::L2, 3600, 64), Utc::now())
+        .spawn(
+            &writable_spec(&live, IsolationLevel::L2, 3600, 64),
+            Utc::now(),
+        )
         .await
         .expect("the first sandbox fits");
 
     let err = live
         .manager
-        .spawn(&spec(&live, IsolationLevel::L2, 3600, 64), Utc::now())
+        .spawn(
+            &writable_spec(&live, IsolationLevel::L2, 3600, 64),
+            Utc::now(),
+        )
         .await
         .expect_err("the second must be refused");
     assert!(err.to_string().contains("1 of 1"), "{err}");
@@ -446,7 +484,7 @@ async fn a_missing_image_fails_without_leaving_a_container_behind() {
     let Some(live) = live(4).await else { return };
     let before = hx_containers(&live.docker).await.len();
 
-    let mut spec = spec(&live, IsolationLevel::L2, 3600, 64);
+    let mut spec = writable_spec(&live, IsolationLevel::L2, 3600, 64);
     spec.image = "hx-does-not-exist:never".to_string();
 
     let err = live
