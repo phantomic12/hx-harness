@@ -1647,7 +1647,11 @@ impl ApprovalSession {
 
     fn build_request(&mut self, req: &ActionRequest, reason: String) -> ApprovalRequest {
         let mut options = vec![ApprovalOption::AllowOnce, ApprovalOption::AllowForChat];
-        if req.reversible {
+        // A permanent approval is offered only where it cannot outlive the thing it describes: local
+        // and reversible. `external` actions (a push, a publish, anything leaving the machine) are
+        // chat-scoped at most, and `destructive`/`privileged` are once-only — see `docs/approvals.md`
+        // §1, which is the table this line implements.
+        if req.reversible && req.risk <= RiskClass::Mutate {
             options.push(ApprovalOption::AllowAlways);
         }
         options.push(ApprovalOption::Deny);
@@ -2111,7 +2115,7 @@ mod tests {
             other => panic!("expected a prompt, got {other:?}"),
         };
         assert!(
-            v_allowed_after_resolve(&mut s, &id, &push) == false,
+            !v_allowed_after_resolve(&mut s, &id, &push),
             "a remembered yes must not bypass ask"
         );
     }

@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
+use hx_agent::ApprovalQueue;
 use hx_agent::ModelCall;
 use hx_core::error::{HxError, Result};
 use hx_core::event::AgentEvent;
@@ -189,6 +190,9 @@ async fn harness(replies: Vec<Result<ChatResponse>>) -> Harness {
         store: Arc::new(store),
         models: Arc::new(Scripted(Arc::clone(&model))),
         tools: Arc::new(hx_server::chat::default_tools(vec![], client)),
+        // Long enough for the test to answer from another request, which is the shape a real client
+        // has: the run waits while the answer comes in over the same surface.
+        approvals: ApprovalQueue::new(std::time::Duration::from_secs(1)),
         search: Arc::new(search),
         sandboxes: None::<Arc<SandboxManager>>,
         sandbox_unavailable_reason: Some("no container engine in a test".to_string()),
@@ -219,6 +223,47 @@ async fn chat(state: &Arc<AppState>, body: serde_json::Value) -> (StatusCode, se
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, json)
+}
+
+/// A GET against the app, parsed as JSON. The same shape as `chat`, for the routes that are not a run.
+async fn get(state: Arc<AppState>, uri: &str) -> (StatusCode, serde_json::Value) {
+    let response = app(state)
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// A POST against the app with a JSON body.
+async fn post(
+    state: Arc<AppState>,
+    uri: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
 }
 
 impl Harness {
@@ -398,9 +443,15 @@ async fn a_shell_command_needs_a_human_and_the_daemon_says_so() {
     assert_eq!(body["refusals"], 1, "{body}");
 
     let said = h.said(body["session_id"].as_str().unwrap());
+    // Silence is a denial, and the refusal says which kind: nobody answered, rather than the
+    // operator saying no. A model that cannot tell those apart retries one and not the other.
     assert!(
-        said.contains("no client is attached"),
+        said.contains("nobody answered"),
         "the refusal must name the reason: {said}"
+    );
+    assert!(
+        said.contains("git push"),
+        "and the action nobody answered about: {said}"
     );
     assert!(
         !said.contains("not a git repository"),
@@ -559,6 +610,116 @@ async fn messages_survive_a_run_that_fails_in_the_middle() {
     assert!(
         session.interrupted_calls().is_empty(),
         "the run failed between turns, not inside a call"
+    );
+}
+
+#[tokio::test]
+async fn a_run_that_needs_a_human_waits_and_runs_once_answered() {
+    // The point of the channel: a questile call does not have to be refused, and does not have to be
+    // waved through with `yolo` either. The run blocks; a client answers over HTTP; the tool runs.
+    let h = harness(vec![]).await;
+    h.model.push(Ok(calls(vec![(
+        "c1",
+        "shell",
+        serde_json::json!({ "cmd": "git push" }),
+    )])));
+    h.model.push(Ok(answer("done")));
+
+    // `git push` is External, and the default level is balanced, so this asks.
+    let state = Arc::clone(&h.state);
+    let body = h.body("push my work");
+    let running = tokio::spawn(async move { chat(&state, body).await });
+
+    // The question is visible while the run waits — this is the loop a client actually polls.
+    let mut waiting = None;
+    for _ in 0..200 {
+        let (status, list) = get(Arc::clone(&h.state), "/v1/approvals").await;
+        assert_eq!(status, StatusCode::OK);
+        if let Some(first) = list.as_array().and_then(|list| list.first()) {
+            waiting = Some(first["id"].as_str().expect("an id").to_string());
+            assert!(
+                first["reason"].as_str().is_some_and(|r| !r.is_empty()),
+                "a question carries why it is being asked: {first}"
+            );
+            assert!(
+                first["options"].as_array().map(Vec::len).unwrap_or(0) >= 2,
+                "a question offers more than one answer: {first}"
+            );
+            // …and not every answer: `git push` is `external`, so a permanent approval must not be on
+            // the menu. Over-asking is recoverable; over-approving is not.
+            let options = first["options"].as_array().cloned().unwrap_or_default();
+            assert!(
+                !options.iter().any(|o| o == "allow_always"),
+                "an external action must not offer a permanent approval: {first}"
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let id = waiting.expect("the question must be visible over HTTP while the run waits");
+
+    // Answer it, attributed to the surface that answered.
+    let (status, body) = post(
+        Arc::clone(&h.state),
+        &format!("/v1/approvals/{id}"),
+        serde_json::json!({ "option": "once", "by": "test-client" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["by"], "test-client");
+
+    // The run resumes and the tool runs.
+    let (status, reply) = running.await.expect("the run task finishes");
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply["tool_calls"], 1, "{reply}");
+    assert_eq!(
+        reply["refusals"], 0,
+        "an answered call is not a refusal: {reply}"
+    );
+    assert!(
+        h.said(reply["session_id"].as_str().unwrap())
+            .contains("not a git repository"),
+        "the command must have reached a shell"
+    );
+
+    // And the queue is empty again: an answered question does not linger for the next client.
+    let (_, list) = get(Arc::clone(&h.state), "/v1/approvals").await;
+    assert_eq!(list.as_array().map(Vec::len), Some(0), "{list}");
+
+    // Answering something that is not waiting is a 404, not a silent success.
+    let (status, body) = post(
+        Arc::clone(&h.state),
+        &format!("/v1/approvals/{id}"),
+        serde_json::json!({ "option": "once" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+#[tokio::test]
+async fn a_request_that_will_not_wait_is_refused_at_once() {
+    // The pre-channel behaviour, kept for a client that cannot answer: fail fast with the reason
+    // rather than hold the connection open for a minute.
+    let h = harness(vec![
+        Ok(calls(vec![(
+            "c1",
+            "shell",
+            serde_json::json!({ "cmd": "git push" }),
+        )])),
+        Ok(answer("I was not allowed")),
+    ])
+    .await;
+
+    let mut body = h.body("push my work");
+    body["approval_wait_secs"] = serde_json::json!(0);
+
+    let (status, reply) = chat(&h.state, body).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply["refusals"], 1, "{reply}");
+    assert!(
+        h.said(reply["session_id"].as_str().unwrap())
+            .contains("asked not to wait"),
+        "the refusal must say why nobody was asked"
     );
 }
 

@@ -46,6 +46,8 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/sessions/{id}/rename", post(rename_session))
         .route("/v1/sessions/{id}/export", get(export_session))
         .route("/v1/sessions/{id}/events", get(session_events))
+        .route("/v1/approvals", get(list_approvals))
+        .route("/v1/approvals/{id}", post(answer_approval))
         .with_state(state)
 }
 
@@ -349,6 +351,10 @@ struct SessionQuery {
     /// does not want to move a megabyte of transcript to render a filename.
     #[serde(default)]
     transcript: Option<bool>,
+    /// `?session=<id>` narrows a list to one session — used by the approvals route, because a client
+    /// showing a chat window wants the questions from that chat and not every prompt on the machine.
+    #[serde(default)]
+    session: Option<String>,
 }
 
 async fn list_sessions(
@@ -445,6 +451,60 @@ async fn export_session(
     };
 
     Ok(([(axum::http::header::CONTENT_TYPE, content_type)], body).into_response())
+}
+
+/// What a run is waiting on, so a client can answer it.
+///
+/// Polled rather than pushed: an approval is a question with a short life, and a poll every second or
+/// two is the least machinery that can carry it. The WebSocket multiplex (M2) will push the same
+/// `ApprovalRequest` when it exists.
+async fn list_approvals(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SessionQuery>,
+) -> Json<Vec<hx_core::approval::ApprovalRequest>> {
+    Json(state.approvals.outstanding(params.session.as_deref()))
+}
+
+/// The body of an answer.
+#[derive(Debug, Deserialize)]
+struct ApprovalAnswer {
+    /// `once`, `chat`, `always` or `deny`.
+    option: String,
+    /// Who answered — a user name, a surface. Recorded, because a tap on a phone and a keystroke in a
+    /// terminal should not look alike afterwards.
+    #[serde(default)]
+    by: Option<String>,
+}
+
+async fn answer_approval(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<ApprovalAnswer>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let option = match body.option.as_str() {
+        "once" | "allow_once" => hx_core::approval::ApprovalOption::AllowOnce,
+        "chat" | "allow_for_chat" => hx_core::approval::ApprovalOption::AllowForChat,
+        "always" | "allow_always" => hx_core::approval::ApprovalOption::AllowAlways,
+        "deny" | "no" => hx_core::approval::ApprovalOption::Deny,
+        other => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("unknown approval option '{other}'; known: once, chat, always, deny"),
+            ))
+        }
+    };
+
+    let by = body.by.unwrap_or_else(|| "http".to_string());
+    if !state.approvals.answer(&id, option, &by) {
+        // Nothing waiting under this id: it was answered already, or it timed out and the run was
+        // refused. A 404 says so rather than pretending an answer landed.
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("no approval is waiting under '{id}' — it was answered already, or it expired"),
+        ));
+    }
+
+    Ok(Json(serde_json::json!({ "answered": id, "by": by })))
 }
 
 /// Every event of a session, in order: what a client that just attached renders.

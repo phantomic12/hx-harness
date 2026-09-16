@@ -28,8 +28,8 @@
 use crate::state::AppState;
 use chrono::{DateTime, Utc};
 use hx_agent::{
-    AgentLoop, AlwaysAllow, Approver, DenyWithReason, Limits, ModelCall, RouterModel, RunOutcome,
-    TranscriptSink,
+    AgentLoop, AlwaysAllow, Approver, Limits, ModelCall, RefusingApprover, RouterModel, RunOutcome,
+    SessionScopedQueue, TranscriptSink,
 };
 use hx_core::approval::{ApprovalSession, AutonomyLevel};
 use hx_core::capability::{Action, Capability, CapabilityToken, Resource};
@@ -54,6 +54,13 @@ const DEFAULT_DEADLINE_SECS: u64 = 600;
 
 /// Capability tokens are issued per run, and the run is what they are for.
 const TOKEN_TTL_SECS: i64 = 3600;
+
+/// How long a run waits for an answer before silence counts as a refusal.
+///
+/// Long enough to answer a phone notification, short enough that a run with no client attached fails
+/// instead of looking hung. A request can ask to wait zero seconds, which is the pre-channel
+/// behaviour: refuse at once and say why.
+pub const DEFAULT_APPROVAL_WAIT_SECS: u64 = 60;
 
 /// Where a role's model call comes from.
 ///
@@ -120,6 +127,12 @@ pub struct ChatRequest {
     /// A title for a session this request creates.
     #[serde(default)]
     pub title: Option<String>,
+    /// How long to wait for a human if a call needs approval. `0` refuses immediately.
+    ///
+    /// Defaults to the daemon's wait. The number matters to a client: it is how long the HTTP request
+    /// stays open before the answer becomes "nobody came".
+    #[serde(default)]
+    pub approval_wait_secs: Option<u64>,
 }
 
 /// What a run did.
@@ -232,17 +245,22 @@ pub async fn run_chat(
     let mut approvals = ApprovalSession::new(state.config.agent.approval.clone());
     approvals.set_level(level);
 
-    // With no channel to ask over, the answer to a prompt is "no" — with the reason, so the message
-    // a client shows says what to do about it.
+    // Who answers a prompt, in the order of how much waiting is warranted.
     let approver: Arc<dyn Approver> = match level {
         // Nothing is prompted at this level, so the approver is never consulted. Selecting
         // `AlwaysAllow` anyway would be a lie in the direction of "this run could have asked".
         AutonomyLevel::Yolo => Arc::new(AlwaysAllow),
-        _ => Arc::new(DenyWithReason::new(
-            "no client is attached to answer approvals: this run is over HTTP and the daemon has no \
-             approval channel yet. Re-send with `autonomy: \"yolo\"` to run unattended, or use \
-             `hx chat` in a terminal, which can ask.",
+        // A client that has said it will not wait gets the old answer at once, with the reason and
+        // the escape hatch, rather than a minute of silence.
+        _ if request.approval_wait_secs == Some(0) => Arc::new(RefusingApprover::new(
+            "this request asked not to wait for approvals. Re-send with a non-zero \
+             `approval_wait_secs` and a client polling GET /v1/approvals, or run with \
+             `autonomy: \"yolo\"` if the work is safe to do unattended.",
         )),
+        _ => SessionScopedQueue::new(
+            Arc::clone(&state.approvals),
+            session_id.as_str().to_string(),
+        ),
     };
 
     let ttl = {

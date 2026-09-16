@@ -24,9 +24,11 @@
 pub mod agent;
 pub mod approver;
 pub mod model;
+pub mod queue;
 
 pub use agent::{AgentLoop, Limits, RunOutcome, TranscriptSink};
 pub use approver::{
     AlwaysAllow, AlwaysDeny, ApprovalDecision, Approver, DenyWithReason, ScriptedApprover,
 };
 pub use model::{DirectProvider, ModelCall, RouterModel};
+pub use queue::{ApprovalQueue, RefusingApprover, SessionScopedQueue};

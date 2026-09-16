@@ -6,6 +6,7 @@
 //! command at all.
 
 use chrono::{DateTime, Utc};
+use hx_agent::ApprovalQueue;
 use hx_core::config::{Config, HostConfig};
 use hx_core::error::{HxError, Result};
 use hx_core::ids::HostId;
@@ -39,6 +40,12 @@ pub struct AppState {
     pub models: Arc<dyn crate::chat::ModelFactory>,
     /// The tools a run may call.
     pub tools: Arc<ToolRegistry>,
+    /// Questions a run is waiting on, for a client that can answer them.
+    ///
+    /// Shared across runs and keyed by approval id: an approval belongs to a session and a call, and
+    /// a client asks "what is waiting for *this* session" rather than being shown every prompt on the
+    /// machine.
+    pub approvals: Arc<ApprovalQueue>,
     pub search: Arc<BackendRegistry>,
     /// One lock per session, held for the duration of a run: two requests on one session would
     /// otherwise interleave into a transcript neither of them wrote.
@@ -61,6 +68,7 @@ pub struct AppStateParts {
     pub store: Arc<Store>,
     pub models: Arc<dyn crate::chat::ModelFactory>,
     pub tools: Arc<ToolRegistry>,
+    pub approvals: Arc<ApprovalQueue>,
     pub search: Arc<BackendRegistry>,
     pub sandboxes: Option<Arc<SandboxManager>>,
     pub sandbox_unavailable_reason: Option<String>,
@@ -106,6 +114,13 @@ impl AppState {
         let search = Arc::new(search);
         let tools = Arc::new(crate::chat::default_tools(search.all(), client.clone()));
 
+        // How long a run waits for a human before treating silence as a refusal. Long enough to
+        // answer a phone notification, short enough that a run with nobody attached does not look
+        // hung; a request can ask for zero, which refuses immediately (the old behaviour).
+        let approvals = ApprovalQueue::new(std::time::Duration::from_secs(
+            crate::chat::DEFAULT_APPROVAL_WAIT_SECS,
+        ));
+
         let (sandboxes, sandbox_unavailable_reason) = match hx_sandbox::docker_manager(
             config.agent.max_concurrent_subagents as usize,
         )
@@ -133,6 +148,7 @@ impl AppState {
             store,
             models,
             tools,
+            approvals,
             search,
             sandboxes,
             sandbox_unavailable_reason,
@@ -151,6 +167,7 @@ impl AppState {
             store: parts.store,
             models: parts.models,
             tools: parts.tools,
+            approvals: parts.approvals,
             search: parts.search,
             chats: Mutex::new(HashMap::new()),
             sandboxes: parts.sandboxes,
