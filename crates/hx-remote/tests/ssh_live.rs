@@ -229,7 +229,10 @@ async fn a_server_whose_key_changed_is_refused() {
     let recorded = std::fs::read_to_string(&store).unwrap();
     assert_eq!(
         recorded,
-        format!("{} ssh-ed25519 {OTHER_KEY}\n", target.host)
+        format!(
+            "{} ssh-ed25519 {OTHER_KEY}\n",
+            host_field(&target.host, target.port)
+        )
     );
 }
 
