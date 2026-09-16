@@ -1,0 +1,95 @@
+name: Integration
+
+# The tests that need a real server, and therefore the only tests that reach tier A.
+#
+# `ci.yml` runs in-process unit tests: a green run there proves the logic, not that anything
+# connects. Everything in this file opens a real socket — an SSH handshake against a real sshd, a
+# container against a real daemon. Without this workflow those tests were run by hand or not at
+# all, so a regression in the transport or the isolation ladder was invisible until someone
+# happened to try it in anger.
+#
+# They are still `#[ignore]`d in the default `cargo test`, deliberately: a developer without Docker
+# should get a green suite and an honest count, not a failure they cannot act on.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # The isolation ladder is the containment story, and until this job existed none of it had ever
+  # met an engine. The first run found two settings the daemon rejects outright (`userns=keep-id`
+  # and `seccomp=default`), which had made every L2/L3 sandbox impossible to start while the unit
+  # suite stayed green.
+  docker:
+    name: sandbox lifecycle (docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Pulled here rather than by the tests: the tests must not depend on the network, so a
+      # missing image has to be a failing test instead of a hang. Ubuntu is the image the repo
+      # uses everywhere else.
+      - run: docker pull ubuntu:24.04
+      - name: The ladder, against a real container engine
+        run: cargo test -p hx-sandbox --test docker_live --locked -- --ignored --test-threads=1 --nocapture
+
+  # A real sshd, a real key, a real handshake. The port is deliberately not 22: the bracketed
+  # `[host]:port` form in `known_hosts` is the part most likely to be wrong, and this is the only
+  # place it is exercised end to end.
+  ssh:
+    name: ssh transport (against a real sshd)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start an sshd to test against
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server
+          ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"
+          cat "$HOME/.ssh/id_ed25519.pub" >> "$HOME/.ssh/authorized_keys"
+          chmod 700 "$HOME/.ssh"
+          chmod 600 "$HOME/.ssh/authorized_keys"
+          sudo mkdir -p /run/sshd
+          sudo /usr/sbin/sshd -p 2222 -o PasswordAuthentication=no
+          # Assert readiness here instead of inside a test: "connection refused" from a test looks
+          # like a transport bug, when it is really a server that never came up.
+          for attempt in $(seq 1 20); do
+            if (exec 3<>/dev/tcp/127.0.0.1/2222) 2>/dev/null; then
+              echo "sshd is listening on 2222"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "::error::sshd did not start on 2222"
+          exit 1
+
+      - name: Configure the test target
+        # The runner's own user, discovered rather than assumed: a hardcoded name breaks the moment
+        # the runner image changes, and the failure would look like an authentication bug.
+        run: |
+          {
+            echo "HX_SSH_TEST_HOST=127.0.0.1"
+            echo "HX_SSH_TEST_PORT=2222"
+            echo "HX_SSH_TEST_USER=$(id -un)"
+            echo "HX_SSH_TEST_KEY=$HOME/.ssh/id_ed25519"
+          } >> "$GITHUB_ENV"
+
+      - name: The transport, against a real server
+        run: cargo test -p hx-remote --test ssh_live --locked -- --ignored --test-threads=1 --nocapture

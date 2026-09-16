@@ -19,6 +19,7 @@
 //! developer's `~/.ssh/known_hosts` and never depends on what happened to be in it.
 
 use hx_core::ids::HostId;
+use hx_remote::known_hosts::host_field;
 use hx_remote::{Host, HostKeyPolicy, KnownHosts, RemoteOs, SshAuth, SshHost};
 use hx_secrets::Secret;
 
@@ -105,7 +106,7 @@ async fn connects_probes_the_far_end_and_records_its_key() {
 
     let recorded = std::fs::read_to_string(&store).unwrap();
     assert!(
-        recorded.starts_with(&format!("{} ssh-", target.host)),
+        recorded.starts_with(&format!("{} ssh-", host_field(&target.host, target.port))),
         "the first connection must be recorded in the trust store: {recorded}"
     );
 }
@@ -193,7 +194,16 @@ async fn a_server_whose_key_changed_is_refused() {
     // This is the whole point of the exercise. Before host key verification, this connection
     // succeeded and the substituted key was used.
     const OTHER_KEY: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
-    std::fs::write(&store, format!("{} ssh-ed25519 {OTHER_KEY}\n", target.host)).unwrap();
+    // `host_field`, not the bare host: on a non-default port the entry `ssh` looks for is
+    // `[host]:port`, and writing the bare form would pin nothing and make this test vacuous.
+    std::fs::write(
+        &store,
+        format!(
+            "{} ssh-ed25519 {OTHER_KEY}\n",
+            host_field(&target.host, target.port)
+        ),
+    )
+    .unwrap();
 
     let err = SshHost::connect(
         HostId::from("hst_live"),
