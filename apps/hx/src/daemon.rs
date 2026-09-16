@@ -105,6 +105,46 @@ pub async fn session(
     Ok(session)
 }
 
+/// The questions a client could answer, from the daemon's own queue.
+///
+/// Whole requests, not a summary of them: the daemon's `/v1/approvals` hands over the same
+/// `ApprovalRequest` the loop asked about, targets and reversibility included, and a client that
+/// re-summarised it would be a client inventing a second opinion about what is being asked.
+pub async fn approvals(
+    client: &reqwest::Client,
+    base: &str,
+    session: Option<&str>,
+) -> anyhow::Result<Value> {
+    let url = match session {
+        Some(id) => format!("{base}/v1/approvals?session={id}"),
+        None => format!("{base}/v1/approvals"),
+    };
+    let (_, list) = send(client.get(url), base, "listing approvals").await?;
+    Ok(list)
+}
+
+/// Answer one waiting question.
+///
+/// `by` travels into the audit trail, which is why it is a parameter rather than a constant here: an
+/// answer typed in a terminal and a tap on a phone must not look alike afterwards.
+pub async fn approve(
+    client: &reqwest::Client,
+    base: &str,
+    id: &str,
+    option: &str,
+    by: &str,
+) -> anyhow::Result<Value> {
+    let (_, reply) = send(
+        client
+            .post(format!("{base}/v1/approvals/{id}"))
+            .json(&serde_json::json!({ "option": option, "by": by })),
+        base,
+        "answering an approval",
+    )
+    .await?;
+    Ok(reply)
+}
+
 /// A session's transcript as a document.
 pub async fn export(
     client: &reqwest::Client,

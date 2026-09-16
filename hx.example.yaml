@@ -124,6 +124,36 @@ sandbox_profiles:
     # Defaults are the safe ones: no network, read-only root, non-root user.
 
 # ---------------------------------------------------------------------------
+# Approval: what runs by itself, and what has to be asked about.
+#
+# Omitted (as here) a deployment gets `ApprovalPolicy::deployment_default()`: `balanced`, plus the
+# catastrophe set *denied* rather than questioned — `rm -rf /`, `rm -rf /etc` and friends, `dd` to a
+# device, `mkfs`, `chmod -R 777 /`, `curl … | sh`, `git push --force`, `DROP DATABASE`. Those are
+# refusals, not prompts, because "yes" is not answerable from a command line. See
+# `hx-core/src/approval.rs::default_denials()` for the exact list, and `docs/approvals.md` for why.
+#
+# Writing an `approval:` block REPLACES that set — a partial block is not merged into it, so keep the
+# rules you still want, or leave this section out. The shape follows:
+#
+# agent:
+#   approval:
+#     level: balanced        # observe | cautious | balanced | trusting | yolo
+#     # ceiling: mutate      # highest risk class that may ever be auto-approved, at any level
+#     # unattended_budget: 20  # check in after this many consecutive unattended actions
+#     # expires_at: 2026-10-01T12:00:00Z
+#     # refuse_unenumerable_deletions: true   # refuses `rm -rf $DIR` / `rm -rf build*` outright
+#     # ask:                 # force a prompt even where the level would auto-allow
+#     #   - { tool: shell, command: "git push*", note: "publishes to the world" }
+#     # allow:
+#     #   - { tool: read_file, command: "*" }
+#     # deny:
+#     #   - { tool: shell, command: "*rm -rf /var*" }
+#
+# `refuse_unenumerable_deletions` is part of the deployment default alone: a library caller that
+# builds a policy in code inherits no opinions, which is why the flag exists separately from the list.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Search: SearXNG is the force multiplier — one JSON API in front of ~70 engines.
 # The keyless scrapers are fallbacks for when no SearXNG is running.
 # ---------------------------------------------------------------------------

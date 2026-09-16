@@ -891,11 +891,18 @@ async fn the_events_tell_the_story_of_a_gated_call() {
         approval,
         call,
         reason,
+        targets,
         ..
     } = &events[3]
     else {
         panic!("expected an approval request, got {:?}", events[3]);
     };
+    // ...and an empty list is honest: `shell` cannot name what `rm -rf /tmp/x` will touch, so it says
+    // nothing rather than guessing. (`delete` fills this in — see the delete tests below.)
+    assert!(
+        targets.is_empty(),
+        "the shell tool has no enumerable target: {targets:?}"
+    );
     assert_eq!(call.as_str(), "tc_1");
     assert!(!reason.is_empty());
     let AgentEvent::ApprovalResolved {
@@ -1072,4 +1079,192 @@ async fn a_sink_that_cannot_write_stops_the_run_rather_than_finishing_a_lie() {
     assert!(transcript
         .iter()
         .all(|m| m.role != hx_core::message::Role::Tool));
+}
+
+// ---------------------------------------------------------------------------------------------
+// What the prompt says will be gone
+// ---------------------------------------------------------------------------------------------
+
+/// The registry plus `delete`, for the tests that need a tool able to name its targets.
+///
+/// Deliberately not folded into [`tools`]: the plain-path tests assert the exact set a model is
+/// offered (`requests[0].tools.len()`), and a fixture that drifts under them makes those assertions
+/// meaningless.
+fn tools_with_delete() -> ToolRegistry {
+    let mut registry = tools();
+    registry.register(Arc::new(hx_tools::DeleteTool::new()));
+    registry
+}
+
+#[tokio::test]
+async fn a_delete_reaches_the_prompt_with_what_will_be_gone() {
+    // `docs/approvals.md` §3, end to end: the question a person is shown names the resolved target,
+    // how much of it there is, and whether it comes back. The measurement happens between the
+    // capability check and the prompt, which is the only order in which the number is *true* — it
+    // describes the tree as it is at the moment of asking, not as the model believed it to be.
+    let host = Arc::new(
+        FakeHost::unix()
+            .with_file("/w/build/a.o", "aaaa")
+            .with_file("/w/build/b.o", "bb"),
+    );
+    let approver = Arc::new(ScriptedApprover::new(vec![ApprovalDecision::deny(
+        "not now",
+    )]));
+    let agent_loop = AgentLoop::new(
+        agent(),
+        ScriptedModel::new(vec![
+            Ok(reply_with(vec![(
+                "c1",
+                "delete",
+                json!({ "path": "build", "recursive": true }),
+            )])),
+            Ok(reply("understood — I will not delete it")),
+        ]),
+        Arc::new(tools_with_delete()),
+        token(vec![grant(
+            Resource::FsPath {
+                path: "/w/build".to_string(),
+            },
+            Action::Delete,
+        )]),
+        ApprovalSession::new(ApprovalPolicy::paranoid()),
+        approver.clone(),
+    );
+
+    let ctx = ToolContext::new(host.clone()).in_workspace("/w");
+    let (tx, mut rx) = mpsc::channel(64);
+    let agent_loop = agent_loop.with_events(tx);
+    let mut transcript = transcript_start();
+    let outcome = agent_loop.run(&mut transcript, &ctx).await.unwrap();
+
+    assert_eq!(
+        outcome.refusals, 1,
+        "a denial is a refusal, not a call that ran"
+    );
+    assert_eq!(outcome.tool_calls, 0);
+
+    let asked = approver.seen();
+    assert_eq!(asked.len(), 1);
+    let question = &asked[0];
+    assert_eq!(question.targets.len(), 1, "{question:?}");
+    assert_eq!(question.targets[0].path, "/w/build");
+    assert_eq!(question.targets[0].entries, Some(2));
+    assert_eq!(question.targets[0].bytes, Some(6));
+
+    // The rendered question is the thing a client shows, so it is the thing to assert on: a target
+    // the person cannot read is a target they cannot price.
+    let rendered = question.render();
+    assert!(
+        rendered.contains("/w/build — directory, 2 entries, 6 B"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("trash"),
+        "the way back is named rather than asserted: {rendered}"
+    );
+    assert!(
+        !rendered.contains("This cannot be undone"),
+        "a trash delete does not claim to be unrecoverable: {rendered}"
+    );
+
+    // And the denial held: nothing moved.
+    assert!(host.file("/w/build/a.o").is_some());
+
+    // The audit trail keeps the question, not only the answer. The event that reaches the store
+    // carries the same measurement the approver saw, because the queue drops the question the moment
+    // it is answered and the rendering is not a thing a store can re-render a year later.
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    let recorded = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ApprovalRequested { targets, .. } => Some(targets.clone()),
+            _ => None,
+        })
+        .expect("an approval request reached the event stream");
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].path, "/w/build");
+    assert_eq!(recorded[0].entries, Some(2));
+    assert_eq!(recorded[0].bytes, Some(6));
+}
+
+#[tokio::test]
+async fn a_call_the_agent_may_not_make_is_not_measured_either() {
+    // A measurement is work — a directory walk on someone's machine — and a capability denial is not
+    // a prompt, so there is nothing to measure *for*. The order matters for the same reason it
+    // matters everywhere else in this loop: capability first, and a denial is not a question.
+    let host = Arc::new(FakeHost::unix().with_file("/w/build/a.o", "aaaa"));
+    let approver = Arc::new(ScriptedApprover::new(vec![]));
+    let agent_loop = AgentLoop::new(
+        agent(),
+        ScriptedModel::new(vec![
+            Ok(reply_with(vec![(
+                "c1",
+                "delete",
+                json!({ "path": "build", "recursive": true }),
+            )])),
+            Ok(reply("I am not allowed to do that")),
+        ]),
+        Arc::new(tools_with_delete()),
+        token(vec![]),
+        ApprovalSession::new(ApprovalPolicy::paranoid()),
+        approver.clone(),
+    );
+
+    let ctx = ToolContext::new(host.clone()).in_workspace("/w");
+    let mut transcript = transcript_start();
+    let outcome = agent_loop.run(&mut transcript, &ctx).await.unwrap();
+
+    assert_eq!(outcome.refusals, 1);
+    assert!(approver.seen().is_empty(), "a denial is not a question");
+    assert!(
+        host.listings().is_empty(),
+        "nothing was walked for a call that could never run: {:?}",
+        host.listings()
+    );
+}
+
+#[tokio::test]
+async fn a_pattern_deletion_is_refused_rather_than_asked_about() {
+    // The other half of §3: `rm -rf build*` covers a set the person answering cannot see, so the
+    // honest answer is not "yes" or "no" but "name the files" — and that decision belongs before the
+    // prompt, not in it. `deployment_default()` carries the check; a blank policy does not.
+    let h = harness(
+        vec![
+            Ok(reply_with(vec![(
+                "c1",
+                "shell",
+                json!({ "cmd": "rm -rf ./build*" }),
+            )])),
+            Ok(reply("then I will name them")),
+        ],
+        vec![process_execute()],
+        ApprovalPolicy::deployment_default(),
+        Arc::new(ScriptedApprover::new(vec![])),
+    );
+
+    let mut transcript = transcript_start();
+    let outcome = h.agent_loop.run(&mut transcript, &h.ctx).await.unwrap();
+
+    assert_eq!(outcome.refusals, 1);
+    assert_eq!(outcome.tool_calls, 0);
+    let results = tool_results(&transcript);
+    assert!(results[0].2.contains("refused"), "{}", results[0].2);
+    assert!(
+        results[0].2.contains("cannot be listed"),
+        "the refusal explains itself: {}",
+        results[0].2
+    );
+    assert!(
+        results[0].2.contains("./build*"),
+        "and names the target it is refusing: {}",
+        results[0].2
+    );
+    assert!(
+        h.host.commands().is_empty(),
+        "nothing ran: {:?}",
+        h.host.commands()
+    );
 }

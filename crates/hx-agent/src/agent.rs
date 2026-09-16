@@ -389,7 +389,18 @@ impl AgentLoop {
 
         // Phase 3: approval, only for tools with an external effect.
         if let Some(requirement) = prepared.requirement() {
-            let action = self.action_request(&prepared, requirement);
+            // What the call will touch, measured *now* — after the capability check, because a call
+            // this agent is not allowed to make is not worth a directory walk, and before the prompt,
+            // because §3 requires the question to name what will be gone. A measurement that fails
+            // does not fail the call: the classification stands, and the prompt is a prompt with less
+            // detail rather than no question at all.
+            let targets = prepared.targets(ctx).await.unwrap_or_default();
+
+            let action = self
+                .action_request(&prepared, requirement)
+                .with_targets(targets)
+                .with_undo_opt(prepared.undo(ctx));
+
             let verdict = {
                 let mut approvals = self.approvals.lock().expect("approval lock");
                 approvals.decide(&action, chrono::Utc::now())
@@ -407,6 +418,9 @@ impl AgentLoop {
                         approval: approval_id.clone(),
                         call: id.clone(),
                         reason: request.reason.clone(),
+                        // Cloned before the resolution moves on: this is the record of what the person
+                        // was actually shown, and the queue drops the question the moment it is answered.
+                        targets: action.targets.clone(),
                     });
 
                     let decision: ApprovalDecision = self.approver.decide(&request, &action).await;

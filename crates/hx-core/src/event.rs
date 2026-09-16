@@ -4,6 +4,7 @@
 //! That is how feature parity stays structural rather than aspirational: a new event is
 //! automatically visible everywhere, because no client owns its own copy of the logic.
 
+use crate::approval::Target;
 use crate::ids::{AgentId, ApprovalId, CredentialId, ProviderId, SessionId, ToolCallId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,15 @@ pub enum AgentEvent {
         approval: ApprovalId,
         call: ToolCallId,
         reason: String,
+        /// What the question named as about to be affected, exactly as the approver was shown it.
+        ///
+        /// Carried in the event because the question itself lives in the in-memory queue and is gone
+        /// once answered: without this the audit trail records that a person approved `delete build`
+        /// but not that they were told it was 1342 entries and half a gigabyte. A store that keeps the
+        /// rendering instead of the facts could never be re-rendered against a better one, so the
+        /// targets travel as data.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        targets: Vec<Target>,
     },
     ApprovalResolved {
         agent: AgentId,
@@ -123,9 +133,18 @@ mod tests {
             approval: ApprovalId::from_raw("apr_1"),
             call: ToolCallId::from_raw("tc_1"),
             reason: "writes outside workspace".into(),
+            targets: vec![Target::file("/etc/hosts", 512)],
         };
         assert!(e.needs_attention());
         assert_eq!(e.agent().map(|a| a.as_str()), Some("agt_1"));
+
+        // The wire shape the store writes and every client reads: the measurement travels as data, so
+        // a client can render the question its own way and a reviewer can still check the numbers.
+        let wire = serde_json::to_value(&e).unwrap();
+        assert_eq!(wire["targets"][0]["path"], "/etc/hosts");
+        assert_eq!(wire["targets"][0]["bytes"], 512);
+        let back: AgentEvent = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, e);
     }
 
     #[test]

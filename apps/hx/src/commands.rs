@@ -690,6 +690,52 @@ pub fn render_chat(reply: &serde_json::Value, json: bool) -> String {
     out
 }
 
+/// The questions waiting for a human, rendered by the *daemon's* own renderer.
+///
+/// `ApprovalRequest::render` is used rather than a format invented here, and that is the point:
+/// `docs/approvals.md` §3 makes the target list and the plain sentence part of the question, and a
+/// terminal that showed less than a web page would be a second, weaker interface to the same
+/// decision. Each question is followed by the command that answers it, so the id never has to be
+/// copied out of a wall of text.
+pub fn render_approvals(list: &serde_json::Value, json: bool) -> String {
+    if json {
+        return match serde_json::to_string_pretty(list) {
+            Ok(pretty) => format!("{pretty}\n"),
+            Err(err) => format!("{{\"error\":\"could not serialise the list: {err}\"}}\n"),
+        };
+    }
+
+    let Some(questions) = list.as_array() else {
+        return format!("the daemon sent something that is not a list of approvals: {list}\n");
+    };
+    if questions.is_empty() {
+        return "no approvals are waiting.\n".to_string();
+    }
+
+    let mut out = String::new();
+    for question in questions {
+        match serde_json::from_value::<hx_core::approval::ApprovalRequest>(question.clone()) {
+            Ok(request) => {
+                out.push_str(&request.render());
+                out.push('\n');
+                let _ = writeln!(
+                    out,
+                    "id: {}   ->  hx approve {} --option once",
+                    request.id.as_str(),
+                    request.id.as_str()
+                );
+            }
+            // A question this build cannot read is still a question, and hiding it would be the
+            // worst possible failure mode: a run waiting on something nobody can see.
+            Err(err) => {
+                let _ = writeln!(out, "could not read an approval ({err}): {question}");
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// The session list.
 pub fn render_sessions(list: &serde_json::Value) -> String {
     let sessions = list.as_array().cloned().unwrap_or_default();
@@ -811,6 +857,66 @@ mod run_tests {
         let mut priced = reply();
         priced["cost_usd"] = json!(0.0123);
         assert!(render_chat(&priced, false).contains("$0.0123"));
+    }
+
+    #[test]
+    fn a_waiting_question_is_rendered_whole_with_the_command_that_answers_it() {
+        // The terminal must not show less than the daemon asked. A client that dropped the target list
+        // would be asking a person to approve something they were never told about, which is the
+        // failure `docs/approvals.md` §3 exists to prevent.
+        let list = json!([{
+            "id": "apr_1",
+            "tool": "delete",
+            "summary": "delete /w/build",
+            "risk": "destructive",
+            "reason": "deletes /w/build",
+            "key": "delete",
+            "options": ["allow_once", "allow_for_chat", "deny"],
+            "targets": [{
+                "path": "/w/build",
+                "kind": "directory",
+                "entries": 1342,
+                "bytes": 503316480,
+                "partial": false
+            }],
+            "reversible": false,
+            "undo": "moves to the trash at /home/agent/.local/share/Trash/files, where it can be moved back",
+            "default_on_timeout": "deny",
+            "timeout_secs": 60
+        }]);
+
+        let rendered = render_approvals(&list, false);
+        assert!(
+            rendered.contains("/w/build — directory, 1342 entries, 480.0 MB"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("moved back"),
+            "the way back, in the tool's own words: {rendered}"
+        );
+        assert!(rendered.contains("risk: destructive"), "{rendered}");
+        assert!(
+            rendered.contains("hx approve apr_1 --option once"),
+            "the answer is one copy-paste away: {rendered}"
+        );
+        assert!(
+            rendered.contains("deny if nobody answers within 60s"),
+            "and silence is spelled out: {rendered}"
+        );
+    }
+
+    #[test]
+    fn no_waiting_questions_says_so_rather_than_printing_nothing() {
+        let rendered = render_approvals(&json!([]), false);
+        assert!(rendered.contains("no approvals are waiting"), "{rendered}");
+    }
+
+    #[test]
+    fn a_question_this_build_cannot_read_is_shown_rather_than_hidden() {
+        // The worst failure mode available here: a run blocked on a question nobody can see.
+        let rendered = render_approvals(&json!([{ "id": "apr_9", "tool": 42 }]), false);
+        assert!(rendered.contains("apr_9"), "{rendered}");
+        assert!(rendered.contains("could not read"), "{rendered}");
     }
 
     #[test]

@@ -238,6 +238,15 @@ pub trait Host: Send + Sync {
 
     async fn list_dir(&self, path: &str) -> Result<Vec<RemoteEntry>>;
 
+    /// Move a file or directory within the host, creating the destination's parent directory.
+    ///
+    /// A transport operation rather than a command the caller composes: the trash a `delete` leaves
+    /// behind has to be created and moved into, and a tool that built `mv …` itself would be a tool
+    /// that needs a POSIX shell on a machine it is not allowed to assume one on. An existing
+    /// destination is an **error, never an overwrite** — a delete picks a free name, and the one
+    /// thing a trash must not do is destroy the file already sitting in it.
+    async fn rename(&self, from: &str, to: &str) -> Result<()>;
+
     /// A one-line description for status output.
     fn describe(&self) -> String;
 }

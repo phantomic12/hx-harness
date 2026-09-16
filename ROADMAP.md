@@ -22,8 +22,9 @@ exist before anything can hide behind an integration test.
   TTL reaping, rollback on a failed start
 - `hx-server` + `hxd` — axum route surface and the daemon binary
 
-**Status: 324 tests green, clippy clean (0 warnings).** Per crate: core 83, provider 61, sandbox
-53, search 45, remote 33, secrets 27, server 11, cli 11.
+**Status: 663 tests green, clippy clean (0 warnings).** M0 closed at 324 of them: core 83, provider
+61, sandbox 53, search 45, remote 33, secrets 27, server 11, cli 11 — `hx-tools`, `hx-agent` and
+`hx-store` came after M0 and are covered in the M1/M2 sections.
 
 What the tests actually pin down: the vault round-trips and rejects both a wrong passphrase and a
 tampered ciphertext; redaction masks known secrets and provider-shaped tokens; the risk classifier
@@ -50,15 +51,16 @@ Those get real tests in M1 against a live endpoint.
   hermetic HTTP suite and a live suite (text, usage, tool calls, transcript)
 - Provider adapter for Anthropic Messages API
 - Streaming over SSE, token deltas into the TUI
-- ✅ Tool dispatch: `shell`, `read_file`, `write_file`, `patch`, `search`, `todo` — each declares the
-  resource and action it needs; none decides whether it is allowed
-- ◐ **Approval wired into dispatch** — done in the loop: every tool call is classified against the
-  capability token and then the approval policy, in that order, and every refusal comes back to the
-  model as a tool result (`crates/hx-agent/tests/loop.rs`). Still to come, in the order
-  `docs/approvals.md` §7 sets out: `ask` rules and the `deny → ask → allow` precedence, a shipped
-  default deny set for the catastrophe cases, remember-scoping by tier, a `delete` tool that trashes
-  and a destructive request that names its targets, `confined` as a second axis, `hx policy` to show
-  the effective ladder, and the approval channel a client answers over
+- ✅ Tool dispatch: `shell`, `read_file`, `write_file`, `patch`, `delete`, `search`, `todo` — each
+  declares the resource and action it needs; none decides whether it is allowed
+- ✅ **Approval wired into dispatch** — every tool call is classified against the capability token and
+  then the approval policy, in that order, and every refusal comes back to the model as a tool result
+  (`crates/hx-agent/tests/loop.rs`). `docs/approvals.md` §7's steps 1–4 have landed with it: `ask`
+  rules and the `deny → ask → allow` precedence, the shipped catastrophe deny set, remember-scoping by
+  tier, and the `delete` tool — a destructive request now names its targets, measured after the
+  capability check and before the prompt, and the question reaches a client over HTTP
+  (`hx approvals` / `hx approve`). Still open in that document: `confined` as a second axis (§4), a
+  persisted project-scoped allowlist (§5), and `hx policy` to print the effective ladder (§6)
 - Context builder + compaction at a token threshold
 - ✅ `hxd` runs, `hx` connects to it: `hx chat` sends the prompt to the daemon over the configured
   HTTP address and prints the run's report (over HTTP rather than the unix socket, which the config

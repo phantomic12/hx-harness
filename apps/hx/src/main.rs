@@ -91,6 +91,32 @@ enum Command {
         export: String,
     },
 
+    /// Show the approval questions a run is waiting on.
+    Approvals {
+        /// Only the questions belonging to this session.
+        #[arg(long)]
+        session: Option<String>,
+
+        /// Print the daemon's reply as JSON instead of a rendering.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Answer a waiting approval question.
+    Approve {
+        /// The id printed by `hx approvals`.
+        id: String,
+
+        /// `once`, `chat`, `always` or `deny`.
+        #[arg(long, default_value = "once")]
+        option: String,
+
+        /// Who is answering. Recorded in the audit trail, so a terminal and a phone do not look
+        /// alike afterwards.
+        #[arg(long, default_value = "terminal")]
+        by: String,
+    },
+
     /// Show the model pools, their routes, and the role bindings.
     Pools,
 
@@ -214,6 +240,21 @@ async fn main() -> Result<()> {
         Command::Pools => {
             let router = ModelRouter::from_config(&config, Utc::now())?;
             print!("{}", commands::render_pools(&router));
+        }
+
+        Command::Approvals { session, json } => {
+            let base = daemon::base_url(&config, cli.daemon.as_deref());
+            let list =
+                daemon::approvals(&reqwest::Client::new(), &base, session.as_deref()).await?;
+            print!("{}", commands::render_approvals(&list, json));
+        }
+
+        Command::Approve { id, option, by } => {
+            let base = daemon::base_url(&config, cli.daemon.as_deref());
+            let reply = daemon::approve(&reqwest::Client::new(), &base, &id, &option, &by).await?;
+            // Echoed, not assumed: the daemon is the one that knows whether a question was still
+            // waiting, and an answer that arrived after the run gave up is not an answer.
+            println!("{}", serde_json::to_string(&reply).unwrap_or_default());
         }
 
         Command::Doctor => {

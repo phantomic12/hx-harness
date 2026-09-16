@@ -1,6 +1,7 @@
 //! The set of tools an agent has, and the two-phase call that keeps policy in one place.
 
 use crate::tool::{Requirement, Tool, ToolContext, ToolError, ToolOutcome};
+use hx_core::approval::Target;
 use indexmap::IndexMap;
 use serde_json::Value;
 use std::sync::Arc;
@@ -60,6 +61,16 @@ impl PreparedCall {
             Some(requirement) => format!("{}: {}", self.name, requirement.describes),
             None => format!("{} (no external effect)", self.name),
         }
+    }
+
+    /// What this call will touch, measured now. See [`Tool::targets`].
+    pub async fn targets(&self, ctx: &ToolContext) -> Result<Vec<Target>, ToolError> {
+        self.tool.targets(&self.args, ctx).await
+    }
+
+    /// How it can be taken back, when it can be. See [`Tool::undo`].
+    pub fn undo(&self, ctx: &ToolContext) -> Option<String> {
+        self.tool.undo(&self.args, ctx)
     }
 
     pub async fn run(self, ctx: &ToolContext) -> Result<ToolOutcome, ToolError> {

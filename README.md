@@ -62,7 +62,7 @@ $ curl -s localhost:7717/v1/status | jq .pools
 | Remote hosts: local + SSH (real `russh`), host key verification, Windows/macOS/Linux capability detection | **Built** — connect, auth, exec and file transfer run against a real host (`crates/hx-remote/tests/ssh_live.rs`) |
 | Sandboxes: L1/L2/L3 isolation ladder, Docker lifecycle, TTL reaper | **Built** — created, confined and reaped against a real daemon (`crates/hx-sandbox/tests/docker_live.rs`), running as the workspace's owner so the bind mount is writable; L3 verified inside gVisor, where the sandbox sees `4.19.0-gvisor` and not the host kernel |
 | Daemon (`hxd`) + HTTP API + CLI (`hx`) | **Done**, runnable |
-| Tools (`hx-tools`) + the agent loop (`hx-agent`) | **Built** — six tools, and a loop that classifies every call against the capability token and then the approval policy; 21 tests pin the gate down against a scripted model (`crates/hx-agent/tests/loop.rs`) |
+| Tools (`hx-tools`) + the agent loop (`hx-agent`) | **Built** — seven tools, and a loop that classifies every call against the capability token and then the approval policy; 26 tests pin the gate down against a scripted model (`crates/hx-agent/tests/loop.rs`). `delete` moves a named path to the XDG trash rather than unlinking it, and a destructive prompt carries what will be gone — the resolved path, its entry count, its bytes — because the tool measures the target before anyone is asked |
 | Sessions (`hx-store`) | **Built** — SQLite: create, resume, list, rename, delete, export (JSON/Markdown), events, usage totals. A transcript that ended mid-call is *repaired*, not sent to a provider that would reject it |
 | Web UI, Tauri desktop/mobile, chat connectors | **Not started** |
 | MCP client, browser-automation pool | **Not started** |
@@ -148,6 +148,24 @@ $ hx doctor                      # validate the config
 $ hxd --config hx.yaml --bind 127.0.0.1:7717
 ```
 
+A call that needs a human does not fail, it waits — and any client can answer it. From a second
+terminal, while the run is blocked:
+
+```console
+$ hx chat "delete the ./build directory" --role glm52 --workspace ~/projects/thing &
+$ hx approvals
+delete /home/yoav/projects/thing/build
+risk: destructive
+why:  deletes /home/yoav/projects/thing/build
+target:
+  /home/yoav/projects/thing/build — directory, 1342 entries, 480.0 MB
+after: moves to the trash at /home/yoav/.local/share/Trash/files, where it can be moved back — nothing is destroyed until the trash is emptied
+answer: allow once | allow for this chat | deny
+id: apr_7f3a…   ->  hx approve apr_7f3a… --option once
+
+$ hx approve apr_7f3a… --option once --by terminal
+```
+
 From a clone:
 
 ```console
@@ -157,7 +175,7 @@ $ ./target/release/hxd --bind 127.0.0.1:7717
 ```
 
 ```console
-$ cargo test --workspace         # 615 tests, 0 failed, 22 ignored live tests
+$ cargo test --workspace         # 663 tests, 0 failed, 22 ignored live tests
 $ cargo test -p hx-sandbox --test docker_live -- --ignored   # needs a container engine
 $ cargo test -p hx-remote --test ssh_live -- --ignored       # needs an SSH server
 $ HX_SEARXNG_URL=... HX_SEARCH_EXPECT_RESULTS=searxng \
@@ -174,15 +192,16 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
 
 ## What is deliberately not done yet
 
-- **A run over HTTP cannot be approved.** There is no approval channel in the API yet, so the
-  daemon's approver refuses every prompt with the reason and names the escape hatch
-  (`autonomy: "yolo"`, which the policy's `ceiling` can still cap) — never a silent yes. Events *and*
-  messages are written as the run produces them, so a daemon killed mid-run leaves a session that
-  says what happened up to that point: one whose kill landed between a tool call and its result is
-  repaired on the next request rather than losing the turn.
-- **The approval channel.** Nothing can answer a prompt over HTTP yet: `hx chat` runs, but a call
-  that needs a human is refused with the reason until `--autonomy yolo` says otherwise. That is the
-  next piece, and it is what M2's approval queue waits on.
+- **Approval is a queue a client polls.** A run that needs a human waits, and any client can read the
+  question and answer it over HTTP (`GET /v1/approvals`, `POST /v1/approvals/{id}`; `hx approvals` and
+  `hx approve` are the terminal one). Silence is a denial on a timer, the answer is recorded as an
+  event with its `by`, and the question itself — including what a deletion measures — is in the
+  stored trail. What is *not* there yet: nothing pushes a question to a client, so a web UI polls.
+- **Project-scoped allowlists are not persisted.** "Always allow this" is remembered in memory for the
+  rest of the run, and `docs/approvals.md` §5's reviewable `.hx/allow.toml` — the file in the
+  repository a team can diff — is not written yet. Until it is, a remembered approval outlives
+  nothing. The `confined` axis (§4) and `hx policy`, which would print the effective ladder (§6), are
+  also designed and unbuilt, so a policy is readable in the code and not from the command line.
 - **Streaming and context compaction.** A turn arrives whole, so a run is one long wait per turn and a
   long session is still sent as-is. Both are stated gaps, not hidden ones.
 - **Nothing in `ci.yml` reaches another machine.** That file is in-process unit tests; the tests

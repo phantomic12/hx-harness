@@ -146,15 +146,74 @@ the first question after "why did it do that?" is "what did I allow?".
 
 ## 7. What is missing in the code, and in what order
 
-| Step | Change | Where | Size |
-|---|---|---|---|
-| 1 | `ask: Vec<Rule>` and the `deny → ask → allow` precedence | `hx-core/src/approval.rs`, `ApprovalSession::decide` | small, ~20 tests |
-| 2 | Shipped default `deny` set for the catastrophe list (§3) | `ApprovalPolicy::default`, `hx.example.yaml` | small |
-| 3 | Remember-scoping by tier: which options a request may offer | `hx-core/src/approval.rs` + the event that renders the prompt | medium |
-| 4 | `delete` tool that trashes, and the enumerable-target requirement for `Destructive` | `hx-tools`, `hx-core` prompt text | medium |
-| 5 | `confined` on `ActionRequest` and in rules | `hx-core`, `hx-agent` (sandbox-aware dispatch) | medium |
-| 6 | `hx policy` renderer | `apps/hx` | small |
+| Step | Change | Where | Size | State |
+|---|---|---|---|---|
+| 1 | `ask: Vec<Rule>` and the `deny → ask → allow` precedence | `hx-core/src/approval.rs`, `ApprovalSession::decide` | small, ~20 tests | **done** |
+| 2 | Shipped default `deny` set for the catastrophe list (§3) | `ApprovalPolicy::default`, `hx.example.yaml` | small | **done** |
+| 3 | Remember-scoping by tier: which options a request may offer | `hx-core/src/approval.rs` + the event that renders the prompt | medium | **done** |
+| 4 | `delete` tool that trashes, and the enumerable-target requirement for `Destructive` | `hx-tools`, `hx-core` prompt text | medium | **done** |
+| 5 | `confined` on `ActionRequest` and in rules | `hx-core`, `hx-agent` (sandbox-aware dispatch) | medium | not started |
+| 6 | `hx policy` renderer | `apps/hx` | small | not started |
 
 Steps 1–2 are the upgrade that makes an *unattended* daemon useful: today the choice is prompt-for-
 everything or `--autonomy yolo`, and an allowlist is what splits that into a real third option. Steps
 3–4 are the safety half, and 4 is the one the user asked for by name.
+
+### What step 4 turned out to be
+
+Three pieces, because "say what will be gone" is a claim about the filesystem and none of the layers
+above the filesystem can make it:
+
+- **`Tool::targets` and `Tool::undo`** (`hx-tools/src/tool.rs`) — the tool answers for itself, since it
+  is the only layer that knows what its arguments mean. Both default to the honest nothing: no targets
+  (so no target section, rather than an invented one) and no undo sentence (so the prompt assumes the
+  worst). `hx-tools/src/trash.rs` is the one tool that answers both today.
+- **The measurement** (`hx-agent/src/agent.rs`, phase 3) — after the capability check and before the
+  prompt, because a call this agent may not make is not worth a directory walk, and a number measured
+  before the question is a number that describes the tree as it is when the question is asked. It is a
+  lower bound: a partial walk says "at least N", and a failed walk degrades the prompt rather than
+  failing the call.
+- **`delete`** (`hx-tools/src/trash.rs`, `hx-remote`'s `Host::rename`) — move to the XDG trash, one
+  named path at a time, refusing the filesystem root and any path it cannot read *before* it touches
+  anything. The path is read literally: there is no shell here, so `build*` is a filename that happens
+  to contain an asterisk, and the honest answer to a path-shaped query for it is "no file is called
+  that, and this tool does not expand it". The refusal for a real pattern lives where expansion
+  happens — `ApprovalPolicy::refuse_unenumerable_deletions` (shipped on by default in
+  `deployment_default`) refuses `rm -rf build*` and `rm -rf $DIR` outright and prints the enumerable
+  form instead.
+
+Two consequences worth stating, because they were decisions rather than mechanics:
+
+- **The question is in the audit trail, not just the answer.** `AgentEvent::ApprovalRequested` carries
+  the targets as data, so a store that keeps the event can prove a year later what the approver was
+  shown. A rendering is not storable for that purpose — a stored rendering can never be re-rendered
+  against a better one.
+- **`delete` is not `Action::Delete`-only.** It still requires the `Delete` action on the resolved path,
+  so a token narrower than the workspace denies it outright and no approval can buy it back. What the
+  *tool* adds is that the effect is recoverable: the prompt says where the file went instead of
+  claiming it is gone.
+
+### Two defects the shipped floor had
+
+Writing the test for §3's catastrophe set turned up two ways the floor was not doing what this document
+says, and both are the kind that only a test written from the document can find:
+
+1. **The root pattern matched every absolute path.** `*rm -rf /*` was meant for `rm -rf /`; as a glob it
+   also matches `rm -rf /tmp/build`, so a deployment refused ordinary cleanups. A floor that blocks
+   ordinary work is a floor people delete — which costs the protection that mattered — so the list now
+   names the directories whose loss nothing can restore (`/etc`, `/usr`, `/var`, `/boot`, … plus the
+   exact root forms) and leaves `/tmp`, `/home`, `/Users` and `/opt` to the prompt that resolves the
+   path and counts what is inside it. `rm -rf /*` — everything at the root — is a *pattern*, and the
+   glob language cannot tell it apart from a path that merely starts with a slash; it is refused by
+   `refuse_unenumerable_deletions` instead, which is the rule that exists for patterns.
+2. **A config that never mentioned a policy got no floor at all.** `AgentConfig`'s field default was
+   `deployment_default()`, but `Config`'s `agent` field is `#[serde(default)]` — so the *shortest*
+   config, the one that omits `agent:` entirely, deserialised through `AgentConfig::default()` and got
+   the blank policy: no catastrophe set, no refusal of unenumerable deletions, in the shape most people
+   write. `AgentConfig::default()` now calls `deployment_approval()`, and
+   `the_shipped_example_config_parses_and_carries_the_floor` pins it against the file people copy.
+
+Known, and next: a config that writes its own `approval:` block still **replaces** the shipped deny set
+rather than adding to it, so `agent: approval: {level: yolo}` quietly removes the floor. The fix is to
+make the shipped rules additive with an explicit opt-out, which is a change to the policy model rather
+than to the delete tool — `hx.example.yaml` states the trap plainly in the meantime.

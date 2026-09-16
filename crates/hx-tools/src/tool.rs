@@ -1,6 +1,7 @@
 //! The tool contract.
 
 use async_trait::async_trait;
+use hx_core::approval::Target;
 use hx_core::capability::{Action, Resource};
 use hx_remote::Host;
 use serde_json::Value;
@@ -190,6 +191,29 @@ pub trait Tool: Send + Sync {
         args: &Value,
         ctx: &ToolContext,
     ) -> Result<Option<Requirement>, ToolError>;
+
+    /// What this call will touch, measured *before* anyone is asked about it.
+    ///
+    /// `docs/approvals.md` §3 is the requirement this answers: the prompt for a deletion has to say
+    /// what will be gone, and that is a fact about the filesystem rather than about the arguments.
+    /// It is therefore measured here — after the capability check (a call the agent is not allowed to
+    /// make is not worth a directory walk) and before the prompt — and it is a **lower bound**: empty
+    /// by default, because a tool that cannot name its targets is not asked to invent them, and the
+    /// prompt is better with no target section than with a wrong one.
+    async fn targets(&self, _args: &Value, _ctx: &ToolContext) -> Result<Vec<Target>, ToolError> {
+        Ok(Vec::new())
+    }
+
+    /// How this call can be taken back, in a sentence the prompt shows, when it can be.
+    ///
+    /// The fact only the tool knows: moving a file into the trash and unlinking it are the same
+    /// [`Action::Delete`] on the same path, and which one it was is the difference between a
+    /// recoverable mistake and a lost file. `None` — the default — means *assume not*, so a tool that
+    /// says nothing gets the conservative prompt, and the one that answers has to describe the way
+    /// back rather than assert a boolean.
+    fn undo(&self, _args: &Value, _ctx: &ToolContext) -> Option<String> {
+        None
+    }
 
     /// Do it.
     async fn call(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutcome, ToolError>;

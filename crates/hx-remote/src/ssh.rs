@@ -657,6 +657,41 @@ impl Host for SshHost {
         Ok(parse_ls_output(&output.stdout, path))
     }
 
+    async fn rename(&self, from: &str, to: &str) -> Result<()> {
+        if !self.caps.is_unix() {
+            return Err(HxError::Remote(format!(
+                "moving files over SSH is only implemented for POSIX hosts; {} is {:?}",
+                self.address, self.caps.os
+            )));
+        }
+
+        let parent = to.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(".");
+
+        // `mv -n` is not portable enough to lean on, so the destination test is written out: the
+        // local host refuses an existing destination, and a remote one has to refuse it the same way
+        // or the two transports disagree about what a move means.
+        let script = format!(
+            "if [ -e {to} ]; then exit 3; fi; mkdir -p {parent} && mv -- {from} {to}",
+            to = shell_quote(to),
+            parent = shell_quote(if parent.is_empty() { "/" } else { parent }),
+            from = shell_quote(from),
+        );
+
+        let output = self.exec(&script, Duration::from_secs(60)).await?;
+        if output.exit_code == Some(3) {
+            return Err(HxError::Remote(format!(
+                "{to} already exists; refusing to replace it"
+            )));
+        }
+        if !output.success() {
+            return Err(HxError::Remote(format!(
+                "could not move {from} to {to}: {}",
+                output.stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
     fn describe(&self) -> String {
         let os = match self.caps.os {
             RemoteOs::Linux => "linux",

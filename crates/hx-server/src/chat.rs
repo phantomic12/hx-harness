@@ -441,6 +441,11 @@ pub fn default_tools(
     tools.register(Arc::new(hx_tools::ReadFileTool::new()));
     tools.register(Arc::new(hx_tools::WriteFileTool::new()));
     tools.register(Arc::new(hx_tools::PatchTool::new()));
+    // `delete` sits next to `shell`, not instead of it: the tool moves a named path to the trash and
+    // reports what it moved, while `rm` stays available through `shell` for the cases a single path
+    // cannot express — classified `Destructive`, and refused outright when a pattern or a variable
+    // stands where a target belongs.
+    tools.register(Arc::new(hx_tools::DeleteTool::new()));
     tools.register(Arc::new(hx_tools::ShellTool::new()));
     tools.register(Arc::new(hx_tools::TodoTool::new()));
     if !search.is_empty() {

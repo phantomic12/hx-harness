@@ -157,6 +157,30 @@ impl Host for LocalHost {
         Ok(entries)
     }
 
+    async fn rename(&self, from: &str, to: &str) -> Result<()> {
+        if let Some(parent) = Path::new(to).parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    HxError::Remote(format!("could not create {}: {e}", parent.display()))
+                })?;
+            }
+        }
+
+        // `rename(2)` replaces an existing destination silently, so the refusal has to be made here.
+        // It is a check and not a promise — nothing on this side can make it atomic, and the window
+        // is acceptable precisely because the caller's destination is a fresh trash name it just
+        // confirmed was free.
+        if tokio::fs::symlink_metadata(to).await.is_ok() {
+            return Err(HxError::Remote(format!(
+                "{to} already exists; refusing to replace it"
+            )));
+        }
+
+        tokio::fs::rename(from, to)
+            .await
+            .map_err(|e| HxError::Remote(format!("could not move {from} to {to}: {e}")))
+    }
+
     fn describe(&self) -> String {
         let os = match self.caps.os {
             RemoteOs::Linux => "linux",

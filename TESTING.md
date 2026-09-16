@@ -1,10 +1,10 @@
 # Testing roadmap — what is verified, and what only looks verified
 
-Status: 2026-09-15. Companion to `ROADMAP.md` (which tracks features); this file tracks **evidence**.
+Status: 2026-09-16. Companion to `ROADMAP.md` (which tracks features); this file tracks **evidence**.
 
 ```console
 $ cargo test --workspace
-615 tests, 0 failed                       # 11 hermetic HTTP + 4 that reopen the database + 12 that run the loop over HTTP
+663 tests, 0 failed                       # 13 hermetic HTTP + 4 that reopen the database + 14 that run the loop over HTTP
 22 ignored                               # live: Docker, SSH, search, a real model
 
 # The 22 that need a real server, run by `.github/workflows/integration.yml`
@@ -319,14 +319,52 @@ over *unmerged streaming fragments* as a `tool_calls` array (seven entries, six 
 and relative paths from the model being checked against an absolute workspace grant — 35 refusals and
 no progress. Both are fixed, and both now have tests that reproduce the real wire bodies.
 
+**A deletion, and what the question said.** `docs/approvals.md` §3 asks a destructive prompt to name
+what will be gone. That is a claim about the filesystem rather than about the arguments, so the test
+that settles it is one where a model chooses the path and a person reads the measurement
+(`~/.hx/delete-demo.sh`, which builds a tree with a nested file, runs the daemon, and answers the
+question through the CLI rather than with a raw `curl`):
+
+```console
+$ ./delete-demo.sh
+--- the target, before ---
+610000  /home/yoav/.hx/ws/delete-demo/build        # one.o, two.o, and sub/three.o
+--- the question a person sees (after 3s) ---
+delete /home/yoav/.hx/ws/delete-demo/build
+risk: destructive
+why:  deletes /home/yoav/.hx/ws/delete-demo/build
+target:
+  /home/yoav/.hx/ws/delete-demo/build — directory, 4 entries, 595.7 KB
+after: moves to the trash at /home/yoav/.local/share/Trash/files, where it can be moved back — nothing is destroyed until the trash is emptied
+answer: allow once | allow for this chat | deny
+id: apr_400a59742a374405b475551db9369089   ->  hx approve apr_400a59… --option once
+```
+
+`glm-prox/swe-2-high` called `delete {"path":"build","recursive":true}` — a **relative** path, measured
+against the workspace — and the count is the tree, not the top level: 4 entries for two object files,
+the `sub` directory, and the object file inside it. The run waited, the CLI answered, and afterwards
+the workspace held only `keep.txt` while the trash held the tree byte-for-byte (610 000 bytes) with an
+XDG `build.trashinfo` naming the original absolute path. Read back from SQLite once the run finished:
+
+```json
+{"event":"approval_requested","approval":"apr_400a59…",
+ "reason":"deletes /home/yoav/.hx/ws/delete-demo/build",
+ "targets":[{"path":"/home/yoav/.hx/ws/delete-demo/build","kind":"directory",
+             "entries":4,"bytes":610000,"partial":false}]}
+{"event":"approval_resolved","approval":"apr_400a59…","approved":true,"by":"terminal"}
+```
+
+The second line is the reason for the first: the trail records *who* answered **and** what they were
+shown, so an approval can never be audited as a bare yes.
+
 ## Running the suite
 
 ```bash
-cargo test --workspace          # 615 tests, 0 failed, 22 ignored live tests
+cargo test --workspace          # 663 tests, 0 failed, 22 ignored live tests
 cargo test -p hx-store          # 42 — migrations, the transcript, and 4 that reopen the file
-cargo test -p hx-agent          # 35 — the loop's gate, the routed model call, the transcript sink
-cargo test -p hx-tools          # 70 — requirements, bounded output, the two-phase registry, workspace resolution
-cargo test -p hx-server         # 28 — routes, and the loop end to end over HTTP
+cargo test -p hx-agent          # 42 — the loop's gate, the routed model call, the transcript sink
+cargo test -p hx-tools          # 91 — requirements, bounded output, the two-phase registry, workspace resolution, the trash
+cargo test -p hx-server         # 30 — routes, and the loop end to end over HTTP
 cargo test -p hx-sandbox        # 62 — includes the ladder and the rollback invariants
 cargo test -p hx-remote         # 90 — includes known_hosts parsing and the host key policy
 cargo build --workspace         # clean: 0 warnings, 0 deprecations

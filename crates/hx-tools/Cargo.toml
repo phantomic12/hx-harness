@@ -9,6 +9,7 @@ publish.workspace = true
 hx-core.workspace = true
 hx-remote.workspace = true
 hx-search.workspace = true
+chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -26,6 +26,7 @@ pub mod registry;
 pub mod shell;
 pub mod todo;
 pub mod tool;
+pub mod trash;
 pub mod web;
 
 /// An in-memory host, for tests.
@@ -44,4 +45,5 @@ pub use tool::{
     bound, resolve_path, Requirement, Tool, ToolContext, ToolError, ToolOutcome,
     MAX_TOOL_OUTPUT_CHARS,
 };
+pub use trash::DeleteTool;
 pub use web::WebSearchTool;

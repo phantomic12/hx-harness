@@ -558,7 +558,11 @@ impl Default for AgentConfig {
         Self {
             max_turns: default_max_turns(),
             compact_at_tokens: default_compact_at(),
-            approval: ApprovalPolicy::default(),
+            // `deployment_approval()`, not `ApprovalPolicy::default()`: `Config`'s `agent` field is
+            // `#[serde(default)]`, so this is what a config that mentions no policy at all gets — and
+            // "the config was silent" must not be the one shape that loses the catastrophe set. The
+            // blank policy stays what a *library caller* builds in code.
+            approval: deployment_approval(),
             max_concurrent_subagents: default_concurrent(),
             default_pool: default_pool_name(),
         }
@@ -787,5 +791,37 @@ roles:
             ..Default::default()
         }
         .is_unbounded());
+    }
+
+    /// The file we tell people to copy has to parse against the schema we actually have.
+    ///
+    /// `hx.example.yaml` promises in its own header that a typo'd key fails loudly, and the file is
+    /// what a first run is built from — so a stale example is the worst kind of documentation: it is
+    /// the thing people type, and nothing notices until their first launch fails. This also pins the
+    /// *behaviour* the example claims by omission: with no `agent:` section, a deployment carries the
+    /// floor (`balanced`, catastrophe set denied, unenumerable deletions refused).
+    #[test]
+    fn the_shipped_example_config_parses_and_carries_the_floor() {
+        let yaml = include_str!("../../../hx.example.yaml");
+        let config = Config::from_yaml(yaml).expect("hx.example.yaml must parse");
+
+        assert!(
+            !config.providers.is_empty(),
+            "it should show, not just tell"
+        );
+        assert!(!config.pools.is_empty());
+        assert!(!config.roles.is_empty());
+
+        let approval = &config.agent.approval;
+        assert_eq!(approval.level, crate::approval::AutonomyLevel::Balanced);
+        assert!(
+            approval.refuse_unenumerable_deletions,
+            "the example documents the refusal, so omitting `agent:` must produce it"
+        );
+        assert!(
+            approval.deny.len() >= 10,
+            "and the catastrophe set with it: {:?}",
+            approval.deny
+        );
     }
 }

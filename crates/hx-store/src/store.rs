@@ -1033,6 +1033,14 @@ mod tests {
                 approval: hx_core::ids::ApprovalId::from_raw("apr_1"),
                 call: ToolCallId::from("tc_1"),
                 reason: "deletes /tmp/build".into(),
+                // The measured target travels with the event, so the stored trail records what the
+                // approver was shown — not just that somebody said yes to something.
+                targets: vec![hx_core::approval::Target::directory(
+                    "/tmp/build",
+                    12,
+                    2048,
+                    false,
+                )],
             },
             AgentEvent::TurnFinished {
                 agent,
