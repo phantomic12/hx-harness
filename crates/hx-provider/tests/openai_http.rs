@@ -453,3 +453,77 @@ async fn the_provider_reports_its_own_identity() {
     assert_eq!(provider.models(), ["gpt-5".to_string()]);
     assert_eq!(provider.kind(), hx_core::config::ProviderKind::Openai);
 }
+
+/// The body below is what litellm returned for `glm-prox/swe-2-high` over the wire, verbatim: seven
+/// `tool_calls` entries, the name on the first and the arguments split across the rest, with no
+/// `index` linking them. A non-streaming request, a non-streaming response, and the fragments of a
+/// stream inside it — an adapter that reads it literally asks the tool layer to run six nameless
+/// tools whose "arguments" are pieces of JSON.
+#[tokio::test]
+async fn a_proxy_that_hands_over_streaming_fragments_still_yields_one_call() {
+    let stub = stub(
+        200,
+        "",
+        &json!({
+            "id": "chatcmpl-1",
+            "model": "glm-prox/swe-2-high",
+            "usage": { "prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18 },
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [
+                        { "id": "read_file_0#00c4ad", "type": "function",
+                          "function": { "arguments": "", "name": "read_file" } },
+                        { "id": "", "type": "function", "function": { "arguments": "{", "name": "" } },
+                        { "id": "", "type": "function",
+                          "function": { "arguments": "\"path\": \"", "name": "" } },
+                        { "id": "", "type": "function",
+                          "function": { "arguments": "Cargo", "name": "" } },
+                        { "id": "", "type": "function",
+                          "function": { "arguments": ".toml", "name": "" } },
+                        { "id": "", "type": "function", "function": { "arguments": "\"", "name": "" } },
+                        { "id": "", "type": "function", "function": { "arguments": "}", "name": "" } }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })
+        .to_string(),
+    )
+    .await;
+
+    let response = stub
+        .provider()
+        .complete(request(), &key())
+        .await
+        .expect("the completion succeeds");
+
+    let calls: Vec<&Part> = response.message.tool_calls().collect();
+    assert_eq!(calls.len(), 1, "seven fragments are one call: {calls:?}");
+    match calls[0] {
+        Part::ToolCall {
+            id,
+            name,
+            arguments,
+        } => {
+            assert_eq!(id.as_str(), "read_file_0#00c4ad");
+            assert_eq!(name, "read_file");
+            assert_eq!(arguments["path"], "Cargo.toml");
+        }
+        other => panic!("expected a tool call, got {other:?}"),
+    }
+}
+
+/// Every request says `stream: false` out loud. Omitting the key is not the same as asking for it:
+/// a proxy that defaults to streaming will stream, and this adapter reads one JSON object.
+#[tokio::test]
+async fn the_request_asks_for_a_non_streaming_response_by_name() {
+    let stub = stub(200, "", "{\"choices\":[{\"message\":{\"content\":\"x\"}}]}").await;
+    stub.provider()
+        .complete(request(), &key())
+        .await
+        .expect("the completion succeeds");
+
+    let body = stub.captured().await.body;
+    assert_eq!(body["stream"], serde_json::Value::Bool(false), "{body}");
+}

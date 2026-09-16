@@ -38,12 +38,27 @@ impl ShellTool {
     /// Quoted through the host's own shell quoting, so a path with a space (or a `;`) cannot become
     /// a second command. The transport quotes again for its own shell; doing it here is what makes
     /// the `cd` unambiguous.
-    fn command_line<F: Fn(&str) -> String>(args: &Args, quote: F) -> String {
-        match &args.workdir {
-            Some(dir) if !dir.trim().is_empty() => {
-                format!("cd {} && {}", quote(dir), args.cmd)
-            }
-            _ => args.cmd.clone(),
+    ///
+    /// The run's workspace is the default directory, because the alternative is real and was once
+    /// expensive: `git push` with no `workdir` runs wherever the *daemon* happens to be, which is not
+    /// the checkout the model was asked about. A command that acts on the wrong repository is worse
+    /// than one that fails.
+    fn command_line<F: Fn(&str) -> String>(
+        args: &Args,
+        workspace: Option<&str>,
+        quote: F,
+    ) -> String {
+        let dir = match &args.workdir {
+            Some(dir) if !dir.trim().is_empty() => Some(dir.clone()),
+            _ => workspace
+                .map(str::trim)
+                .filter(|root| !root.is_empty())
+                .map(str::to_string),
+        };
+
+        match dir {
+            Some(dir) => format!("cd {} && {}", quote(&dir), args.cmd),
+            None => args.cmd.clone(),
         }
     }
 }
@@ -81,7 +96,11 @@ impl Tool for ShellTool {
         })
     }
 
-    fn requirement(&self, args: &Value) -> Result<Option<Requirement>, ToolError> {
+    fn requirement(
+        &self,
+        args: &Value,
+        _ctx: &ToolContext,
+    ) -> Result<Option<Requirement>, ToolError> {
         let parsed: Args = parse_args(args)?;
         if parsed.cmd.trim().is_empty() {
             return Err(ToolError::Arguments("cmd is empty".to_string()));
@@ -108,7 +127,7 @@ impl Tool for ShellTool {
                 .clamp(1, MAX_TIMEOUT_SECS),
         );
 
-        let line = Self::command_line(&parsed, |arg| shell.quote(arg));
+        let line = Self::command_line(&parsed, ctx.workspace.as_deref(), |arg| shell.quote(arg));
 
         let output = match ctx.host.exec(&line, timeout).await {
             Ok(output) => output,
@@ -177,7 +196,9 @@ mod tests {
 
     #[test]
     fn an_empty_command_is_refused_before_anything_runs() {
-        let err = ShellTool.requirement(&json!({"cmd": "   "})).unwrap_err();
+        let err = ShellTool
+            .requirement(&json!({"cmd": "   "}), &ctx(Arc::new(FakeHost::unix())))
+            .unwrap_err();
         assert!(err.to_string().contains("cmd is empty"), "{err}");
     }
 
@@ -185,11 +206,40 @@ mod tests {
     fn the_requirement_is_a_process_execution_carrying_the_command() {
         // The command line is what the risk classifier sees, so it must travel with the request.
         let requirement = ShellTool
-            .requirement(&json!({"cmd": "rm -rf /"}))
+            .requirement(
+                &json!({"cmd": "rm -rf /"}),
+                &ctx(Arc::new(FakeHost::unix())),
+            )
             .unwrap()
             .expect("running a command has an external effect");
         assert_eq!(requirement.action, Action::Execute);
         assert_eq!(requirement.command(), Some("rm -rf /"));
+    }
+
+    #[test]
+    fn the_workspace_is_the_default_directory_for_a_command() {
+        // No `workdir` in the arguments, so the run's workspace decides. Without this the command
+        // runs wherever the daemon happens to be — which is how a test `git push` reached the real
+        // repository instead of a temporary directory.
+        let args = Args {
+            cmd: "git status".to_string(),
+            workdir: None,
+            timeout_secs: None,
+        };
+        let line = ShellTool::command_line(&args, Some("/ws"), shell_quote);
+        // `shell_quote` quotes unconditionally, so the expected line carries the quotes too.
+        assert_eq!(line, "cd '/ws' && git status");
+    }
+
+    #[test]
+    fn an_explicit_workdir_beats_the_workspace() {
+        let args = Args {
+            cmd: "ls".to_string(),
+            workdir: Some("/elsewhere".to_string()),
+            timeout_secs: None,
+        };
+        let line = ShellTool::command_line(&args, Some("/ws"), shell_quote);
+        assert_eq!(line, "cd '/elsewhere' && ls");
     }
 
     #[test]
@@ -199,7 +249,7 @@ mod tests {
             workdir: Some("/tmp/it's here".to_string()),
             timeout_secs: None,
         };
-        let line = ShellTool::command_line(&args, shell_quote);
+        let line = ShellTool::command_line(&args, None, shell_quote);
         assert!(line.starts_with("cd '/tmp/it'\\''s here' && "), "{line}");
         assert!(line.ends_with("ls -la"));
     }
@@ -211,7 +261,7 @@ mod tests {
             workdir: None,
             timeout_secs: None,
         };
-        assert_eq!(ShellTool::command_line(&args, shell_quote), "pwd");
+        assert_eq!(ShellTool::command_line(&args, None, shell_quote), "pwd");
     }
 
     #[tokio::test]
@@ -311,7 +361,10 @@ mod tests {
         // silently executes in the wrong directory is worse than one that fails. (It pushed a real
         // branch once.)
         let err = ShellTool
-            .requirement(&serde_json::json!({ "cmd": "pwd", "cwd": "/tmp" }))
+            .requirement(
+                &serde_json::json!({ "cmd": "pwd", "cwd": "/tmp" }),
+                &ctx(Arc::new(FakeHost::unix())),
+            )
             .expect_err("a misnamed argument must not be ignored");
 
         let message = format!("{err}");

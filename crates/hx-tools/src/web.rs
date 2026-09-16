@@ -103,7 +103,11 @@ impl Tool for WebSearchTool {
         })
     }
 
-    fn requirement(&self, args: &Value) -> Result<Option<Requirement>, ToolError> {
+    fn requirement(
+        &self,
+        args: &Value,
+        _ctx: &ToolContext,
+    ) -> Result<Option<Requirement>, ToolError> {
         let parsed: Args = parse_args(args)?;
         if parsed.query.trim().is_empty() {
             return Err(ToolError::Arguments("query is empty".to_string()));
@@ -286,7 +290,7 @@ mod tests {
     #[test]
     fn searching_asks_for_a_connect_grant_on_the_search_resource() {
         let requirement = tool(vec![])
-            .requirement(&json!({"query": "rust"}))
+            .requirement(&json!({"query": "rust"}), &ctx())
             .unwrap()
             .expect("searching has an external effect");
         assert_eq!(requirement.action, Action::Connect);
@@ -299,7 +303,7 @@ mod tests {
     #[test]
     fn an_empty_query_is_refused() {
         let err = tool(vec![])
-            .requirement(&json!({"query": "  "}))
+            .requirement(&json!({"query": "  "}), &ctx())
             .unwrap_err();
         assert!(err.to_string().contains("query is empty"), "{err}");
     }

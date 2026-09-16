@@ -102,12 +102,66 @@ pub enum ToolError {
 /// their todo list), not connections, so one registry can serve several hosts.
 pub struct ToolContext {
     pub host: Arc<dyn Host>,
+    /// The directory this run may act in.
+    ///
+    /// Relative paths from a model are resolved against it, and that matters more than it sounds: a
+    /// model asked to "read Cargo.toml in this workspace" writes `Cargo.toml`, and a capability token
+    /// holds an absolute workspace path. Without the join, the token denies every call the model
+    /// naturally makes — which is exactly what happened the first time a real model was pointed at
+    /// this harness. `shell` also runs here when the model names no directory of its own, because a
+    /// command that runs wherever the daemon happens to be is a command that can act on the wrong
+    /// checkout.
+    pub workspace: Option<String>,
 }
 
 impl ToolContext {
     pub fn new(host: Arc<dyn Host>) -> Self {
-        Self { host }
+        Self {
+            host,
+            workspace: None,
+        }
     }
+
+    /// The context a run has: a host and the directory it may act in.
+    pub fn in_workspace(mut self, workspace: impl Into<String>) -> Self {
+        self.workspace = Some(workspace.into());
+        self
+    }
+
+    /// Resolve a path as the model wrote it: absolute stays as it is, relative joins the workspace.
+    ///
+    /// `..` is deliberately *not* collapsed. The capability token refuses any path containing a
+    /// parent component before it consults a grant, and normalising it away here would hide the one
+    /// shape of path that cannot be safely evaluated for containment.
+    pub fn resolve(&self, path: &str) -> String {
+        resolve_path(path, self.workspace.as_deref())
+    }
+}
+
+/// Join a relative path onto a workspace. See [`ToolContext::resolve`] for why `..` survives.
+pub fn resolve_path(path: &str, workspace: Option<&str>) -> String {
+    if is_absolute_path(path) {
+        return path.to_string();
+    }
+    match workspace.map(str::trim).filter(|root| !root.is_empty()) {
+        Some(root) => format!("{}/{}", root.trim_end_matches('/'), path),
+        // No workspace: the path stays relative, the host resolves it against its own directory, and
+        // the capability token refuses it for not being absolute. Failing closed beats guessing.
+        None => path.to_string(),
+    }
+}
+
+/// Absolute on the daemon's platform *or* on a host it might be driving.
+///
+/// A Linux daemon managing a Windows box sees `C:\Users\...`, which `Path::is_absolute` calls
+/// relative; joining that onto a workspace would produce a path that is wrong on both machines.
+fn is_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if matches!(bytes.first(), Some(b'/') | Some(b'\\')) {
+        return true;
+    }
+    // A drive letter: `C:`, `d:/`.
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 #[async_trait]
@@ -123,12 +177,19 @@ pub trait Tool: Send + Sync {
 
     /// What this call implies, or `None` when it has no external effect at all.
     ///
-    /// Called before anything runs, with the raw arguments. `None` is a real claim — "this touches
-    /// nothing outside the process" — and the loop acts on it by running the tool without asking a
-    /// capability token or a human. Anything that reads or writes a file, spawns a process, or
-    /// opens a connection must return `Some`, which is why the todo list is the only tool in this
-    /// crate that returns `None`.
-    fn requirement(&self, args: &Value) -> Result<Option<Requirement>, ToolError>;
+    /// Called before anything runs, with the raw arguments *and the run's context*, because what a
+    /// call implies can depend on it: `read_file { path: "Cargo.toml" }` is a different resource
+    /// depending on which workspace the run is in, and the resource named here is the one the
+    /// capability token is asked about — and the one the tool must then act on, or the check and the
+    /// effect disagree. `None` is a real claim — "this touches nothing outside the process" — and the
+    /// loop acts on it by running the tool without asking a capability token or a human. Anything
+    /// that reads or writes a file, spawns a process, or opens a connection must return `Some`, which
+    /// is why the todo list is the only tool in this crate that returns `None`.
+    fn requirement(
+        &self,
+        args: &Value,
+        ctx: &ToolContext,
+    ) -> Result<Option<Requirement>, ToolError>;
 
     /// Do it.
     async fn call(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutcome, ToolError>;

@@ -41,6 +41,7 @@ pub use registry::{PreparedCall, ToolInfo, ToolRegistry};
 pub use shell::ShellTool;
 pub use todo::TodoTool;
 pub use tool::{
-    bound, Requirement, Tool, ToolContext, ToolError, ToolOutcome, MAX_TOOL_OUTPUT_CHARS,
+    bound, resolve_path, Requirement, Tool, ToolContext, ToolError, ToolOutcome,
+    MAX_TOOL_OUTPUT_CHARS,
 };
 pub use web::WebSearchTool;

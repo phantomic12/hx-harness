@@ -4,7 +4,7 @@ Status: 2026-09-15. Companion to `ROADMAP.md` (which tracks features); this file
 
 ```console
 $ cargo test --workspace
-587 tests, 0 failed                       # 11 hermetic HTTP + 4 that reopen the database + 8 that run the loop over HTTP
+603 tests, 0 failed                       # 11 hermetic HTTP + 4 that reopen the database + 11 that run the loop over HTTP
 22 ignored                               # live: Docker, SSH, search, a real model
 
 # The 22 that need a real server, run by `.github/workflows/integration.yml`
@@ -145,16 +145,15 @@ returning an empty list.
 | Crate | Tests | LOC | What the tests actually prove |
 |---|---|---|---|
 | `hx-core` | 85 | 4142 | ID monotonicity, error taxonomy (**a rejected credential is an auth failure, and a 500 is not**, so a pool retries one and benches the other), **capability path grants** (incl. the empty-grant-means-root regression), approval policy incl. unattended budgets, message/event round-trips, config parsing and rejection of unknown keys |
-| `hx-provider` | 85 | 3913 | Token-bucket timing, **budget fail-closed on a zero estimate**, credential pool round-robin, shared-limiter identity across pools, routing and fallthrough, a granted ticket carrying the credential's `secret_ref`, a role's reservation estimated from the **dearest** route, and the provider factory refusing a kind it has no adapter for |
+| `hx-provider` | 102 | 4091 | Token-bucket timing, **budget fail-closed on a zero estimate**, credential pool round-robin, shared-limiter identity across pools, routing and fallthrough, a granted ticket carrying the credential's `secret_ref`, a role's reservation estimated from the **dearest** route, and the provider factory refusing a kind it has no adapter for |
 | `hx-remote` | 90 | 3108 | Platform caps parsing (`uname`/`ver`), path translation, shell quoting incl. injection attempts, risky-command classification, mid-truncation, approval round-trip against the local host, and **`known_hosts`**: hashed host fields (HMAC-SHA1), globs, negation, `@revoked` beating trust regardless of line order, a different key type reading as first use rather than substitution, plus the policy's fail-closed behaviour and the wording of every refusal |
 | `hx-sandbox` | 62 | 2057 | Isolation ladder ordering and monotonicity, spec↔YAML round-trip, `SandboxSpec`→`HostConfig` mapping field by field, **no engine-rejected security option** (`userns=`, `seccomp=default`), an egress allowlist that cannot be enforced, registry/TTL bookkeeping, the concurrency cap, and rollback on a failed start |
-| `hx-tools` | 62 | 2307 | Each tool's **requirement** (a shell line implies `Process`, a read implies its path — and the todo list implies nothing), argument errors phrased for a model to act on, output bounded in the middle with the dropped count stated, a patch that is ambiguous or anchored on stale text refusing to write, and the two-phase registry: **the arguments that were checked are the arguments that ran** |
 | `hx-search` | 45 | 1732 | RRF rank fusion, HTML extraction, entity decoding, per-backend failure isolation (with **fake** backends) |
 | `hx-secrets` | 36 | 1302 | Argon2id+XChaCha20 round-trip, tamper detection, redaction patterns, and **credential resolution**: a `store:name` reference resolved through `vault:`/`env:`/a fixed map, an empty environment variable refused like an absent one, an unknown store listing the stores that *are* configured, and every error message asserted **not** to contain a value |
-| `hx-agent` | 33 | 960 | The loop's gate, in one file of integration tests: a **capability denial is a result the model reads and cannot be approved away** (an approver willing to say yes is never asked), an approval denial is reported and the command never reaches the host, `allow for chat` stops the second prompt while a remembered denial is not re-asked, a tool declaring no external effect is never prompted about, a refused call does not stop its sibling, unknown tools and unusable arguments return as results, a non-zero exit is still a call that *ran*, `max_turns` and the deadline stop the run, and the exact event sequence a client renders. Plus the **routed model call** over a real `ModelRouter` and a real `ProviderRegistry`, with only the adapter faked: the route decides the model, the key follows the credential the pool granted, a refused credential is benched and its *sibling* is tried before another provider, a missing key and a 502 both give the reservation back (asserted with `concurrent: 1`, since a leaked lease looks exactly like a rate limit), and a day's budget that covers one pessimistic reservation still allows three calls |
+| `hx-agent` | 33 | 991 | The loop's gate, in one file of integration tests: a **capability denial is a result the model reads and cannot be approved away** (an approver willing to say yes is never asked), an approval denial is reported and the command never reaches the host, `allow for chat` stops the second prompt while a remembered denial is not re-asked, a tool declaring no external effect is never prompted about, a refused call does not stop its sibling, unknown tools and unusable arguments return as results, a non-zero exit is still a call that *ran*, `max_turns` and the deadline stop the run, and the exact event sequence a client renders. Plus the **routed model call** over a real `ModelRouter` and a real `ProviderRegistry`, with only the adapter faked: the route decides the model, the key follows the credential the pool granted, a refused credential is benched and its *sibling* is tried before another provider, a missing key and a 502 both give the reservation back (asserted with `concurrent: 1`, since a leaked lease looks exactly like a rate limit), and a day's budget that covers one pessimistic reservation still allows three calls |
 | `hx-store` | 38 | 2051 | Migrations applied once and never re-run, **a database from a newer build refused with both versions named** (and left untouched), `STRICT` rejecting a type mistake at insert, the transcript written by `seq` the caller does not track, a batch written whole or not at all, a cascade that only happens because `Store` sets `foreign_keys`, every part type round-tripping while an unknown one is reported rather than dropped, events and usage surviving a reopen — plus 4 in `tests/resume.rs` that drop the store and open a **new connection** to the same file, which is the closest a test gets to killing the daemon |
-| `hx-tools` | 63 | 2325 | Requirements per tool, bounded output, the two-phase registry, and **a misnamed argument refused rather than ignored** — `cwd` instead of `workdir` used to drop silently and run the command in the daemon's own directory |
-| `hx-server` | 24 | 1690 | Route dispatch via `oneshot`, `HxError`→HTTP status mapping, and eight tests that run the **real loop over the real HTTP surface** with only the model scripted: an answer comes back with its session, its cost and its events; a tool call runs and its result reaches the model; a write outside the workspace is denied and never happens; a shell command that needs a human is refused **with the reason**, and the same command runs under `yolo`; a second request on a session continues the transcript; unknown autonomy and unknown roles are 400s that name what is accepted; and a request that cannot run leaves no session behind |
+| `hx-tools` | 70 | 2576 | Requirements per tool, bounded output, the two-phase registry, and **a misnamed argument refused rather than ignored** — `cwd` instead of `workdir` used to drop silently and run the command in the daemon's own directory |
+| `hx-server` | 27 | 1699 | Route dispatch via `oneshot`, `HxError`→HTTP status mapping, and eleven tests that run the **real loop over the real HTTP surface** with only the model scripted: an answer comes back with its session, its cost and its events; a tool call runs and its result reaches the model; a write outside the workspace is denied and never happens; a shell command that needs a human is refused **with the reason**, and the same command runs under `yolo`; a second request on a session continues the transcript; unknown autonomy and unknown roles are 400s that name what is accepted; and a request that cannot run leaves no session behind |
 | `hx` | 11 | — | Renderers for pools/hosts/sandbox-spec, CLI parsing |
 
 Two families in that table are worth naming, because in both the obvious implementation is wrong and
@@ -267,14 +266,49 @@ quietly stop being tested.
 guards have never met a real server. It needs a Windows box with an SSH server and a key, which is
 environment work rather than code work.
 
+## Tier C — a real model through the daemon (manual, recorded)
+
+The suites above fake the model. This is the row that proves the harness drives one, and it is run by
+hand because it needs a key and someone else's rate limits:
+
+```console
+$ export HX_LITELLM_KEY=...                      # a LiteLLM proxy key, never in the config
+$ ./target/release/hxd --config ~/.hx/litellm.yaml --bind 127.0.0.1:8899
+$ curl -s :8899/v1/chat -d '{"prompt":"...","role":"swe2high","workspace":"/tmp/ws"}'
+```
+
+Measured against `litellm.phantomic.live` (2026-09-16, hx-harness at `9de1227`):
+
+| Model | Task | Result |
+|---|---|---|
+| `glm-prox/swe-2-high` | read 6 files, one call each | 6 tool calls, 0 refusals, correct; 22 s |
+| `glm-prox/swe-2-high` | read 13 `Cargo.toml`s, name the `hx-provider` dependants | 3 calls, correct (batched) |
+| `glm-prox/swe-2-high` | create a file and read it back | 2 calls, file on disk byte-for-byte |
+| `minimax/MiniMax-M3` | read `Cargo.toml`, count members | 1 call, correct ("15") |
+| `opencode-go/deepseek-v4.1-flash` | same | 1 call, correct |
+| `glm-prox/glm-5-2` | same | 1 call, correct |
+| `openrouter/nvidia/nemotron-3-super-120b-a12b:free` | same | 1 call, correct |
+| `openrouter/cohere/north-mini-code:free` | same | 1 call, correct |
+
+Three did **not** work, and none of it was the harness: `openrouter/google/gemma-4-31b-it:free` and
+`openrouter/z-ai/glm-5.2:free` are upstream-limited or do not route tool use at all (verified with a
+direct `curl` to the proxy), and `opencode-zen/nemotron-3.5-lightning-free` is restricted by the
+provider to OpenCode's own client. A model that cannot call tools cannot drive this harness, and the
+error says which of those it was.
+
+The first run of this tier found two bugs no scripted test could: an OpenAI-compatible proxy that hands
+over *unmerged streaming fragments* as a `tool_calls` array (seven entries, six nameless, one call),
+and relative paths from the model being checked against an absolute workspace grant — 35 refusals and
+no progress. Both are fixed, and both now have tests that reproduce the real wire bodies.
+
 ## Running the suite
 
 ```bash
-cargo test --workspace          # 587 tests, 0 failed, 22 ignored live tests
+cargo test --workspace          # 603 tests, 0 failed, 22 ignored live tests
 cargo test -p hx-store          # 42 — migrations, the transcript, and 4 that reopen the file
 cargo test -p hx-agent          # 33 — the loop's gate, and the routed model call
-cargo test -p hx-tools          # 63 — requirements, bounded output, the two-phase registry
-cargo test -p hx-server         # 24 — routes, and the loop end to end over HTTP
+cargo test -p hx-tools          # 70 — requirements, bounded output, the two-phase registry, workspace resolution
+cargo test -p hx-server         # 27 — routes, and the loop end to end over HTTP
 cargo test -p hx-sandbox        # 62 — includes the ladder and the rollback invariants
 cargo test -p hx-remote         # 90 — includes known_hosts parsing and the host key policy
 cargo build --workspace         # clean: 0 warnings, 0 deprecations

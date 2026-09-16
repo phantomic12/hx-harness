@@ -316,7 +316,7 @@ impl AgentLoop {
     ) -> CallOutcome {
         // Phase 1: parse and ask the tool what it would need. `prepare` also rejects an unknown
         // tool or unusable arguments, which is a result the model can act on.
-        let prepared = match self.tools.prepare(name, arguments) {
+        let prepared = match self.tools.prepare(name, arguments, ctx) {
             Ok(prepared) => prepared,
             Err(err) => {
                 return CallOutcome::refused(format!("could not run {name}: {err}"));

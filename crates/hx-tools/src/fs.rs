@@ -79,13 +79,24 @@ impl Tool for ReadFileTool {
         })
     }
 
-    fn requirement(&self, args: &Value) -> Result<Option<Requirement>, ToolError> {
+    fn requirement(
+        &self,
+        args: &Value,
+        ctx: &ToolContext,
+    ) -> Result<Option<Requirement>, ToolError> {
         let parsed: ReadArgs = parse_args(args)?;
-        Ok(Some(fs_requirement(&parsed.path, Action::Read, "read")))
+        // Resolved before it is named, so the resource the token is asked about is the path that will
+        // be opened — not the relative string the model happened to write.
+        Ok(Some(fs_requirement(
+            &ctx.resolve(&parsed.path),
+            Action::Read,
+            "read",
+        )))
     }
 
     async fn call(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutcome, ToolError> {
-        let parsed: ReadArgs = parse_args(&args)?;
+        let mut parsed: ReadArgs = parse_args(&args)?;
+        parsed.path = ctx.resolve(&parsed.path);
 
         let bytes = match ctx.host.read_file(&parsed.path).await {
             Ok(bytes) => bytes,
@@ -167,13 +178,22 @@ impl Tool for WriteFileTool {
         })
     }
 
-    fn requirement(&self, args: &Value) -> Result<Option<Requirement>, ToolError> {
+    fn requirement(
+        &self,
+        args: &Value,
+        ctx: &ToolContext,
+    ) -> Result<Option<Requirement>, ToolError> {
         let parsed: WriteArgs = parse_args(args)?;
-        Ok(Some(fs_requirement(&parsed.path, Action::Write, "write")))
+        Ok(Some(fs_requirement(
+            &ctx.resolve(&parsed.path),
+            Action::Write,
+            "write",
+        )))
     }
 
     async fn call(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutcome, ToolError> {
-        let parsed: WriteArgs = parse_args(&args)?;
+        let mut parsed: WriteArgs = parse_args(&args)?;
+        parsed.path = ctx.resolve(&parsed.path);
 
         match ctx
             .host
@@ -262,13 +282,22 @@ impl Tool for PatchTool {
         })
     }
 
-    fn requirement(&self, args: &Value) -> Result<Option<Requirement>, ToolError> {
+    fn requirement(
+        &self,
+        args: &Value,
+        ctx: &ToolContext,
+    ) -> Result<Option<Requirement>, ToolError> {
         let parsed: PatchArgs = parse_args(args)?;
-        Ok(Some(fs_requirement(&parsed.path, Action::Write, "patch")))
+        Ok(Some(fs_requirement(
+            &ctx.resolve(&parsed.path),
+            Action::Write,
+            "patch",
+        )))
     }
 
     async fn call(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutcome, ToolError> {
-        let parsed: PatchArgs = parse_args(&args)?;
+        let mut parsed: PatchArgs = parse_args(&args)?;
+        parsed.path = ctx.resolve(&parsed.path);
         if parsed.old.is_empty() {
             return Ok(ToolOutcome::failed(
                 "`old` is empty: a patch with nothing to find would either do nothing or match \
@@ -321,6 +350,7 @@ impl Tool for PatchTool {
 mod tests {
     use super::*;
     use crate::testing::{BrokenHost, FakeHost};
+    use crate::tool::resolve_path;
     use std::sync::Arc;
 
     fn ctx(host: Arc<dyn hx_remote::Host>) -> ToolContext {
@@ -340,10 +370,96 @@ mod tests {
         assert_eq!(outcome.content, "hello\nworld\n");
     }
 
+    #[test]
+    fn resolve_path_leaves_absolute_paths_alone() {
+        assert_eq!(resolve_path("/etc/hosts", Some("/ws")), "/etc/hosts");
+        // Windows, because this daemon drives Windows hosts too: `Path::is_absolute` on Linux says a
+        // drive letter is relative, and joining it onto a Linux workspace produces nonsense.
+        assert_eq!(
+            resolve_path("C:\\Users\\yoav\\a.txt", Some("/ws")),
+            "C:\\Users\\yoav\\a.txt"
+        );
+        assert_eq!(resolve_path("d:/x", Some("/ws")), "d:/x");
+    }
+
+    #[test]
+    fn resolve_path_joins_relative_paths_onto_the_workspace() {
+        assert_eq!(resolve_path("Cargo.toml", Some("/ws")), "/ws/Cargo.toml");
+        assert_eq!(resolve_path("crates/x.rs", Some("/ws/")), "/ws/crates/x.rs");
+        // A parent component survives on purpose: the capability token refuses any path containing
+        // `..` before it looks at a grant, and collapsing it here would hide exactly the shape of
+        // path that cannot be safely evaluated for containment.
+        assert_eq!(
+            resolve_path("../../etc/shadow", Some("/ws")),
+            "/ws/../../etc/shadow"
+        );
+    }
+
+    #[test]
+    fn resolve_path_without_a_workspace_changes_nothing() {
+        // The host resolves it against its own directory and the token refuses it for not being
+        // absolute. Failing closed beats guessing at a directory the run never named.
+        assert_eq!(resolve_path("Cargo.toml", None), "Cargo.toml");
+        assert_eq!(resolve_path("Cargo.toml", Some("   ")), "Cargo.toml");
+    }
+
+    #[tokio::test]
+    async fn a_relative_path_is_read_against_the_workspace_and_checked_as_the_absolute_one() {
+        // The bug this pins, found by pointing a real model at the harness: a model asked to read
+        // "Cargo.toml in this workspace" writes `Cargo.toml`, the token holds an absolute workspace
+        // path, and every call was denied. The requirement and the read must agree on one path.
+        let host = Arc::new(FakeHost::unix().with_file("/ws/Cargo.toml", "[package]\n"));
+        let ctx = ctx(host).in_workspace("/ws");
+
+        let requirement = ReadFileTool
+            .requirement(&json!({"path": "Cargo.toml"}), &ctx)
+            .unwrap()
+            .expect("reading a file has an external effect");
+
+        match requirement.resource {
+            hx_core::capability::Resource::FsPath { path } => assert_eq!(path, "/ws/Cargo.toml"),
+            other => panic!("expected a path resource, got {other:?}"),
+        }
+
+        let outcome = ReadFileTool
+            .call(json!({"path": "Cargo.toml"}), &ctx)
+            .await
+            .unwrap();
+        assert!(outcome.ok, "{outcome:?}");
+        assert!(outcome.content.contains("[package]"), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn the_workspace_is_the_requirement_even_when_the_path_climbs_out() {
+        // `..` is not collapsed, so the token's traversal rule still sees it and denies.
+        let ctx = ctx(Arc::new(FakeHost::unix())).in_workspace("/ws");
+        let requirement = ReadFileTool
+            .requirement(&json!({"path": "../../etc/shadow"}), &ctx)
+            .unwrap()
+            .expect("reading a file has an external effect");
+
+        match requirement.resource {
+            hx_core::capability::Resource::FsPath { path } => {
+                assert_eq!(path, "/ws/../../etc/shadow");
+                assert!(!path_contains_escape_was_collapsed(&path));
+            }
+            other => panic!("expected a path resource, got {other:?}"),
+        }
+    }
+
+    /// The traversal rule is in `hx-core`; this test only asserts the path still *contains* what the
+    /// rule looks for, so the join cannot quietly launder an escape.
+    fn path_contains_escape_was_collapsed(path: &str) -> bool {
+        !path.split('/').any(|segment| segment == "..")
+    }
+
     #[tokio::test]
     async fn reading_requires_a_read_grant_on_that_path() {
         let requirement = ReadFileTool
-            .requirement(&json!({"path": "/etc/shadow"}))
+            .requirement(
+                &json!({"path": "/etc/shadow"}),
+                &ctx(Arc::new(FakeHost::unix())),
+            )
             .unwrap()
             .expect("reading a file has an external effect");
         assert_eq!(requirement.action, Action::Read);
@@ -437,7 +553,10 @@ mod tests {
     #[tokio::test]
     async fn writing_requires_a_write_grant() {
         let requirement = WriteFileTool
-            .requirement(&json!({"path": "/etc/hosts", "content": "x"}))
+            .requirement(
+                &json!({"path": "/etc/hosts", "content": "x"}),
+                &ctx(Arc::new(FakeHost::unix())),
+            )
             .unwrap()
             .expect("writing a file has an external effect");
         assert_eq!(requirement.action, Action::Write);

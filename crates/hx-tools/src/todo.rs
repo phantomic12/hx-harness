@@ -133,7 +133,11 @@ impl Tool for TodoTool {
         })
     }
 
-    fn requirement(&self, args: &Value) -> Result<Option<Requirement>, ToolError> {
+    fn requirement(
+        &self,
+        args: &Value,
+        _ctx: &ToolContext,
+    ) -> Result<Option<Requirement>, ToolError> {
         let parsed: Args = parse_args(args)?;
         // No external effect at all: this is the agent's own memory for the length of a run. The
         // loop runs it without asking a capability token or a human, which is why the trait returns
@@ -261,7 +265,7 @@ mod tests {
         // the agent's own memory. Anything that touched the host, a file or the network would have
         // to return one.
         let requirement = TodoTool::new()
-            .requirement(&json!({"action": "list"}))
+            .requirement(&json!({"action": "list"}), &ctx())
             .unwrap();
         assert!(requirement.is_none());
     }
@@ -269,7 +273,7 @@ mod tests {
     #[test]
     fn adding_without_text_is_refused_with_the_reason() {
         let err = TodoTool::new()
-            .requirement(&json!({"action": "add"}))
+            .requirement(&json!({"action": "add"}), &ctx())
             .unwrap_err();
         assert!(err.to_string().contains("`text` is required"), "{err}");
     }
@@ -277,7 +281,7 @@ mod tests {
     #[test]
     fn completing_without_an_id_is_refused() {
         let err = TodoTool::new()
-            .requirement(&json!({"action": "complete"}))
+            .requirement(&json!({"action": "complete"}), &ctx())
             .unwrap_err();
         assert!(err.to_string().contains("`id` is required"), "{err}");
     }
@@ -285,7 +289,7 @@ mod tests {
     #[test]
     fn an_unknown_action_is_an_argument_error() {
         let err = TodoTool::new()
-            .requirement(&json!({"action": "delete_everything"}))
+            .requirement(&json!({"action": "delete_everything"}), &ctx())
             .unwrap_err();
         assert!(err.to_string().contains("unknown variant"), "{err}");
     }

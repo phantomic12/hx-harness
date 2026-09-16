@@ -265,7 +265,13 @@ pub async fn run_chat(
     .with_limits(ttl)
     .with_events(events_tx);
 
-    let run = loop_.run(&mut transcript, &ToolContext::new(host)).await;
+    // The context the run acts in: the host, and the workspace every relative path is resolved
+    // against. A run whose tools do not know its workspace denies the paths the model naturally
+    // writes (`Cargo.toml`), and a shell command with no directory of its own runs wherever the
+    // daemon happens to be.
+    let ctx = ToolContext::new(host).in_workspace(workspace.clone());
+
+    let run = loop_.run(&mut transcript, &ctx).await;
     // The sender lives in the loop, which is dropped here — that is what ends the writer.
     drop(loop_);
     let priced = writer.await.unwrap_or_default();

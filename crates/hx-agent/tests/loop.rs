@@ -100,6 +100,7 @@ impl Tool for InertTool {
     fn requirement(
         &self,
         _args: &Value,
+        _ctx: &ToolContext,
     ) -> std::result::Result<Option<hx_tools::Requirement>, ToolError> {
         Ok(None)
     }

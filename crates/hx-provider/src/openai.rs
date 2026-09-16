@@ -241,6 +241,9 @@ pub fn build_body(req: &ChatRequest) -> Result<Value> {
         "model": req.model,
         "messages": messages,
         "max_tokens": req.max_tokens,
+        // Explicit, because omitting it is not the same as asking for it: a proxy that defaults to
+        // streaming will stream, and this adapter reads one JSON object and no more.
+        "stream": false,
     });
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
@@ -285,6 +288,74 @@ fn text_content(message: &Message) -> Result<String> {
     Ok(out)
 }
 
+/// A tool call as the wire sends it, after fragments have been folded back together.
+#[derive(Debug, PartialEq, Eq)]
+struct RawCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Fold unmerged streaming fragments back into whole tool calls.
+///
+/// The OpenAI wire format sends a tool call as a *stream* of deltas: the first carries the id and the
+/// name, the rest carry pieces of `function.arguments`. An endpoint that streams internally and then
+/// hands the fragments over unmerged produces a `tool_calls` array whose entries after the first have
+/// an empty id and name — read literally that is seven tool calls, six of them nameless with a
+/// fragment of the JSON as their arguments, and the model is told its arguments were malformed when
+/// they were complete all along. (Found the first time a real model was asked to call a tool through
+/// litellm in front of the GLM proxy; no scripted test could have produced it.)
+///
+/// The rule is the one a stream accumulator uses: `index` decides when present, otherwise an entry
+/// with a name starts a call and an entry with neither name nor id extends the previous one. A
+/// well-formed response is left exactly as it was, because every entry in one carries its own id,
+/// name and arguments.
+fn merge_tool_call_fragments(calls: &[Value]) -> Vec<RawCall> {
+    let mut merged: Vec<RawCall> = Vec::new();
+    // `index` is optional and, when present, is the authority. Tracked separately so an entry with an
+    // index can extend a call that is not the last one (interleaved parallel calls do that).
+    let mut by_index: Vec<(u64, usize)> = Vec::new();
+
+    for call in calls {
+        let id = call.get("id").and_then(Value::as_str).unwrap_or("");
+        let name = call
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let arguments = call
+            .get("function")
+            .and_then(|f| f.get("arguments"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        let target = match call.get("index").and_then(Value::as_u64) {
+            Some(index) => by_index
+                .iter()
+                .find(|(seen, _)| *seen == index)
+                .map(|(_, at)| *at),
+            None if name.is_empty() && id.is_empty() => merged.len().checked_sub(1),
+            None => None,
+        };
+
+        match target {
+            Some(at) => merged[at].arguments.push_str(arguments),
+            None => {
+                if let Some(index) = call.get("index").and_then(Value::as_u64) {
+                    by_index.push((index, merged.len()));
+                }
+                merged.push(RawCall {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    arguments: arguments.to_string(),
+                });
+            }
+        }
+    }
+
+    merged
+}
+
 /// Normalise a chat-completions response.
 pub fn parse_response(body: &Value, requested_model: &str) -> Result<ChatResponse> {
     let choice = body
@@ -308,34 +379,31 @@ pub fn parse_response(body: &Value, requested_model: &str) -> Result<ChatRespons
     }
 
     if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
-        for call in calls {
-            let id = call.get("id").and_then(Value::as_str).ok_or_else(|| {
-                HxError::Provider("a tool call arrived without an id".to_string())
-            })?;
-            let name = call
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    HxError::Provider(format!("tool call {id} arrived without a function name"))
-                })?;
+        for call in merge_tool_call_fragments(calls) {
+            if call.id.is_empty() {
+                return Err(HxError::Provider(
+                    "a tool call arrived without an id".to_string(),
+                ));
+            }
+            if call.name.is_empty() {
+                return Err(HxError::Provider(format!(
+                    "tool call {} arrived without a function name",
+                    call.id
+                )));
+            }
 
             // Arguments arrive as a string. When it is not valid JSON the call is kept, carrying
             // the raw text, so the tool layer can tell the model what was wrong with its arguments
             // instead of the whole turn failing with a parse error the model never sees.
-            let raw = call
-                .get("function")
-                .and_then(|f| f.get("arguments"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let raw = call.arguments.as_str();
             let arguments = match serde_json::from_str::<Value>(raw) {
                 Ok(value) => value,
                 Err(_) => json!({ "__malformed_arguments": raw }),
             };
 
             parts.push(Part::ToolCall {
-                id: ToolCallId::from_raw(id),
-                name: name.to_string(),
+                id: ToolCallId::from_raw(call.id),
+                name: call.name,
                 arguments,
             });
         }
@@ -720,6 +788,107 @@ mod tests {
             }
             other => panic!("expected a tool call, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unmerged_stream_fragments_are_folded_back_into_one_call() {
+        // Exactly what litellm returned for glm-prox/swe-2-high: the name on the first entry, the
+        // arguments as six fragments after it, and empty ids on the fragments. Read literally, that
+        // is seven tool calls — six of them nameless, with a piece of JSON as their "arguments".
+        let fragments = json!([
+            { "id": "read_file_0#abc", "type": "function",
+              "function": { "arguments": "", "name": "read_file" } },
+            { "id": "", "type": "function", "function": { "arguments": "{", "name": "" } },
+            { "id": "", "type": "function", "function": { "arguments": "\"path\": \"", "name": "" } },
+            { "id": "", "type": "function", "function": { "arguments": "Cargo", "name": "" } },
+            { "id": "", "type": "function", "function": { "arguments": ".toml", "name": "" } },
+            { "id": "", "type": "function", "function": { "arguments": "\"", "name": "" } },
+            { "id": "", "type": "function", "function": { "arguments": "}", "name": "" } }
+        ]);
+
+        let merged = merge_tool_call_fragments(fragments.as_array().unwrap());
+        assert_eq!(merged.len(), 1, "seven fragments are one call: {merged:?}");
+        assert_eq!(merged[0].name, "read_file");
+        assert_eq!(merged[0].id, "read_file_0#abc");
+        assert_eq!(merged[0].arguments, "{\"path\": \"Cargo.toml\"}");
+
+        // And the arguments then parse, which is the point: the model's call was well-formed all
+        // along and the tool layer must not be told otherwise.
+        let body = json!({
+            "choices": [{
+                "message": { "tool_calls": fragments },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let response = parse_response(&body, "swe-2-high").unwrap();
+        let calls: Vec<&Part> = response.message.tool_calls().collect();
+        assert_eq!(calls.len(), 1);
+        match calls[0] {
+            Part::ToolCall {
+                id,
+                name,
+                arguments,
+                ..
+            } => {
+                assert_eq!(id.as_str(), "read_file_0#abc");
+                assert_eq!(name, "read_file");
+                assert_eq!(arguments["path"], "Cargo.toml");
+            }
+            other => panic!("expected a tool call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parallel_calls_are_left_exactly_as_they_arrived() {
+        // The merge rule must not touch the well-formed case: every entry carries its own id, name
+        // and arguments.
+        let calls = json!([
+            { "id": "call_1", "function": { "name": "shell", "arguments": "{\"cmd\":\"ls\"}" } },
+            { "id": "call_2", "function": { "name": "read_file", "arguments": "{\"path\":\"/x\"}" } }
+        ]);
+
+        let merged = merge_tool_call_fragments(calls.as_array().unwrap());
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].arguments, "{\"cmd\":\"ls\"}");
+        assert_eq!(merged[1].arguments, "{\"path\":\"/x\"}");
+    }
+
+    #[test]
+    fn fragments_merge_by_index_when_the_index_is_there() {
+        // Interleaved parallel calls: index is the authority, not arrival order.
+        let calls = json!([
+            { "index": 0, "id": "a", "function": { "name": "shell", "arguments": "{\"cmd\":" } },
+            { "index": 1, "id": "b", "function": { "name": "read_file", "arguments": "{\"path\":" } },
+            { "index": 0, "function": { "arguments": "\"ls\"}", "name": "" } },
+            { "index": 1, "function": { "arguments": "\"/x\"}", "name": "" } }
+        ]);
+
+        let merged = merge_tool_call_fragments(calls.as_array().unwrap());
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].name, "shell");
+        assert_eq!(merged[0].arguments, "{\"cmd\":\"ls\"}");
+        assert_eq!(merged[1].name, "read_file");
+        assert_eq!(merged[1].arguments, "{\"path\":\"/x\"}");
+    }
+
+    #[test]
+    fn a_lone_fragment_is_still_an_error_rather_than_a_silent_merge() {
+        // Nothing to extend: an entry with no id and no name cannot become a call, and inventing one
+        // would hide a malformed response behind a nameless tool call.
+        let calls = json!([{ "function": { "arguments": "\"path\": \"x\"", "name": "" } }]);
+        assert_eq!(
+            merge_tool_call_fragments(calls.as_array().unwrap()).len(),
+            1
+        );
+
+        let body = json!({
+            "choices": [{
+                "message": { "tool_calls": calls },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let err = parse_response(&body, "gpt-5").unwrap_err();
+        assert!(format!("{err}").contains("without an id"), "{err}");
     }
 
     #[test]

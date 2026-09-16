@@ -116,7 +116,12 @@ impl ToolRegistry {
     ///
     /// An unknown tool or unusable arguments come back as an error the loop turns into a tool
     /// result, so the model sees what was wrong with its call instead of watching the run end.
-    pub fn prepare(&self, name: &str, args: Value) -> Result<PreparedCall, ToolError> {
+    pub fn prepare(
+        &self,
+        name: &str,
+        args: Value,
+        ctx: &ToolContext,
+    ) -> Result<PreparedCall, ToolError> {
         let tool = self.tools.get(name).cloned().ok_or_else(|| {
             ToolError::Unavailable(format!(
                 "no tool named '{name}'. Available tools: {}",
@@ -124,7 +129,7 @@ impl ToolRegistry {
             ))
         })?;
 
-        let requirement = tool.requirement(&args)?;
+        let requirement = tool.requirement(&args, ctx)?;
 
         Ok(PreparedCall {
             tool,
@@ -141,7 +146,7 @@ impl ToolRegistry {
         args: Value,
         ctx: &ToolContext,
     ) -> Result<ToolOutcome, ToolError> {
-        self.prepare(name, args)?.run(ctx).await
+        self.prepare(name, args, ctx)?.run(ctx).await
     }
 }
 
@@ -166,7 +171,11 @@ impl Tool for NoopTool {
         serde_json::json!({"type": "object", "properties": {}})
     }
 
-    fn requirement(&self, _args: &Value) -> Result<Option<Requirement>, ToolError> {
+    fn requirement(
+        &self,
+        _args: &Value,
+        _ctx: &ToolContext,
+    ) -> Result<Option<Requirement>, ToolError> {
         Ok(None)
     }
 
@@ -213,7 +222,7 @@ mod tests {
     #[test]
     fn an_unknown_tool_names_the_ones_that_exist() {
         let err = registry()
-            .prepare("rm_rf", serde_json::json!({}))
+            .prepare("rm_rf", serde_json::json!({}), &ctx())
             .unwrap_err();
         let message = err.to_string();
         assert!(message.contains("no tool named 'rm_rf'"), "{message}");
@@ -225,7 +234,7 @@ mod tests {
     fn preparing_does_not_run_anything() {
         // The whole point: the loop decides first.
         let prepared = registry()
-            .prepare("shell", serde_json::json!({"cmd": "ls"}))
+            .prepare("shell", serde_json::json!({"cmd": "ls"}), &ctx())
             .unwrap();
         assert_eq!(prepared.name(), "shell");
         assert!(prepared.requirement().is_some());
@@ -235,7 +244,7 @@ mod tests {
     #[test]
     fn bad_arguments_are_caught_before_preparation_succeeds() {
         let err = registry()
-            .prepare("shell", serde_json::json!({}))
+            .prepare("shell", serde_json::json!({}), &ctx())
             .unwrap_err();
         assert!(err.to_string().contains("missing field `cmd`"), "{err}");
     }
@@ -243,7 +252,7 @@ mod tests {
     #[test]
     fn a_tool_without_an_external_effect_has_no_requirement() {
         let prepared = registry()
-            .prepare("todo", serde_json::json!({"action": "list"}))
+            .prepare("todo", serde_json::json!({"action": "list"}), &ctx())
             .unwrap();
         assert!(prepared.requirement().is_none());
         assert!(prepared.describe().contains("no external effect"));
@@ -255,7 +264,7 @@ mod tests {
         let ctx = ToolContext::new(host.clone());
 
         let prepared = registry()
-            .prepare("shell", serde_json::json!({"cmd": "echo hi"}))
+            .prepare("shell", serde_json::json!({"cmd": "echo hi"}), &ctx)
             .unwrap();
         let outcome = prepared.run(&ctx).await.unwrap();
 
@@ -296,7 +305,7 @@ mod tests {
         assert!(registry.is_empty());
         assert!(registry.describe().is_empty());
         let err = registry
-            .prepare("anything", serde_json::json!({}))
+            .prepare("anything", serde_json::json!({}), &ctx())
             .unwrap_err();
         assert!(err.to_string().contains("Available tools: "), "{err}");
     }

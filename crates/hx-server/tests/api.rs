@@ -438,6 +438,86 @@ async fn the_same_command_runs_when_the_request_asks_for_yolo() {
 }
 
 #[tokio::test]
+async fn a_relative_path_from_the_model_is_read_against_the_workspace() {
+    // What a real model does: asked to read a file "in this workspace", it writes a relative path.
+    // The capability token holds an absolute workspace path, so without the join *every* call it
+    // makes is denied — which is exactly what happened the first time a real model was pointed at
+    // this harness (35 refusals, no progress, and the model reporting that its grant was too narrow).
+    let h = harness(vec![]).await;
+    std::fs::write(h.workspace.join("notes.txt"), "relative paths work\n").expect("fixture");
+
+    h.model.push(Ok(calls(vec![(
+        "c1",
+        "read_file",
+        serde_json::json!({ "path": "notes.txt" }),
+    )])));
+    h.model.push(Ok(answer("read it")));
+
+    let (status, body) = chat(&h.state, h.body("read notes.txt")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["refusals"], 0,
+        "a relative path inside the workspace must not be denied: {body}"
+    );
+    assert_eq!(body["tool_calls"], 1);
+    assert!(
+        h.said(body["session_id"].as_str().unwrap())
+            .contains("relative paths work"),
+        "the file's contents must reach the model"
+    );
+}
+
+#[tokio::test]
+async fn a_relative_path_that_climbs_out_of_the_workspace_is_denied() {
+    // The join must not launder an escape. `..` survives resolution on purpose, because the token's
+    // traversal rule is what catches it — and a rule that never sees the `..` cannot catch anything.
+    let h = harness(vec![]).await;
+
+    h.model.push(Ok(calls(vec![(
+        "c1",
+        "read_file",
+        serde_json::json!({ "path": "../../../../etc/passwd" }),
+    )])));
+    h.model.push(Ok(answer("I could not read that")));
+
+    let (status, body) = chat(&h.state, h.body("read the system file")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["refusals"], 1, "{body}");
+    assert!(
+        h.said(body["session_id"].as_str().unwrap())
+            .contains("does not cover"),
+        "the refusal must say why"
+    );
+}
+
+#[tokio::test]
+async fn a_shell_command_runs_in_the_workspace_when_the_model_names_no_directory() {
+    // The same root cause as the relative-path bug, one layer down: the tool had no idea which
+    // directory the run was in, so a command with no `workdir` ran wherever the daemon happened to
+    // be. This is the test that would have caught a test suite pushing a real branch.
+    let h = harness(vec![]).await;
+    h.model.push(Ok(calls(vec![(
+        "c1",
+        "shell",
+        serde_json::json!({ "cmd": "pwd" }),
+    )])));
+    h.model.push(Ok(answer("done")));
+
+    let mut body = h.body("where am I");
+    body["autonomy"] = serde_json::json!("yolo");
+
+    let (status, reply) = chat(&h.state, body).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply["tool_calls"], 1, "{reply}");
+
+    let said = h.said(reply["session_id"].as_str().unwrap());
+    assert!(
+        said.contains(&h.workspace.display().to_string()),
+        "pwd must print the workspace, not the daemon's directory: {said}"
+    );
+}
+
+#[tokio::test]
 async fn a_second_request_on_a_session_continues_the_transcript() {
     let h = harness(vec![Ok(answer("first")), Ok(answer("second"))]).await;
 
