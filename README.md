@@ -57,7 +57,7 @@ $ curl -s localhost:7717/v1/status | jq .pools
 | Capability tokens, approval policy, command classification | **Done**, tested |
 | Encrypted secret vault (Argon2id + XChaCha20), outbound redaction | **Done**, tested |
 | Model pools, per-credential rate/token/budget limits, role routing | **Done**, tested |
-| Web search: SearXNG + keyless DuckDuckGo, RRF fusion, failure reporting | **Done**, tested |
+| Web search: self-hosted SearXNG + keyless DuckDuckGo, RRF fusion, per-backend failure reporting | **Built** — SearXNG verified end to end against a live instance; DuckDuckGo is bot-walled for a non-browser client and *says so* rather than returning nothing |
 | Remote hosts: local + SSH (real `russh`), host key verification, Windows/macOS/Linux capability detection | **Built** — connect, auth, exec and file transfer run against a real host (`crates/hx-remote/tests/ssh_live.rs`) |
 | Sandboxes: L1/L2 isolation ladder, Docker lifecycle, TTL reaper | **Built** — created, confined and reaped against a real daemon (`crates/hx-sandbox/tests/docker_live.rs`), running as the workspace's owner so the bind mount is writable; L3 (`runsc`) unexecuted |
 | Daemon (`hxd`) + HTTP API + CLI (`hx`) | **Done**, runnable |
@@ -151,9 +151,11 @@ $ ./target/release/hxd --bind 127.0.0.1:7717
 ```
 
 ```console
-$ cargo test --workspace         # 390 unit tests + 13 ignored integration tests
+$ cargo test --workspace         # 390 unit tests + 17 ignored integration tests
 $ cargo test -p hx-sandbox --test docker_live -- --ignored   # needs a container engine
 $ cargo test -p hx-remote --test ssh_live -- --ignored       # needs an SSH server
+$ HX_SEARXNG_URL=... HX_SEARCH_EXPECT_RESULTS=searxng \
+  cargo test -p hx-search --test search_live -- --ignored   # needs the internet
 ```
 
 The last two are what reach a real service; `.github/workflows/integration.yml` runs both, against a
@@ -170,12 +172,17 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
 - **Nothing in `ci.yml` reaches another machine.** That file is in-process unit tests; the tests
   that open a socket — a real Docker daemon, a real `sshd` — live in
   `.github/workflows/integration.yml` and are `#[ignore]`d by default, so a local `cargo test` stays
-  green on a laptop without Docker while still reporting `13 ignored` rather than implying coverage.
+  green on a laptop without Docker while still reporting `17 ignored` rather than implying coverage.
   Even so, **L3 has never run**: `runtime: runsc` is passed to the engine and asserted, but nothing
   installs gVisor, so the strongest claim in the ladder is unexecuted.
 - **Egress filtering.** A sandbox has a network or it does not. There is no proxy and no firewall
   rule behind `egress`, so an allowlist is *refused* (`SpecError::EgressNotEnforced`) rather than
   silently ignored — a profile that says four hostnames must not mean the whole internet.
+- **Keyless scraping that survives a bot wall.** DuckDuckGo, Mojeek and public SearXNG instances
+  now serve a challenge to a plain HTTP client — a TLS-fingerprint problem, not a markup one, and
+  one no amount of parsing fixes. The harness reports it per backend rather than returning an empty
+  list, self-hosted SearXNG works because you host it, and a browser-fingerprint client is the M6
+  browser pool's job.
 - **Host certificates.** A server presenting one is *refused*, not accepted: `@cert-authority`
   lines are parsed so they cannot be mistaken for a host key, but no certificate chain is
   verified, and accepting an unverified chain would claim a check that did not happen. The same
