@@ -125,6 +125,17 @@ pub fn render_sandbox_spec(name: &str, profile: &SandboxProfile, workspace: &str
         "  security opts     {}",
         settings.security_opt.join(", ")
     );
+    // "requested" rather than a bare value: the engine applies remapping only when its daemon is
+    // configured for it, and printing it as though it were enforced would overstate the sandbox.
+    let _ = writeln!(
+        out,
+        "  userns mode       {}",
+        settings
+            .userns_mode
+            .as_deref()
+            .map(|mode| format!("{mode} (requested)"))
+            .unwrap_or_else(|| "(engine default)".to_string())
+    );
     let _ = writeln!(
         out,
         "  runtime           {}",
@@ -441,6 +452,18 @@ sandbox_profiles:
         );
         assert!(rendered.contains("dropped: ALL"), "{rendered}");
         assert!(rendered.contains("no-new-privileges:true"), "{rendered}");
+        // Remapping is printed as *requested*, because that is what it is: the engine applies it
+        // only when its daemon is configured for it. An operator reading "private" without the
+        // qualifier would take the sandbox for stronger than it is.
+        assert!(
+            rendered.contains("userns mode       private (requested)"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("userns=keep-id"),
+            "a security option the engine rejects is not a setting, it is a failed create: \
+             {rendered}"
+        );
         assert!(rendered.contains("tmpfs             /tmp"), "{rendered}");
         assert!(rendered.contains("noexec"), "{rendered}");
         assert!(rendered.contains("/tmp/ws -> /workspace"), "{rendered}");

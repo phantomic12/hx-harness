@@ -416,6 +416,7 @@ mod tests {
             readonly_rootfs: true,
             workspace_host_path: "/tmp/hx/ws".into(),
             workspace_path: "/workspace".into(),
+            user: None,
             env: Vec::new(),
         }
     }

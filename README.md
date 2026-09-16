@@ -37,7 +37,8 @@ profile untrusted  (isolation L2)
   readonly rootfs   yes
   user              1000:1000
   capabilities      (none granted)  [dropped: ALL]
-  security opts     no-new-privileges:true, seccomp=default, userns=keep-id
+  security opts     no-new-privileges:true
+  userns mode       private (requested)
   runtime           (engine default)
   tmpfs             /tmp rw,noexec,nosuid,size=1g
   workspace         /home/you/proj -> /workspace
@@ -58,7 +59,7 @@ $ curl -s localhost:7717/v1/status | jq .pools
 | Model pools, per-credential rate/token/budget limits, role routing | **Done**, tested |
 | Web search: SearXNG + keyless DuckDuckGo, RRF fusion, failure reporting | **Done**, tested |
 | Remote hosts: local + SSH (real `russh`), host key verification, Windows/macOS/Linux capability detection | **Built** — connect, auth, exec and file transfer run against a real host (`crates/hx-remote/tests/ssh_live.rs`) |
-| Sandboxes: L1/L2/L3 isolation ladder, Docker lifecycle, TTL reaper | **Built** — spec→config tested, lifecycle unverified |
+| Sandboxes: L1/L2 isolation ladder, Docker lifecycle, TTL reaper | **Built** — created, confined and reaped against a real daemon (`crates/hx-sandbox/tests/docker_live.rs`), running as the workspace's owner so the bind mount is writable; L3 (`runsc`) unexecuted |
 | Daemon (`hxd`) + HTTP API + CLI (`hx`) | **Done**, runnable |
 | Web UI, Tauri desktop/mobile, chat connectors | **Not started** |
 | MCP client, browser-automation pool | **Not started** |
@@ -150,9 +151,14 @@ $ ./target/release/hxd --bind 127.0.0.1:7717
 ```
 
 ```console
-$ cargo test --workspace         # 381 unit tests, no external dependencies
-$ cargo test -p hx-remote --test ssh_live -- --ignored   # against a real host: see TESTING.md
+$ cargo test --workspace         # 390 unit tests + 13 ignored integration tests
+$ cargo test -p hx-sandbox --test docker_live -- --ignored   # needs a container engine
+$ cargo test -p hx-remote --test ssh_live -- --ignored       # needs an SSH server
 ```
+
+The last two are what reach a real service; `.github/workflows/integration.yml` runs both, against a
+real Docker daemon and a throwaway `sshd`. **[TESTING.md](TESTING.md)** keeps the honest ledger of
+what has been executed, what is only unit-tested, and what merely compiles.
 
 Rust 1.89+ (edition 2021). Verified on 1.98.1.
 
@@ -161,22 +167,22 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
 - **The agent loop.** The provider router, tool plumbing, search, sandboxes, approvals and hosts
   all build and are unit-tested, but nothing yet ties them into a model-calling loop. `/v1/chat`
   returns `501` and says so rather than pretending.
-- **Nothing has ever connected to anything under CI.** The suite is in-process unit tests plus
-  `#[ignore]`d integration tests that CI does not run, so a green suite proves the logic, not the
-  connectivity. The SSH transport *has* now been exercised against a real machine by hand
-  (`crates/hx-remote/tests/ssh_live.rs`; the run is recorded in **[TESTING.md](TESTING.md)**),
-  but the Docker container lifecycle has **never been executed** at all, and a regression in
-  either is invisible to CI. TESTING.md separates "executed and observed" from "unit-tested" from
-  "merely compiles", and lists the six empty crates the green suite says nothing about.
-- **A Docker integration test.** The sandbox lifecycle still only compiles: the isolation ladder,
-  `network=none`, the pids limit, the read-only rootfs and the TTL reaper have never met a real
-  daemon. This is the largest remaining unverified surface, and `TESTING.md` ranks it next.
+- **Nothing in `ci.yml` reaches another machine.** That file is in-process unit tests; the tests
+  that open a socket — a real Docker daemon, a real `sshd` — live in
+  `.github/workflows/integration.yml` and are `#[ignore]`d by default, so a local `cargo test` stays
+  green on a laptop without Docker while still reporting `13 ignored` rather than implying coverage.
+  Even so, **L3 has never run**: `runtime: runsc` is passed to the engine and asserted, but nothing
+  installs gVisor, so the strongest claim in the ladder is unexecuted.
+- **Egress filtering.** A sandbox has a network or it does not. There is no proxy and no firewall
+  rule behind `egress`, so an allowlist is *refused* (`SpecError::EgressNotEnforced`) rather than
+  silently ignored — a profile that says four hostnames must not mean the whole internet.
 - **Host certificates.** A server presenting one is *refused*, not accepted: `@cert-authority`
   lines are parsed so they cannot be mistaken for a host key, but no certificate chain is
   verified, and accepting an unverified chain would claim a check that did not happen. The same
   applies to `ssh-agent` auth, which returns an explicit error rather than pretending.
 - **Host key policy from config.** The policy is an argument to `SshHost::connect`
   (`Strict` / `Tofu` / `Insecure`) with `~/.ssh/known_hosts` as the default store. Reading it out
-  of `hx.yaml` belongs to the host registry in M4, along with `WinRMHost`.
+  of `hx.yaml` belongs to the host registry in M4, along with `WinRMHost` and a Windows remote,
+  where the shell wrapping and the POSIX-only file-transfer guards have never met a real server.
 - **Web UI, desktop/mobile apps, chat connectors, MCP, browser pool.** Designed in
   `ARCHITECTURE.md`, not built.
