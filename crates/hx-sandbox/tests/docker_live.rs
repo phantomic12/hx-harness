@@ -201,10 +201,17 @@ async fn an_l2_sandbox_is_created_by_a_real_daemon_and_carries_its_settings() {
     );
     assert_ne!(expected_user, "0:0");
 
-    // And it is a working container, not just an accepted one.
+    // And it is a working container, not just an accepted one. The uid is the workspace's owner —
+    // on CI's runner that is 1001, not the 1000 the spec used to hardcode, which is why the
+    // workspace was unwritable there.
     let out = exec(&live.manager, handle.id.as_str(), "id -u; echo alive").await;
     assert!(out.success(), "{out:?}");
-    assert_eq!(out.stdout.trim(), "1000\nalive");
+    let uid = expected_user.split(':').next().expect("uid:gid");
+    assert_eq!(
+        out.stdout.trim(),
+        format!("{uid}\nalive"),
+        "the container has to run as the owner of the mount, or the workspace is read-only"
+    );
 
     live.manager.destroy(handle.id.as_str()).await.unwrap();
     assert!(

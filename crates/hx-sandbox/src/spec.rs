@@ -134,6 +134,9 @@ impl SandboxSpec {
     /// Callers that know the workspace owner should use this instead of setting [`SANDBOX_UID`]:
     /// it is I/O (a `stat`), which is why it is a builder step here and not a `host_settings`
     /// decision — that function stays pure and testable.
+    ///
+    /// Off Unix this is a no-op: there is no uid:gid to match, and Windows containers do not select
+    /// their user that way, so `user` is left unset rather than filled with an invented id.
     pub fn adopt_workspace_owner(&mut self) -> Result<(), SpecError> {
         let path = self.workspace_host_path.clone();
         let metadata = std::fs::metadata(&path).map_err(|err| SpecError::WorkspaceOwner {
@@ -150,11 +153,10 @@ impl SandboxSpec {
         }
         #[cfg(not(unix))]
         {
+            // There is no uid:gid to adopt off Unix, and Windows containers do not select their
+            // user this way. Leaving `user` unset is the honest outcome — inventing an id would be
+            // worse than letting the engine use its default.
             let _ = metadata;
-            return Err(SpecError::WorkspaceOwner {
-                path: path.clone(),
-                reason: "this platform has no uid/gid to match; set `user` explicitly".to_string(),
-            });
         }
 
         Ok(())
@@ -805,6 +807,13 @@ mod tests {
                 format!("{}:{}", owner.uid(), owner.gid()),
                 "the sandbox has to run as whoever owns the mount"
             );
+        }
+        #[cfg(not(unix))]
+        {
+            // Nothing to adopt off Unix: Windows containers do not pick their user as a uid:gid,
+            // so the engine default is left alone rather than an invented id being sent.
+            assert!(s.user.is_none());
+            assert_eq!(s.host_settings().user, SANDBOX_UID);
         }
     }
 
