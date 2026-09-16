@@ -96,6 +96,9 @@ pub fn status_for(err: &HxError) -> StatusCode {
         // Provider and sandbox failures are upstream, not the client's fault.
         HxError::Provider(_) | HxError::Sandbox(_) | HxError::Remote(_) => StatusCode::BAD_GATEWAY,
         HxError::Secret(_) => StatusCode::FORBIDDEN,
+        // A rejected credential is not the client's fault either, but it is a 401: the fix is on the
+        // operator's side (rotate the key), and the credential is benched meanwhile.
+        HxError::ProviderAuth { .. } => StatusCode::UNAUTHORIZED,
         HxError::Tool(_) => StatusCode::BAD_REQUEST,
         HxError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         HxError::Serde(_) => StatusCode::BAD_REQUEST,

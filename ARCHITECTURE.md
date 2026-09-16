@@ -53,7 +53,7 @@ Deliberately layered so the core has **zero IO** and is testable without a netwo
 
 ```
 hx-core          ids, message/event types, errors, config model, capability tokens   [no IO]
-  ├─ hx-secrets    vault (argon2id→xchacha20poly1305), OS keyring, redaction engine
+  ├─ hx-secrets    vault (argon2id→xchacha20poly1305), credential resolution, redaction engine
   ├─ hx-store      sqlite: sessions, events, usage counters, audit log
   ├─ hx-provider   Provider trait, pools, rate limits, reservation accounting
   ├─ hx-search     SearchBackend trait + free backends + RRF aggregation

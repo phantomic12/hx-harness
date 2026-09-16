@@ -341,9 +341,14 @@ async fn an_auth_failure_says_so_and_quotes_the_provider() {
         .complete(request(), &key())
         .await
         .expect_err("401 is a failure");
-    let message = err.to_string();
 
-    assert!(message.contains("authentication failed"), "{message}");
+    // The classification a pool acts on, end to end through the adapter: this is what benches a
+    // credential, and it must not be confused with a transient provider error.
+    assert!(err.is_auth_failure(), "{err:?}");
+    assert!(!err.is_retryable(), "{err:?}");
+
+    let message = err.to_string();
+    assert!(message.contains("rejected the credential"), "{message}");
     assert!(message.contains("Incorrect API key"), "{message}");
     assert!(
         !message.contains("test-key-do-not-log"),

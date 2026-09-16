@@ -410,9 +410,10 @@ pub fn classify_error(
             // usual one-minute window rather than retrying immediately into another 429.
             retry_after_ms: retry_after.unwrap_or(60).saturating_mul(1000),
         },
-        401 | 403 => HxError::Provider(format!(
-            "{id}: authentication failed (HTTP {status}) — check the credential: {detail}"
-        )),
+        401 | 403 => HxError::ProviderAuth {
+            provider: id.to_string(),
+            reason: format!("HTTP {status} — the credential was refused: {detail}"),
+        },
         404 => HxError::Provider(format!(
             "{id}: HTTP 404 — the model or the base URL is wrong: {detail}"
         )),
@@ -813,18 +814,23 @@ mod tests {
 
     #[test]
     fn an_auth_failure_is_named_as_one() {
-        // The pool benches a credential on this, so it must not read like a generic 500.
+        // The pool benches a credential on this, so it must not read like a generic 500 — and
+        // `is_auth_failure` has to be true, which is what the router keys off.
         let err = classify_error(&id(), 401, None, "{\"error\":\"invalid api key\"}");
+        assert!(err.is_auth_failure(), "{err:?}");
+        assert!(
+            !err.is_retryable(),
+            "the same key will be refused again: {err:?}"
+        );
+
         let message = err.to_string();
-        assert!(message.contains("authentication failed"), "{message}");
+        assert!(message.contains("rejected the credential"), "{message}");
         assert!(
             message.contains("invalid api key"),
             "the body is the useful part: {message}"
         );
 
-        assert!(classify_error(&id(), 403, None, "")
-            .to_string()
-            .contains("authentication failed"));
+        assert!(classify_error(&id(), 403, None, "").is_auth_failure());
     }
 
     #[test]

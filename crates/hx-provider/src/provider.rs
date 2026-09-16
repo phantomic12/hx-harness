@@ -8,8 +8,9 @@
 //! server, Ollama, LiteLLM, and most gateways. Anthropic and Google have bespoke wire formats
 //! and get their own modules.
 
+use crate::openai::OpenAiCompatible;
 use async_trait::async_trait;
-use hx_core::config::{Price, ProviderKind};
+use hx_core::config::{Config, Price, ProviderKind};
 use hx_core::error::{HxError, Result};
 use hx_core::ids::ProviderId;
 use hx_core::message::{approximate_tokens, Message};
@@ -198,6 +199,67 @@ impl ProviderRegistry {
         self.providers.get(id).cloned()
     }
 
+    /// Build one adapter per configured provider.
+    ///
+    /// The client is passed in rather than built here so that a deployment's timeouts, proxy and
+    /// user agent are decided in one place — a provider that quietly made its own HTTP client would
+    /// be the one that ignores the proxy.
+    ///
+    /// A kind this build has no adapter for is **refused by name**. Speaking the wrong protocol to
+    /// a provider is the failure that looks like a hundred different bugs: the request goes out,
+    /// the answer is unparseable, and the error blames the model. Better to fail at startup.
+    pub fn from_config(cfg: &Config, client: reqwest::Client) -> Result<Self> {
+        let mut registry = Self::new();
+
+        for (name, pc) in &cfg.providers {
+            let id = ProviderId::from_raw(name);
+            let base_url = pc.base_url.as_deref().ok_or_else(|| {
+                HxError::Config(format!(
+                    "provider '{name}' has no base_url; the adapter needs an API root \
+                     (e.g. https://api.openai.com/v1)"
+                ))
+            })?;
+
+            let provider: Arc<dyn Provider> = match pc.kind {
+                ProviderKind::Openai | ProviderKind::Custom => Arc::new(OpenAiCompatible::new(
+                    id.clone(),
+                    base_url,
+                    pc.models.clone(),
+                    client.clone(),
+                )),
+                // Ollama's OpenAI-compatible surface lives under `/v1`, and the config names the
+                // server rather than the API root. Normalising here is what stops every ollama user
+                // from having to know that.
+                ProviderKind::Ollama => Arc::new(
+                    OpenAiCompatible::new(
+                        id.clone(),
+                        api_root_for_ollama(base_url),
+                        pc.models.clone(),
+                        client.clone(),
+                    )
+                    .without_auth(),
+                ),
+                ProviderKind::Anthropic => {
+                    return Err(HxError::Config(format!(
+                        "provider '{name}' is configured as `anthropic`, but the Anthropic Messages \
+                         adapter does not exist yet (ROADMAP.md M1). Point it at an OpenAI-compatible \
+                         gateway, or leave it out of the config until the adapter lands."
+                    )))
+                }
+                ProviderKind::Google => {
+                    return Err(HxError::Config(format!(
+                        "provider '{name}' is configured as `google`, which has its own wire format \
+                         and no adapter yet. Use an OpenAI-compatible gateway in the meantime."
+                    )))
+                }
+            };
+
+            registry.insert(provider);
+        }
+
+        Ok(registry)
+    }
+
     pub fn ids(&self) -> Vec<ProviderId> {
         self.providers.keys().cloned().collect()
     }
@@ -227,6 +289,31 @@ impl ProviderRegistry {
             )));
         }
         Ok(provider)
+    }
+}
+
+impl std::fmt::Debug for ProviderRegistry {
+    /// Hand-written because `dyn Provider` is not `Debug`: what a log line needs is which providers
+    /// are configured, not the internals of each adapter.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderRegistry")
+            .field("providers", &self.providers.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// The API root to speak to an Ollama server's OpenAI-compatible surface.
+///
+/// Ollama serves `/v1/chat/completions` on the same port as its native API, and the config names
+/// the *server* (`http://127.0.0.1:11434`) because that is what every other Ollama tool wants.
+/// The adapter needs the API root, so the difference is absorbed here rather than in a comment
+/// nobody reads.
+fn api_root_for_ollama(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/v1") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/v1")
     }
 }
 
@@ -328,5 +415,102 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(u.total_tokens(), 15);
+    }
+
+    // -- the provider factory ------------------------------------------------------------------
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::new()
+    }
+
+    fn config_with(providers: Vec<(&str, ProviderKind, &str)>) -> Config {
+        let mut config = Config::default();
+        for (name, kind, base_url) in providers {
+            config.providers.insert(
+                name.to_string(),
+                hx_core::config::ProviderConfig {
+                    kind,
+                    base_url: Some(base_url.to_string()),
+                    credentials: Vec::new(),
+                    routing: hx_core::config::Strategy::Priority,
+                    models: vec![format!("{name}-model")],
+                    price: None,
+                    priority: 0,
+                },
+            );
+        }
+        config
+    }
+
+    #[test]
+    fn the_factory_builds_one_adapter_per_openai_compatible_provider() {
+        let config = config_with(vec![
+            (
+                "openrouter",
+                ProviderKind::Openai,
+                "https://openrouter.ai/api/v1",
+            ),
+            ("local", ProviderKind::Ollama, "http://127.0.0.1:11434"),
+        ]);
+        let registry = ProviderRegistry::from_config(&config, client()).unwrap();
+
+        assert_eq!(registry.len(), 2);
+        assert!(registry.get(&ProviderId::from("openrouter")).is_some());
+        assert!(registry.get(&ProviderId::from("local")).is_some());
+        // The adapter advertises the models the config listed, so `resolve` can check them.
+        assert_eq!(
+            registry
+                .get(&ProviderId::from("openrouter"))
+                .unwrap()
+                .models(),
+            ["openrouter-model"]
+        );
+    }
+
+    #[test]
+    fn ollama_gets_the_v1_api_root_however_the_config_spells_it() {
+        // The config names the server; the OpenAI-compatible surface is under /v1. Getting this
+        // wrong sends the request to `/chat/completions` on the host root, which 404s.
+        assert_eq!(
+            api_root_for_ollama("http://127.0.0.1:11434"),
+            "http://127.0.0.1:11434/v1"
+        );
+        assert_eq!(
+            api_root_for_ollama("http://127.0.0.1:11434/"),
+            "http://127.0.0.1:11434/v1"
+        );
+        assert_eq!(
+            api_root_for_ollama("http://127.0.0.1:11434/v1"),
+            "http://127.0.0.1:11434/v1",
+            "already an API root: appending again would 404"
+        );
+    }
+
+    #[test]
+    fn an_anthropic_provider_is_refused_by_name_rather_than_spoken_to_in_the_wrong_protocol() {
+        let config = config_with(vec![(
+            "anthropic",
+            ProviderKind::Anthropic,
+            "https://api.anthropic.com",
+        )]);
+        let err = ProviderRegistry::from_config(&config, client()).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("anthropic"), "{text}");
+        assert!(
+            text.contains("does not exist yet"),
+            "the refusal should say why, and that it is temporary: {text}"
+        );
+    }
+
+    #[test]
+    fn a_provider_with_no_base_url_is_refused_with_the_example_in_the_message() {
+        let mut config = config_with(vec![("bare", ProviderKind::Openai, "https://x/v1")]);
+        config.providers.get_mut("bare").unwrap().base_url = None;
+
+        let err = ProviderRegistry::from_config(&config, client()).unwrap_err();
+        assert!(
+            err.to_string().contains("https://api.openai.com/v1"),
+            "{err}"
+        );
     }
 }
