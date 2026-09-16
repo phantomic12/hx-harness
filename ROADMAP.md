@@ -135,6 +135,18 @@ key ever enters the model context or a sandbox.
 - Delivery targets, home-channel pinning, so cron output doesn't interleave with chat
 - Then: Slack (Socket Mode) → Matrix → Email → WhatsApp Cloud → Signal → SMS
 
+- **Approvals out of band, as a configurable option** — a request can be answered from anywhere the
+  user already is, not only from the surface that started the run: `approval.ask_via` naming one or
+  more channels (Telegram, Discord, Slack, email, a webhook), each with the policy for what it may
+  answer. The prompt is the same `ApprovalRequest` that renders in the TUI (§3.11), so the buttons on
+  a phone and the dialog in the terminal are the same decision — but the *answer authority* is
+  configured per channel, because a phone tap is a weaker signal than a terminal. Rules worth
+  pinning: only a channel that can display the full request (targets, sizes, what is irreversible)
+  may answer; per-channel ceilings, so a chat bridge can approve a `Mutate` but never a
+  `Destructive`; a channel that is down must fail closed rather than leave the run waiting; and the
+  answer is attributed in the audit log to the channel it came from. `/yolo` and `/approval` over a
+  DM follow the same rule: scoped to one chat, expiring, and never above the deployment's ceiling
+
 **Exit criteria:** DM the bot from your phone, get a streaming answer, approve a dangerous
 command with a button, receive a cron digest in a separate pinned thread.
 

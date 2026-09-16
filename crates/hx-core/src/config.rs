@@ -545,7 +545,7 @@ pub struct AgentConfig {
     ///
     /// Per-chat sessions override this at runtime ([`crate::approval::ApprovalSession::set_level`]);
     /// this value is the starting point for a new chat.
-    #[serde(default)]
+    #[serde(default = "deployment_approval")]
     pub approval: ApprovalPolicy,
     #[serde(default = "default_concurrent")]
     pub max_concurrent_subagents: u32,
@@ -576,6 +576,15 @@ fn default_concurrent() -> u32 {
 }
 fn default_pool_name() -> String {
     "interactive".into()
+}
+
+/// The approval policy a *configuration* starts from.
+///
+/// Not `ApprovalPolicy::default()`: that one is blank so library callers and tests are not handed an
+/// opinion. A deployment gets the floor — `balanced`, with the catastrophe set denied — and can still
+/// delete a rule it disagrees with, in writing, which is the review.
+fn deployment_approval() -> ApprovalPolicy {
+    ApprovalPolicy::deployment_default()
 }
 
 #[cfg(test)]
