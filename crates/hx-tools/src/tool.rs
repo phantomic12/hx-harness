@@ -1,9 +1,10 @@
 //! The tool contract.
 
 use async_trait::async_trait;
-use hx_core::approval::Target;
+use hx_core::approval::{Confinement, Target};
 use hx_core::capability::{Action, Resource};
-use hx_remote::Host;
+use hx_core::error::HxError;
+use hx_remote::{ExecOutput, Host};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -101,6 +102,29 @@ pub enum ToolError {
 ///
 /// A borrowed context rather than a `&self` field: tools hold configuration (their backend set,
 /// their todo list), not connections, so one registry can serve several hosts.
+/// A boundary a command can be run inside, when a run was given one.
+///
+/// The daemon implements this over `hx_sandbox::SandboxManager`; the *trait* lives here and the
+/// dependency does not, because a tool layer that linked a container engine in order to say "run this in
+/// a box" would make every embedder link one. Returning [`ExecOutput`] rather than a type of its own is
+/// the same idea from the other side: `shell` treats a sandbox exactly as it treats an SSH host — a place
+/// with its own shell, its own paths and its own exit codes — so both paths share one output type and one
+/// reporter.
+#[async_trait]
+pub trait SandboxExec: Send + Sync {
+    /// Run a command line inside the boundary.
+    ///
+    /// `workdir` is a path as the *host* knows it, because that is what the model's arguments and the
+    /// capability token are expressed in; mapping it into the boundary is the implementation's job, since
+    /// the implementation is the side that created the mount. A path that is not visible inside must be
+    /// an error rather than a silent fallback to some other directory — a command that runs in the wrong
+    /// place is worse than one that fails.
+    async fn exec(&self, command: &str, workdir: Option<&str>) -> Result<ExecOutput, HxError>;
+
+    /// One line naming the boundary, for a transcript: `sandbox dev (l2, ubuntu:24.04)`.
+    fn describe(&self) -> String;
+}
+
 pub struct ToolContext {
     pub host: Arc<dyn Host>,
     /// The directory this run may act in.
@@ -113,6 +137,12 @@ pub struct ToolContext {
     /// command that runs wherever the daemon happens to be is a command that can act on the wrong
     /// checkout.
     pub workspace: Option<String>,
+    /// A boundary this run may use, when it was given one. See [`SandboxExec`].
+    ///
+    /// `None` is the default and the honest one: a tool that claimed confinement without a boundary to
+    /// run in would be claiming the single fact an approval can rest on, which is why nothing here is
+    /// inferred and why [`Tool::confinement`] defaults to the host rather than to this field.
+    pub sandbox: Option<Arc<dyn SandboxExec>>,
 }
 
 impl ToolContext {
@@ -120,6 +150,7 @@ impl ToolContext {
         Self {
             host,
             workspace: None,
+            sandbox: None,
         }
     }
 
@@ -127,6 +158,20 @@ impl ToolContext {
     pub fn in_workspace(mut self, workspace: impl Into<String>) -> Self {
         self.workspace = Some(workspace.into());
         self
+    }
+
+    /// Give this run a boundary to run commands in — `docs/approvals.md` §4's other half.
+    pub fn with_sandbox(mut self, sandbox: Arc<dyn SandboxExec>) -> Self {
+        self.sandbox = Some(sandbox);
+        self
+    }
+
+    /// Whether a command run through this context would end up inside a boundary.
+    pub fn confinement(&self) -> Confinement {
+        match self.sandbox {
+            Some(_) => Confinement::Sandbox,
+            None => Confinement::Host,
+        }
     }
 
     /// Resolve a path as the model wrote it: absolute stays as it is, relative joins the workspace.
@@ -213,6 +258,16 @@ pub trait Tool: Send + Sync {
     /// back rather than assert a boolean.
     fn undo(&self, _args: &Value, _ctx: &ToolContext) -> Option<String> {
         None
+    }
+
+    /// Where this call will run. See [`Confinement`] and `docs/approvals.md` §4.
+    ///
+    /// The default is the *host*, and deliberately not "whatever the context says": a read through a
+    /// filesystem tool touches the real filesystem even in a run whose `shell` has a sandbox under it,
+    /// so a tool that has not thought about it must not claim a boundary. `shell` is the one tool that
+    /// answers from the context, because it is the one that can run either way.
+    fn confinement(&self, _args: &Value, _ctx: &ToolContext) -> Confinement {
+        Confinement::Host
     }
 
     /// Do it.

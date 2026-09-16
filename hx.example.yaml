@@ -146,6 +146,11 @@ sandbox_profiles:
 #     #   - { tool: shell, command: "git push*", note: "publishes to the world" }
 #     # allow:
 #     #   - { tool: read_file, command: "*" }
+#     #   # `confined: true` matches only a call that runs inside a sandbox — §4's axis, and the reason
+#     #   # a sandbox is worth having: this lets a build run unattended in the box while the same command
+#     #   # on the host still has to be asked about. Absent means "either", so a rule written before this
+#     #   # existed keeps its meaning.
+#     #   - { tool: shell, command: "npm test*", confined: true }
 #     # deny:
 #     #   - { tool: shell, command: "*rm -rf /var*" }
 #

@@ -224,6 +224,19 @@ fn describe_rule(rule: &hx_core::approval::Rule) -> String {
     if let Some(risk) = rule.risk {
         let _ = write!(line, ", risk {}", risk.label());
     }
+    if let Some(confined) = rule.confined {
+        // §4's axis, spelled the way the config spells it. "either" is not shown, because a rule that does
+        // not mention confinement matching both is the *absence* of a restriction rather than one.
+        let _ = write!(
+            line,
+            ", {}",
+            if confined {
+                "confined: true (a sandbox only)"
+            } else {
+                "confined: false (the host only)"
+            }
+        );
+    }
     if let Some(note) = &rule.note {
         let _ = write!(line, "  # {note}");
     }
@@ -881,6 +894,7 @@ agent:
     refuse_unenumerable_deletions: true
     allow:
       - {{ tool: shell, command: \"cargo test*\" }}
+      - {{ tool: shell, command: \"npm test*\", confined: true }}
     ask:
       - {{ tool: shell, command: \"git push*\", note: \"publishes to the world\" }}
     deny:
@@ -900,6 +914,10 @@ agent:
         assert!(rendered.contains("   1. tool shell, matching *rm -rf /var*, risk destructive"));
         assert!(rendered.contains("   2. tool shell, matching git push*  # publishes to the world"));
         assert!(rendered.contains("   3. tool shell, matching cargo test*"));
+        assert!(
+            rendered.contains("   4. tool shell, matching npm test*, confined: true (a sandbox only)"),
+            "§4's axis is part of the ladder, so a reader can see which rules need a boundary: {rendered}"
+        );
 
         // A ceiling is shown where it bites, not as a footnote: `read` and `mutate` run free at
         // `trusting`, and the ceiling is what would stop anything above `mutate` from doing so.

@@ -13,6 +13,85 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::time::Duration;
 
+/// A boundary that records what it was asked to run.
+///
+/// `docs/approvals.md` §4's tests need a confined run without a container engine: the facts under test are
+/// *where* the command went and what the tool reported, not whether Docker works, and a test that needed
+/// Docker would be `#[ignore]`d and therefore not run in CI. The real boundary is exercised by
+/// `hx-sandbox`'s live suite and by the daemon's adapter.
+pub struct FakeSandbox {
+    /// Every `(command, workdir)` this boundary was asked for, in order.
+    pub runs: Mutex<Vec<(String, Option<String>)>>,
+    /// What to answer. `Err` is a boundary that cannot be entered.
+    response: Mutex<Result<ExecOutput, String>>,
+    /// What `describe()` says — the line a transcript shows.
+    pub label: String,
+}
+
+impl Default for FakeSandbox {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FakeSandbox {
+    /// A boundary that accepts everything and answers with no output.
+    pub fn new() -> Self {
+        Self {
+            runs: Mutex::new(Vec::new()),
+            response: Mutex::new(Ok(ExecOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: Some(0),
+                duration_ms: 1,
+            })),
+            label: "sandbox fake (l2, for tests)".to_string(),
+        }
+    }
+
+    /// A boundary whose entry fails — an engine that is gone, a mount that disappeared.
+    pub fn unavailable(reason: &str) -> Self {
+        let sandbox = Self::new();
+        *sandbox.response.lock().unwrap() = Err(reason.to_string());
+        sandbox
+    }
+
+    /// A boundary that answers with this output.
+    pub fn answering(stdout: &str, exit_code: i32) -> Self {
+        let sandbox = Self::new();
+        *sandbox.response.lock().unwrap() = Ok(ExecOutput {
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            exit_code: Some(exit_code),
+            duration_ms: 3,
+        });
+        sandbox
+    }
+
+    /// Every command this boundary was asked to run, with the directory it was given.
+    pub fn runs(&self) -> Vec<(String, Option<String>)> {
+        self.runs.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl crate::tool::SandboxExec for FakeSandbox {
+    async fn exec(&self, command: &str, workdir: Option<&str>) -> Result<ExecOutput> {
+        self.runs
+            .lock()
+            .unwrap()
+            .push((command.to_string(), workdir.map(str::to_string)));
+        match self.response.lock().unwrap().clone() {
+            Ok(output) => Ok(output),
+            Err(reason) => Err(HxError::Sandbox(reason)),
+        }
+    }
+
+    fn describe(&self) -> String {
+        self.label.clone()
+    }
+}
+
 /// A host with an in-memory filesystem and a scripted command runner.
 pub struct FakeHost {
     id: HostId,

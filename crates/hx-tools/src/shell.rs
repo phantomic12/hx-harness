@@ -2,6 +2,7 @@
 
 use crate::tool::{parse_args, Requirement, Tool, ToolContext, ToolError, ToolOutcome};
 use async_trait::async_trait;
+use hx_core::approval::Confinement;
 use hx_core::capability::{Action, Resource};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -116,6 +117,13 @@ impl Tool for ShellTool {
         )))
     }
 
+    /// `shell` is the one tool that can run either way, so it answers from the context: a run was given
+    /// a boundary or it was not, and the approval that has already happened was based on exactly this
+    /// fact (`docs/approvals.md` §4).
+    fn confinement(&self, _args: &Value, ctx: &ToolContext) -> Confinement {
+        ctx.confinement()
+    }
+
     async fn call(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutcome, ToolError> {
         let parsed: Args = parse_args(&args)?;
         let shell = ctx.host.caps().shell;
@@ -129,14 +137,38 @@ impl Tool for ShellTool {
 
         let line = Self::command_line(&parsed, ctx.workspace.as_deref(), |arg| shell.quote(arg));
 
-        let output = match ctx.host.exec(&line, timeout).await {
-            Ok(output) => output,
-            Err(err) => {
-                // A transport failure is a result the model should read: it can retry, or work
-                // around a host that has gone away, but only if it is told.
-                return Ok(ToolOutcome::failed(format!(
-                    "could not run the command: {err}"
-                )));
+        // Which of the two places this runs in is decided by the context, not here: the capability check
+        // and the approval both already happened against `Tool::confinement`, and running on the host
+        // anyway would make the answer to that question false after the fact. The quoting above is the
+        // host's shell, which is the right one either way — a sandbox runs the line through a POSIX shell
+        // of its own, and quoting exists to stop a path with a `;` in it from becoming a second command.
+        let (output, where_it_ran) = match &ctx.sandbox {
+            Some(sandbox) => {
+                let output = match sandbox.exec(&line, ctx.workspace.as_deref()).await {
+                    Ok(output) => output,
+                    Err(err) => {
+                        // A boundary that cannot be entered is the failure that matters most for an
+                        // unattended run: do *not* fall back to the host, say so.
+                        return Ok(ToolOutcome::failed(format!(
+                            "could not run the command in {}: {err}. It was not run on the host instead.",
+                            sandbox.describe()
+                        )));
+                    }
+                };
+                (output, Some(sandbox.describe()))
+            }
+            None => {
+                let output = match ctx.host.exec(&line, timeout).await {
+                    Ok(output) => output,
+                    Err(err) => {
+                        // A transport failure is a result the model should read: it can retry, or work
+                        // around a host that has gone away, but only if it is told.
+                        return Ok(ToolOutcome::failed(format!(
+                            "could not run the command: {err}"
+                        )));
+                    }
+                };
+                (output, None)
             }
         };
 
@@ -161,6 +193,12 @@ impl Tool for ShellTool {
             }
         }
 
+        // The model is told where its command ran, because the two answers differ in ways it can act on
+        // — paths inside a sandbox are not the host's paths, and a file written there is not on the host.
+        if let Some(boundary) = where_it_ran {
+            report.push_str(&format!("\n[ran in {boundary}]"));
+        }
+
         let ok = output.exit_code.unwrap_or(0) == 0;
         // `bound` keeps both ends and says how much it dropped. One bounding path, not two: an
         // earlier version also called `ExecOutput::bounded`, which produced a different shape,
@@ -178,13 +216,101 @@ impl Tool for ShellTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{BrokenHost, FakeHost};
+    use crate::testing::{BrokenHost, FakeHost, FakeSandbox};
     use crate::tool::MAX_TOOL_OUTPUT_CHARS;
     use hx_remote::host::shell_quote;
     use std::sync::Arc;
 
     fn ctx(host: Arc<dyn hx_remote::Host>) -> ToolContext {
         ToolContext::new(host)
+    }
+
+    // ---- where the command runs (`docs/approvals.md` §4) ---------------------
+
+    #[tokio::test]
+    async fn a_run_with_a_boundary_runs_the_command_inside_it() {
+        // The point of the axis: the same string, sent elsewhere. A host that was not touched is the
+        // assertion that matters — a fallback would be invisible in the output and would silently
+        // unconfine every server whose container engine hiccuped.
+        let host = Arc::new(FakeHost::unix());
+        let sandbox = Arc::new(FakeSandbox::answering("ok from inside\n", 0));
+        let ctx = ToolContext::new(host.clone())
+            .in_workspace("/w")
+            .with_sandbox(sandbox.clone());
+
+        let outcome = ShellTool
+            .call(json!({ "cmd": "cargo test" }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(outcome.ok, "{}", outcome.content);
+        assert_eq!(sandbox.runs().len(), 1);
+        assert_eq!(sandbox.runs()[0].0, "cd '/w' && cargo test");
+        assert_eq!(sandbox.runs()[0].1.as_deref(), Some("/w"));
+        assert!(
+            host.commands().is_empty(),
+            "the host was not touched: {:?}",
+            host.commands()
+        );
+        assert!(
+            outcome.content.contains("ran in sandbox fake"),
+            "the model is told where its command ran, because paths inside a box are not the host's: {}",
+            outcome.content
+        );
+        assert_eq!(
+            ShellTool.confinement(&json!({}), &ctx),
+            Confinement::Sandbox
+        );
+    }
+
+    #[tokio::test]
+    async fn a_boundary_that_cannot_be_entered_does_not_quietly_become_the_host() {
+        // The failure that would matter most: an unattended run whose sandbox is gone, deciding that the
+        // host will do. It is reported as a failed call, and the host sees nothing.
+        let host = Arc::new(FakeHost::unix());
+        let sandbox = Arc::new(FakeSandbox::unavailable("engine is not running"));
+        let ctx = ToolContext::new(host.clone())
+            .in_workspace("/w")
+            .with_sandbox(sandbox);
+
+        let outcome = ShellTool
+            .call(json!({ "cmd": "cargo test" }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(!outcome.ok);
+        assert!(
+            outcome.content.contains("engine is not running"),
+            "{}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.contains("not run on the host instead"),
+            "and says what it did not do: {}",
+            outcome.content
+        );
+        assert!(host.commands().is_empty(), "{:?}", host.commands());
+    }
+
+    #[tokio::test]
+    async fn without_a_boundary_the_command_runs_on_the_host_and_says_so() {
+        // The other half, and the reason the default is the host rather than the context: a tool that has
+        // not been given a boundary must not report one.
+        let host = Arc::new(FakeHost::unix());
+        let ctx = ctx(host.clone()).in_workspace("/w");
+
+        assert_eq!(ShellTool.confinement(&json!({}), &ctx), Confinement::Host);
+
+        let outcome = ShellTool
+            .call(json!({ "cmd": "cargo test" }), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(host.commands(), vec!["cd '/w' && cargo test"]);
+        assert!(
+            !outcome.content.contains("ran in"),
+            "no boundary, no claim about one: {}",
+            outcome.content
+        );
     }
 
     #[test]

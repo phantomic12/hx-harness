@@ -119,6 +119,33 @@ ask:
 That is Codex's insight applied to hx's existing isolation ladder: allow-by-confinement lets an agent
 run untrusted build steps unattended, which is the main reason to have a sandbox at all.
 
+**As built.** `ActionRequest` carries a `Confinement` (`host` | `sandbox`), `Rule` may require one
+(`confined: bool`, absent means *either*), and the loop fills the field from the **tool** before the
+decision — `Tool::confinement(args, ctx)` defaults to the host, so a tool that has not thought about it
+cannot claim a boundary, and `shell` is the one tool that answers from the context it was given.
+
+The boundary itself is `hx_tools::tool::SandboxExec`: a trait, so the tool layer never links a container
+engine, returning the same `hx_remote::ExecOutput` a transport returns — a sandbox is a place with its own
+shell and its own paths, so both paths share one output type and one reporter. `hx-server::sandbox`'s
+`SandboxFor` implements it over a live `SandboxManager`, translating a host path into its mounted
+equivalent and refusing a path outside the mount **rather than passing it through**, because a command
+that resolved against the sandbox's own root would succeed and touch the wrong filesystem.
+
+Two properties are the whole point, and both are asserted:
+
+- **A boundary that cannot be entered does not become the host.** `ShellTool` reports a failed call and
+  says so; nothing falls back. Otherwise the answer §4 gave before the command ran is false by the time
+  it runs, and every rule written to require confinement quietly means nothing.
+- **The prompt says which one it is.** A confined request renders `where: inside a sandbox, not on the
+  host`, above the `after:` line — it qualifies what follows, because a promise about what a sandbox will
+  do is not a promise about the machine.
+
+Not built yet: a *request* that asks for confinement. `SandboxFor` is opened per checkout through
+`SandboxCache` (keyed on profile + host workspace path, so two runs in one checkout share a container and
+two checkouts never do), and the manager's TTL reaper plus a drop-guard own its lifetime — but nothing in
+the chat request path reaches for it yet. The wiring is the next step, and it is deliberately small: the
+mechanism above is what it needed.
+
 ## 5. Where "remember" lives, and for how long
 
 `RememberedDecision` today is `Allow`/`Deny` with `AllowOnce`/`AllowForChat` decision variants. The tier
@@ -164,7 +191,7 @@ line rather than in a test nobody ran.
 | 2 | Shipped default `deny` set for the catastrophe list (§3) | `ApprovalPolicy::default`, `hx.example.yaml` | small | **done** |
 | 3 | Remember-scoping by tier: which options a request may offer | `hx-core/src/approval.rs` + the event that renders the prompt | medium | **done** |
 | 4 | `delete` tool that trashes, and the enumerable-target requirement for `Destructive` | `hx-tools`, `hx-core` prompt text | medium | **done** |
-| 5 | `confined` on `ActionRequest` and in rules | `hx-core`, `hx-agent` (sandbox-aware dispatch) | medium | not started |
+| 5 | `confined` on `ActionRequest` and in rules | `hx-core`, `hx-agent` (sandbox-aware dispatch) | medium | **done** |
 | 6 | `hx policy` renderer | `apps/hx` | small | **done** |
 
 Steps 1–2 are the upgrade that makes an *unattended* daemon useful: today the choice is prompt-for-

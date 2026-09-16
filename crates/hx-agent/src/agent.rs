@@ -399,7 +399,12 @@ impl AgentLoop {
             let action = self
                 .action_request(&prepared, requirement)
                 .with_targets(targets)
-                .with_undo_opt(prepared.undo(ctx));
+                .with_undo_opt(prepared.undo(ctx))
+                // Where the call will run is part of the request *before* the decision, because a rule
+                // may match on it (`docs/approvals.md` §4) — and it comes from the tool, which is the only
+                // layer that knows whether it was given a boundary to run in. A tool that cannot say
+                // honestly says the host.
+                .confined_to(prepared.confinement(ctx));
 
             let verdict = {
                 let mut approvals = self.approvals.lock().expect("approval lock");

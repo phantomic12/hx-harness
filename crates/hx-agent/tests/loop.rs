@@ -12,14 +12,14 @@
 use async_trait::async_trait;
 use hx_agent::approver::{AlwaysAllow, AlwaysDeny, ApprovalDecision, Approver, ScriptedApprover};
 use hx_agent::{AgentLoop, Limits, ModelCall, TranscriptSink};
-use hx_core::approval::{ApprovalPolicy, ApprovalSession, AutonomyLevel};
+use hx_core::approval::{ApprovalPolicy, ApprovalSession, AutonomyLevel, Confinement, Rule};
 use hx_core::capability::{Action, Capability, CapabilityToken, Resource};
 use hx_core::error::{HxError, Result};
 use hx_core::event::{AgentEvent, StopReason};
 use hx_core::ids::{AgentId, CredentialId, ProviderId, ToolCallId};
 use hx_core::message::{Message, Part};
 use hx_provider::{ChatRequest, ChatResponse, FinishReason, Usage};
-use hx_tools::testing::{BrokenHost, FakeHost};
+use hx_tools::testing::{BrokenHost, FakeHost, FakeSandbox};
 use hx_tools::{ReadFileTool, ShellTool, Tool, ToolContext, ToolError, ToolOutcome, ToolRegistry};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -1188,6 +1188,130 @@ async fn a_delete_reaches_the_prompt_with_what_will_be_gone() {
     assert_eq!(recorded[0].path, "/w/build");
     assert_eq!(recorded[0].entries, Some(2));
     assert_eq!(recorded[0].bytes, Some(6));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Where a call runs (`docs/approvals.md` §4)
+// ---------------------------------------------------------------------------------------------
+
+/// The policy §4 describes: `npm test` may run unattended *in a box*, and not on the host.
+fn confined_only_policy() -> ApprovalPolicy {
+    ApprovalPolicy {
+        level: AutonomyLevel::Cautious,
+        allow: vec![Rule::tool("shell").command("cargo test*").confined(true)],
+        ..ApprovalPolicy::default()
+    }
+}
+
+fn scripted_test_run() -> Vec<Result<ChatResponse>> {
+    vec![
+        Ok(reply_with(vec![(
+            "c1",
+            "shell",
+            json!({ "cmd": "cargo test", "workdir": "/w" }),
+        )])),
+        Ok(reply("done")),
+    ]
+}
+
+#[tokio::test]
+async fn a_rule_that_requires_confinement_lets_the_confined_run_through_without_asking() {
+    // The whole point of the axis: an unattended agent can be given build steps because they run inside a
+    // boundary, and the *same string* is still questioned when it would run on the machine itself. The
+    // approver is never asked here, which is what `seen().is_empty()` asserts — a question would be a
+    // failure of the rule, not a detail of it.
+    let host = Arc::new(FakeHost::unix());
+    let sandbox = Arc::new(FakeSandbox::answering("test result: ok\n", 0));
+    let approver = Arc::new(ScriptedApprover::new(vec![]));
+    let h = harness_on(
+        FakeHost::unix(),
+        scripted_test_run(),
+        vec![process_execute()],
+        confined_only_policy(),
+        approver.clone(),
+    );
+    let ctx = ToolContext::new(host)
+        .in_workspace("/w")
+        .with_sandbox(sandbox.clone());
+
+    let mut transcript = transcript_start();
+    let outcome = h.agent_loop.run(&mut transcript, &ctx).await.unwrap();
+
+    assert_eq!(outcome.refusals, 0);
+    assert_eq!(outcome.tool_calls, 1);
+    assert!(
+        approver.seen().is_empty(),
+        "a confined allowance is not a question: {:?}",
+        approver.seen()
+    );
+    assert_eq!(sandbox.runs().len(), 1, "it ran in the boundary");
+    assert!(h.host.commands().is_empty(), "{:?}", h.host.commands());
+}
+
+#[tokio::test]
+async fn the_same_command_on_the_host_is_still_asked_about() {
+    // And the other half, in the same configuration: no boundary, so the allow rule must not match and the
+    // cautious level must ask. If this ever stops asking, §4's axis has become a way to launder an
+    // unconfined command through a rule written for a confined one.
+    let approver = Arc::new(ScriptedApprover::new(vec![ApprovalDecision::deny(
+        "not on my machine",
+    )]));
+    let h = harness_on(
+        FakeHost::unix(),
+        scripted_test_run(),
+        vec![process_execute()],
+        confined_only_policy(),
+        approver.clone(),
+    );
+
+    let mut transcript = transcript_start();
+    let outcome = h
+        .agent_loop
+        .run(
+            &mut transcript,
+            &ToolContext::new(h.host.clone()).in_workspace("/w"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.refusals, 1);
+    assert_eq!(outcome.tool_calls, 0);
+    let asked = approver.seen();
+    assert_eq!(asked.len(), 1, "it was put to a human");
+    assert_eq!(asked[0].confined, Confinement::Host);
+    assert!(h.host.commands().is_empty(), "{:?}", h.host.commands());
+}
+
+#[tokio::test]
+async fn the_prompt_says_when_the_call_is_confined() {
+    // A person answering a prompt is deciding about their own machine, so "inside a sandbox" has to be in
+    // the question rather than inferred from the fact that a rule exists.
+    let approver = Arc::new(ScriptedApprover::new(vec![ApprovalDecision::allow_once()]));
+    let h = harness_on(
+        FakeHost::unix(),
+        scripted_test_run(),
+        vec![process_execute()],
+        // Paranoid, so the question is asked whatever the rules say.
+        ApprovalPolicy::paranoid(),
+        approver.clone(),
+    );
+    let ctx = ToolContext::new(h.host.clone())
+        .in_workspace("/w")
+        .with_sandbox(Arc::new(FakeSandbox::answering("", 0)));
+
+    let mut transcript = transcript_start();
+    h.agent_loop.run(&mut transcript, &ctx).await.unwrap();
+
+    let asked = approver.seen();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].confined, Confinement::Sandbox);
+    assert!(
+        asked[0]
+            .render()
+            .contains("where: inside a sandbox, not on the host"),
+        "{}",
+        asked[0].render()
+    );
 }
 
 #[tokio::test]

@@ -16,6 +16,7 @@ hx-agent.workspace = true
 hx-tools.workspace = true
 hx-store.workspace = true
 axum.workspace = true
+async-trait.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

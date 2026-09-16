@@ -13,8 +13,10 @@
 
 pub mod chat;
 pub mod routes;
+pub mod sandbox;
 pub mod state;
 
 pub use chat::{ChatReply, ChatRequest, ModelFactory, RouterModels};
 pub use routes::{app, status_for, ApiError};
+pub use sandbox::{SandboxCache, SandboxFor};
 pub use state::{AppState, AppStateParts, HostSummary, SandboxSummary, StatusReport};

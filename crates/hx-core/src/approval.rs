@@ -1152,6 +1152,15 @@ pub struct Rule {
     /// Optional restriction to one risk class.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk: Option<RiskClass>,
+    /// Optional requirement that the call be confined, or that it *not* be — `docs/approvals.md` §4.
+    ///
+    /// `Some(true)` matches only a call that runs inside a boundary; `Some(false)` only one that runs on
+    /// the host. Absent matches either, which is what every rule written before this existed meant.
+    /// `None` is not the same as `Some(false)`: the point of the axis is that a rule can be *narrower*
+    /// than "on the host", and `allow: {command: "npm test"}` in a config that also runs sandboxed
+    /// commands should not silently mean the unconfined one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confined: Option<bool>,
     /// Shown to the user when the rule fires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -1163,12 +1172,19 @@ impl Rule {
             tool: pattern.into(),
             command: None,
             risk: None,
+            confined: None,
             note: None,
         }
     }
 
     pub fn command(mut self, pattern: impl Into<String>) -> Self {
         self.command = Some(pattern.into());
+        self
+    }
+
+    /// Require confinement — `confined: true` in a config, which is §4's spelling.
+    pub fn confined(mut self, confined: bool) -> Self {
+        self.confined = Some(confined);
         self
     }
 
@@ -1197,6 +1213,11 @@ impl Rule {
                 return false;
             }
         }
+        if let Some(required) = self.confined {
+            if required != req.confined.is_sandbox() {
+                return false;
+            }
+        }
         true
     }
 }
@@ -1204,6 +1225,45 @@ impl Rule {
 // ---------------------------------------------------------------------------
 // Requests and verdicts
 // ---------------------------------------------------------------------------
+
+/// Where a call will run.
+///
+/// `docs/approvals.md` §4: the same command is not the same action on the host and inside an L2 sandbox
+/// with only the workspace mounted, so confinement is part of the *decision* rather than a detail of
+/// execution. `npm test` inside a box can be allowed unattended; the same string on the host cannot.
+///
+/// It is an enum and not a boolean because "not the host" is a family and it will grow: a container with
+/// a mount namespace, a gVisor VM, a remote build host are all boundaries, and a rule that wants to say
+/// *which* one should not need a widening of the type. Today every non-host answer is [`Sandbox`], and a
+/// rule asks the yes/no question (§4's config spells it `confined: true`) — the asymmetry is deliberate:
+/// the rule requires, the request records.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Confinement {
+    /// The machine itself: whatever runs here can do whatever the daemon's user can.
+    #[default]
+    Host,
+    /// Inside an isolation boundary — the workspace mounted, no network unless the profile grants it,
+    /// capabilities dropped.
+    Sandbox,
+}
+
+impl Confinement {
+    pub fn is_host(&self) -> bool {
+        matches!(self, Self::Host)
+    }
+
+    pub fn is_sandbox(&self) -> bool {
+        matches!(self, Self::Sandbox)
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Host => "the host",
+            Self::Sandbox => "a sandbox",
+        }
+    }
+}
 
 /// A proposed action, already classified, waiting on a decision.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1238,6 +1298,13 @@ pub struct ActionRequest {
     /// the delete happened, and it is still not something to remember for the rest of the project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undo: Option<String>,
+    /// Where it will run. See [`Confinement`], and `docs/approvals.md` §4.
+    ///
+    /// Skipped on the wire when it is [`Confinement::Host`], which is the honest default for every tool
+    /// that has not been given a boundary to run in — and the case a rule that requires confinement
+    /// must *not* match.
+    #[serde(default, skip_serializing_if = "Confinement::is_host")]
+    pub confined: Confinement,
 }
 
 impl ActionRequest {
@@ -1257,6 +1324,7 @@ impl ActionRequest {
             reversible: c.risk < RiskClass::Destructive,
             targets: Vec::new(),
             undo: None,
+            confined: Confinement::Host,
         }
     }
 
@@ -1279,6 +1347,7 @@ impl ActionRequest {
             reversible: risk < RiskClass::Destructive,
             targets: Vec::new(),
             undo: None,
+            confined: Confinement::Host,
         }
     }
 
@@ -1292,6 +1361,12 @@ impl ActionRequest {
     /// Attach the tool's own account of how the effect can be reversed, when it has one.
     pub fn with_undo(mut self, undo: impl Into<String>) -> Self {
         self.undo = Some(undo.into());
+        self
+    }
+
+    /// Say where the call will run. See [`Confinement`].
+    pub fn confined_to(mut self, confinement: Confinement) -> Self {
+        self.confined = confinement;
         self
     }
 
@@ -1513,9 +1588,12 @@ pub struct ApprovalRequest {
     /// Whether the effect can be taken back at all — the plain sentence's input.
     #[serde(default)]
     pub reversible: bool,
-    /// The tool's own account of how to reverse it, when it can be reversed.
+    /// How the effect can be taken back, in the tool's own words, when it can be.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undo: Option<String>,
+    /// Where the call will run, so the person answering knows whether the effect lands on their machine.
+    #[serde(default, skip_serializing_if = "Confinement::is_host")]
+    pub confined: Confinement,
     /// What happens if nobody answers.
     ///
     /// Fail-closed by default: an unattended agent must not get a "yes" because the human was
@@ -1542,6 +1620,12 @@ impl ApprovalRequest {
         if !self.targets.is_empty() {
             lines.push("target:".to_string());
             lines.extend(self.targets.iter().map(|t| format!("  {}", t.describe())));
+        }
+
+        if self.confined.is_sandbox() {
+            // Above `after:` because it qualifies *everything* below it: a promise about what the
+            // sandbox will do is not a promise about the machine.
+            lines.push("where: inside a sandbox, not on the host".to_string());
         }
 
         lines.push(format!("after: {}", self.after()));
@@ -2023,6 +2107,7 @@ impl ApprovalSession {
             targets: req.targets.clone(),
             reversible: req.reversible,
             undo: req.undo.clone(),
+            confined: req.confined,
             default_on_timeout: ApprovalOption::Deny,
             timeout_secs: None,
         };
@@ -2913,6 +2998,95 @@ deny:
                 "and says why it cannot be answered: {why}"
             );
         }
+    }
+
+    #[test]
+    fn confinement_is_part_of_the_decision_and_not_a_detail_of_it() {
+        // `docs/approvals.md` §4's example, as a test: an unattended build step is fine *in the box* and
+        // is not fine on the host, and one config has to be able to say both. Without this axis the only
+        // way to let `npm test` run unattended is to allow it everywhere, which is how a sandbox stops
+        // being worth having.
+        let policy = ApprovalPolicy {
+            level: AutonomyLevel::Cautious,
+            allow: vec![Rule::tool("shell").command("npm test*").confined(true)],
+            ask: vec![Rule::tool("shell").command("npm test*").confined(false)],
+            ..ApprovalPolicy::default()
+        };
+
+        let mut session = ApprovalSession::new(policy);
+
+        let confined = ActionRequest::shell("npm test -- --run").confined_to(Confinement::Sandbox);
+        let verdict = session.decide(&confined, t0());
+        assert!(
+            verdict.is_allowed(),
+            "a confined build step is what an allowlist is for: {verdict:?}"
+        );
+
+        let unconfined = ActionRequest::shell("npm test -- --run");
+        let verdict = session.decide(&unconfined, t0());
+        assert!(
+            verdict.is_asking(),
+            "the same string on the host is a different action: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn a_rule_that_says_nothing_about_confinement_matches_both() {
+        // Every rule written before this axis existed meant "either", and reading `Some(false)` into an
+        // absent field would have quietly narrowed the whole shipped deny list to host-only calls.
+        let rule = Rule::tool("shell").command("rm -rf /var*");
+        assert!(rule.matches(&ActionRequest::shell("rm -rf /var/log")));
+        assert!(rule
+            .matches(&ActionRequest::shell("rm -rf /var/log").confined_to(Confinement::Sandbox)));
+    }
+
+    #[test]
+    fn a_prompt_says_when_the_effect_lands_somewhere_other_than_this_machine() {
+        // The person answering is deciding about their own machine. "Inside a sandbox" is the difference
+        // between a build step that can be run unattended and one that cannot, so it is not a footnote.
+        let mut session = ApprovalSession::new(ApprovalPolicy::at(AutonomyLevel::Cautious));
+        let request = ActionRequest::shell("npm test")
+            .confined_to(Confinement::Sandbox)
+            .with_undo("nothing on this machine changes");
+        let Verdict::Ask(question) = session.decide(&request, t0()) else {
+            panic!("cautious asks about a mutate");
+        };
+        let rendered = question.render();
+        assert!(
+            rendered.contains("where: inside a sandbox, not on the host"),
+            "{rendered}"
+        );
+
+        // And a host call says nothing, because a line saying "on the host" on every prompt is noise
+        // that trains people to stop reading the section.
+        let mut session = ApprovalSession::new(ApprovalPolicy::at(AutonomyLevel::Cautious));
+        let Verdict::Ask(question) = session.decide(&ActionRequest::shell("npm test"), t0()) else {
+            panic!("cautious asks about a mutate");
+        };
+        assert!(
+            !question.render().contains("where:"),
+            "{}",
+            question.render()
+        );
+    }
+
+    #[test]
+    fn confinement_travels_on_the_wire_only_when_it_is_not_the_host() {
+        // The field is skipped when it is `Host` so a client parsing an older payload still works, and a
+        // rule that requires confinement cannot match a request that never mentioned it.
+        let host = ActionRequest::shell("npm test");
+        let sandbox = ActionRequest::shell("npm test").confined_to(Confinement::Sandbox);
+
+        let host_wire = serde_json::to_value(&host).unwrap();
+        assert!(
+            host_wire.get("confined").is_none(),
+            "an absent field is the host case: {host_wire}"
+        );
+        let sandbox_wire = serde_json::to_value(&sandbox).unwrap();
+        assert_eq!(sandbox_wire["confined"], "sandbox");
+
+        let back: ActionRequest = serde_json::from_value(host_wire).unwrap();
+        assert_eq!(back, host);
     }
 
     #[test]
