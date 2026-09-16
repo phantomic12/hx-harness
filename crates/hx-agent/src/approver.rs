@@ -75,6 +75,35 @@ impl Approver for AlwaysDeny {
     }
 }
 
+/// Refuses every prompt, with a reason of the caller's choosing.
+///
+/// The daemon's case: a request arrives over HTTP and no client is attached to answer a prompt, so
+/// the answer is "no" with an explanation a human can act on — never a silent yes. The escape hatch
+/// is the request's autonomy level, which decides *whether* a prompt happens at all; this approver
+/// only ever sees the ones that still need a human.
+pub struct DenyWithReason {
+    reason: String,
+}
+
+impl DenyWithReason {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Approver for DenyWithReason {
+    async fn decide(
+        &self,
+        _request: &ApprovalRequest,
+        _action: &ActionRequest,
+    ) -> ApprovalDecision {
+        ApprovalDecision::deny(self.reason.clone())
+    }
+}
+
 /// Answers from a script, in order, and refuses once it runs out.
 ///
 /// Running out refusing rather than allowing is the point: a test whose script is exhausted is a

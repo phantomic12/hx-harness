@@ -66,7 +66,7 @@ $ curl -s localhost:7717/v1/status | jq .pools
 | Sessions (`hx-store`) | **Built** — SQLite: create, resume, list, rename, delete, export (JSON/Markdown), events, usage totals. A transcript that ended mid-call is *repaired*, not sent to a provider that would reject it |
 | Web UI, Tauri desktop/mobile, chat connectors | **Not started** |
 | MCP client, browser-automation pool | **Not started** |
-| The loop wired into `hxd`/`hx` | **Not started** — see below |
+| The loop wired into `hxd`: `POST /v1/chat`, session routes over `hx-store` | **Built** — one request runs the loop against a session: the prompt is stored before the model is called, the role decides the model, credentials come from a `store:name` reference, events are written as they happen, and a transcript that ended mid-call is repaired before it is sent. Eight tests drive the **real loop over the real HTTP surface**, scripted only in the model |
 
 ---
 
@@ -157,7 +157,7 @@ $ ./target/release/hxd --bind 127.0.0.1:7717
 ```
 
 ```console
-$ cargo test --workspace         # 573 tests, 0 failed, 22 ignored live tests
+$ cargo test --workspace         # 587 tests, 0 failed, 22 ignored live tests
 $ cargo test -p hx-sandbox --test docker_live -- --ignored   # needs a container engine
 $ cargo test -p hx-remote --test ssh_live -- --ignored       # needs an SSH server
 $ HX_SEARXNG_URL=... HX_SEARCH_EXPECT_RESULTS=searxng \
@@ -174,11 +174,17 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
 
 ## What is deliberately not done yet
 
-- **The loop and the store exist; nothing wires them together.** `hx-agent` has the model call, the
-  tool dispatch, the capability check, the approval prompt and refusals-as-results; `hx-store` has
-  sessions, transcripts, events and usage in SQLite. What is missing is the seam between them and a
-  client: streaming, context compaction, and any caller — `hxd` and `hx` construct neither yet, so
-  `/v1/chat` returns `501` and says so rather than pretending.
+- **A run over HTTP cannot be approved, and a killed run loses its turn.** There is no approval
+  channel in the API yet, so the daemon's approver refuses every prompt with the reason and names the
+  escape hatch (`autonomy: "yolo"`, which the policy's `ceiling` can still cap) — never a silent yes.
+  Events are written as the run happens, so a client that reconnects can redraw; the *messages* of a
+  run are written when it returns, so a daemon killed mid-run keeps its events, its repaired dangling
+  call and the prompt it was asked, and loses the in-flight turn. Writing each message as it is
+  produced needs the loop to hand messages out as it appends them, and that is not in yet.
+- **`hx` has no `chat` command.** The daemon answers `POST /v1/chat`; the terminal still does not,
+  which is the gap the next commit closes rather than something to claim.
+- **Streaming and context compaction.** A turn arrives whole, so a run is one long wait per turn and a
+  long session is still sent as-is. Both are stated gaps, not hidden ones.
 - **Nothing in `ci.yml` reaches another machine.** That file is in-process unit tests; the tests
   that open a socket — a real Docker daemon, a real `sshd` — live in
   `.github/workflows/integration.yml` and are `#[ignore]`d by default, so a local `cargo test` stays

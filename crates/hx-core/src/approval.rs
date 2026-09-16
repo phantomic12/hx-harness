@@ -1022,6 +1022,12 @@ impl AutonomyLevel {
         }
     }
 
+    /// The accepted spellings, for an error message or a CLI's help.
+    ///
+    /// One list, so a daemon that rejects `reckless` and a terminal that completes on Tab cannot
+    /// disagree about what the levels are called.
+    pub const NAMES: [&'static str; 5] = ["paranoid", "cautious", "balanced", "trusting", "yolo"];
+
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_lowercase().as_str() {
             "paranoid" | "ask" => Some(Self::Paranoid),

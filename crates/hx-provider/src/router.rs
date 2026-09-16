@@ -342,8 +342,17 @@ impl ModelRouter {
 
     /// Estimated cost of a response on a route, from the provider's rate card.
     pub fn estimate_cost(&self, route: &Route, usage: &Usage) -> f64 {
+        self.cost_for(&route.provider, usage)
+    }
+
+    /// The same, for a provider known by id rather than a route.
+    ///
+    /// The loop reports usage per turn without a route — a price table is not its business — so the
+    /// daemon prices those turns with this. `0.0` when no rate card is configured, which is the
+    /// absence of a price rather than a claim that the call was free.
+    pub fn cost_for(&self, provider: &ProviderId, usage: &Usage) -> f64 {
         self.prices
-            .get(&route.provider)
+            .get(provider)
             .map(|price| cost_usd(price, usage))
             .unwrap_or(0.0)
     }

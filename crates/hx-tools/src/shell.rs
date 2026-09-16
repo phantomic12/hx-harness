@@ -16,6 +16,7 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 pub const MAX_TIMEOUT_SECS: u64 = 900;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Args {
     cmd: String,
     #[serde(default)]
@@ -301,6 +302,23 @@ mod tests {
             serde_json::from_value(json!({"cmd": "x", "timeout_secs": 999_999})).unwrap();
         let requested = args.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
         assert_eq!(requested.clamp(1, MAX_TIMEOUT_SECS), MAX_TIMEOUT_SECS);
+    }
+
+    #[tokio::test]
+    async fn a_misnamed_argument_is_refused_rather_than_ignored() {
+        // The dangerous shape of this bug: `cwd` instead of `workdir`. Without `deny_unknown_fields`
+        // serde drops the unknown key, the command runs *somewhere else* — and a shell command that
+        // silently executes in the wrong directory is worse than one that fails. (It pushed a real
+        // branch once.)
+        let err = ShellTool
+            .requirement(&serde_json::json!({ "cmd": "pwd", "cwd": "/tmp" }))
+            .expect_err("a misnamed argument must not be ignored");
+
+        let message = format!("{err}");
+        assert!(
+            message.contains("cwd") || message.contains("unknown field"),
+            "the error must name the offending key: {message}"
+        );
     }
 
     #[tokio::test]

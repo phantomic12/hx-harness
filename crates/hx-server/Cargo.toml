@@ -12,6 +12,9 @@ hx-search.workspace = true
 hx-sandbox.workspace = true
 hx-remote.workspace = true
 hx-secrets.workspace = true
+hx-agent.workspace = true
+hx-tools.workspace = true
+hx-store.workspace = true
 axum.workspace = true
 tokio.workspace = true
 serde.workspace = true
@@ -22,5 +25,7 @@ indexmap.workspace = true
 reqwest.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
+async-trait.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

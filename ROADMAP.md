@@ -60,6 +60,12 @@ Those get real tests in M1 against a live endpoint.
 - `hxd` runs, `hx` connects to it over the local socket
 - ✅ Session persistence (`hx-store`): resume, list, export — and the case that actually matters, a
   transcript that ended mid-call being repaired rather than sent to a provider, which rejects it
+- ◐ **The loop reachable over HTTP** — `POST /v1/chat` runs the loop against a session, `hx-server`
+  resolves the role's model through the routing table (reserving capacity and resolving the key), the
+  prompt is stored before the model is called, events are written as they happen, and `/v1/sessions*`
+  reads sessions, transcripts, events and exports back. Still to come: an approval channel (so a
+  client can answer a prompt instead of the daemon refusing it), per-message durability for a run
+  that is killed, `hx chat` in the terminal, and a WebSocket event stream
 
 **Exit criteria:** a multi-step task (5+ tool calls) completes end-to-end; killing the TUI and
 reconnecting resumes the session mid-flight.

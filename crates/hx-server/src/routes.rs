@@ -16,13 +16,14 @@
 //! forever.
 
 use crate::state::AppState;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use hx_core::config::SandboxProfile;
 use hx_core::error::HxError;
+use hx_core::ids::SessionId;
 use hx_sandbox::SandboxSpec;
 use hx_search::{Recency, SearchQuery};
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,11 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/sandboxes/{id}", delete(destroy_sandbox))
         .route("/v1/sandboxes/{id}/exec", post(exec_sandbox))
         .route("/v1/chat", post(chat))
+        .route("/v1/sessions", get(list_sessions))
+        .route("/v1/sessions/{id}", get(get_session).delete(delete_session))
+        .route("/v1/sessions/{id}/rename", post(rename_session))
+        .route("/v1/sessions/{id}/export", get(export_session))
+        .route("/v1/sessions/{id}/events", get(session_events))
         .with_state(state)
 }
 
@@ -131,8 +137,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<crate::state::Status
 }
 
 async fn pools(State(state): State<Arc<AppState>>) -> Json<Vec<hx_provider::PoolStatus>> {
-    let router = state.router.lock().await;
-    Json(router.status().pools)
+    Json(state.router().status().pools)
 }
 
 async fn hosts(State(state): State<Arc<AppState>>) -> Json<Vec<crate::state::HostSummary>> {
@@ -282,14 +287,172 @@ async fn exec_sandbox(
     ))
 }
 
-/// The agent loop is not wired to HTTP yet; say so precisely rather than returning a stub.
-async fn chat() -> ApiError {
-    ApiError::new(
-        StatusCode::NOT_IMPLEMENTED,
-        "the agent loop is not exposed over HTTP yet — see ROADMAP.md M1. The provider router, \
-         search, sandboxes, hosts and capabilities are all live; only the loop that ties them \
-         together is missing.",
-    )
+/// Run a turn: create or continue a session, run the loop, report what happened.
+///
+/// The response carries the session id, so a client can continue the conversation without a second
+/// call — and so a request that started a session is distinguishable from one that resumed it.
+async fn chat(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<crate::chat::ChatRequest>,
+) -> Result<Json<crate::chat::ChatReply>, ApiError> {
+    // Two fields a client can get wrong, checked here so the answer is a 400 with the accepted values
+    // rather than a 500 that reads like the daemon is broken. `run_chat` validates both again: this
+    // is the HTTP surface's courtesy, not the only guard.
+    if let Some(name) = &request.autonomy {
+        if hx_core::approval::AutonomyLevel::parse(name).is_none() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "unknown autonomy level '{name}'; known: {}",
+                    hx_core::approval::AutonomyLevel::NAMES.join(", ")
+                ),
+            ));
+        }
+    }
+
+    if let Some(role) = &request.role {
+        if !state.config.roles.contains_key(role) {
+            let mut configured: Vec<&str> = state
+                .config
+                .roles
+                .keys()
+                .map(|name| name.as_str())
+                .collect();
+            configured.sort_unstable();
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "unknown role '{role}'; configured roles: {}",
+                    if configured.is_empty() {
+                        "none".to_string()
+                    } else {
+                        configured.join(", ")
+                    }
+                ),
+            ));
+        }
+    }
+
+    Ok(Json(
+        crate::chat::run_chat(&state, request, chrono::Utc::now()).await?,
+    ))
+}
+
+/// Query parameters for the session routes.
+#[derive(Debug, Deserialize)]
+struct SessionQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    format: Option<String>,
+    /// `?transcript=false` returns the record and totals without the messages, for a list view that
+    /// does not want to move a megabyte of transcript to render a filename.
+    #[serde(default)]
+    transcript: Option<bool>,
+}
+
+async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SessionQuery>,
+) -> Result<Json<Vec<hx_store::SessionSummary>>, ApiError> {
+    let limit = params.limit.unwrap_or(50).clamp(1, 500);
+    Ok(Json(state.store.list(limit)?))
+}
+
+async fn get_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<SessionQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let session = SessionId::from_raw(id);
+    let record = state.store.record(&session)?;
+    let totals = state.store.totals(&session)?;
+    let interrupted = state.store.load(&session)?.interrupted_calls().len();
+    let transcript = params.transcript.unwrap_or(true);
+
+    let messages = if transcript {
+        Some(state.store.messages(&session)?)
+    } else {
+        None
+    };
+
+    Ok(Json(serde_json::json!({
+        "record": record,
+        "totals": totals,
+        "interrupted_calls": interrupted,
+        "messages": messages,
+    })))
+}
+
+async fn delete_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let deleted = state.store.delete(&SessionId::from_raw(id))?;
+    if !deleted {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "no such session"));
+    }
+    Ok(Json(serde_json::json!({ "deleted": true })))
+}
+
+#[derive(Debug, Deserialize)]
+struct RenameBody {
+    title: String,
+}
+
+async fn rename_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<RenameBody>,
+) -> Result<Json<hx_store::SessionRecord>, ApiError> {
+    if body.title.trim().is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "a title cannot be empty: an unnamed session is one nobody can find",
+        ));
+    }
+    state.store.rename(
+        &SessionId::from_raw(id.clone()),
+        body.title.trim(),
+        chrono::Utc::now(),
+    )?;
+    Ok(Json(state.store.record(&SessionId::from_raw(id))?))
+}
+
+/// The transcript as a document, for a client that wants to read or attach it.
+async fn export_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<SessionQuery>,
+) -> Result<Response, ApiError> {
+    let format = match params.format.as_deref().unwrap_or("json") {
+        "json" => hx_store::ExportFormat::Json,
+        "markdown" | "md" => hx_store::ExportFormat::Markdown,
+        other => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("unknown export format '{other}'; known: json, markdown"),
+            ))
+        }
+    };
+
+    let is_json = matches!(format, hx_store::ExportFormat::Json);
+    let body = state.store.export(&SessionId::from_raw(id), format)?;
+    let content_type = if is_json {
+        "application/json"
+    } else {
+        "text/markdown; charset=utf-8"
+    };
+
+    Ok(([(axum::http::header::CONTENT_TYPE, content_type)], body).into_response())
+}
+
+/// Every event of a session, in order: what a client that just attached renders.
+async fn session_events(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<hx_core::event::AgentEvent>>, ApiError> {
+    Ok(Json(state.store.events(&SessionId::from_raw(id))?))
 }
 
 fn sandbox_unavailable_message(state: &AppState) -> String {
@@ -338,7 +501,13 @@ search:
 "#;
 
     async fn test_state() -> Arc<AppState> {
-        let config = hx_core::config::Config::from_yaml(CONFIG).expect("config parses");
+        let mut config = hx_core::config::Config::from_yaml(CONFIG).expect("config parses");
+        // A test must not write a session database into the developer's home directory, and the
+        // directory has to outlive the store: `keep()` hands back the path rather than deleting it on
+        // drop, so the file is still there when a later assertion reopens the session.
+        let dir = tempfile::tempdir().expect("temp dir");
+        config.daemon.data_dir = dir.keep().display().to_string();
+
         let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         AppState::build(config, now).await.expect("state builds")
     }
@@ -367,6 +536,36 @@ search:
                     .uri(uri)
                     .header("content-type", "application/json")
                     .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// A GET whose body is text rather than JSON: the export route returns a document.
+    async fn get_text(state: Arc<AppState>, uri: &str) -> (StatusCode, String) {
+        let response = app(state)
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    async fn delete(state: Arc<AppState>, uri: &str) -> (StatusCode, serde_json::Value) {
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(uri)
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
@@ -451,12 +650,86 @@ search:
     }
 
     #[tokio::test]
-    async fn chat_reports_not_implemented_with_an_explanation() {
-        let (status, body) = post(test_state().await, "/v1/chat", serde_json::json!({})).await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    async fn a_run_that_cannot_reach_a_provider_still_records_what_was_asked() {
+        let state = test_state().await;
+
+        // The config points at a llama.cpp server that is not running in a test environment, so the
+        // call itself fails. What must not fail is the bookkeeping: the prompt is stored *before* the
+        // model is consulted, so a client can retry a run instead of losing what it asked.
+        let (status, body) = post(
+            Arc::clone(&state),
+            "/v1/chat",
+            serde_json::json!({ "prompt": "hello", "autonomy": "yolo", "workspace": "/tmp" }),
+        )
+        .await;
         assert!(
-            body["error"].as_str().unwrap().contains("ROADMAP"),
-            "the error must point somewhere useful: {body}"
+            status.is_client_error() || status.is_server_error(),
+            "an unreachable provider must be an error: {status} {body}"
+        );
+
+        let (status, sessions) = get(Arc::clone(&state), "/v1/sessions").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            sessions.as_array().map(|list| list.len()),
+            Some(1),
+            "the session must exist even though the run failed: {sessions}"
+        );
+
+        // The transcript is asserted through the store rather than through the wire format: a test
+        // that pins the JSON shape of a message would have to be edited every time a part type is
+        // added, and would stop testing the thing it cares about.
+        let id = hx_core::ids::SessionId::from_raw(
+            sessions[0]["id"]
+                .as_str()
+                .expect("a session id")
+                .to_string(),
+        );
+        let messages = state.store.messages(&id).expect("transcript reads");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text(), "hello");
+    }
+
+    #[tokio::test]
+    async fn a_session_exports_as_a_document_and_deletes_once() {
+        let state = test_state().await;
+        post(
+            Arc::clone(&state),
+            "/v1/chat",
+            serde_json::json!({ "prompt": "find the bug", "autonomy": "yolo", "workspace": "/tmp" }),
+        )
+        .await;
+
+        let (_, sessions) = get(Arc::clone(&state), "/v1/sessions").await;
+        let id = sessions[0]["id"].as_str().unwrap().to_string();
+
+        let (status, markdown) = get_text(
+            Arc::clone(&state),
+            &format!("/v1/sessions/{id}/export?format=markdown"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            markdown.contains("find the bug"),
+            "the export must contain the prompt: {markdown}"
+        );
+
+        let (status, body) = delete(Arc::clone(&state), &format!("/v1/sessions/{id}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // Deleting twice is a 404, not a second success: a client that retries a delete must be able
+        // to tell "gone" from "never existed".
+        let (status, _) = delete(state, &format!("/v1/sessions/{id}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_export_format_names_the_known_ones() {
+        let state = test_state().await;
+        let (status, body) = get(state, "/v1/sessions/whatever/export?format=pdf").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"].as_str().unwrap().contains("json, markdown"),
+            "{body}"
         );
     }
 
