@@ -57,7 +57,7 @@ $ curl -s localhost:7717/v1/status | jq .pools
 | Encrypted secret vault (Argon2id + XChaCha20), outbound redaction | **Done**, tested |
 | Model pools, per-credential rate/token/budget limits, role routing | **Done**, tested |
 | Web search: SearXNG + keyless DuckDuckGo, RRF fusion, failure reporting | **Done**, tested |
-| Remote hosts: local + SSH (real `russh`), Windows/macOS/Linux capability detection | **Built** — parsing tested, handshake unverified |
+| Remote hosts: local + SSH (real `russh`), host key verification, Windows/macOS/Linux capability detection | **Built** — connect, auth, exec and file transfer run against a real host (`crates/hx-remote/tests/ssh_live.rs`) |
 | Sandboxes: L1/L2/L3 isolation ladder, Docker lifecycle, TTL reaper | **Built** — spec→config tested, lifecycle unverified |
 | Daemon (`hxd`) + HTTP API + CLI (`hx`) | **Done**, runnable |
 | Web UI, Tauri desktop/mobile, chat connectors | **Not started** |
@@ -150,7 +150,8 @@ $ ./target/release/hxd --bind 127.0.0.1:7717
 ```
 
 ```console
-$ cargo test --workspace         # 347 unit tests, no external dependencies
+$ cargo test --workspace         # 381 unit tests, no external dependencies
+$ cargo test -p hx-remote --test ssh_live -- --ignored   # against a real host: see TESTING.md
 ```
 
 Rust 1.89+ (edition 2021). Verified on 1.98.1.
@@ -160,14 +161,22 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
 - **The agent loop.** The provider router, tool plumbing, search, sandboxes, approvals and hosts
   all build and are unit-tested, but nothing yet ties them into a model-calling loop. `/v1/chat`
   returns `501` and says so rather than pretending.
-- **Nothing has ever connected to anything under CI.** Every test is an in-process unit test and
-  there are zero integration tests, so a green suite proves the logic, not the connectivity. The
-  SSH handshake and the Docker container lifecycle compile but have **never been executed**. Read
-  **[TESTING.md](TESTING.md)** — it separates "executed and observed" from "unit-tested" from
+- **Nothing has ever connected to anything under CI.** The suite is in-process unit tests plus
+  `#[ignore]`d integration tests that CI does not run, so a green suite proves the logic, not the
+  connectivity. The SSH transport *has* now been exercised against a real machine by hand
+  (`crates/hx-remote/tests/ssh_live.rs`; the run is recorded in **[TESTING.md](TESTING.md)**),
+  but the Docker container lifecycle has **never been executed** at all, and a regression in
+  either is invisible to CI. TESTING.md separates "executed and observed" from "unit-tested" from
   "merely compiles", and lists the six empty crates the green suite says nothing about.
-- **SSH host key verification.** `check_server_key` accepts any key unless `strict` was
-  requested, in which case it refuses to connect. The fix is `~/.ssh/known_hosts` plus
-  trust-on-first-use. Until then, treat the SSH transport as suitable for trusted networks only.
-  This is the one place the harness is *less* safe than the `ssh` it replaces.
+- **A Docker integration test.** The sandbox lifecycle still only compiles: the isolation ladder,
+  `network=none`, the pids limit, the read-only rootfs and the TTL reaper have never met a real
+  daemon. This is the largest remaining unverified surface, and `TESTING.md` ranks it next.
+- **Host certificates.** A server presenting one is *refused*, not accepted: `@cert-authority`
+  lines are parsed so they cannot be mistaken for a host key, but no certificate chain is
+  verified, and accepting an unverified chain would claim a check that did not happen. The same
+  applies to `ssh-agent` auth, which returns an explicit error rather than pretending.
+- **Host key policy from config.** The policy is an argument to `SshHost::connect`
+  (`Strict` / `Tofu` / `Insecure`) with `~/.ssh/known_hosts` as the default store. Reading it out
+  of `hx.yaml` belongs to the host registry in M4, along with `WinRMHost`.
 - **Web UI, desktop/mobile apps, chat connectors, MCP, browser pool.** Designed in
   `ARCHITECTURE.md`, not built.

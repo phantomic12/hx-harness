@@ -2,12 +2,21 @@
 //!
 //! ## Security posture, stated plainly
 //!
-//! **Host key verification is not yet implemented.** `check_server_key` returns `true` unless
-//! `strict` was requested, in which case it refuses to connect. That is a real gap and it is
-//! called out here and in `ROADMAP.md` rather than quietly accepted: the intended fix is
-//! `russh::keys::check_known_hosts` against `~/.ssh/known_hosts` with trust-on-first-use
-//! prompting. Until then, a man-in-the-middle on the path to a host would go unnoticed — so
-//! treat this transport as suitable for trusted networks only.
+//! **Host keys are verified against `known_hosts`.** Every connection is checked before
+//! authentication begins, and the check has three outcomes that are all distinct on purpose:
+//! a key that matches is accepted, an unknown host is either refused ([`HostKeyPolicy::Strict`])
+//! or recorded and then enforced ([`HostKeyPolicy::Tofu`]), and a key that does not match the
+//! recorded one is **refused** — that is the man-in-the-middle case, and it is a rejection, not a
+//! warning. A server presenting a certificate is refused too: hx does not verify certificates yet,
+//! so accepting one would be claiming a verification that did not happen.
+//!
+//! See [`crate::known_hosts`] for the file format and the verdicts. [`HostKeyPolicy::Insecure`]
+//! still exists, and exists to be explicit: accepting any key is a decision an operator makes on
+//! a disposable target, never a default that happens because verification was absent.
+//!
+//! Still unverified: nothing in this file's handshake has been executed against a real SSH server
+//! under test. The transport compiles, its parsing and its key policy are unit-tested, and
+//! `TESTING.md` lists the handshake itself as tier C until an integration test runs it.
 //!
 //! Everything else is real: publickey and password auth with key material pulled from the
 //! encrypted vault, capability probing on connect, and binary-safe file transfer.
@@ -16,6 +25,7 @@ use crate::host::{
     caps_from_uname, caps_from_ver, enrich_caps_from_posix_probe, powershell_quote, shell_quote,
     ExecOutput, Host, HostCaps, RemoteEntry, RemoteOs, ShellKind,
 };
+use crate::known_hosts::{HostKeyVerdict, KnownHosts};
 use async_trait::async_trait;
 use hx_core::error::{HxError, Result};
 use hx_core::ids::HostId;
@@ -60,8 +70,177 @@ impl std::fmt::Debug for SshAuth {
     }
 }
 
+/// What to do about the host key of a machine being connected to.
+///
+/// The choice is explicit because the alternative — a `bool` that means "skip the check" — is how
+/// an unverified connection becomes the default by accident.
+#[derive(Clone, Debug)]
+pub enum HostKeyPolicy {
+    /// Require an entry that already trusts the host. An unknown host is refused, so the first
+    /// connection to a machine has to be an act, not a side effect.
+    Strict { known_hosts: KnownHosts },
+    /// Trust on first use: record the key of an unknown host, then require it never to change.
+    /// A *changed* key is still refused — this is the mode that makes MITM visible after the fact
+    /// without making every new machine a manual step.
+    Tofu { known_hosts: KnownHosts },
+    /// Accept any key and record nothing. Refuses nothing, so the user has to say it out loud.
+    Insecure,
+}
+
+/// The outcome of a host key check.
+///
+/// A refusal carries its reason because a bare `false` cannot be reported: by the time the caller
+/// sees a failed connect, the detail that distinguishes "unknown host" from "key changed" is the
+/// only thing that tells an operator whether to run `ssh-keyscan` or to start investigating.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostKeyDecision {
+    Accept,
+    Refuse(String),
+}
+
+impl HostKeyPolicy {
+    /// Trust on first use, against `~/.ssh/known_hosts`. The default for a real harness.
+    pub fn tofu() -> Result<Self> {
+        Ok(Self::Tofu {
+            known_hosts: KnownHosts::user_default()?,
+        })
+    }
+
+    /// Strict, against `~/.ssh/known_hosts`.
+    pub fn strict() -> Result<Self> {
+        Ok(Self::Strict {
+            known_hosts: KnownHosts::user_default()?,
+        })
+    }
+
+    /// Trust on first use, against a specific file. What tests and an explicit daemon config use.
+    pub fn tofu_at(path: impl Into<std::path::PathBuf>) -> Self {
+        Self::Tofu {
+            known_hosts: KnownHosts::at(path),
+        }
+    }
+
+    /// Decide whether `key` may be accepted for `host:port`.
+    ///
+    /// `Err` is also a refusal — one that could not be completed. A trust store that cannot be
+    /// read or written is not a reason to trust anyway, so the error surfaces rather than turning
+    /// a filesystem problem into a silent downgrade.
+    pub fn decide(
+        &self,
+        host: &str,
+        port: u16,
+        key: &russh::keys::PublicKey,
+    ) -> Result<HostKeyDecision> {
+        let known_hosts = match self {
+            Self::Insecure => {
+                tracing::warn!(
+                    host,
+                    port,
+                    algorithm = %key.algorithm(),
+                    "HostKeyPolicy::Insecure — accepting an unverified SSH host key"
+                );
+                return Ok(HostKeyDecision::Accept);
+            }
+            Self::Strict { known_hosts } | Self::Tofu { known_hosts } => known_hosts,
+        };
+
+        let store = known_hosts.path().display();
+
+        Ok(match known_hosts.lookup(host, port, key)? {
+            HostKeyVerdict::Trusted => HostKeyDecision::Accept,
+            HostKeyVerdict::Unknown => {
+                if matches!(self, Self::Strict { .. }) {
+                    let reason = format!(
+                        "no known_hosts entry for {host}:{port} in {store}; refusing under strict \
+                         host key checking (add the key with ssh-keyscan, or use \
+                         HostKeyPolicy::Tofu)"
+                    );
+                    tracing::error!(host, port, "{reason}");
+                    return Ok(HostKeyDecision::Refuse(reason));
+                }
+
+                // Record before accepting. If the write fails, the connection fails: a key that
+                // cannot be pinned now would be re-accepted silently on the next attempt, which
+                // is exactly the behaviour TOFU exists to stop.
+                known_hosts.record(host, port, key)?;
+                tracing::warn!(
+                    host,
+                    port,
+                    store = %store,
+                    algorithm = %key.algorithm(),
+                    "first connection to this host; recording its key in known_hosts"
+                );
+                HostKeyDecision::Accept
+            }
+            HostKeyVerdict::Changed { line, recorded } => {
+                let reason = format!(
+                    "the host key for {host}:{port} does not match the one recorded at \
+                     {store}:{line} (recorded {recorded}, offered {}); a changed host key is what \
+                     a man-in-the-middle looks like, and a rebuilt server looks identical — remove \
+                     that entry if the change is expected",
+                    key.algorithm()
+                );
+                tracing::error!(host, port, line, "{reason}");
+                HostKeyDecision::Refuse(reason)
+            }
+            HostKeyVerdict::Revoked { line } => {
+                let reason =
+                    format!("the host key for {host}:{port} is marked @revoked at {store}:{line}");
+                tracing::error!(host, port, line, "{reason}");
+                HostKeyDecision::Refuse(reason)
+            }
+        })
+    }
+
+    /// Whether the key may be accepted, without the reason. Convenience for callers that log the
+    /// refusal themselves.
+    pub fn accepts(&self, host: &str, port: u16, key: &russh::keys::PublicKey) -> Result<bool> {
+        Ok(matches!(
+            self.decide(host, port, key)?,
+            HostKeyDecision::Accept
+        ))
+    }
+
+    /// One line for logs and `hx doctor`.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Strict { known_hosts } => {
+                format!("strict (known_hosts: {})", known_hosts.path().display())
+            }
+            Self::Tofu { known_hosts } => {
+                format!("tofu (known_hosts: {})", known_hosts.path().display())
+            }
+            Self::Insecure => "insecure (host keys are not verified)".to_string(),
+        }
+    }
+}
+
+/// Hands russh the trust decision, and remembers why a key was refused.
+///
+/// The reason is kept because `check_server_key` can only answer a `bool`: without this the caller
+/// would report "could not reach host" for a connection that was deliberately refused, which is
+/// the least useful possible message for an operator.
 struct ClientHandler {
-    strict: bool,
+    policy: HostKeyPolicy,
+    host: String,
+    port: u16,
+    refusal: Refusal,
+}
+
+/// The reason the last host key check said no, shared with the code that reports the error.
+#[derive(Clone, Default)]
+struct Refusal(Arc<std::sync::Mutex<Option<String>>>);
+
+impl Refusal {
+    fn set(&self, reason: String) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(reason);
+        }
+    }
+
+    fn get(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|slot| slot.clone())
+    }
 }
 
 impl client::Handler for ClientHandler {
@@ -71,20 +250,33 @@ impl client::Handler for ClientHandler {
         &mut self,
         server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> std::result::Result<bool, Self::Error> {
-        if self.strict {
-            // Refusing outright is the honest behaviour until known_hosts is wired up: silently
-            // accepting would claim a verification that did not happen.
-            tracing::error!(
-                "strict host key checking requested but not implemented; refusing to connect"
-            );
-            return Ok(false);
-        }
+        let key = match server_public_key {
+            russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => key,
+            // Certificates are not verified yet, and "not verified" is not the same as "fine".
+            // The signature over the certificate would be checked, but the authority that issued
+            // it would not, so accepting here would be trusting anything.
+            russh::keys::PublicKeyOrCertificate::Certificate(_) => {
+                let reason = "the server presented a host certificate, which hx cannot verify yet"
+                    .to_string();
+                tracing::error!(host = %self.host, port = self.port, "{reason}");
+                self.refusal.set(reason);
+                return Ok(false);
+            }
+        };
 
-        tracing::warn!(
-            key = ?server_public_key,
-            "accepting an unverified SSH host key (see ROADMAP: known_hosts integration)"
-        );
-        Ok(true)
+        match self.policy.decide(&self.host, self.port, key) {
+            Ok(HostKeyDecision::Accept) => Ok(true),
+            Ok(HostKeyDecision::Refuse(reason)) => {
+                self.refusal.set(reason);
+                Ok(false)
+            }
+            Err(err) => {
+                let reason = format!("host key verification could not be completed: {err}");
+                tracing::error!(host = %self.host, port = self.port, "{reason}");
+                self.refusal.set(reason);
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -98,6 +290,22 @@ pub struct SshHost {
     port: u16,
 }
 
+impl std::fmt::Debug for SshHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Not derived: the session handle has no useful rendering, and there is nothing in this
+        // type that a log line should be hiding either. Identity, address and the probed platform
+        // are what a reader needs.
+        f.debug_struct("SshHost")
+            .field("id", &self.id)
+            .field("user", &self.user)
+            .field("address", &self.address)
+            .field("port", &self.port)
+            .field("os", &self.caps.os)
+            .field("arch", &self.caps.arch)
+            .finish()
+    }
+}
+
 impl SshHost {
     /// Connect, authenticate, and probe what the far end is.
     pub async fn connect(
@@ -106,7 +314,7 @@ impl SshHost {
         port: u16,
         user: &str,
         auth: &SshAuth,
-        accept_unknown_host_keys: bool,
+        host_key_policy: &HostKeyPolicy,
     ) -> Result<Self> {
         let config = Arc::new(client::Config {
             // An agent loop should not hang for the default 2 minutes on an unreachable host.
@@ -114,15 +322,33 @@ impl SshHost {
             ..Default::default()
         });
 
+        let refusal = Refusal::default();
         let handler = ClientHandler {
-            strict: !accept_unknown_host_keys,
+            policy: host_key_policy.clone(),
+            host: address.to_string(),
+            port,
+            refusal: refusal.clone(),
         };
 
-        let mut session = client::connect(config, (address, port), handler)
-            .await
-            .map_err(|e| {
-                HxError::Remote(format!("could not reach {user}@{address}:{port}: {e}"))
-            })?;
+        let mut session = match client::connect(config, (address, port), handler).await {
+            Ok(session) => session,
+            // `UnknownKey` is russh's answer to a `check_server_key` that returned false, and the
+            // only reason that happens here is a deliberate refusal. Reporting it as "could not
+            // reach the host" would hide the one message an operator needs.
+            Err(russh::Error::UnknownKey) => {
+                let reason = refusal
+                    .get()
+                    .unwrap_or_else(|| format!("no known_hosts entry for {address}:{port}"));
+                return Err(HxError::Remote(format!(
+                    "refused to connect to {address}:{port} — {reason}"
+                )));
+            }
+            Err(err) => {
+                return Err(HxError::Remote(format!(
+                    "could not reach {user}@{address}:{port}: {err}"
+                )))
+            }
+        };
 
         let outcome = match auth {
             SshAuth::Agent => {
@@ -553,5 +779,238 @@ mod tests {
         };
         let rendered = format!("{auth:?}");
         assert!(!rendered.contains("hunter2"), "{rendered}");
+    }
+
+    // ---- host key policy ---------------------------------------------------------------
+
+    /// Real keys: `ED25519_A` from `ssh-keygen`, `ED25519_B` OpenSSH's own test key.
+    const ED25519_A: &str = "AAAAC3NzaC1lZDI1NTE5AAAAILZs0NPMDY3wMHo5EX9Fh6AwmQzQyf9AkTL2z+0UvKRT";
+    const ED25519_B: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
+
+    fn key(blob: &str) -> russh::keys::PublicKey {
+        russh::keys::parse_public_key_base64(blob).expect("fixture key parses")
+    }
+
+    /// What russh hands `check_server_key`.
+    fn envelope(key: &russh::keys::PublicKey) -> russh::keys::PublicKeyOrCertificate {
+        russh::keys::PublicKeyOrCertificate::PublicKey {
+            key: key.clone(),
+            hash_alg: None,
+        }
+    }
+
+    fn handler(policy: HostKeyPolicy) -> ClientHandler {
+        ClientHandler {
+            policy,
+            host: "buildbox".to_string(),
+            port: 22,
+            refusal: Refusal::default(),
+        }
+    }
+
+    #[test]
+    fn strict_refuses_a_host_that_is_not_in_the_trust_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = HostKeyPolicy::Strict {
+            known_hosts: KnownHosts::at(dir.path().join("known_hosts")),
+        };
+        assert!(!policy.accepts("buildbox", 22, &key(ED25519_A)).unwrap());
+    }
+
+    #[test]
+    fn tofu_records_a_first_connection_and_then_trusts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+
+        assert!(HostKeyPolicy::tofu_at(&path)
+            .accepts("buildbox", 22, &key(ED25519_A))
+            .unwrap());
+
+        let recorded = std::fs::read_to_string(&path).unwrap();
+        assert!(recorded.contains(ED25519_A), "{recorded}");
+
+        // Trust comes from the file, not from memory: a fresh policy over the same path is the
+        // case that a reconnect (or a restarted daemon) actually hits.
+        assert!(HostKeyPolicy::tofu_at(&path)
+            .accepts("buildbox", 22, &key(ED25519_A))
+            .unwrap());
+    }
+
+    #[test]
+    fn tofu_refuses_a_changed_key_and_leaves_the_record_alone() {
+        // This is the man-in-the-middle case, and the reason the fix exists. Accepting here, or
+        // rewriting the entry, would make the attack silent.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        assert!(HostKeyPolicy::tofu_at(&path)
+            .accepts("buildbox", 22, &key(ED25519_A))
+            .unwrap());
+
+        assert!(!HostKeyPolicy::tofu_at(&path)
+            .accepts("buildbox", 22, &key(ED25519_B))
+            .unwrap());
+
+        let recorded = std::fs::read_to_string(&path).unwrap();
+        assert!(recorded.contains(ED25519_A), "{recorded}");
+        assert!(
+            !recorded.contains(ED25519_B),
+            "the attacker's key was recorded"
+        );
+    }
+
+    #[test]
+    fn a_refusal_says_which_key_was_recorded_and_where() {
+        // The connect error is the only thing an operator sees, so it has to carry the detail that
+        // separates "unknown host, run ssh-keyscan" from "something is wrong, investigate".
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        assert!(HostKeyPolicy::tofu_at(&path)
+            .accepts("buildbox", 22, &key(ED25519_A))
+            .unwrap());
+
+        let decision = HostKeyPolicy::tofu_at(&path)
+            .decide("buildbox", 22, &key(ED25519_B))
+            .unwrap();
+
+        let HostKeyDecision::Refuse(reason) = decision else {
+            panic!("expected a refusal, got {decision:?}");
+        };
+        assert!(reason.contains(ED25519_A), "the pinned key: {reason}");
+        assert!(reason.contains("man-in-the-middle"), "{reason}");
+        assert!(
+            reason.contains("known_hosts:1"),
+            "the line to look at: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_first_use_after_an_earlier_refusal_still_works_with_tofu() {
+        // Strict refused it; Tofu is the mode that records it. Nothing about the refusal may
+        // have written a placeholder entry that then reads as a change.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+
+        assert!(!HostKeyPolicy::Strict {
+            known_hosts: KnownHosts::at(&path)
+        }
+        .accepts("buildbox", 22, &key(ED25519_A))
+        .unwrap());
+
+        assert!(HostKeyPolicy::tofu_at(&path)
+            .accepts("buildbox", 22, &key(ED25519_A))
+            .unwrap());
+    }
+
+    #[test]
+    fn insecure_accepts_without_creating_a_trust_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+
+        let policy = HostKeyPolicy::Insecure;
+        assert!(policy.accepts("buildbox", 22, &key(ED25519_A)).unwrap());
+        assert!(policy.accepts("buildbox", 22, &key(ED25519_B)).unwrap());
+        assert!(
+            !path.exists(),
+            "Insecure must not leave a file behind that later reads as trust"
+        );
+        assert!(
+            policy.describe().contains("insecure"),
+            "{}",
+            policy.describe()
+        );
+    }
+
+    #[test]
+    fn a_trust_store_that_cannot_be_read_fails_closed() {
+        // A trust store that cannot be read is not a reason to trust. Returning Ok(true) here — or
+        // treating the error as "unknown host" — would turn a filesystem problem into a silent
+        // downgrade, so the failure has to surface as a refusal the caller can report.
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("known_hosts");
+        std::fs::create_dir(&store).unwrap();
+
+        let err = HostKeyPolicy::tofu_at(&store)
+            .accepts("buildbox", 22, &key(ED25519_A))
+            .unwrap_err();
+        assert!(err.to_string().contains("could not read"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_trust_store_others_can_write_fails_closed() {
+        // A key that cannot be pinned now would be accepted silently on the next attempt, so a
+        // failure to record has to be a failure to connect.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("known_hosts");
+        std::fs::write(&store, "").unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let err = HostKeyPolicy::tofu_at(&store)
+            .accepts("buildbox", 22, &key(ED25519_A))
+            .unwrap_err();
+        assert!(err.to_string().contains("writable by other users"), "{err}");
+    }
+
+    #[test]
+    fn the_policy_describes_itself_with_the_file_it_uses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let described = HostKeyPolicy::tofu_at(&path).describe();
+        assert!(described.contains("tofu"), "{described}");
+        assert!(described.contains("known_hosts"), "{described}");
+    }
+
+    #[tokio::test]
+    async fn the_handler_refuses_an_unknown_host_and_records_why() {
+        use russh::client::Handler as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut handler = handler(HostKeyPolicy::Strict {
+            known_hosts: KnownHosts::at(dir.path().join("known_hosts")),
+        });
+
+        let accepted = handler
+            .check_server_key(&envelope(&key(ED25519_A)))
+            .await
+            .unwrap();
+        assert!(!accepted);
+
+        // Without this the connect error says "could not reach the host", which is exactly the
+        // wrong thing to tell an operator whose connection was refused on purpose.
+        let reason = handler.refusal.get().expect("a refusal reason is recorded");
+        assert!(reason.contains("buildbox:22"), "{reason}");
+        assert!(reason.contains("strict"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn the_handler_records_a_first_use_so_the_next_connection_is_verified() {
+        use russh::client::Handler as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+
+        let mut first = handler(HostKeyPolicy::tofu_at(&path));
+        assert!(first
+            .check_server_key(&envelope(&key(ED25519_A)))
+            .await
+            .unwrap());
+        assert!(std::fs::read_to_string(&path).unwrap().contains(ED25519_A));
+
+        // The second connection is checked against what the first one recorded.
+        let mut second = handler(HostKeyPolicy::tofu_at(&path));
+        assert!(second
+            .check_server_key(&envelope(&key(ED25519_A)))
+            .await
+            .unwrap());
+
+        let mut attacker = handler(HostKeyPolicy::tofu_at(&path));
+        assert!(!attacker
+            .check_server_key(&envelope(&key(ED25519_B)))
+            .await
+            .unwrap());
+        let reason = attacker.refusal.get().unwrap();
+        assert!(reason.contains("does not match"), "{reason}");
     }
 }
