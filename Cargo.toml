@@ -109,6 +109,10 @@ rusqlite = { version = "0.32", features = ["bundled", "chrono", "serde_json"] }
 # remote / sandbox
 russh = "0.63"
 russh-keys = "0.45"
+# `known_hosts` hashed host fields are HMAC-SHA1 — the format on disk, not a choice. Same
+# versions `russh` already pulls in, so this adds no new crate to the graph.
+hmac = "0.13"
+sha1 = "0.11"
 bollard = "0.21"
 
 # mcp

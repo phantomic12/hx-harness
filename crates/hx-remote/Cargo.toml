@@ -17,3 +17,8 @@ tracing.workspace = true
 chrono.workspace = true
 base64.workspace = true
 russh.workspace = true
+hmac.workspace = true
+sha1.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

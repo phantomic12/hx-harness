@@ -2,8 +2,9 @@ name: CI
 
 # The three checks that gate every change: formatting, lints, and the test suite.
 #
-# `cargo test` here runs 347 in-process unit tests with no external dependencies. Read
-# TESTING.md before trusting a green badge: it separates "executed against a real service"
+# `cargo test` here runs 381 in-process unit tests with no external dependencies, plus 5
+# `#[ignore]`d integration tests that need a real SSH host and are therefore not run here.
+# Read TESTING.md before trusting a green badge: it separates "executed against a real service"
 # from "unit-tested" from "merely compiles", and nothing in this file reaches tier A.
 
 on:
