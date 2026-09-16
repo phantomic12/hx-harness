@@ -57,6 +57,7 @@ $ curl -s localhost:7717/v1/status | jq .pools
 | Capability tokens, approval policy, command classification | **Done**, tested |
 | Encrypted secret vault (Argon2id + XChaCha20), outbound redaction | **Done**, tested |
 | Model pools, per-credential rate/token/budget limits, role routing | **Done**, tested |
+| Provider adapters: OpenAI-compatible `/v1/chat/completions` | **Built** — wire mapping unit-tested, real HTTP against a stub, and a real model: text, usage, tool calls and a tool-result round trip (`crates/hx-provider/tests/openai_live.rs`) |
 | Web search: self-hosted SearXNG + keyless DuckDuckGo, RRF fusion, per-backend failure reporting | **Built** — SearXNG verified end to end against a live instance; DuckDuckGo is bot-walled for a non-browser client and *says so* rather than returning nothing |
 | Remote hosts: local + SSH (real `russh`), host key verification, Windows/macOS/Linux capability detection | **Built** — connect, auth, exec and file transfer run against a real host (`crates/hx-remote/tests/ssh_live.rs`) |
 | Sandboxes: L1/L2/L3 isolation ladder, Docker lifecycle, TTL reaper | **Built** — created, confined and reaped against a real daemon (`crates/hx-sandbox/tests/docker_live.rs`), running as the workspace's owner so the bind mount is writable; L3 verified inside gVisor, where the sandbox sees `4.19.0-gvisor` and not the host kernel |
@@ -151,11 +152,13 @@ $ ./target/release/hxd --bind 127.0.0.1:7717
 ```
 
 ```console
-$ cargo test --workspace         # 390 unit tests + 18 ignored integration tests
+$ cargo test --workspace         # 410 unit tests + 11 hermetic HTTP tests + 22 ignored live tests
 $ cargo test -p hx-sandbox --test docker_live -- --ignored   # needs a container engine
 $ cargo test -p hx-remote --test ssh_live -- --ignored       # needs an SSH server
 $ HX_SEARXNG_URL=... HX_SEARCH_EXPECT_RESULTS=searxng \
   cargo test -p hx-search --test search_live -- --ignored   # needs the internet
+$ HX_OPENAI_TEST_BASE_URL=... HX_OPENAI_TEST_MODEL=... HX_OPENAI_TEST_KEY=... \
+  cargo test -p hx-provider --test openai_live -- --ignored # needs a real model
 ```
 
 The last two are what reach a real service; `.github/workflows/integration.yml` runs both, against a

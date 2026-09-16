@@ -4,12 +4,16 @@ Status: 2026-09-15. Companion to `ROADMAP.md` (which tracks features); this file
 
 ```console
 $ cargo test --workspace
-390 passed; 0 failed; 18 ignored         # 8 crates with code
+410 unit + 11 hermetic HTTP tests, 0 failed
+22 ignored                               # live: Docker, SSH, search, a real model
 
 # The 18 that need a real server, run by `.github/workflows/integration.yml`
 # and `.github/workflows/canary.yml`:
 $ cargo test -p hx-sandbox --test docker_live -- --ignored --test-threads=1
 9 passed; 0 failed                       # a real Docker daemon, with gVisor installed
+$ HX_OPENAI_TEST_BASE_URL=… HX_OPENAI_TEST_MODEL=… HX_OPENAI_TEST_KEY=… \
+  cargo test -p hx-provider --test openai_live -- --ignored --test-threads=1
+4 passed; 0 failed                       # a real model, through a real gateway
 $ cargo test -p hx-remote --test ssh_live -- --ignored --test-threads=1
 5 passed; 0 failed                       # a real sshd, real key auth
 $ HX_SEARXNG_URL=http://127.0.0.1:8888 HX_SEARCH_EXPECT_RESULTS=searxng \
@@ -82,6 +86,23 @@ keep. The first failing run also happened to demonstrate the rollback invariant 
 engine: seven spawns failed at *start* after a successful create, and every one reported
 `it has been removed`.
 
+**A real model, through a real gateway** (`crates/hx-provider/tests/openai_live.rs`)
+
+Four tests against a hosted gateway (OpenAI-compatible `/v1`), model `gemini/gemini-3.1-flash-lite`,
+key from the deployment's env file and never echoed:
+
+| What ran | Observed |
+|---|---|
+| A completion, with usage | `finish=Stop in=11 out=1 text="Ok"` — real token accounting, not an estimate |
+| A tool call, and its result going back | The model emitted `ls({"path":"/tmp"})`, the arguments parsed into an object, the result was appended as a tool message, and the follow-up turn answered in prose: *"The contents of `/tmp` are: cargo-target, rustc-log.txt, hx-workspace"* — the exact cycle the agent loop will run |
+| Multi-turn context | Two turns, the second referring to the first, answered `"41"` — the transcript is not being dropped by the adapter |
+| A wrong credential | Clean `401` classified as an authentication failure, with the provider's own message quoted and no key material in it |
+
+The same suite has a hermetic sibling (`openai_http.rs`, 11 tests, runs on every commit) which points
+the adapter at a stub server and asserts the real request line, headers and body: `arguments` as a
+JSON *string*, `content: null` for a tool-only assistant turn, one `tool` message per call id, and
+`Retry-After` honoured on a `429`.
+
 **The SSH transport, against a real sshd** (`crates/hx-remote/tests/ssh_live.rs`)
 
 Against an Ubuntu 24.04 host by hand, and against a throwaway `sshd` on a non-default port in CI —
@@ -124,7 +145,7 @@ returning an empty list.
 | Crate | Tests | LOC | What the tests actually prove |
 |---|---|---|---|
 | `hx-core` | 83 | 4092 | ID monotonicity, error taxonomy, **capability path grants** (incl. the empty-grant-means-root regression), approval policy incl. unattended budgets, message/event round-trips, config parsing and rejection of unknown keys |
-| `hx-provider` | 61 | 2820 | Token-bucket timing, **budget fail-closed on a zero estimate**, credential pool round-robin, shared-limiter identity across pools, routing and fallthrough |
+| `hx-provider` | 81 | 3679 | Token-bucket timing, **budget fail-closed on a zero estimate**, credential pool round-robin, shared-limiter identity across pools, routing and fallthrough |
 | `hx-remote` | 90 | 3108 | Platform caps parsing (`uname`/`ver`), path translation, shell quoting incl. injection attempts, risky-command classification, mid-truncation, approval round-trip against the local host, and **`known_hosts`**: hashed host fields (HMAC-SHA1), globs, negation, `@revoked` beating trust regardless of line order, a different key type reading as first use rather than substitution, plus the policy's fail-closed behaviour and the wording of every refusal |
 | `hx-sandbox` | 62 | 2057 | Isolation ladder ordering and monotonicity, spec↔YAML round-trip, `SandboxSpec`→`HostConfig` mapping field by field, **no engine-rejected security option** (`userns=`, `seccomp=default`), an egress allowlist that cannot be enforced, registry/TTL bookkeeping, the concurrency cap, and rollback on a failed start |
 | `hx-search` | 45 | 1732 | RRF rank fusion, HTML extraction, entity decoding, per-backend failure isolation (with **fake** backends) |
@@ -148,9 +169,8 @@ the failure is silent:
 
 | Call site | Why it has never run | Risk if wrong |
 |---|---|---|
-| **Egress filtering** | Not implemented: no proxy, no firewall rule. Now *refused* rather than ignored (`SpecError::EgressNotEnforced`), so it cannot silently mean "open internet" |
+| **Egress filtering** | Not implemented: no proxy, no firewall rule. Now *refused* rather than ignored (`SpecError::EgressNotEnforced`), so it cannot silently mean "open internet" | Medium — a networked sandbox is unrestricted |
 | DuckDuckGo keyless scraping — the *success* path | Every attempt from a plain HTTP client is answered with an `anomaly` challenge: a TLS-fingerprint wall, not a markup change. The failure path is verified live; the success path needs a browser-fingerprint client (M6) | Medium — search silently loses a source, but `SearchReport` names it |
-| Provider HTTP calls to a real model API | Needs keys | Medium |
 | Vault written to disk and reopened in a **new process** | Untested | Medium — in-process round-trip only |
 | `hxd` reaper loop, `axum::serve` under load | Manual only | Low |
 
@@ -243,7 +263,7 @@ environment work rather than code work.
 ## Running the suite
 
 ```bash
-cargo test --workspace          # 390 unit tests + 18 ignored integration tests
+cargo test --workspace          # 410 unit tests + 11 hermetic HTTP + 22 ignored live tests
 cargo test -p hx-sandbox        # 62 — includes the ladder and the rollback invariants
 cargo test -p hx-remote         # 90 — includes known_hosts parsing and the host key policy
 cargo build --workspace         # clean: 0 warnings, 0 deprecations
@@ -259,8 +279,9 @@ HX_SSH_TEST_HOST=<host> HX_SSH_TEST_USER=<user> HX_SSH_TEST_KEY=~/.ssh/id_ed2551
 
 - **8 crates with logic**: unit-tested at the level of pure functions and in-process lifecycles.
 - **6 crates**: empty. The green suite does not cover them.
-- **18 integration tests**, all `#[ignore]`d by default, all run in CI: a real Docker daemon with
-  gVisor installed, a real `sshd`, and a real SearXNG against the live internet.
+- **22 live tests**, all `#[ignore]`d by default: a real Docker daemon with gVisor installed, a real
+  `sshd` and a real SearXNG are run in CI; the four against a real model are run deliberately, since
+  they need a key and CI has none.
 - **The SSH transport and the sandbox lifecycle are tier A, and regress loudly**: host key refusals
   observed against a real server, and a container whose egress, pid ceiling, read-only root, bind
   mount and reaper were each verified against the daemon rather than against our own bookkeeping.
