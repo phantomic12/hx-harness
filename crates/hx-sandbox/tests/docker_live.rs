@@ -33,7 +33,7 @@ fn image() -> String {
 }
 
 struct Live {
-    manager: SandboxManager,
+    manager: Arc<SandboxManager>,
     docker: Docker,
     /// Held so the directory outlives the container that bind-mounts it.
     _workspace: tempfile::TempDir,
@@ -64,7 +64,7 @@ async fn live(cap: usize) -> Option<Live> {
     let workspace_path = workspace.path().to_string_lossy().into_owned();
 
     Some(Live {
-        manager: SandboxManager::new(runtime, cap),
+        manager: Arc::new(SandboxManager::new(runtime, cap)),
         docker,
         _workspace: workspace,
         workspace_path,
@@ -106,6 +106,59 @@ fn writable_spec(
     spec.adopt_workspace_owner()
         .expect("the temp workspace is statable");
     spec
+}
+
+/// Whether the daemon has this OCI runtime registered (e.g. `runsc` for gVisor).
+async fn has_runtime(docker: &Docker, name: &str) -> bool {
+    docker
+        .info()
+        .await
+        .ok()
+        .and_then(|info| info.runtimes)
+        .map(|runtimes| runtimes.contains_key(name))
+        .unwrap_or(false)
+}
+
+/// True when this environment says a capability must be present rather than skipped.
+///
+/// Without it, "install nothing and the test skips" is a way for a capability to disappear from CI
+/// while the suite stays green — the exact failure this file exists to prevent.
+fn required(name: &str) -> bool {
+    std::env::var(format!("HX_DOCKER_REQUIRE_{}", name.to_uppercase())).is_ok()
+}
+
+/// Removes a sandbox when it goes out of scope — including when the test panics.
+///
+/// The first version of this file destroyed the sandbox at the end of the test body, which meant a
+/// failing assertion left a container running on the host: the run that found the `seccomp=default`
+/// defect leaked one and it was still up 36 minutes later. A test that fails should not also
+/// litter.
+struct Cleanup {
+    manager: Arc<SandboxManager>,
+    id: String,
+    runtime: tokio::runtime::Handle,
+}
+
+impl Cleanup {
+    fn new(manager: &Arc<SandboxManager>, id: &str) -> Self {
+        Self {
+            manager: Arc::clone(manager),
+            id: id.to_string(),
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+}
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        let manager = Arc::clone(&self.manager);
+        let id = std::mem::take(&mut self.id);
+        // `destroy` is idempotent, so the tests that assert the container is gone can still do so;
+        // this only matters on the paths that never reach their own cleanup.
+        self.runtime.spawn(async move {
+            let _ = manager.destroy(&id).await;
+        });
+    }
 }
 
 /// Whether the engine still has this container.
@@ -154,6 +207,7 @@ async fn an_l2_sandbox_is_created_by_a_real_daemon_and_carries_its_settings() {
         .spawn(&spec, Utc::now())
         .await
         .expect("the daemon accepts an L2 sandbox");
+    let _cleanup = Cleanup::new(&live.manager, handle.id.as_str());
 
     // What the daemon actually stored, not what we asked for.
     let inspected = live
@@ -232,6 +286,7 @@ async fn network_none_really_blocks_egress() {
         )
         .await
         .expect("spawn");
+    let _cleanup = Cleanup::new(&live.manager, handle.id.as_str());
 
     // A TCP connection attempt. `network=none` gives the container a loopback interface and
     // nothing else, so this must fail rather than merely be discouraged.
@@ -284,6 +339,7 @@ async fn a_read_only_root_rejects_writes_while_the_workspace_stays_writable() {
         )
         .await
         .expect("spawn");
+    let _cleanup = Cleanup::new(&live.manager, handle.id.as_str());
 
     let root_write = exec(
         &live.manager,
@@ -353,6 +409,7 @@ async fn the_pid_ceiling_is_applied_by_the_kernel_and_stops_a_fork_bomb() {
         )
         .await
         .expect("spawn");
+    let _cleanup = Cleanup::new(&live.manager, handle.id.as_str());
 
     // What the kernel was told, read from *inside* the container so it is the sandbox's own cgroup
     // and not the host's.
@@ -413,6 +470,7 @@ async fn the_ttl_reaper_actually_removes_the_container() {
         .spawn(&writable_spec(&live, IsolationLevel::L2, 1, 64), Utc::now())
         .await
         .expect("spawn");
+    let _cleanup = Cleanup::new(&live.manager, handle.id.as_str());
 
     assert!(container_exists(&live.docker, &handle.runtime_id).await);
 
@@ -441,6 +499,7 @@ async fn destroying_a_sandbox_stops_and_removes_it_and_is_idempotent() {
         )
         .await
         .expect("spawn");
+    let _cleanup = Cleanup::new(&live.manager, handle.id.as_str());
 
     live.manager.destroy(handle.id.as_str()).await.unwrap();
     assert!(!container_exists(&live.docker, &handle.runtime_id).await);
@@ -464,6 +523,7 @@ async fn the_concurrency_cap_refuses_the_n_plus_first_container() {
         )
         .await
         .expect("the first sandbox fits");
+    let _cleanup = Cleanup::new(&live.manager, first.id.as_str());
 
     let err = live
         .manager
@@ -518,4 +578,91 @@ async fn a_missing_image_fails_without_leaving_a_container_behind() {
         before,
         "a failed spawn left a container behind"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// L3: the level that exists to deny the sandbox the host kernel
+// ---------------------------------------------------------------------------------------------
+
+#[ignore = "requires a docker daemon with the gVisor (runsc) runtime registered"]
+#[tokio::test]
+async fn l3_runs_inside_a_guest_kernel() {
+    let Some(live) = live(4).await else { return };
+
+    if !has_runtime(&live.docker, "runsc").await {
+        assert!(
+            !required("l3"),
+            "HX_DOCKER_REQUIRE_L3 is set but the daemon has no runsc runtime — installing gVisor is              what makes this test mean anything"
+        );
+        eprintln!("skipped: the daemon has no gVisor runtime registered (install runsc)");
+        return;
+    }
+
+    let spec = writable_spec(&live, IsolationLevel::L3, 3600, 128);
+    let handle = live
+        .manager
+        .spawn(&spec, Utc::now())
+        .await
+        .expect("the daemon accepts an L3 sandbox");
+    let _cleanup = Cleanup::new(&live.manager, handle.id.as_str());
+
+    // The daemon's record: it really is on the VM-backed runtime, not on runc.
+    let inspected = live
+        .docker
+        .inspect_container(&handle.runtime_id, None::<InspectContainerOptions>)
+        .await
+        .expect("the container exists");
+    let host_config = inspected.host_config.expect("a host config");
+    assert_eq!(
+        host_config.runtime.as_deref(),
+        Some("runsc"),
+        "L3 must be started on the VM-backed runtime, not the default one"
+    );
+    assert_eq!(host_config.network_mode.as_deref(), Some("none"));
+    assert_eq!(host_config.readonly_rootfs, Some(true));
+
+    // The claim L3 makes, tested directly: the kernel the sandbox sees is not the host's.
+    let inside = exec(&live.manager, handle.id.as_str(), "uname -r").await;
+    let guest = inside.stdout.trim().to_string();
+    let host = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .expect("the host kernel release")
+        .trim()
+        .to_string();
+
+    eprintln!("L3 kernel: guest={guest} host={host}");
+    assert!(inside.success(), "{inside:?}");
+    assert!(
+        !guest.is_empty() && guest != host,
+        "the sandbox reports the host kernel ({guest}); L3 exists precisely to deny it"
+    );
+    assert!(
+        guest.contains("gvisor"),
+        "expected gVisor's synthetic kernel release, got {guest:?}"
+    );
+
+    // And it is still a usable sandbox: non-root, read-only root, workspace writable.
+    let id = exec(&live.manager, handle.id.as_str(), "id -u; echo alive").await;
+    assert!(id.success(), "{id:?}");
+    let uid = id.stdout.lines().next().unwrap_or_default().to_string();
+    assert_ne!(uid, "0", "the sandbox must not run as root: {id:?}");
+
+    let write = exec(
+        &live.manager,
+        handle.id.as_str(),
+        "touch /workspace/from-l3 && echo WORKSPACE_WRITABLE",
+    )
+    .await;
+    assert!(write.stdout.contains("WORKSPACE_WRITABLE"), "{write:?}");
+    assert!(
+        live._workspace.path().join("from-l3").exists(),
+        "the bind mount did not reach the host from inside gVisor"
+    );
+
+    let denied = exec(&live.manager, handle.id.as_str(), "touch /not-allowed").await;
+    assert!(
+        !denied.success(),
+        "a read-only root accepted a write: {denied:?}"
+    );
+
+    live.manager.destroy(handle.id.as_str()).await.unwrap();
 }

@@ -4,12 +4,12 @@ Status: 2026-09-15. Companion to `ROADMAP.md` (which tracks features); this file
 
 ```console
 $ cargo test --workspace
-390 passed; 0 failed; 17 ignored         # 8 crates with code
+390 passed; 0 failed; 18 ignored         # 8 crates with code
 
-# The 17 that need a real server, run by `.github/workflows/integration.yml`
+# The 18 that need a real server, run by `.github/workflows/integration.yml`
 # and `.github/workflows/canary.yml`:
 $ cargo test -p hx-sandbox --test docker_live -- --ignored --test-threads=1
-8 passed; 0 failed                       # a real Docker daemon
+9 passed; 0 failed                       # a real Docker daemon, with gVisor installed
 $ cargo test -p hx-remote --test ssh_live -- --ignored --test-threads=1
 5 passed; 0 failed                       # a real sshd, real key auth
 $ HX_SEARXNG_URL=http://127.0.0.1:8888 HX_SEARCH_EXPECT_RESULTS=searxng \
@@ -18,7 +18,7 @@ $ HX_SEARXNG_URL=http://127.0.0.1:8888 HX_SEARCH_EXPECT_RESULTS=searxng \
 ```
 
 The counts matter in both directions. A green `cargo test` alone still means **the logic is right**;
-those 17 ignored tests are the ones that have reached another process, and the only ones here that
+those 18 ignored tests are the ones that have reached another process, and the only ones here that
 could catch a protocol mistake. They now run in CI, which is the difference between "verified once"
 and "stays verified".
 
@@ -37,7 +37,7 @@ Every claim in the repo falls into one of these. The gap that bites is B→C.
 
 **The isolation ladder, against a real Docker daemon** (`crates/hx-sandbox/tests/docker_live.rs`)
 
-Eight tests against Docker 29 on Ubuntu 24.04 with cgroup v2. This suite exists because the ladder
+Nine tests against Docker 29 on Ubuntu 24.04 with cgroup v2 and gVisor registered. This suite exists because the ladder
 was a *mapping* — `SandboxSpec` → `HostConfig`, asserted field by field — and a mapping proves
 intent, not that the engine accepts it.
 
@@ -53,6 +53,7 @@ intent, not that the engine accepts it.
 | Destroy, twice | Container gone, slot released, second call is a no-op |
 | The concurrency cap | The N+1th spawn fails with `1 of 1` and the daemon's container count is unchanged — refused, not created-then-cleaned |
 | A missing image | Fails naming the image, tracks nothing, consumes no slot, leaves no container |
+| **L3 on a VM-backed runtime** | `inspect_container` reports `runtime: runsc`, `network_mode: none`, read-only root; the sandbox sees kernel **`4.19.0-gvisor`** while the host is on `7.0.0-30-generic`; non-root; a write through the bind mount reaches the host from inside gVisor; a write to the root is refused |
 
 **Four defects the live runs found, none of them visible to the unit suite:**
 
@@ -147,7 +148,6 @@ the failure is silent:
 
 | Call site | Why it has never run | Risk if wrong |
 |---|---|---|
-| **L3 sandbox** (`runtime: runsc`) | Nothing installs gVisor, including CI | **High** — the level exists to deny the sandbox the host kernel, and no container has ever started on it |
 | **Egress filtering** | Not implemented: no proxy, no firewall rule. Now *refused* rather than ignored (`SpecError::EgressNotEnforced`), so it cannot silently mean "open internet" |
 | DuckDuckGo keyless scraping — the *success* path | Every attempt from a plain HTTP client is answered with an `anomaly` challenge: a TLS-fingerprint wall, not a markup change. The failure path is verified live; the success path needs a browser-fingerprint client (M6) | Medium — search silently loses a source, but `SearchReport` names it |
 | Provider HTTP calls to a real model API | Needs keys | Medium |
@@ -181,6 +181,11 @@ test. And a suite with no integration tests cannot tell "verified" from "compile
 settings the engine rejects, and one security control that did nothing, survived 347 green tests and
 shipped in a config an operator would read as hardened.
 
+A third, smaller lesson came out of running the live suite on a real machine: **a failing test
+littered**. Cleanup lived at the end of each test body, so the run that found the `seccomp=default`
+defect left a container running, and it was still up 36 minutes later. A `Drop` guard now destroys
+the sandbox however the test ends — including a panic. A test that fails should not also leak.
+
 ## Roadmap: closing the gaps, in priority order
 
 Ordered by (security impact × likelihood of silent breakage), not by effort.
@@ -205,7 +210,7 @@ CI, on a non-default port so the bracketed `known_hosts` form is exercised. It i
 machine and not a Windows host — that is item 7.
 
 **4 — Mark the untested paths so the suite cannot lie. ✅ Done for both live surfaces.**
-`cargo test --workspace` reports `17 ignored` instead of implying full coverage, and
+`cargo test --workspace` reports `18 ignored` instead of implying full coverage, and
 `.github/workflows/integration.yml` runs them where CI can host them. The remaining tier C paths —
 L3, the egress proxy, real search backends — should get the same treatment as they gain tests; the
 suite's real weakness was never low coverage but that **nothing distinguished "verified" from
@@ -223,14 +228,22 @@ recorded in README as the reason a browser-fingerprint client is M6 work rather 
 **6 — End-to-end agent test.** Blocked on M1. The moment the loop exists it should drive one real
 task against a real sandbox — that becomes the first true end-to-end test in the repo.
 
-**7 — L3, and a non-Linux remote.** Two things the ladder and the transport claim and nothing has
-run: a sandbox on a VM-backed runtime (`runsc`), and the transport against a Windows host, where the
-shell wrapping and the POSIX-only file-transfer guards have never met a real server.
+**7 — L3, and a non-Linux remote.**
+
+✅ **L3 done.** gVisor's `runsc` is installed by the integration job, registered as a daemon runtime,
+and the L3 test asserts the claim rather than the mapping: the sandbox reports `4.19.0-gvisor` where
+the host reports `7.0.0-30-generic`, keeps a read-only root, runs non-root, and writes through the
+bind mount. `HX_DOCKER_REQUIRE_L3=1` makes a missing gVisor a failure, so the capability cannot
+quietly stop being tested.
+
+◐ **A Windows remote is still unverified** — its shell wrapping and the POSIX-only file-transfer
+guards have never met a real server. It needs a Windows box with an SSH server and a key, which is
+environment work rather than code work.
 
 ## Running the suite
 
 ```bash
-cargo test --workspace          # 390 unit tests + 17 ignored integration tests
+cargo test --workspace          # 390 unit tests + 18 ignored integration tests
 cargo test -p hx-sandbox        # 62 — includes the ladder and the rollback invariants
 cargo test -p hx-remote         # 90 — includes known_hosts parsing and the host key policy
 cargo build --workspace         # clean: 0 warnings, 0 deprecations
@@ -246,8 +259,8 @@ HX_SSH_TEST_HOST=<host> HX_SSH_TEST_USER=<user> HX_SSH_TEST_KEY=~/.ssh/id_ed2551
 
 - **8 crates with logic**: unit-tested at the level of pure functions and in-process lifecycles.
 - **6 crates**: empty. The green suite does not cover them.
-- **17 integration tests**, all `#[ignore]`d by default, all run in CI: a real Docker daemon, a real
-  `sshd`, and a real SearXNG against the live internet.
+- **18 integration tests**, all `#[ignore]`d by default, all run in CI: a real Docker daemon with
+  gVisor installed, a real `sshd`, and a real SearXNG against the live internet.
 - **The SSH transport and the sandbox lifecycle are tier A, and regress loudly**: host key refusals
   observed against a real server, and a container whose egress, pid ceiling, read-only root, bind
   mount and reaper were each verified against the daemon rather than against our own bookkeeping.
@@ -255,6 +268,8 @@ HX_SSH_TEST_HOST=<host> HX_SSH_TEST_USER=<user> HX_SSH_TEST_KEY=~/.ssh/id_ed2551
   rejects (so every L2/L3 sandbox failed to start), an egress allowlist that was accepted and
   ignored, and a hardcoded sandbox uid that made the workspace unwritable on any host whose user is
   not uid 1000. All four are fixed and pinned by tests.
-- **What is still tier C is the sandbox's strongest claim**: L3 has never run, because nothing
-  installs gVisor. That is next, with the egress proxy behind it — and behind that, keyless scraping
-  that survives a TLS-fingerprint bot wall, which is browser-pool work rather than parser work.
+- **The ladder is now verified end to end**, L3 included: the sandbox on a VM-backed runtime sees a
+  guest kernel, not the host's.
+- **What is still tier C**: egress filtering (not implemented, and refused rather than pretended),
+  keyless scraping that survives a TLS-fingerprint bot wall (browser-pool work), the vault opened in
+  a new process, and provider calls to a real model API.
