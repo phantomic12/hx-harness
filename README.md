@@ -63,6 +63,7 @@ $ curl -s localhost:7717/v1/status | jq .pools
 | Sandboxes: L1/L2/L3 isolation ladder, Docker lifecycle, TTL reaper | **Built** — created, confined and reaped against a real daemon (`crates/hx-sandbox/tests/docker_live.rs`), running as the workspace's owner so the bind mount is writable; L3 verified inside gVisor, where the sandbox sees `4.19.0-gvisor` and not the host kernel |
 | Daemon (`hxd`) + HTTP API + CLI (`hx`) | **Done**, runnable |
 | Tools (`hx-tools`) + the agent loop (`hx-agent`) | **Built** — six tools, and a loop that classifies every call against the capability token and then the approval policy; 21 tests pin the gate down against a scripted model (`crates/hx-agent/tests/loop.rs`) |
+| Sessions (`hx-store`) | **Built** — SQLite: create, resume, list, rename, delete, export (JSON/Markdown), events, usage totals. A transcript that ended mid-call is *repaired*, not sent to a provider that would reject it |
 | Web UI, Tauri desktop/mobile, chat connectors | **Not started** |
 | MCP client, browser-automation pool | **Not started** |
 | The loop wired into `hxd`/`hx` | **Not started** — see below |
@@ -113,14 +114,15 @@ crates/
   hx-sandbox     isolation ladder, sandbox specs, container lifecycle + reaper
   hx-tools       the tools an agent calls, each declaring the resource it needs
   hx-agent       the loop, and the two gates — capability, then approval — every call passes
+  hx-store       SQLite: sessions, transcripts, events, usage
   hx-server      the HTTP API and shared daemon state
 apps/
   hxd            the daemon
   hx             the CLI
 ```
 
-Empty placeholder crates (`hx-store`, `hx-gateway`, `hx-mcp`, `hx-browser`) are reserved for the
-milestones that need them.
+Empty placeholder crates (`hx-browser`, `hx-gateway`, `hx-mcp`) are reserved for the milestones that
+need them.
 
 ## Installing
 
@@ -155,7 +157,7 @@ $ ./target/release/hxd --bind 127.0.0.1:7717
 ```
 
 ```console
-$ cargo test --workspace         # 493 unit tests + 11 hermetic HTTP tests + 22 ignored live tests
+$ cargo test --workspace         # 546 tests: 531 unit + 11 hermetic HTTP + 4 file-backed store, 22 ignored
 $ cargo test -p hx-sandbox --test docker_live -- --ignored   # needs a container engine
 $ cargo test -p hx-remote --test ssh_live -- --ignored       # needs an SSH server
 $ HX_SEARXNG_URL=... HX_SEARCH_EXPECT_RESULTS=searxng \
@@ -172,11 +174,11 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
 
 ## What is deliberately not done yet
 
-- **The loop exists; nothing constructs it yet.** `hx-agent` has the model call, the tool dispatch,
-  the capability check, the approval prompt and refusals-as-results, tested against a scripted model.
-  What is missing is everything around it: streaming, context compaction, a session store, and any
-  caller — `hxd` and `hx` do not build a loop yet, so `/v1/chat` returns `501` and says so rather
-  than pretending.
+- **The loop and the store exist; nothing wires them together.** `hx-agent` has the model call, the
+  tool dispatch, the capability check, the approval prompt and refusals-as-results; `hx-store` has
+  sessions, transcripts, events and usage in SQLite. What is missing is the seam between them and a
+  client: streaming, context compaction, and any caller — `hxd` and `hx` construct neither yet, so
+  `/v1/chat` returns `501` and says so rather than pretending.
 - **Nothing in `ci.yml` reaches another machine.** That file is in-process unit tests; the tests
   that open a socket — a real Docker daemon, a real `sshd` — live in
   `.github/workflows/integration.yml` and are `#[ignore]`d by default, so a local `cargo test` stays

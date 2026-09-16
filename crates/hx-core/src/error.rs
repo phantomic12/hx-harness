@@ -46,6 +46,15 @@ pub enum HxError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// A durable-store failure — SQLite, a migration, or a row that does not parse.
+    ///
+    /// Deliberately *not* retryable: the transient case (`SQLITE_BUSY`) is absorbed by the store's
+    /// own busy timeout, so anything that reaches here is a real fault — a corrupt file, a schema
+    /// from a newer build, a row whose JSON no longer parses — and retrying it forever is how a
+    /// daemon turns a broken database into a busy loop.
+    #[error("store error: {0}")]
+    Store(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

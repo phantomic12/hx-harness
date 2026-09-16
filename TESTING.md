@@ -4,7 +4,7 @@ Status: 2026-09-15. Companion to `ROADMAP.md` (which tracks features); this file
 
 ```console
 $ cargo test --workspace
-493 unit + 11 hermetic HTTP tests, 0 failed
+546 tests, 0 failed                       # 531 unit + 11 hermetic HTTP + 4 file-backed store
 22 ignored                               # live: Docker, SSH, search, a real model
 
 # The 22 that need a real server, run by `.github/workflows/integration.yml`
@@ -152,6 +152,7 @@ returning an empty list.
 | `hx-search` | 45 | 1732 | RRF rank fusion, HTML extraction, entity decoding, per-backend failure isolation (with **fake** backends) |
 | `hx-secrets` | 27 | 901 | Argon2id+XChaCha20 round-trip, tamper detection, redaction patterns |
 | `hx-agent` | 21 | 727 | The loop's gate, in one file of integration tests: a **capability denial is a result the model reads and cannot be approved away** (an approver willing to say yes is never asked), an approval denial is reported and the command never reaches the host, `allow for chat` stops the second prompt while a remembered denial is not re-asked, a tool declaring no external effect is never prompted about, a refused call does not stop its sibling, unknown tools and unusable arguments return as results, a non-zero exit is still a call that *ran*, `max_turns` and the deadline stop the run, and the exact event sequence a client renders |
+| `hx-store` | 38 | 2051 | Migrations applied once and never re-run, **a database from a newer build refused with both versions named** (and left untouched), `STRICT` rejecting a type mistake at insert, the transcript written by `seq` the caller does not track, a batch written whole or not at all, a cascade that only happens because `Store` sets `foreign_keys`, every part type round-tripping while an unknown one is reported rather than dropped, events and usage surviving a reopen — plus 4 in `tests/resume.rs` that drop the store and open a **new connection** to the same file, which is the closest a test gets to killing the daemon |
 | `hx-server` | 11 | 739 | Route dispatch via `oneshot`, `HxError`→HTTP status mapping |
 | `hx` | 11 | — | Renderers for pools/hosts/sandbox-spec, CLI parsing |
 
@@ -178,9 +179,9 @@ the failure is silent:
 
 ### Tier D — absent
 
-Four crates are one line each — placeholder `lib.rs` with a doc comment and nothing else:
+Three crates are one line each — placeholder `lib.rs` with a doc comment and nothing else:
 
-`hx-browser` · `hx-gateway` · `hx-mcp` · `hx-store`
+`hx-browser` · `hx-gateway` · `hx-mcp`
 
 They are declared as workspace members, so `cargo test` reports nothing for them and the build is
 green. **A green suite says nothing about them.** Also absent: the web UI, the Tauri desktop/mobile
@@ -268,7 +269,8 @@ environment work rather than code work.
 ## Running the suite
 
 ```bash
-cargo test --workspace          # 493 unit tests + 11 hermetic HTTP + 22 ignored live tests
+cargo test --workspace          # 546 tests: 531 unit + 11 hermetic HTTP + 4 file-backed store, 22 ignored
+cargo test -p hx-store          # 42 — migrations, the transcript, and 4 that reopen the file
 cargo test -p hx-agent          # 21 — the loop's gate, against a scripted model and a fake host
 cargo test -p hx-tools          # 62 — requirements, bounded output, the two-phase registry
 cargo test -p hx-sandbox        # 62 — includes the ladder and the rollback invariants
@@ -284,8 +286,14 @@ HX_SSH_TEST_HOST=<host> HX_SSH_TEST_USER=<user> HX_SSH_TEST_KEY=~/.ssh/id_ed2551
 
 ## Summary
 
-- **10 crates with logic**: unit-tested at the level of pure functions and in-process lifecycles.
-- **4 crates**: empty. The green suite does not cover them.
+- **11 crates with logic**: unit-tested at the level of pure functions and in-process lifecycles.
+- **3 crates**: empty. The green suite does not cover them.
+- **The store's resume path is tested across a real process boundary, in the only way a test can**:
+  four tests in `crates/hx-store/tests/resume.rs` drop the `Store` and open a *new connection* to
+  the same file, then continue the conversation. One of them is the case M1's exit criterion turns
+  on — a run that died between a tool call and its result — where the transcript is repaired with a
+  result that says the call did not run, rather than being sent to a provider that would reject it
+  with an error that does not mention the cause.
 - **The agent loop's gate is tested where it can be**: 21 integration tests with no network and no
   model — a capability denial that an approval cannot widen, an approval denial that never reaches the
   host, a refusal that does not stop the next call, and the event sequence a client will render. What

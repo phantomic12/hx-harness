@@ -32,7 +32,7 @@ ceiling, unattended budget and expiry; buckets refuse when exhausted and recover
 fail over and bench unhealthy credentials; RRF dedupes `?utm_source=` variants of one URL; a
 failed sandbox create rolls back rather than leaking a container.
 
-**Not landed yet** (typed stubs only): `hx-store`, `hx-browser`, `hx-mcp`, `hx-gateway`.
+**Not landed yet** (typed stubs only): `hx-browser`, `hx-mcp`, `hx-gateway`.
 
 **Deliberately unverified at M0:** the concrete HTTP adapters (`OpenAiCompatible`,
 `AnthropicMessages`) and the fetch/parse halves of the search backends. Their *pure* halves —
@@ -58,7 +58,8 @@ Those get real tests in M1 against a live endpoint.
   `/yolo [duration]` as chat commands, and the prompt UI, which need a client to render them (§3.11)
 - Context builder + compaction at a token threshold
 - `hxd` runs, `hx` connects to it over the local socket
-- Session persistence (`hx-store`): resume, list, export
+- ✅ Session persistence (`hx-store`): resume, list, export — and the case that actually matters, a
+  transcript that ended mid-call being repaired rather than sent to a provider, which rejects it
 
 **Exit criteria:** a multi-step task (5+ tool calls) completes end-to-end; killing the TUI and
 reconnecting resumes the session mid-flight.
