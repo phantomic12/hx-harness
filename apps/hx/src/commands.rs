@@ -624,3 +624,241 @@ hosts:
         assert!(rendered.contains("403 bot check"), "{rendered}");
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Runs and sessions: what the daemon reports back
+// ---------------------------------------------------------------------------------------------
+
+/// A run's report, written for a person unless `--json` was asked for.
+///
+/// The numbers come before the answer, because a run that stopped early explains itself that way:
+/// `stop` is the first thing that says whether the text below is an answer or a fragment of one.
+pub fn render_chat(reply: &serde_json::Value, json: bool) -> String {
+    if json {
+        return match serde_json::to_string_pretty(reply) {
+            Ok(pretty) => format!("{pretty}\n"),
+            Err(err) => format!("{{\"error\":\"could not serialise the reply: {err}\"}}\n"),
+        };
+    }
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "session {}  ({})",
+        reply["session_id"].as_str().unwrap_or("?"),
+        if reply["created"].as_bool().unwrap_or(false) {
+            "new"
+        } else {
+            "resumed"
+        }
+    );
+
+    let repaired = reply["repaired"].as_u64().unwrap_or(0);
+    if repaired > 0 {
+        let _ = writeln!(
+            out,
+            "repaired {repaired} call(s) a previous run left without a result"
+        );
+    }
+
+    let _ = writeln!(
+        out,
+        "stop {} after {} turn(s): {} tool call(s), {} refusal(s)",
+        reply["stop"].as_str().unwrap_or("?"),
+        reply["turns"].as_u64().unwrap_or(0),
+        reply["tool_calls"].as_u64().unwrap_or(0),
+        reply["refusals"].as_u64().unwrap_or(0),
+    );
+
+    let cost = reply["cost_usd"].as_f64().unwrap_or(0.0);
+    let _ = writeln!(
+        out,
+        "tokens {} in / {} out   cost {}",
+        reply["input_tokens"].as_u64().unwrap_or(0),
+        reply["output_tokens"].as_u64().unwrap_or(0),
+        if cost > 0.0 {
+            format!("${cost:.4}")
+        } else {
+            // The absence of a price table is reported as an absence, not as free.
+            "no rate card configured".to_string()
+        }
+    );
+
+    out.push('\n');
+    out.push_str(reply["final_text"].as_str().unwrap_or("(no text)"));
+    out.push('\n');
+    out
+}
+
+/// The session list.
+pub fn render_sessions(list: &serde_json::Value) -> String {
+    let sessions = list.as_array().cloned().unwrap_or_default();
+    if sessions.is_empty() {
+        return "no sessions yet: `hx chat \"…\"` starts one.\n".to_string();
+    }
+
+    let mut out = String::new();
+    let _ = writeln!(out, "{:<34} {:>4} {:>5}  TITLE", "ID", "MSGS", "TURNS");
+    for session in sessions {
+        let _ = writeln!(
+            out,
+            "{:<34} {:>4} {:>5}  {}",
+            session["id"].as_str().unwrap_or("?"),
+            session["messages"].as_u64().unwrap_or(0),
+            session["turns"].as_u64().unwrap_or(0),
+            session["title"].as_str().unwrap_or("(untitled)")
+        );
+    }
+    out
+}
+
+/// One session's record and totals.
+pub fn render_session(value: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let record = &value["record"];
+
+    let _ = writeln!(out, "session  {}", record["id"].as_str().unwrap_or("?"));
+    let _ = writeln!(
+        out,
+        "title    {}",
+        record["title"].as_str().unwrap_or("(untitled)")
+    );
+    if let Some(workspace) = record["workspace"].as_str() {
+        let _ = writeln!(out, "workspace {workspace}");
+    }
+    if let Some(model) = record["model"].as_str() {
+        let _ = writeln!(out, "model    {model}");
+    }
+
+    let totals = &value["totals"];
+    let cost = totals["cost_usd"].as_f64().unwrap_or(0.0);
+    let _ = writeln!(
+        out,
+        "spent    {} provider call(s), {} in / {} out tokens, {}",
+        totals["provider_calls"].as_u64().unwrap_or(0),
+        totals["input_tokens"].as_u64().unwrap_or(0),
+        totals["output_tokens"].as_u64().unwrap_or(0),
+        if cost > 0.0 {
+            format!("${cost:.4}")
+        } else {
+            "no rate card configured".to_string()
+        }
+    );
+
+    // A dangling call is the one thing about a session that changes what a caller should do next, so
+    // it is stated rather than left to be inferred from the transcript.
+    let interrupted = value["interrupted_calls"].as_u64().unwrap_or(0);
+    if interrupted > 0 {
+        let _ = writeln!(
+            out,
+            "note     {interrupted} call(s) have no result: a previous run ended inside them. The next\n         \
+             `hx chat --session` on this session repairs them before the model sees it."
+        );
+    }
+    out
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn reply() -> serde_json::Value {
+        json!({
+            "session_id": "ses_abc",
+            "created": false,
+            "repaired": 2,
+            "stop": "maxturns",
+            "turns": 12,
+            "tool_calls": 7,
+            "refusals": 1,
+            "input_tokens": 1234,
+            "output_tokens": 56,
+            "cost_usd": 0.0,
+            "final_text": "I ran out of turns.",
+            "messages": 30,
+        })
+    }
+
+    #[test]
+    fn a_run_for_a_person_leads_with_what_stopped_it() {
+        let rendered = render_chat(&reply(), false);
+
+        assert!(rendered.contains("ses_abc"), "{rendered}");
+        assert!(rendered.contains("resumed"), "{rendered}");
+        assert!(rendered.contains("repaired 2 call(s)"), "{rendered}");
+        assert!(rendered.contains("stop maxturns"), "{rendered}");
+        assert!(rendered.contains("12 turn(s)"), "{rendered}");
+        assert!(rendered.contains("7 tool call(s)"), "{rendered}");
+        assert!(rendered.contains("1 refusal(s)"), "{rendered}");
+        assert!(rendered.contains("1234 in / 56 out"), "{rendered}");
+        // No price table means no price, which is not the same statement as "$0.0000".
+        assert!(rendered.contains("no rate card configured"), "{rendered}");
+        assert!(rendered.contains("I ran out of turns."), "{rendered}");
+    }
+
+    #[test]
+    fn a_run_as_json_is_still_the_daemons_reply() {
+        let rendered = render_chat(&reply(), true);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&rendered).expect("the JSON mode emits JSON");
+        assert_eq!(parsed["session_id"], "ses_abc");
+        assert_eq!(parsed["cost_usd"], 0.0);
+    }
+
+    #[test]
+    fn a_priced_run_shows_the_price() {
+        let mut priced = reply();
+        priced["cost_usd"] = json!(0.0123);
+        assert!(render_chat(&priced, false).contains("$0.0123"));
+    }
+
+    #[test]
+    fn an_empty_session_list_says_how_to_start_one() {
+        let rendered = render_sessions(&json!([]));
+        assert!(rendered.contains("hx chat"), "{rendered}");
+        assert!(
+            !rendered.contains("ID"),
+            "no header for no rows: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_session_list_is_a_table() {
+        let list = json!([{
+            "id": "ses_1",
+            "messages": 20,
+            "turns": 4,
+            "title": "untitled",
+        }]);
+        let rendered = render_sessions(&list);
+        assert!(rendered.contains("ses_1"), "{rendered}");
+        assert!(rendered.contains("20"), "{rendered}");
+        assert!(rendered.contains("untitled"), "{rendered}");
+    }
+
+    #[test]
+    fn a_dangling_call_is_called_out_with_what_to_do_about_it() {
+        let value = json!({
+            "record": { "id": "ses_1", "title": "untitled", "workspace": "/w" },
+            "totals": { "provider_calls": 3, "input_tokens": 10, "output_tokens": 2, "cost_usd": 0.0 },
+            "interrupted_calls": 1,
+        });
+        let rendered = render_session(&value);
+        assert!(rendered.contains("ses_1"), "{rendered}");
+        assert!(rendered.contains("3 provider call(s)"), "{rendered}");
+        assert!(rendered.contains("1 call(s) have no result"), "{rendered}");
+        assert!(rendered.contains("repairs them"), "{rendered}");
+    }
+
+    #[test]
+    fn a_healthy_session_says_nothing_about_repair() {
+        let value = json!({
+            "record": { "id": "ses_1", "title": "untitled" },
+            "totals": { "provider_calls": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0 },
+            "interrupted_calls": 0,
+        });
+        let rendered = render_session(&value);
+        assert!(!rendered.contains("no result"), "{rendered}");
+    }
+}

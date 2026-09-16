@@ -66,7 +66,7 @@ $ curl -s localhost:7717/v1/status | jq .pools
 | Sessions (`hx-store`) | **Built** — SQLite: create, resume, list, rename, delete, export (JSON/Markdown), events, usage totals. A transcript that ended mid-call is *repaired*, not sent to a provider that would reject it |
 | Web UI, Tauri desktop/mobile, chat connectors | **Not started** |
 | MCP client, browser-automation pool | **Not started** |
-| The loop wired into `hxd`: `POST /v1/chat`, session routes over `hx-store` | **Built** — one request runs the loop against a session: the prompt is stored before the model is called, the role decides the model, credentials come from a `store:name` reference, events are written as they happen, and a transcript that ended mid-call is repaired before it is sent. Eight tests drive the **real loop over the real HTTP surface**, scripted only in the model |
+| The loop wired into `hxd` and `hx`: `POST /v1/chat`, `hx chat`, session routes over `hx-store` | **Built** — one request runs the loop against a session: the prompt is stored before the model is called, the role decides the model, credentials come from a `store:name` reference, events are written as they happen, and a transcript that ended mid-call is repaired before it is sent. Eight tests drive the **real loop over the real HTTP surface**, scripted only in the model |
 
 ---
 
@@ -157,7 +157,7 @@ $ ./target/release/hxd --bind 127.0.0.1:7717
 ```
 
 ```console
-$ cargo test --workspace         # 606 tests, 0 failed, 22 ignored live tests
+$ cargo test --workspace         # 615 tests, 0 failed, 22 ignored live tests
 $ cargo test -p hx-sandbox --test docker_live -- --ignored   # needs a container engine
 $ cargo test -p hx-remote --test ssh_live -- --ignored       # needs an SSH server
 $ HX_SEARXNG_URL=... HX_SEARCH_EXPECT_RESULTS=searxng \
@@ -180,8 +180,9 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
   messages are written as the run produces them, so a daemon killed mid-run leaves a session that
   says what happened up to that point: one whose kill landed between a tool call and its result is
   repaired on the next request rather than losing the turn.
-- **`hx` has no `chat` command.** The daemon answers `POST /v1/chat`; the terminal still does not,
-  which is the gap the next commit closes rather than something to claim.
+- **The approval channel.** Nothing can answer a prompt over HTTP yet: `hx chat` runs, but a call
+  that needs a human is refused with the reason until `--autonomy yolo` says otherwise. That is the
+  next piece, and it is what M2's approval queue waits on.
 - **Streaming and context compaction.** A turn arrives whole, so a run is one long wait per turn and a
   long session is still sent as-is. Both are stated gaps, not hidden ones.
 - **Nothing in `ci.yml` reaches another machine.** That file is in-process unit tests; the tests

@@ -57,7 +57,10 @@ Those get real tests in M1 against a live endpoint.
   model as a tool result (`crates/hx-agent/tests/loop.rs`). Still to come: `/approval <level>` and
   `/yolo [duration]` as chat commands, and the prompt UI, which need a client to render them (§3.11)
 - Context builder + compaction at a token threshold
-- `hxd` runs, `hx` connects to it over the local socket
+- ✅ `hxd` runs, `hx` connects to it: `hx chat` sends the prompt to the daemon over the configured
+  HTTP address and prints the run's report (over HTTP rather than the unix socket, which the config
+  also names and nothing uses yet); `hx sessions` / `hx session <id> [--export md]` read back what the
+  daemon stored. A run that did not complete exits non-zero, so a script can tell
 - ✅ Session persistence (`hx-store`): resume, list, export — and the case that actually matters, a
   transcript that ended mid-call being repaired rather than sent to a provider, which rejects it
 - ◐ **The loop reachable over HTTP** — `POST /v1/chat` runs the loop against a session, `hx-server`
@@ -66,7 +69,7 @@ Those get real tests in M1 against a live endpoint.
   reads sessions, transcripts, events and exports back. Messages and events are written as the run
   produces them, so a killed daemon leaves a session that says what happened — the difference between
   "restartable" and "resumable". Still to come: an approval channel (so a client can answer a prompt
-  instead of the daemon refusing it), `hx chat` in the terminal, and a WebSocket event stream
+  instead of the daemon refusing it) and a WebSocket event stream
 
 **Exit criteria:** a multi-step task (5+ tool calls) completes end-to-end; killing the TUI and
 reconnecting resumes the session mid-flight.

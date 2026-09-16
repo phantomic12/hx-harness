@@ -4,7 +4,7 @@ Status: 2026-09-15. Companion to `ROADMAP.md` (which tracks features); this file
 
 ```console
 $ cargo test --workspace
-606 tests, 0 failed                       # 11 hermetic HTTP + 4 that reopen the database + 12 that run the loop over HTTP
+615 tests, 0 failed                       # 11 hermetic HTTP + 4 that reopen the database + 12 that run the loop over HTTP
 22 ignored                               # live: Docker, SSH, search, a real model
 
 # The 22 that need a real server, run by `.github/workflows/integration.yml`
@@ -154,7 +154,7 @@ returning an empty list.
 | `hx-store` | 38 | 2051 | Migrations applied once and never re-run, **a database from a newer build refused with both versions named** (and left untouched), `STRICT` rejecting a type mistake at insert, the transcript written by `seq` the caller does not track, a batch written whole or not at all, a cascade that only happens because `Store` sets `foreign_keys`, every part type round-tripping while an unknown one is reported rather than dropped, events and usage surviving a reopen — plus 4 in `tests/resume.rs` that drop the store and open a **new connection** to the same file, which is the closest a test gets to killing the daemon |
 | `hx-tools` | 70 | 2576 | Requirements per tool, bounded output, the two-phase registry, and **a misnamed argument refused rather than ignored** — `cwd` instead of `workdir` used to drop silently and run the command in the daemon's own directory |
 | `hx-server` | 28 | 1730 | Route dispatch via `oneshot`, `HxError`→HTTP status mapping, and twelve tests that run the **real loop over the real HTTP surface** with only the model scripted: an answer comes back with its session, its cost and its events; a tool call runs and its result reaches the model; a write outside the workspace is denied and never happens; a shell command that needs a human is refused **with the reason**, and the same command runs under `yolo`; a second request on a session continues the transcript; unknown autonomy and unknown roles are 400s that name what is accepted; and a request that cannot run leaves no session behind |
-| `hx` | 11 | — | Renderers for pools/hosts/sandbox-spec, CLI parsing |
+| `hx` | 20 | 570 | Renderers for pools/hosts/sandbox-spec/sessions/runs, CLI parsing, and the daemon client's URL rules (an explicit `--daemon` wins, a bare `host:port` from the config gets a scheme, a URL that already has one is left alone) |
 
 Two families in that table are worth naming, because in both the obvious implementation is wrong and
 the failure is silent:
@@ -322,7 +322,7 @@ no progress. Both are fixed, and both now have tests that reproduce the real wir
 ## Running the suite
 
 ```bash
-cargo test --workspace          # 606 tests, 0 failed, 22 ignored live tests
+cargo test --workspace          # 615 tests, 0 failed, 22 ignored live tests
 cargo test -p hx-store          # 42 — migrations, the transcript, and 4 that reopen the file
 cargo test -p hx-agent          # 35 — the loop's gate, the routed model call, the transcript sink
 cargo test -p hx-tools          # 70 — requirements, bounded output, the two-phase registry, workspace resolution

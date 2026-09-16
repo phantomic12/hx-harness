@@ -1,0 +1,174 @@
+//! The daemon client.
+//!
+//! `hx` prints configuration from files, but a *run* belongs to `hxd`: the process that owns the
+//! routing table, the session store and the limits. So the chat-shaped commands are clients, exactly
+//! like the TUI and the browser will be, and this module is that client — the HTTP surface is the
+//! only way in.
+//!
+//! Every failure here says which of two things went wrong: the daemon is not there (an actionable
+//! "start it with …"), or the daemon answered with an error of its own (which is quoted, not
+//! paraphrased — the daemon's message is usually better than one this layer could invent).
+
+use anyhow::{bail, Context};
+use hx_core::config::Config;
+use serde_json::Value;
+
+/// Where to reach the daemon: `--daemon`, else the config, else the documented default.
+///
+/// `daemon.http_addr` is a bare `host:port` — there is no scheme in the config because the daemon
+/// serves one protocol — so the scheme is added here rather than demanded from every deployment.
+pub fn base_url(config: &Config, explicit: Option<&str>) -> String {
+    let raw = match explicit {
+        Some(url) => url.to_string(),
+        None => config.daemon.http_addr.clone(),
+    };
+
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        raw.trim_end_matches('/').to_string()
+    } else {
+        format!("http://{}", raw.trim_end_matches('/'))
+    }
+}
+
+async fn send(
+    request: reqwest::RequestBuilder,
+    base: &str,
+    what: &str,
+) -> anyhow::Result<(reqwest::StatusCode, Value)> {
+    let response = request.send().await.map_err(|err| {
+        anyhow::anyhow!(
+            "could not reach the daemon at {base} ({err}). Start it with `hxd --config <config>`, \
+             or point this command elsewhere with --daemon"
+        )
+    })?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .with_context(|| format!("{what}: the daemon's reply could not be read"))?;
+
+    let body: Value = serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text.clone()));
+
+    if !status.is_success() {
+        // The daemon's own words: it knows why, this layer does not.
+        let message = body
+            .get("error")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or(text);
+        bail!("{what} failed: {} — {message}", status.as_u16());
+    }
+
+    Ok((status, body))
+}
+
+/// Run one prompt against one session.
+pub async fn chat(client: &reqwest::Client, base: &str, body: &Value) -> anyhow::Result<Value> {
+    let (_, reply) = send(
+        client.post(format!("{base}/v1/chat")).json(body),
+        base,
+        "the run",
+    )
+    .await?;
+
+    if reply.get("session_id").is_none() {
+        bail!("the daemon answered a run with something that is not a run: {reply}");
+    }
+    Ok(reply)
+}
+
+/// The sessions the daemon knows about.
+pub async fn sessions(client: &reqwest::Client, base: &str, limit: usize) -> anyhow::Result<Value> {
+    let (_, list) = send(
+        client.get(format!("{base}/v1/sessions?limit={limit}")),
+        base,
+        "listing sessions",
+    )
+    .await?;
+    Ok(list)
+}
+
+/// One session's record, totals and dangling calls.
+pub async fn session(
+    client: &reqwest::Client,
+    base: &str,
+    id: &str,
+    transcript: bool,
+) -> anyhow::Result<Value> {
+    let (_, session) = send(
+        client.get(format!("{base}/v1/sessions/{id}?transcript={transcript}")),
+        base,
+        "reading the session",
+    )
+    .await?;
+    Ok(session)
+}
+
+/// A session's transcript as a document.
+pub async fn export(
+    client: &reqwest::Client,
+    base: &str,
+    id: &str,
+    format: &str,
+) -> anyhow::Result<String> {
+    let url = format!("{base}/v1/sessions/{id}/export?format={format}");
+    let response = client.get(url).send().await.map_err(|err| {
+        anyhow::anyhow!(
+            "could not reach the daemon at {base} ({err}). Start it with `hxd --config <config>`, \
+             or point this command elsewhere with --daemon"
+        )
+    })?;
+
+    let status = response.status();
+    let text = response.text().await.context("reading the export")?;
+
+    if !status.is_success() {
+        let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let message = parsed
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or(&text)
+            .to_string();
+        bail!("the export failed: {} — {message}", status.as_u16());
+    }
+
+    Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with(http_addr: &str) -> Config {
+        let mut config = Config::default();
+        config.daemon.http_addr = http_addr.to_string();
+        config
+    }
+
+    #[test]
+    fn an_explicit_daemon_wins_and_gets_a_scheme() {
+        let config = config_with("127.0.0.1:9999");
+        assert_eq!(
+            base_url(&config, Some("192.168.1.5:8799")),
+            "http://192.168.1.5:8799"
+        );
+        // A URL that already carries one is left alone, including a trailing slash.
+        assert_eq!(
+            base_url(&config, Some("http://box:8799/")),
+            "http://box:8799"
+        );
+        assert_eq!(
+            base_url(&config, Some("https://hx.example.com")),
+            "https://hx.example.com"
+        );
+    }
+
+    #[test]
+    fn the_config_supplies_the_default_address() {
+        assert_eq!(
+            base_url(&config_with("127.0.0.1:8799"), None),
+            "http://127.0.0.1:8799"
+        );
+    }
+}
