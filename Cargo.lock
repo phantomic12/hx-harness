@@ -1392,7 +1392,17 @@ dependencies = [
 name = "hx-tools"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "hx-core",
+ "hx-remote",
+ "hx-search",
+ "indexmap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
