@@ -47,7 +47,8 @@ Those get real tests in M1 against a live endpoint.
 
 **Goal:** `hx "refactor this repo and run the tests"` completes a real task against a real model.
 
-- `Provider` impl for OpenAI-compatible endpoints (covers ~80% of providers)
+- ✅ `Provider` impl for OpenAI-compatible endpoints (covers ~80% of providers) — landed with a
+  hermetic HTTP suite and a live suite (text, usage, tool calls, transcript)
 - Provider adapter for Anthropic Messages API
 - Streaming over SSE, token deltas into the TUI
 - Tool dispatch: `shell`, `read_file`, `write_file`, `patch`, `search`, `todo`

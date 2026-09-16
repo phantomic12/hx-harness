@@ -24,23 +24,27 @@
 //! reconciled is released at request teardown, which is what makes a crashed request stop
 //! leaking budget.
 //!
-//! ## What is not here yet
+//! ## The wire format
 //!
-//! The concrete HTTP adapters (`OpenAiCompatible`, `AnthropicMessages`, `GoogleGenAi`) are M1
-//! work: they need `reqwest`, SSE parsing, and a retry/backoff layer, none of which can be
-//! proven correct without a server to talk to. The trait they will implement —
-//! [`provider::Provider`] — is defined here, and the registry that will hold them
-//! ([`provider::ProviderRegistry`]) is real and tested.
+//! [`openai::OpenAiCompatible`] speaks `/v1/chat/completions`, which covers OpenAI itself and
+//! essentially every gateway, reseller and local server. Its mapping is two pure functions
+//! ([`openai::build_body`], [`openai::parse_response`]) with the HTTP call as the only impure part,
+//! so the vendor quirks are asserted against literals rather than discovered in production.
 //!
-//! Note that this crate is deliberately **not** async. Limits, pools and routing are pure
-//! bookkeeping; making them `async` would buy nothing and make every test a runtime.
+//! Not here yet: `AnthropicMessages`, `GoogleGenAi`, streaming (SSE), and a retry/backoff layer.
+//!
+//! Note that the limits/pools/routing layers are deliberately **not** async — they are pure
+//! bookkeeping, and making them `async` would buy nothing and make every test a runtime. Only the
+//! adapters are async.
 
 pub mod limits;
+pub mod openai;
 pub mod pool;
 pub mod provider;
 pub mod router;
 
 pub use limits::{Lease, LimitError, Limiter, TokenBucket};
+pub use openai::OpenAiCompatible;
 pub use pool::{CostPerMtok, CredentialPool, PoolError, Slot, SlotStatus, Ticket};
 pub use provider::{
     cost_usd, ChatRequest, ChatResponse, FinishReason, Provider, ProviderRegistry, ToolSpec, Usage,
