@@ -4,7 +4,7 @@ Status: 2026-09-16. Companion to `ROADMAP.md` (which tracks features); this file
 
 ```console
 $ cargo test --workspace
-663 tests, 0 failed                       # 13 hermetic HTTP + 4 that reopen the database + 14 that run the loop over HTTP
+667 tests, 0 failed                       # 13 hermetic HTTP + 4 that reopen the database + 14 that run the loop over HTTP
 22 ignored                               # live: Docker, SSH, search, a real model
 
 # The 22 that need a real server, run by `.github/workflows/integration.yml`
@@ -144,17 +144,17 @@ returning an empty list.
 
 | Crate | Tests | LOC | What the tests actually prove |
 |---|---|---|---|
-| `hx-core` | 85 | 4142 | ID monotonicity, error taxonomy (**a rejected credential is an auth failure, and a 500 is not**, so a pool retries one and benches the other), **capability path grants** (incl. the empty-grant-means-root regression), approval policy incl. unattended budgets, message/event round-trips, config parsing and rejection of unknown keys |
+| `hx-core` | 100 | 5006 | ID monotonicity, error taxonomy (**a rejected credential is an auth failure, and a 500 is not**, so a pool retries one and benches the other), **capability path grants** (incl. the empty-grant-means-root regression), approval policy incl. unattended budgets and **the shipped catastrophe set in both directions** (the unrecoverable paths refused, `/tmp` and `/home` left answerable) and the refusal of a delete whose target is a pattern, message/event round-trips, target descriptions a person can price, and config parsing incl. rejection of unknown keys and **`hx.example.yaml` itself parsing** |
 | `hx-provider` | 102 | 4091 | Token-bucket timing, **budget fail-closed on a zero estimate**, credential pool round-robin, shared-limiter identity across pools, routing and fallthrough, a granted ticket carrying the credential's `secret_ref`, a role's reservation estimated from the **dearest** route, and the provider factory refusing a kind it has no adapter for |
-| `hx-remote` | 90 | 3108 | Platform caps parsing (`uname`/`ver`), path translation, shell quoting incl. injection attempts, risky-command classification, mid-truncation, approval round-trip against the local host, and **`known_hosts`**: hashed host fields (HMAC-SHA1), globs, negation, `@revoked` beating trust regardless of line order, a different key type reading as first use rather than substitution, plus the policy's fail-closed behaviour and the wording of every refusal |
-| `hx-sandbox` | 62 | 2057 | Isolation ladder ordering and monotonicity, spec↔YAML round-trip, `SandboxSpec`→`HostConfig` mapping field by field, **no engine-rejected security option** (`userns=`, `seccomp=default`), an egress allowlist that cannot be enforced, registry/TTL bookkeeping, the concurrency cap, and rollback on a failed start |
-| `hx-search` | 45 | 1732 | RRF rank fusion, HTML extraction, entity decoding, per-backend failure isolation (with **fake** backends) |
+| `hx-remote` | 90 | 3176 | Platform caps parsing (`uname`/`ver`), path translation, shell quoting incl. injection attempts, risky-command classification, mid-truncation, approval round-trip against the local host, and **`known_hosts`**: hashed host fields (HMAC-SHA1), globs, negation, `@revoked` beating trust regardless of line order, a different key type reading as first use rather than substitution, plus the policy's fail-closed behaviour and the wording of every refusal |
+| `hx-sandbox` | 62 | 2066 | Isolation ladder ordering and monotonicity, spec↔YAML round-trip, `SandboxSpec`→`HostConfig` mapping field by field, **no engine-rejected security option** (`userns=`, `seccomp=default`), an egress allowlist that cannot be enforced, registry/TTL bookkeeping, the concurrency cap, and rollback on a failed start |
+| `hx-search` | 45 | 1740 | RRF rank fusion, HTML extraction, entity decoding, per-backend failure isolation (with **fake** backends) |
 | `hx-secrets` | 36 | 1302 | Argon2id+XChaCha20 round-trip, tamper detection, redaction patterns, and **credential resolution**: a `store:name` reference resolved through `vault:`/`env:`/a fixed map, an empty environment variable refused like an absent one, an unknown store listing the stores that *are* configured, and every error message asserted **not** to contain a value |
-| `hx-agent` | 35 | 1027 | The loop's gate, in one file of integration tests: a **capability denial is a result the model reads and cannot be approved away** (an approver willing to say yes is never asked), an approval denial is reported and the command never reaches the host, `allow for chat` stops the second prompt while a remembered denial is not re-asked, a tool declaring no external effect is never prompted about, a refused call does not stop its sibling, unknown tools and unusable arguments return as results, a non-zero exit is still a call that *ran*, `max_turns` and the deadline stop the run, and the exact event sequence a client renders. Plus the **routed model call** over a real `ModelRouter` and a real `ProviderRegistry`, with only the adapter faked: the route decides the model, the key follows the credential the pool granted, a refused credential is benched and its *sibling* is tried before another provider, a missing key and a 502 both give the reservation back (asserted with `concurrent: 1`, since a leaked lease looks exactly like a rate limit), and a day's budget that covers one pessimistic reservation still allows three calls |
-| `hx-store` | 38 | 2051 | Migrations applied once and never re-run, **a database from a newer build refused with both versions named** (and left untouched), `STRICT` rejecting a type mistake at insert, the transcript written by `seq` the caller does not track, a batch written whole or not at all, a cascade that only happens because `Store` sets `foreign_keys`, every part type round-tripping while an unknown one is reported rather than dropped, events and usage surviving a reopen — plus 4 in `tests/resume.rs` that drop the store and open a **new connection** to the same file, which is the closest a test gets to killing the daemon |
-| `hx-tools` | 70 | 2576 | Requirements per tool, bounded output, the two-phase registry, and **a misnamed argument refused rather than ignored** — `cwd` instead of `workdir` used to drop silently and run the command in the daemon's own directory |
-| `hx-server` | 28 | 1730 | Route dispatch via `oneshot`, `HxError`→HTTP status mapping, and twelve tests that run the **real loop over the real HTTP surface** with only the model scripted: an answer comes back with its session, its cost and its events; a tool call runs and its result reaches the model; a write outside the workspace is denied and never happens; a shell command that needs a human is refused **with the reason**, and the same command runs under `yolo`; a second request on a session continues the transcript; unknown autonomy and unknown roles are 400s that name what is accepted; and a request that cannot run leaves no session behind |
-| `hx` | 20 | 570 | Renderers for pools/hosts/sandbox-spec/sessions/runs, CLI parsing, and the daemon client's URL rules (an explicit `--daemon` wins, a bare `host:port` from the config gets a scheme, a URL that already has one is left alone) |
+| `hx-agent` | 42 | 1402 | The loop's gate, in one file of integration tests: the target of a destructive call is **measured after the capability check and before the prompt** (and the event that reaches the store carries it, so the trail proves what the approver was shown), a **capability denial is a result the model reads and cannot be approved away** (an approver willing to say yes is never asked), an approval denial is reported and the command never reaches the host, `allow for chat` stops the second prompt while a remembered denial is not re-asked, a tool declaring no external effect is never prompted about, a refused call does not stop its sibling, unknown tools and unusable arguments return as results, a non-zero exit is still a call that *ran*, `max_turns` and the deadline stop the run, and the exact event sequence a client renders. Plus the **routed model call** over a real `ModelRouter` and a real `ProviderRegistry`, with only the adapter faked: the route decides the model, the key follows the credential the pool granted, a refused credential is benched and its *sibling* is tried before another provider, a missing key and a 502 both give the reservation back (asserted with `concurrent: 1`, since a leaked lease looks exactly like a rate limit), and a day's budget that covers one pessimistic reservation still allows three calls |
+| `hx-store` | 42 | 2059 | Migrations applied once and never re-run, **a database from a newer build refused with both versions named** (and left untouched), `STRICT` rejecting a type mistake at insert, the transcript written by `seq` the caller does not track, a batch written whole or not at all, a cascade that only happens because `Store` sets `foreign_keys`, every part type round-tripping while an unknown one is reported rather than dropped, events and usage surviving a reopen — plus 4 in `tests/resume.rs` that drop the store and open a **new connection** to the same file, which is the closest a test gets to killing the daemon |
+| `hx-tools` | 91 | 3561 | Requirements per tool, bounded output, the two-phase registry, and **a misnamed argument refused rather than ignored** — `cwd` instead of `workdir` used to drop silently and run the command in the daemon's own directory. `delete` is the largest entry: the XDG trash round-trip on a real in-memory host, a directory walked rather than counted at the top level, the filesystem root refused, an unreadable path refused **before** anything is touched, an existing trash name never overwritten, a *pattern* read as one literal filename and told so, a transport failure that says nothing was deleted, and a `delete` that still requires the `Delete` capability on the resolved path |
+| `hx-server` | 30 | 1823 | Route dispatch via `oneshot`, `HxError`→HTTP status mapping, and twelve tests that run the **real loop over the real HTTP surface** with only the model scripted: an answer comes back with its session, its cost and its events; a tool call runs and its result reaches the model; a write outside the workspace is denied and never happens; a shell command that needs a human is refused **with the reason**, and the same command runs under `yolo`; a second request on a session continues the transcript; unknown autonomy and unknown roles are 400s that name what is accepted; and a request that cannot run leaves no session behind |
+| `hx` | 27 | 1825 | Renderers for pools/hosts/sandbox-spec/**policy**/sessions/runs/approvals, CLI parsing, and the daemon client's URL rules (an explicit `--daemon` wins, a bare `host:port` from the config gets a scheme, a URL that already has one is left alone). The policy renderer is asserted on the *order* of the rules rather than their presence — printing them in the struct's order would describe a policy the session does not have — and the approvals renderer is asserted to show a target list, the way back, and the command that answers the question, because a terminal that showed less than the daemon asked would be a weaker interface to one decision |
 
 Two families in that table are worth naming, because in both the obvious implementation is wrong and
 the failure is silent:
@@ -357,10 +357,36 @@ XDG `build.trashinfo` naming the original absolute path. Read back from SQLite o
 The second line is the reason for the first: the trail records *who* answered **and** what they were
 shown, so an approval can never be audited as a bare yes.
 
+**`hx policy`, against the real config.** The renderer is unit-tested, but the thing it is for is
+reading a *deployment's* ladder, and that is a fact about a file nobody tests:
+
+```console
+$ hx policy --config ~/.hx/litellm.yaml
+approval policy from /home/yoav/.hx/litellm.yaml
+  level    balanced — asks before anything leaving the machine, or worse
+  read         runs free
+  mutate       runs free
+  external     asks
+  destructive  asks
+  privileged   asks
+  ceiling  none — a `yolo` chat can auto-approve anything, including a deleted database
+  deletes  a pattern or a variable in a delete is refused outright (`rm -rf build*`, `rm -rf $DIR`), …
+rules, in the order they are checked:
+  deny — refused before anything else is considered, and no approval can buy it back
+     1. tool shell, matching rm -rf /  # recursive delete of the root directory
+     …
+    32. tool shell, matching *DROP DATABASE*  # dropping a database
+      (all 32 shipped catastrophe rules, from `default_denials()`)
+```
+
+That output is what makes the two defects in §7 of `docs/approvals.md` *visible*: rule 4 used to be a
+single `*rm -rf /*` that also matched `/tmp`, and a config with no `agent:` section printed no rules at
+all until `AgentConfig::default()` was fixed.
+
 ## Running the suite
 
 ```bash
-cargo test --workspace          # 663 tests, 0 failed, 22 ignored live tests
+cargo test --workspace          # 667 tests, 0 failed, 22 ignored live tests
 cargo test -p hx-store          # 42 — migrations, the transcript, and 4 that reopen the file
 cargo test -p hx-agent          # 42 — the loop's gate, the routed model call, the transcript sink
 cargo test -p hx-tools          # 91 — requirements, bounded output, the two-phase registry, workspace resolution, the trash

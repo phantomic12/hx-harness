@@ -5,6 +5,7 @@
 //! output is part of the interface and belongs under test.
 
 use chrono::Utc;
+use hx_core::approval::RiskClass;
 use hx_core::config::{Config, SandboxProfile};
 use hx_provider::ModelRouter;
 use hx_sandbox::{SandboxRuntime, SandboxSpec};
@@ -36,6 +37,197 @@ pub fn render_pools(router: &ModelRouter) -> String {
     }
 
     out
+}
+
+/// The effective approval ladder for a configuration.
+///
+/// `docs/approvals.md` §6: a policy nobody can read is a policy nobody will check, and the first
+/// question after "why did it do that?" is "what did I allow?". So this prints what *will happen*
+/// rather than what the config file says — the level with its threshold spelled out per risk class,
+/// the ceiling, the budget, the rules in the order they are checked, and which options a prompt may
+/// offer at each tier — because "balanced" on its own tells nobody whether `git push` is prompted for.
+///
+/// Two honest limits, both stated in the output rather than implied. It reads the *configuration*, so
+/// it cannot see a session's live level (`--autonomy` on a chat, or an `allow for this chat` answer);
+/// and it cannot know what the classifier will call a command, which is why the tiers are shown by
+/// risk class and not by example.
+pub fn render_policy(config: &Config, source: &str) -> String {
+    let policy = &config.agent.approval;
+    let mut out = String::new();
+
+    let _ = writeln!(out, "approval policy from {source}");
+    let _ = writeln!(
+        out,
+        "  level    {} — {}",
+        policy.level.label(),
+        policy.level.describe()
+    );
+
+    // What the level does with each risk class, in the order the classifier escalates. The ceiling is
+    // folded in here rather than listed separately, because what a person needs to know is not that a
+    // ceiling exists but *which calls still get asked about* because of it.
+    let threshold = policy.level.threshold();
+    for risk in [
+        RiskClass::Read,
+        RiskClass::Mutate,
+        RiskClass::External,
+        RiskClass::Destructive,
+        RiskClass::Privileged,
+    ] {
+        let above_threshold = threshold.is_some_and(|t| risk >= t);
+        let capped = policy.ceiling.is_some_and(|c| risk > c);
+        let (verdict, note) = if capped && !above_threshold {
+            ("asks", "  <- capped by `ceiling`")
+        } else if above_threshold {
+            ("asks", "")
+        } else {
+            ("runs free", "")
+        };
+        let _ = writeln!(out, "  {:<12} {}{note}", risk.label(), verdict);
+    }
+
+    match policy.ceiling {
+        Some(ceiling) => {
+            let _ = writeln!(
+                out,
+                "  ceiling  {:?} — nothing above it is ever auto-approved, at any autonomy level",
+                ceiling
+            );
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "  ceiling  none — a `yolo` chat can auto-approve anything, including a deleted database"
+            );
+        }
+    }
+    match policy.unattended_budget {
+        Some(n) => {
+            let _ = writeln!(
+                out,
+                "  budget   {n} — a check-in is forced after {n} consecutive actions nobody reviewed"
+            );
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "  budget   none — a run may keep going without a check-in"
+            );
+        }
+    }
+    match policy.expires_at {
+        Some(when) => {
+            let _ = writeln!(
+                out,
+                "  expires  {when} — the session tightens itself after that"
+            );
+        }
+        None => {
+            let _ = writeln!(out, "  expires  never");
+        }
+    }
+    let _ = writeln!(
+        out,
+        "  deletes  {}",
+        if policy.refuse_unenumerable_deletions {
+            "a pattern or a variable in a delete is refused outright (`rm -rf build*`, `rm -rf $DIR`), \
+             with the enumerable form offered"
+        } else {
+            "no refusal — a delete of a pattern or a variable is classified like any other destructive \
+             call, and its targets stay unknown to whoever answers"
+        }
+    );
+
+    // The rule layer, in the order it fires. The order *is* the semantics (`deny → ask → allow`), so
+    // printing the lists in the struct's order would be a different policy from the one in force.
+    let shipped = hx_core::approval::default_denials();
+    let shipped_in_deny = shipped.iter().filter(|r| policy.deny.contains(r)).count();
+    let _ = writeln!(out, "\nrules, in the order they are checked:");
+
+    let mut index = 0usize;
+    let mut section =
+        |out: &mut String, title: &str, why: &str, rules: &[hx_core::approval::Rule]| {
+            let _ = writeln!(out, "  {title} — {why}");
+            if rules.is_empty() {
+                let _ = writeln!(out, "    (none)");
+            }
+            for rule in rules {
+                index += 1;
+                let _ = writeln!(out, "    {:>2}. {}", index, describe_rule(rule));
+            }
+        };
+
+    section(
+        &mut out,
+        "deny",
+        "refused before anything else is considered, and no approval can buy it back",
+        &policy.deny,
+    );
+    if !shipped.is_empty() {
+        // Three different truths, and the report has to say which one holds: a config that writes its
+        // own `deny` list *replaces* the shipped floor (the trap `hx.example.yaml` warns about), and a
+        // report that rendered "0 of these are shipped" as a footnote would hide exactly that.
+        let _ = if shipped_in_deny == 0 {
+            writeln!(
+                out,
+                "      (none of the shipped catastrophe set: this config's `deny` list replaced it)"
+            )
+        } else if shipped_in_deny < shipped.len() {
+            writeln!(
+                out,
+                "      ({shipped_in_deny} of the {} shipped catastrophe rules; the rest were removed \
+                 in this config)",
+                shipped.len()
+            )
+        } else {
+            writeln!(
+                out,
+                "      (all {} shipped catastrophe rules, from `default_denials()`)",
+                shipped.len()
+            )
+        };
+    }
+    section(
+        &mut out,
+        "ask",
+        "a prompt, even where the level would have let it through",
+        &policy.ask,
+    );
+    section(
+        &mut out,
+        "allow",
+        "no prompt, even above the level's threshold",
+        &policy.allow,
+    );
+
+    let _ = writeln!(out, "\nwhat a prompt may offer (§1's tiers):");
+    let _ = writeln!(out, "  allow once, allow for this chat, deny   any call");
+    let _ = writeln!(
+        out,
+        "  always allow this                       only a `reversible` call at `mutate` or below: a \
+         local edit that can be taken back"
+    );
+
+    let _ = writeln!(out, "\nlive state this cannot see: a chat's `--autonomy` level, an `allow for this \
+                            chat` answer, and the unattended counter (which restarts on every human \
+                            answer). `hx approvals` shows what is waiting right now.");
+
+    out
+}
+
+/// One rule, as the config wrote it.
+fn describe_rule(rule: &hx_core::approval::Rule) -> String {
+    let mut line = format!("tool {}", rule.tool);
+    if let Some(command) = &rule.command {
+        let _ = write!(line, ", matching {command}");
+    }
+    if let Some(risk) = rule.risk {
+        let _ = write!(line, ", risk {}", risk.label());
+    }
+    if let Some(note) = &rule.note {
+        let _ = write!(line, "  # {note}");
+    }
+    line
 }
 
 /// Render the configured hosts.
@@ -622,6 +814,136 @@ hosts:
         assert!(rendered.contains("https://x.test/"), "{rendered}");
         assert!(rendered.contains("agreed by 1"), "{rendered}");
         assert!(rendered.contains("403 bot check"), "{rendered}");
+    }
+    // ---- the ladder ---------------------------------------------------------
+
+    #[test]
+    fn the_policy_report_says_what_this_level_does_with_each_risk_class() {
+        // "balanced" is the config's word for it and tells nobody whether `git push` is prompted for.
+        // The report has to answer that in the terms the classifier uses, or it is decoration.
+        let rendered = render_policy(&config(), "hx.yaml");
+
+        assert!(
+            rendered.contains("approval policy from hx.yaml"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("level    balanced — asks before anything leaving the machine"),
+            "{rendered}"
+        );
+        // `Balanced`'s threshold is `external`: below it runs free, at it and above it asks.
+        assert!(rendered.contains("read         runs free"), "{rendered}");
+        assert!(rendered.contains("mutate       runs free"), "{rendered}");
+        assert!(rendered.contains("external     asks"), "{rendered}");
+        assert!(rendered.contains("destructive  asks"), "{rendered}");
+        assert!(rendered.contains("privileged   asks"), "{rendered}");
+    }
+
+    #[test]
+    fn the_policy_report_shows_the_shipped_floor_and_where_it_came_from() {
+        // The question this answers is "what did I allow?" — and `deny: 31 rules` is not an answer
+        // unless a reader can tell which of them they wrote and which came with the software.
+        let rendered = render_policy(&config(), "hx.yaml");
+        let shipped = hx_core::approval::default_denials().len();
+
+        assert!(
+            rendered.contains(&format!(
+                "(all {shipped} shipped catastrophe rules, from `default_denials()`)"
+            )),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("recursive delete of the root directory"),
+            "the rules themselves, not a count: {rendered}"
+        );
+        assert!(
+            rendered.contains("a pattern or a variable in a delete is refused outright"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("ceiling  none"),
+            "and where the ceiling is absent, say so: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_rules_are_printed_in_the_order_they_are_checked() {
+        // The order *is* the policy (`deny → ask → allow`). Printing them in the struct's order would
+        // describe a policy this program does not have, which is the failure this command exists to
+        // prevent — so the numbering is asserted, not just the presence of each rule.
+        let yaml = format!(
+            "{CONFIG}
+agent:
+  approval:
+    level: trusting
+    ceiling: mutate
+    unattended_budget: 20
+    refuse_unenumerable_deletions: true
+    allow:
+      - {{ tool: shell, command: \"cargo test*\" }}
+    ask:
+      - {{ tool: shell, command: \"git push*\", note: \"publishes to the world\" }}
+    deny:
+      - {{ tool: shell, command: \"*rm -rf /var*\", risk: destructive }}
+"
+        );
+        let config = Config::from_yaml(&yaml).unwrap();
+        let rendered = render_policy(&config, "hx.yaml");
+
+        let deny = rendered.find("  deny — ").unwrap();
+        let ask = rendered.find("\n  ask — ").unwrap();
+        let allow = rendered.find("\n  allow — ").unwrap();
+        assert!(
+            deny < ask && ask < allow,
+            "deny first, allow last: {rendered}"
+        );
+        assert!(rendered.contains("   1. tool shell, matching *rm -rf /var*, risk destructive"));
+        assert!(rendered.contains("   2. tool shell, matching git push*  # publishes to the world"));
+        assert!(rendered.contains("   3. tool shell, matching cargo test*"));
+
+        // A ceiling is shown where it bites, not as a footnote: `read` and `mutate` run free at
+        // `trusting`, and the ceiling is what would stop anything above `mutate` from doing so.
+        assert!(rendered.contains("capped by `ceiling`"), "{rendered}");
+        assert!(rendered.contains("budget   20"), "{rendered}");
+        assert!(
+            rendered.contains(
+                "(none of the shipped catastrophe set: this config's `deny` list replaced it)"
+            ),
+            "a config that replaced the floor must be told so, not told a count: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_policy_with_no_rules_says_it_has_no_rules_rather_than_printing_nothing() {
+        // The blank policy is what a library caller gets, and it is the one shape where a prompt with a
+        // pattern in it will be asked about instead of refused. A report that left the sections empty
+        // would read as "nothing is allowed"; the truth is "nothing is decided here".
+        let yaml = format!(
+            "{CONFIG}
+agent:
+  approval:
+    level: yolo
+"
+        );
+        let config = Config::from_yaml(&yaml).unwrap();
+        let rendered = render_policy(&config, "hx.yaml");
+
+        assert_eq!(rendered.matches("(none)").count(), 3, "{rendered}");
+        assert!(
+            rendered.contains("no refusal — a delete of a pattern or a variable"),
+            "the absent floor is the important part: {rendered}"
+        );
+        for risk in ["read", "mutate", "external", "destructive", "privileged"] {
+            assert!(
+                rendered.contains(&format!("{risk:<12} runs free")),
+                "`yolo` with no ceiling asks about nothing, and the report has to say so for every \
+                 class rather than reassure the reader: {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("a `yolo` chat can auto-approve anything"),
+            "{rendered}"
+        );
     }
 }
 

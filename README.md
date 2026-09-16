@@ -145,7 +145,26 @@ has no authentication of its own.
 ```console
 $ cp hx.example.yaml hx.yaml     # then edit
 $ hx doctor                      # validate the config
+$ hx policy                      # what runs free, what is asked about, what is refused
 $ hxd --config hx.yaml --bind 127.0.0.1:7717
+```
+
+`hx policy` prints the ladder the daemon will actually apply, in the order it is checked: the level
+spelled out per risk class, the ceiling, the rules as a numbered list with `deny` first, and which of
+them are the shipped catastrophe set. It is the answer to "what did I allow?" without reading
+`hx-core/src/approval.rs`:
+
+```console
+$ hx policy
+approval policy from hx.yaml
+  level    balanced — asks before anything leaving the machine, or worse
+  read         runs free
+  mutate       runs free
+  external     asks
+  destructive  asks
+  privileged   asks
+  ceiling  none — a `yolo` chat can auto-approve anything, including a deleted database
+  deletes  a pattern or a variable in a delete is refused outright (`rm -rf build*`, `rm -rf $DIR`), …
 ```
 
 A call that needs a human does not fail, it waits — and any client can answer it. From a second
@@ -175,7 +194,7 @@ $ ./target/release/hxd --bind 127.0.0.1:7717
 ```
 
 ```console
-$ cargo test --workspace         # 663 tests, 0 failed, 22 ignored live tests
+$ cargo test --workspace         # 667 tests, 0 failed, 22 ignored live tests
 $ cargo test -p hx-sandbox --test docker_live -- --ignored   # needs a container engine
 $ cargo test -p hx-remote --test ssh_live -- --ignored       # needs an SSH server
 $ HX_SEARXNG_URL=... HX_SEARCH_EXPECT_RESULTS=searxng \
@@ -197,6 +216,8 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
   `hx approve` are the terminal one). Silence is a denial on a timer, the answer is recorded as an
   event with its `by`, and the question itself — including what a deletion measures — is in the
   stored trail. What is *not* there yet: nothing pushes a question to a client, so a web UI polls.
+  `hx policy` prints the ladder in force, so "why did it ask?" and "what did I allow?" are answered by
+  the same output rather than by reading the source.
 - **Project-scoped allowlists are not persisted.** "Always allow this" is remembered in memory for the
   rest of the run, and `docs/approvals.md` §5's reviewable `.hx/allow.toml` — the file in the
   repository a team can diff — is not written yet. Until it is, a remembered approval outlives

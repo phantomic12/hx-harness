@@ -120,6 +120,12 @@ enum Command {
     /// Show the model pools, their routes, and the role bindings.
     Pools,
 
+    /// Show the effective approval ladder: what runs free, what is asked about, and what is refused.
+    ///
+    /// Reads the configuration, so it shows what a *new* run will do. A live session's level can
+    /// differ (`--autonomy`, `allow for this chat`), which the output says rather than hides.
+    Policy,
+
     /// Check the configuration and the environment.
     Doctor,
 
@@ -240,6 +246,13 @@ async fn main() -> Result<()> {
         Command::Pools => {
             let router = ModelRouter::from_config(&config, Utc::now())?;
             print!("{}", commands::render_pools(&router));
+        }
+
+        Command::Policy => {
+            print!(
+                "{}",
+                commands::render_policy(&config, &cli.config.display().to_string())
+            );
         }
 
         Command::Approvals { session, json } => {

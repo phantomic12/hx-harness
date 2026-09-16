@@ -4,7 +4,7 @@
 # instead of being silently ignored.
 #
 # Verify with:  hx doctor
-# Inspect with: hx pools ; hx sandbox profiles ; hx sandbox spec dev
+# Inspect with: hx policy ; hx pools ; hx sandbox profiles ; hx sandbox spec dev
 
 # ---------------------------------------------------------------------------
 # Providers: one entry per upstream, each with one or more credentials.

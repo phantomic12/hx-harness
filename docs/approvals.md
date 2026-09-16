@@ -139,10 +139,22 @@ rows in a database — and they apply to one repository, matching what Claude Co
 
 ## 6. Being able to see it
 
-`hx policy` should print the effective ladder for the current configuration: for each tier, whether it
-auto-allows, asks, or is denied; which rules fire in which order; and the ceiling. Prior art has a
-`/permissions` panel for the same reason: a policy nobody can read is a policy nobody will check, and
-the first question after "why did it do that?" is "what did I allow?".
+`hx policy` prints the effective ladder for the current configuration: for each risk class, whether it
+runs free or asks; whether a run is capped by the ceiling or by a check-in budget; the rules as a
+numbered list in the order they are checked (`deny` first, because that is the order the session uses);
+how many of them are the shipped catastrophe set; and which options a prompt may offer at which tier.
+Prior art has a `/permissions` panel for the same reason: a policy nobody can read is a policy nobody
+will check, and the first question after "why did it do that?" is "what did I allow?".
+
+It reads the *configuration*, and says so at the bottom of its own output: a chat's `--autonomy` level
+and an `allow for this chat` answer are live state it cannot see, and `hx approvals` is the command for
+what is waiting right now. It also cannot tell you what the classifier will call a given command, which
+is why the tiers are shown by risk class rather than by example — a renderer that guessed would be
+wrong in exactly the case a reader cares about.
+
+It is what would have caught the two floor defects §7 records: the report prints the shipped rules
+individually, so `rm -rf /tmp/build` being refused by a pattern meant for the root is visible in one
+line rather than in a test nobody ran.
 
 ## 7. What is missing in the code, and in what order
 
@@ -153,7 +165,7 @@ the first question after "why did it do that?" is "what did I allow?".
 | 3 | Remember-scoping by tier: which options a request may offer | `hx-core/src/approval.rs` + the event that renders the prompt | medium | **done** |
 | 4 | `delete` tool that trashes, and the enumerable-target requirement for `Destructive` | `hx-tools`, `hx-core` prompt text | medium | **done** |
 | 5 | `confined` on `ActionRequest` and in rules | `hx-core`, `hx-agent` (sandbox-aware dispatch) | medium | not started |
-| 6 | `hx policy` renderer | `apps/hx` | small | not started |
+| 6 | `hx policy` renderer | `apps/hx` | small | **done** |
 
 Steps 1–2 are the upgrade that makes an *unattended* daemon useful: today the choice is prompt-for-
 everything or `--autonomy yolo`, and an allowlist is what splits that into a real third option. Steps

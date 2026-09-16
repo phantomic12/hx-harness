@@ -22,7 +22,7 @@ exist before anything can hide behind an integration test.
   TTL reaping, rollback on a failed start
 - `hx-server` + `hxd` — axum route surface and the daemon binary
 
-**Status: 663 tests green, clippy clean (0 warnings).** M0 closed at 324 of them: core 83, provider
+**Status: 667 tests green, clippy clean (0 warnings).** M0 closed at 324 of them: core 83, provider
 61, sandbox 53, search 45, remote 33, secrets 27, server 11, cli 11 — `hx-tools`, `hx-agent` and
 `hx-store` came after M0 and are covered in the M1/M2 sections.
 
@@ -59,8 +59,9 @@ Those get real tests in M1 against a live endpoint.
   rules and the `deny → ask → allow` precedence, the shipped catastrophe deny set, remember-scoping by
   tier, and the `delete` tool — a destructive request now names its targets, measured after the
   capability check and before the prompt, and the question reaches a client over HTTP
-  (`hx approvals` / `hx approve`). Still open in that document: `confined` as a second axis (§4), a
-  persisted project-scoped allowlist (§5), and `hx policy` to print the effective ladder (§6)
+  (`hx approvals` / `hx approve`), and `hx policy` prints the ladder in force, in the order it is
+  checked (§6). Still open in that document: `confined` as a second axis (§4) and a persisted
+  project-scoped allowlist (§5)
 - Context builder + compaction at a token threshold
 - ✅ `hxd` runs, `hx` connects to it: `hx chat` sends the prompt to the daemon over the configured
   HTTP address and prints the run's report (over HTTP rather than the unix socket, which the config
