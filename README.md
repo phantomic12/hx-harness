@@ -157,7 +157,7 @@ $ ./target/release/hxd --bind 127.0.0.1:7717
 ```
 
 ```console
-$ cargo test --workspace         # 587 tests, 0 failed, 22 ignored live tests
+$ cargo test --workspace         # 606 tests, 0 failed, 22 ignored live tests
 $ cargo test -p hx-sandbox --test docker_live -- --ignored   # needs a container engine
 $ cargo test -p hx-remote --test ssh_live -- --ignored       # needs an SSH server
 $ HX_SEARXNG_URL=... HX_SEARCH_EXPECT_RESULTS=searxng \
@@ -174,13 +174,12 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
 
 ## What is deliberately not done yet
 
-- **A run over HTTP cannot be approved, and a killed run loses its turn.** There is no approval
-  channel in the API yet, so the daemon's approver refuses every prompt with the reason and names the
-  escape hatch (`autonomy: "yolo"`, which the policy's `ceiling` can still cap) — never a silent yes.
-  Events are written as the run happens, so a client that reconnects can redraw; the *messages* of a
-  run are written when it returns, so a daemon killed mid-run keeps its events, its repaired dangling
-  call and the prompt it was asked, and loses the in-flight turn. Writing each message as it is
-  produced needs the loop to hand messages out as it appends them, and that is not in yet.
+- **A run over HTTP cannot be approved.** There is no approval channel in the API yet, so the
+  daemon's approver refuses every prompt with the reason and names the escape hatch
+  (`autonomy: "yolo"`, which the policy's `ceiling` can still cap) — never a silent yes. Events *and*
+  messages are written as the run produces them, so a daemon killed mid-run leaves a session that
+  says what happened up to that point: one whose kill landed between a tool call and its result is
+  repaired on the next request rather than losing the turn.
 - **`hx` has no `chat` command.** The daemon answers `POST /v1/chat`; the terminal still does not,
   which is the gap the next commit closes rather than something to claim.
 - **Streaming and context compaction.** A turn arrives whole, so a run is one long wait per turn and a

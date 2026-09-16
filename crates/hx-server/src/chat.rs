@@ -29,6 +29,7 @@ use crate::state::AppState;
 use chrono::{DateTime, Utc};
 use hx_agent::{
     AgentLoop, AlwaysAllow, Approver, DenyWithReason, Limits, ModelCall, RouterModel, RunOutcome,
+    TranscriptSink,
 };
 use hx_core::approval::{ApprovalSession, AutonomyLevel};
 use hx_core::capability::{Action, Capability, CapabilityToken, Resource};
@@ -38,7 +39,7 @@ use hx_core::ids::{AgentId, HostId, ProviderId, SessionId};
 use hx_core::message::Message;
 use hx_provider::{ModelRouter, ProviderRegistry, Usage};
 use hx_secrets::SecretStores;
-use hx_store::{NewSession, UsageRecord};
+use hx_store::{NewSession, Store, UsageRecord};
 use hx_tools::web::SEARCH_RESOURCE_HOST;
 use hx_tools::{ToolContext, ToolRegistry};
 use serde::{Deserialize, Serialize};
@@ -142,6 +143,23 @@ pub struct ChatReply {
     /// The transcript length now, so a client can tell a resumed session from a fresh one.
     pub messages: usize,
     pub totals: hx_store::Totals,
+}
+
+/// Where a run's messages go while it is still running: the session store, one row at a time.
+///
+/// This is what makes a killed daemon resumable rather than merely restartable. Events already went
+/// out live; messages used to wait for the run to return, so a `kill -9` at turn three lost two turns
+/// of work *after* the tools in them had already run — the transcript could not say what they did.
+struct StoreSink {
+    store: Arc<Store>,
+    session: SessionId,
+}
+
+impl TranscriptSink for StoreSink {
+    fn appended(&self, message: &Message) -> Result<()> {
+        self.store.append(&self.session, message, Utc::now())?;
+        Ok(())
+    }
 }
 
 /// Run one request against one session.
@@ -263,7 +281,11 @@ pub async fn run_chat(
         approver,
     )
     .with_limits(ttl)
-    .with_events(events_tx);
+    .with_events(events_tx)
+    .with_transcript_sink(Arc::new(StoreSink {
+        store: Arc::clone(&state.store),
+        session: session_id.clone(),
+    }));
 
     // The context the run acts in: the host, and the workspace every relative path is resolved
     // against. A run whose tools do not know its workspace denies the paths the model naturally
@@ -278,16 +300,18 @@ pub async fn run_chat(
 
     let outcome = run?;
 
-    // Everything from the prompt onwards: the loop appended as it went, and the store gets it in one
-    // transaction so a transcript is never half-written.
-    let appended = transcript
-        .len()
-        .saturating_sub(state.store.message_count(&session_id)? as usize);
-    if appended > 0 {
-        let from = transcript.len() - appended;
-        state
-            .store
-            .append_all(&session_id, &transcript[from..], now)?;
+    // No batch append: every message the loop produced went to the store as it was produced, through
+    // the sink. What is left is to notice if that ever stops being true — a transcript in memory that
+    // is longer than the one on disk means a message a kill would have lost, and the run that
+    // reported success would have been lying about what is resumable.
+    let stored = state.store.message_count(&session_id)? as usize;
+    if stored != transcript.len() {
+        tracing::warn!(
+            session = %session_id.as_str(),
+            in_memory = transcript.len(),
+            stored,
+            "the transcript on disk does not match the one the run produced"
+        );
     }
 
     let totals = state.store.totals(&session_id)?;

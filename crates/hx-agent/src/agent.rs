@@ -73,6 +73,21 @@ pub struct RunOutcome {
     pub refusals: u32,
 }
 
+/// Where the messages of a run go as they are produced.
+///
+/// The loop owns no storage — a session store does — and this is how that store hears about a message
+/// before the run is over. The difference matters most exactly when a tool has already run: a
+/// transcript that stops at the last turn boundary loses the only record of what that call did, while
+/// a daemon that was killed leaves a session that cannot be resumed honestly.
+///
+/// Synchronous on purpose. The loop calls it the moment a message exists and stops the run if it
+/// fails, because a store that cannot write is a store problem the caller must see rather than
+/// something to paper over by finishing a run whose transcript will never be complete.
+pub trait TranscriptSink: Send + Sync {
+    /// One message, in the order the loop produced it.
+    fn appended(&self, message: &Message) -> Result<()>;
+}
+
 /// The loop.
 pub struct AgentLoop {
     agent: AgentId,
@@ -85,6 +100,7 @@ pub struct AgentLoop {
     approver: Arc<dyn Approver>,
     limits: Limits,
     events: Option<mpsc::Sender<AgentEvent>>,
+    sink: Option<Arc<dyn TranscriptSink>>,
     system: Option<String>,
 }
 
@@ -106,6 +122,7 @@ impl AgentLoop {
             approver,
             limits: Limits::default(),
             events: None,
+            sink: None,
             system: None,
         }
     }
@@ -127,8 +144,31 @@ impl AgentLoop {
         self
     }
 
+    /// Where a produced message goes before the run ends.
+    ///
+    /// A session store passes one so that a killed run leaves a transcript of what actually happened.
+    /// Without it the transcript lives only in memory until the run returns, and the run that a
+    /// client most needs to resume is the one that never returned.
+    pub fn with_transcript_sink(mut self, sink: Arc<dyn TranscriptSink>) -> Self {
+        self.sink = Some(sink);
+        self
+    }
+
     pub fn tools(&self) -> &Arc<ToolRegistry> {
         &self.tools
+    }
+
+    /// Append a produced message, in the one order that is safe.
+    ///
+    /// The sink first: a message that reached the transcript but not the store is one a killed run
+    /// loses *after* its tool has already run — the transcript would then be unable to say what the
+    /// tool did, which is the single most important thing for it to say.
+    fn append(&self, transcript: &mut Vec<Message>, message: Message) -> Result<()> {
+        if let Some(sink) = &self.sink {
+            sink.appended(&message)?;
+        }
+        transcript.push(message);
+        Ok(())
     }
 
     fn emit(&self, event: AgentEvent) {
@@ -235,7 +275,7 @@ impl AgentLoop {
                 })
                 .collect();
 
-            transcript.push(response.message.clone());
+            self.append(transcript, response.message.clone())?;
 
             if calls.is_empty() {
                 self.emit(AgentEvent::TurnFinished {
@@ -278,7 +318,10 @@ impl AgentLoop {
                     }
                 };
 
-                transcript.push(Message::tool_result(id.clone(), ok, summary.clone()));
+                self.append(
+                    transcript,
+                    Message::tool_result(id.clone(), ok, summary.clone()),
+                )?;
 
                 self.emit(AgentEvent::ToolCallFinished {
                     agent: self.agent.clone(),

@@ -4,7 +4,7 @@ Status: 2026-09-15. Companion to `ROADMAP.md` (which tracks features); this file
 
 ```console
 $ cargo test --workspace
-603 tests, 0 failed                       # 11 hermetic HTTP + 4 that reopen the database + 11 that run the loop over HTTP
+606 tests, 0 failed                       # 11 hermetic HTTP + 4 that reopen the database + 12 that run the loop over HTTP
 22 ignored                               # live: Docker, SSH, search, a real model
 
 # The 22 that need a real server, run by `.github/workflows/integration.yml`
@@ -150,10 +150,10 @@ returning an empty list.
 | `hx-sandbox` | 62 | 2057 | Isolation ladder ordering and monotonicity, spec↔YAML round-trip, `SandboxSpec`→`HostConfig` mapping field by field, **no engine-rejected security option** (`userns=`, `seccomp=default`), an egress allowlist that cannot be enforced, registry/TTL bookkeeping, the concurrency cap, and rollback on a failed start |
 | `hx-search` | 45 | 1732 | RRF rank fusion, HTML extraction, entity decoding, per-backend failure isolation (with **fake** backends) |
 | `hx-secrets` | 36 | 1302 | Argon2id+XChaCha20 round-trip, tamper detection, redaction patterns, and **credential resolution**: a `store:name` reference resolved through `vault:`/`env:`/a fixed map, an empty environment variable refused like an absent one, an unknown store listing the stores that *are* configured, and every error message asserted **not** to contain a value |
-| `hx-agent` | 33 | 991 | The loop's gate, in one file of integration tests: a **capability denial is a result the model reads and cannot be approved away** (an approver willing to say yes is never asked), an approval denial is reported and the command never reaches the host, `allow for chat` stops the second prompt while a remembered denial is not re-asked, a tool declaring no external effect is never prompted about, a refused call does not stop its sibling, unknown tools and unusable arguments return as results, a non-zero exit is still a call that *ran*, `max_turns` and the deadline stop the run, and the exact event sequence a client renders. Plus the **routed model call** over a real `ModelRouter` and a real `ProviderRegistry`, with only the adapter faked: the route decides the model, the key follows the credential the pool granted, a refused credential is benched and its *sibling* is tried before another provider, a missing key and a 502 both give the reservation back (asserted with `concurrent: 1`, since a leaked lease looks exactly like a rate limit), and a day's budget that covers one pessimistic reservation still allows three calls |
+| `hx-agent` | 35 | 1027 | The loop's gate, in one file of integration tests: a **capability denial is a result the model reads and cannot be approved away** (an approver willing to say yes is never asked), an approval denial is reported and the command never reaches the host, `allow for chat` stops the second prompt while a remembered denial is not re-asked, a tool declaring no external effect is never prompted about, a refused call does not stop its sibling, unknown tools and unusable arguments return as results, a non-zero exit is still a call that *ran*, `max_turns` and the deadline stop the run, and the exact event sequence a client renders. Plus the **routed model call** over a real `ModelRouter` and a real `ProviderRegistry`, with only the adapter faked: the route decides the model, the key follows the credential the pool granted, a refused credential is benched and its *sibling* is tried before another provider, a missing key and a 502 both give the reservation back (asserted with `concurrent: 1`, since a leaked lease looks exactly like a rate limit), and a day's budget that covers one pessimistic reservation still allows three calls |
 | `hx-store` | 38 | 2051 | Migrations applied once and never re-run, **a database from a newer build refused with both versions named** (and left untouched), `STRICT` rejecting a type mistake at insert, the transcript written by `seq` the caller does not track, a batch written whole or not at all, a cascade that only happens because `Store` sets `foreign_keys`, every part type round-tripping while an unknown one is reported rather than dropped, events and usage surviving a reopen — plus 4 in `tests/resume.rs` that drop the store and open a **new connection** to the same file, which is the closest a test gets to killing the daemon |
 | `hx-tools` | 70 | 2576 | Requirements per tool, bounded output, the two-phase registry, and **a misnamed argument refused rather than ignored** — `cwd` instead of `workdir` used to drop silently and run the command in the daemon's own directory |
-| `hx-server` | 27 | 1699 | Route dispatch via `oneshot`, `HxError`→HTTP status mapping, and eleven tests that run the **real loop over the real HTTP surface** with only the model scripted: an answer comes back with its session, its cost and its events; a tool call runs and its result reaches the model; a write outside the workspace is denied and never happens; a shell command that needs a human is refused **with the reason**, and the same command runs under `yolo`; a second request on a session continues the transcript; unknown autonomy and unknown roles are 400s that name what is accepted; and a request that cannot run leaves no session behind |
+| `hx-server` | 28 | 1730 | Route dispatch via `oneshot`, `HxError`→HTTP status mapping, and twelve tests that run the **real loop over the real HTTP surface** with only the model scripted: an answer comes back with its session, its cost and its events; a tool call runs and its result reaches the model; a write outside the workspace is denied and never happens; a shell command that needs a human is refused **with the reason**, and the same command runs under `yolo`; a second request on a session continues the transcript; unknown autonomy and unknown roles are 400s that name what is accepted; and a request that cannot run leaves no session behind |
 | `hx` | 11 | — | Renderers for pools/hosts/sandbox-spec, CLI parsing |
 
 Two families in that table are worth naming, because in both the obvious implementation is wrong and
@@ -296,6 +296,24 @@ direct `curl` to the proxy), and `opencode-zen/nemotron-3.5-lightning-free` is r
 provider to OpenCode's own client. A model that cannot call tools cannot drive this harness, and the
 error says which of those it was.
 
+**A kill, and what it leaves behind.** `kill -9` on the daemon 6 s into a run, once the first tool
+result was on disk (`~/.hx/kill-test.sh` polls the database and kills at that moment rather than
+guessing):
+
+```console
+$ ./kill-test.sh
+session ses_7c8f29c6… has 3 messages on disk — killing -9 now
+1 | user      | "Read every Cargo.toml under crates/ …"
+2 | assistant | "I'll first find all the Cargo.toml files …"      (with a tool call)
+3 | tool      | tool_result for shell_0#f8cdea97…
+messages=3 events=6 usage=1
+```
+
+Then restart and resume the same session: `created=false repaired=0`, 13 tool calls, 0 refusals, 20
+messages, and the answer correct. That is M1's second exit criterion — a killed run resumes because
+its transcript was never only in memory, and a kill that lands *between* a call and its result is
+repaired on the next request rather than sent to a provider that rejects it.
+
 The first run of this tier found two bugs no scripted test could: an OpenAI-compatible proxy that hands
 over *unmerged streaming fragments* as a `tool_calls` array (seven entries, six nameless, one call),
 and relative paths from the model being checked against an absolute workspace grant — 35 refusals and
@@ -304,11 +322,11 @@ no progress. Both are fixed, and both now have tests that reproduce the real wir
 ## Running the suite
 
 ```bash
-cargo test --workspace          # 603 tests, 0 failed, 22 ignored live tests
+cargo test --workspace          # 606 tests, 0 failed, 22 ignored live tests
 cargo test -p hx-store          # 42 — migrations, the transcript, and 4 that reopen the file
-cargo test -p hx-agent          # 33 — the loop's gate, and the routed model call
+cargo test -p hx-agent          # 35 — the loop's gate, the routed model call, the transcript sink
 cargo test -p hx-tools          # 70 — requirements, bounded output, the two-phase registry, workspace resolution
-cargo test -p hx-server         # 27 — routes, and the loop end to end over HTTP
+cargo test -p hx-server         # 28 — routes, and the loop end to end over HTTP
 cargo test -p hx-sandbox        # 62 — includes the ladder and the rollback invariants
 cargo test -p hx-remote         # 90 — includes known_hosts parsing and the host key policy
 cargo build --workspace         # clean: 0 warnings, 0 deprecations

@@ -518,6 +518,51 @@ async fn a_shell_command_runs_in_the_workspace_when_the_model_names_no_directory
 }
 
 #[tokio::test]
+async fn messages_survive_a_run_that_fails_in_the_middle() {
+    // The property the second M1 exit criterion rests on: a run that dies at turn two has *already*
+    // run the tool in turn one, and its result is the only record of what that call did. Messages go
+    // to the store as they are produced, so the failure costs the turn it happened in and nothing
+    // before it.
+    let h = harness(vec![]).await;
+    std::fs::write(h.workspace.join("notes.txt"), "durable\n").expect("fixture");
+
+    h.model.push(Ok(calls(vec![(
+        "c1",
+        "read_file",
+        serde_json::json!({ "path": "notes.txt" }),
+    )])));
+    // No second reply: the model call for the next turn fails.
+
+    let (status, body) = chat(&h.state, h.body("read the notes")).await;
+    assert!(status.is_server_error(), "{status} {body}");
+
+    let sessions = h.state.store.list(10).expect("sessions list");
+    assert_eq!(sessions.len(), 1, "the session exists despite the failure");
+    let id = sessions[0].record.id.clone();
+
+    let messages = h.state.store.messages(&id).expect("transcript reads");
+    assert_eq!(
+        messages.len(),
+        3,
+        "prompt, the assistant's call, and the result of a tool that really ran: {messages:#?}"
+    );
+    assert_eq!(messages[0].text(), "read the notes");
+    assert!(
+        messages[2].text().contains("durable"),
+        "the tool's output is the record of what it did: {:#?}",
+        messages[2]
+    );
+
+    // And nothing is left dangling: the call has its result, so resuming this session is a normal
+    // continuation rather than a repair.
+    let session = h.state.store.load(&id).expect("session loads");
+    assert!(
+        session.interrupted_calls().is_empty(),
+        "the run failed between turns, not inside a call"
+    );
+}
+
+#[tokio::test]
 async fn a_second_request_on_a_session_continues_the_transcript() {
     let h = harness(vec![Ok(answer("first")), Ok(answer("second"))]).await;
 

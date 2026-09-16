@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 use hx_agent::approver::{AlwaysAllow, AlwaysDeny, ApprovalDecision, Approver, ScriptedApprover};
-use hx_agent::{AgentLoop, Limits, ModelCall};
+use hx_agent::{AgentLoop, Limits, ModelCall, TranscriptSink};
 use hx_core::approval::{ApprovalPolicy, ApprovalSession, AutonomyLevel};
 use hx_core::capability::{Action, Capability, CapabilityToken, Resource};
 use hx_core::error::{HxError, Result};
@@ -952,4 +952,124 @@ async fn a_run_with_nobody_listening_still_completes() {
 
     assert_eq!(outcome.stop, StopReason::Completed);
     assert_eq!(outcome.final_text, "done");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Where the messages go while the run is still going
+// ---------------------------------------------------------------------------------------------
+
+/// A store's stand-in: keeps what it was handed, and can be told to fail at a given message.
+#[derive(Default)]
+struct RecordingSink {
+    seen: Mutex<Vec<Message>>,
+    /// Fail when this many messages have already been recorded — one message short of `N`.
+    fail_at: Option<usize>,
+}
+
+impl RecordingSink {
+    fn fail_at(n: usize) -> Arc<Self> {
+        Arc::new(Self {
+            fail_at: Some(n),
+            ..Default::default()
+        })
+    }
+
+    fn seen(&self) -> Vec<Message> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl TranscriptSink for RecordingSink {
+    fn appended(&self, message: &Message) -> Result<()> {
+        let mut seen = self.seen.lock().unwrap();
+        if Some(seen.len()) == self.fail_at {
+            return Err(HxError::Store("the disk is full".to_string()));
+        }
+        seen.push(message.clone());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn every_message_the_run_produces_reaches_the_sink_as_it_is_produced() {
+    // The property a session store depends on: the messages exist *outside* the run as soon as the
+    // run makes them. A daemon killed mid-run then has a transcript that says what happened instead
+    // of one that stops at the last turn boundary.
+    let sink: Arc<RecordingSink> = Arc::default();
+    let model = ScriptedModel::new(vec![
+        Ok(reply_with(vec![("c1", "shell", json!({"cmd": "echo hi"}))])),
+        Ok(reply("done")),
+    ]);
+    let agent_loop = AgentLoop::new(
+        agent(),
+        model,
+        Arc::new(tools()),
+        token(vec![Capability::new(Resource::Process, [Action::Execute])]),
+        ApprovalSession::new(ApprovalPolicy::at(AutonomyLevel::Yolo)),
+        Arc::new(AlwaysAllow),
+    )
+    .with_transcript_sink(Arc::clone(&sink) as Arc<dyn TranscriptSink>);
+
+    let ctx = ToolContext::new(Arc::new(FakeHost::unix().with_exec_output(
+        "hi\n",
+        "",
+        Some(0),
+    )));
+    let mut transcript = vec![Message::user("run echo")];
+    let outcome = agent_loop.run(&mut transcript, &ctx).await.unwrap();
+
+    assert_eq!(outcome.stop, StopReason::Completed);
+    let recorded = sink.seen();
+    assert_eq!(
+        recorded.len(),
+        transcript.len() - 1,
+        "every message the loop appended, and only those"
+    );
+    assert_eq!(
+        recorded,
+        transcript[1..].to_vec(),
+        "in the same order, with the same content"
+    );
+    // The tool result is among them, which is the message that matters most: it is the only record
+    // of what a call did.
+    assert!(
+        recorded.iter().any(|m| m.text().contains("hi")),
+        "{recorded:#?}"
+    );
+}
+
+#[tokio::test]
+async fn a_sink_that_cannot_write_stops_the_run_rather_than_finishing_a_lie() {
+    // A store that fails is a store problem the caller must see. Finishing the run would report
+    // success for a transcript that will never be complete.
+    let sink = RecordingSink::fail_at(1);
+    let model = ScriptedModel::new(vec![
+        Ok(reply_with(vec![("c1", "shell", json!({"cmd": "echo hi"}))])),
+        Ok(reply("done")),
+    ]);
+    let agent_loop = AgentLoop::new(
+        agent(),
+        model,
+        Arc::new(tools()),
+        token(vec![Capability::new(Resource::Process, [Action::Execute])]),
+        ApprovalSession::new(ApprovalPolicy::at(AutonomyLevel::Yolo)),
+        Arc::new(AlwaysAllow),
+    )
+    .with_transcript_sink(sink.clone());
+
+    let ctx = ToolContext::new(Arc::new(FakeHost::unix().with_exec_output(
+        "hi\n",
+        "",
+        Some(0),
+    )));
+    let mut transcript = vec![Message::user("run echo")];
+    let err = agent_loop.run(&mut transcript, &ctx).await.unwrap_err();
+
+    assert!(matches!(err, HxError::Store(_)), "{err:?}");
+    // The assistant turn was recorded, the tool ran, and the result could not be — so the run stops
+    // with the transcript holding exactly what is durable, and nothing that is not.
+    assert_eq!(sink.seen().len(), 1);
+    assert!(transcript
+        .iter()
+        .all(|m| m.role != hx_core::message::Role::Tool));
 }
