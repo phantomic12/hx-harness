@@ -4,10 +4,10 @@ Status: 2026-09-15. Companion to `ROADMAP.md` (which tracks features); this file
 
 ```console
 $ cargo test --workspace
-410 unit + 11 hermetic HTTP tests, 0 failed
+493 unit + 11 hermetic HTTP tests, 0 failed
 22 ignored                               # live: Docker, SSH, search, a real model
 
-# The 18 that need a real server, run by `.github/workflows/integration.yml`
+# The 22 that need a real server, run by `.github/workflows/integration.yml`
 # and `.github/workflows/canary.yml`:
 $ cargo test -p hx-sandbox --test docker_live -- --ignored --test-threads=1
 9 passed; 0 failed                       # a real Docker daemon, with gVisor installed
@@ -22,7 +22,7 @@ $ HX_SEARXNG_URL=http://127.0.0.1:8888 HX_SEARCH_EXPECT_RESULTS=searxng \
 ```
 
 The counts matter in both directions. A green `cargo test` alone still means **the logic is right**;
-those 18 ignored tests are the ones that have reached another process, and the only ones here that
+those 22 ignored tests are the ones that have reached another process, and the only ones here that
 could catch a protocol mistake. They now run in CI, which is the difference between "verified once"
 and "stays verified".
 
@@ -148,8 +148,10 @@ returning an empty list.
 | `hx-provider` | 81 | 3679 | Token-bucket timing, **budget fail-closed on a zero estimate**, credential pool round-robin, shared-limiter identity across pools, routing and fallthrough |
 | `hx-remote` | 90 | 3108 | Platform caps parsing (`uname`/`ver`), path translation, shell quoting incl. injection attempts, risky-command classification, mid-truncation, approval round-trip against the local host, and **`known_hosts`**: hashed host fields (HMAC-SHA1), globs, negation, `@revoked` beating trust regardless of line order, a different key type reading as first use rather than substitution, plus the policy's fail-closed behaviour and the wording of every refusal |
 | `hx-sandbox` | 62 | 2057 | Isolation ladder ordering and monotonicity, spec↔YAML round-trip, `SandboxSpec`→`HostConfig` mapping field by field, **no engine-rejected security option** (`userns=`, `seccomp=default`), an egress allowlist that cannot be enforced, registry/TTL bookkeeping, the concurrency cap, and rollback on a failed start |
+| `hx-tools` | 62 | 2307 | Each tool's **requirement** (a shell line implies `Process`, a read implies its path — and the todo list implies nothing), argument errors phrased for a model to act on, output bounded in the middle with the dropped count stated, a patch that is ambiguous or anchored on stale text refusing to write, and the two-phase registry: **the arguments that were checked are the arguments that ran** |
 | `hx-search` | 45 | 1732 | RRF rank fusion, HTML extraction, entity decoding, per-backend failure isolation (with **fake** backends) |
 | `hx-secrets` | 27 | 901 | Argon2id+XChaCha20 round-trip, tamper detection, redaction patterns |
+| `hx-agent` | 21 | 727 | The loop's gate, in one file of integration tests: a **capability denial is a result the model reads and cannot be approved away** (an approver willing to say yes is never asked), an approval denial is reported and the command never reaches the host, `allow for chat` stops the second prompt while a remembered denial is not re-asked, a tool declaring no external effect is never prompted about, a refused call does not stop its sibling, unknown tools and unusable arguments return as results, a non-zero exit is still a call that *ran*, `max_turns` and the deadline stop the run, and the exact event sequence a client renders |
 | `hx-server` | 11 | 739 | Route dispatch via `oneshot`, `HxError`→HTTP status mapping |
 | `hx` | 11 | — | Renderers for pools/hosts/sandbox-spec, CLI parsing |
 
@@ -176,9 +178,9 @@ the failure is silent:
 
 ### Tier D — absent
 
-Six crates are one line each — placeholder `lib.rs` with a doc comment and nothing else:
+Four crates are one line each — placeholder `lib.rs` with a doc comment and nothing else:
 
-`hx-agent` · `hx-browser` · `hx-gateway` · `hx-mcp` · `hx-store` · `hx-tools`
+`hx-browser` · `hx-gateway` · `hx-mcp` · `hx-store`
 
 They are declared as workspace members, so `cargo test` reports nothing for them and the build is
 green. **A green suite says nothing about them.** Also absent: the web UI, the Tauri desktop/mobile
@@ -245,8 +247,11 @@ failure is accounted for, results that do come back are usable and not redirect 
 found DuckDuckGo serving an `anomaly` challenge on every request — reported correctly, and now
 recorded in README as the reason a browser-fingerprint client is M6 work rather than a parsing bug.
 
-**6 — End-to-end agent test.** Blocked on M1. The moment the loop exists it should drive one real
-task against a real sandbox — that becomes the first true end-to-end test in the repo.
+**6 — End-to-end agent test.** ◐ Unblocked, not done. The loop exists now (`crates/hx-agent`), and
+its 21 tests exercise the gate end to end — but against a *scripted* model and an in-memory host,
+which is still only our own assumptions. The test that counts drives a real model through the loop
+with a real tool against a real host or sandbox, and it cannot be written before the loop is wired
+into something that owns a credential and a host (`hx-store` and `hxd`, next in M1).
 
 **7 — L3, and a non-Linux remote.**
 
@@ -263,7 +268,9 @@ environment work rather than code work.
 ## Running the suite
 
 ```bash
-cargo test --workspace          # 410 unit tests + 11 hermetic HTTP + 22 ignored live tests
+cargo test --workspace          # 493 unit tests + 11 hermetic HTTP + 22 ignored live tests
+cargo test -p hx-agent          # 21 — the loop's gate, against a scripted model and a fake host
+cargo test -p hx-tools          # 62 — requirements, bounded output, the two-phase registry
 cargo test -p hx-sandbox        # 62 — includes the ladder and the rollback invariants
 cargo test -p hx-remote         # 90 — includes known_hosts parsing and the host key policy
 cargo build --workspace         # clean: 0 warnings, 0 deprecations
@@ -277,8 +284,12 @@ HX_SSH_TEST_HOST=<host> HX_SSH_TEST_USER=<user> HX_SSH_TEST_KEY=~/.ssh/id_ed2551
 
 ## Summary
 
-- **8 crates with logic**: unit-tested at the level of pure functions and in-process lifecycles.
-- **6 crates**: empty. The green suite does not cover them.
+- **10 crates with logic**: unit-tested at the level of pure functions and in-process lifecycles.
+- **4 crates**: empty. The green suite does not cover them.
+- **The agent loop's gate is tested where it can be**: 21 integration tests with no network and no
+  model — a capability denial that an approval cannot widen, an approval denial that never reaches the
+  host, a refusal that does not stop the next call, and the event sequence a client will render. What
+  none of them reaches is a real model: a scripted one is a model we wrote.
 - **22 live tests**, all `#[ignore]`d by default: a real Docker daemon with gVisor installed, a real
   `sshd` and a real SearXNG are run in CI; the four against a real model are run deliberately, since
   they need a key and CI has none.

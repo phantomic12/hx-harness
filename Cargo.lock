@@ -1233,7 +1233,16 @@ dependencies = [
 name = "hx-agent"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
+ "chrono",
  "hx-core",
+ "hx-provider",
+ "hx-remote",
+ "hx-secrets",
+ "hx-tools",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

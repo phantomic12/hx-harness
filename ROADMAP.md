@@ -32,8 +32,7 @@ ceiling, unattended budget and expiry; buckets refuse when exhausted and recover
 fail over and bench unhealthy credentials; RRF dedupes `?utm_source=` variants of one URL; a
 failed sandbox create rolls back rather than leaking a container.
 
-**Not landed yet** (typed stubs only): `hx-store`, `hx-tools`, `hx-agent`, `hx-browser`,
-`hx-mcp`, `hx-gateway`.
+**Not landed yet** (typed stubs only): `hx-store`, `hx-browser`, `hx-mcp`, `hx-gateway`.
 
 **Deliberately unverified at M0:** the concrete HTTP adapters (`OpenAiCompatible`,
 `AnthropicMessages`) and the fetch/parse halves of the search backends. Their *pure* halves —
@@ -51,10 +50,12 @@ Those get real tests in M1 against a live endpoint.
   hermetic HTTP suite and a live suite (text, usage, tool calls, transcript)
 - Provider adapter for Anthropic Messages API
 - Streaming over SSE, token deltas into the TUI
-- Tool dispatch: `shell`, `read_file`, `write_file`, `patch`, `search`, `todo`
-- **Approval wired into dispatch** — every tool call classified before it runs, `/approval
-  <level>` and `/yolo [duration]` per chat, prompts rendered in the TUI (§3.11). The engine
-  already exists; this milestone is the wiring and the prompt UI.
+- ✅ Tool dispatch: `shell`, `read_file`, `write_file`, `patch`, `search`, `todo` — each declares the
+  resource and action it needs; none decides whether it is allowed
+- ◐ **Approval wired into dispatch** — done in the loop: every tool call is classified against the
+  capability token and then the approval policy, in that order, and every refusal comes back to the
+  model as a tool result (`crates/hx-agent/tests/loop.rs`). Still to come: `/approval <level>` and
+  `/yolo [duration]` as chat commands, and the prompt UI, which need a client to render them (§3.11)
 - Context builder + compaction at a token threshold
 - `hxd` runs, `hx` connects to it over the local socket
 - Session persistence (`hx-store`): resume, list, export

@@ -28,11 +28,16 @@ pub mod todo;
 pub mod tool;
 pub mod web;
 
-#[cfg(test)]
+/// An in-memory host, for tests.
+///
+/// Not `#[cfg(test)]`: a downstream crate's tests of the *loop* need a host to hand to a tool,
+/// and a mock library would only assert that we call the methods we think we call. The real host
+/// semantics (filesystem, command output) are what make an assertion about a tool's effect mean
+/// something.
 pub mod testing;
 
 pub use fs::{PatchTool, ReadFileTool, WriteFileTool};
-pub use registry::ToolRegistry;
+pub use registry::{PreparedCall, ToolInfo, ToolRegistry};
 pub use shell::ShellTool;
 pub use todo::TodoTool;
 pub use tool::{
