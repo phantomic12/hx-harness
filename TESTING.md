@@ -4,17 +4,21 @@ Status: 2026-09-15. Companion to `ROADMAP.md` (which tracks features); this file
 
 ```console
 $ cargo test --workspace
-390 passed; 0 failed; 13 ignored         # 8 crates with code
+390 passed; 0 failed; 17 ignored         # 8 crates with code
 
-# The 13 that need a real server, run by `.github/workflows/integration.yml`:
+# The 17 that need a real server, run by `.github/workflows/integration.yml`
+# and `.github/workflows/canary.yml`:
 $ cargo test -p hx-sandbox --test docker_live -- --ignored --test-threads=1
 8 passed; 0 failed                       # a real Docker daemon
 $ cargo test -p hx-remote --test ssh_live -- --ignored --test-threads=1
 5 passed; 0 failed                       # a real sshd, real key auth
+$ HX_SEARXNG_URL=http://127.0.0.1:8888 HX_SEARCH_EXPECT_RESULTS=searxng \
+  cargo test -p hx-search --test search_live -- --ignored --test-threads=1
+4 passed; 0 failed                       # a real SearXNG, real internet
 ```
 
 The counts matter in both directions. A green `cargo test` alone still means **the logic is right**;
-those 13 ignored tests are the ones that have reached another process, and the only ones here that
+those 17 ignored tests are the ones that have reached another process, and the only ones here that
 could catch a protocol mistake. They now run in CI, which is the difference between "verified once"
 and "stays verified".
 
@@ -99,6 +103,15 @@ connection negotiated and recorded `ssh-ed25519`.
 Still not covered by any run: a Windows SSH server, a jump host, and `ssh-agent` auth (which returns
 an explicit "not implemented" error rather than a wrong answer).
 
+**Search, against a real SearXNG and the real internet** (`crates/hx-search/tests/search_live.rs`)
+
+A SearXNG in Docker, JSON output enabled, the canary pointed at it: **10 fused results for one
+query**, `answered: searxng`, every result carrying the backend that produced it, no redirect
+wrappers, and a nonsense query correctly reported as five results rather than as a failure. In the
+same run DuckDuckGo was asked, refused with an `anomaly` challenge, and appeared in the report as
+`unavailable: duckduckgo` — which is the whole point of per-backend failure reporting: the search
+still worked, and the caller knows what was missing.
+
 **The daemon, by hand (earlier session, M0)** — `hxd` boots and serves (`/healthz` 200, unknown route
 404, `/v1/chat` 501 with an explanation), the `hx` subcommands render correctly, `hx doctor` reported
 a dead container engine as `FAIL` rather than crashing, and `/v1/search` against the live internet
@@ -136,7 +149,7 @@ the failure is silent:
 |---|---|---|
 | **L3 sandbox** (`runtime: runsc`) | Nothing installs gVisor, including CI | **High** — the level exists to deny the sandbox the host kernel, and no container has ever started on it |
 | **Egress filtering** | Not implemented: no proxy, no firewall rule. Now *refused* rather than ignored (`SpecError::EgressNotEnforced`), so it cannot silently mean "open internet" |
-| `hx-search` real backends — SearXNG + DuckDuckGo HTTP fetch | Needs network | Medium. Only fixture-parsed; the one live run hit failures on both |
+| DuckDuckGo keyless scraping — the *success* path | Every attempt from a plain HTTP client is answered with an `anomaly` challenge: a TLS-fingerprint wall, not a markup change. The failure path is verified live; the success path needs a browser-fingerprint client (M6) | Medium — search silently loses a source, but `SearchReport` names it |
 | Provider HTTP calls to a real model API | Needs keys | Medium |
 | Vault written to disk and reopened in a **new process** | Untested | Medium — in-process round-trip only |
 | `hxd` reaper loop, `axum::serve` under load | Manual only | Low |
@@ -192,14 +205,20 @@ CI, on a non-default port so the bracketed `known_hosts` form is exercised. It i
 machine and not a Windows host — that is item 7.
 
 **4 — Mark the untested paths so the suite cannot lie. ✅ Done for both live surfaces.**
-`cargo test --workspace` reports `13 ignored` instead of implying full coverage, and
+`cargo test --workspace` reports `17 ignored` instead of implying full coverage, and
 `.github/workflows/integration.yml` runs them where CI can host them. The remaining tier C paths —
 L3, the egress proxy, real search backends — should get the same treatment as they gain tests; the
 suite's real weakness was never low coverage but that **nothing distinguished "verified" from
 "compiles"**, so a green run read as more assurance than it was.
 
-**5 — Live search canary.** A scheduled test that hits one real backend and *fails loudly* on a bot
-check. The design correctly reports bot checks as failures; nothing yet notices when it happens.
+**5 — Live search canary. ✅ Done.** `crates/hx-search/tests/search_live.rs`, four tests, run nightly
+by `.github/workflows/canary.yml` — which starts a SearXNG of its own, because that is the one
+backend a non-browser client can rely on. It asserts the promises the design makes rather than
+wishing the web were friendlier: *never a silent empty* (no results implies a named reason), every
+failure is accounted for, results that do come back are usable and not redirect wrappers, and with
+`HX_SEARCH_EXPECT_RESULTS=searxng` the configured backend must actually answer. The first live run
+found DuckDuckGo serving an `anomaly` challenge on every request — reported correctly, and now
+recorded in README as the reason a browser-fingerprint client is M6 work rather than a parsing bug.
 
 **6 — End-to-end agent test.** Blocked on M1. The moment the loop exists it should drive one real
 task against a real sandbox — that becomes the first true end-to-end test in the repo.
@@ -211,7 +230,7 @@ shell wrapping and the POSIX-only file-transfer guards have never met a real ser
 ## Running the suite
 
 ```bash
-cargo test --workspace          # 390 unit tests + 13 ignored integration tests
+cargo test --workspace          # 390 unit tests + 17 ignored integration tests
 cargo test -p hx-sandbox        # 62 — includes the ladder and the rollback invariants
 cargo test -p hx-remote         # 90 — includes known_hosts parsing and the host key policy
 cargo build --workspace         # clean: 0 warnings, 0 deprecations
@@ -227,8 +246,8 @@ HX_SSH_TEST_HOST=<host> HX_SSH_TEST_USER=<user> HX_SSH_TEST_KEY=~/.ssh/id_ed2551
 
 - **8 crates with logic**: unit-tested at the level of pure functions and in-process lifecycles.
 - **6 crates**: empty. The green suite does not cover them.
-- **13 integration tests**, all `#[ignore]`d by default and all run in CI: a real Docker daemon and a
-  real `sshd`.
+- **17 integration tests**, all `#[ignore]`d by default, all run in CI: a real Docker daemon, a real
+  `sshd`, and a real SearXNG against the live internet.
 - **The SSH transport and the sandbox lifecycle are tier A, and regress loudly**: host key refusals
   observed against a real server, and a container whose egress, pid ceiling, read-only root, bind
   mount and reaper were each verified against the daemon rather than against our own bookkeeping.
@@ -237,4 +256,5 @@ HX_SSH_TEST_HOST=<host> HX_SSH_TEST_USER=<user> HX_SSH_TEST_KEY=~/.ssh/id_ed2551
   ignored, and a hardcoded sandbox uid that made the workspace unwritable on any host whose user is
   not uid 1000. All four are fixed and pinned by tests.
 - **What is still tier C is the sandbox's strongest claim**: L3 has never run, because nothing
-  installs gVisor. That is next, with the egress proxy behind it.
+  installs gVisor. That is next, with the egress proxy behind it — and behind that, keyless scraping
+  that survives a TLS-fingerprint bot wall, which is browser-pool work rather than parser work.

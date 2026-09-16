@@ -1,0 +1,84 @@
+name: Search canary
+
+# Keyless search backends break on their own schedule: bot detection tightens, markup changes, an
+# endpoint is retired. Nothing in `cargo test` can see that — every other search test runs against
+# a fixture. This job is the thing that notices, and a red run here *is* the alert.
+#
+# It points the harness at a real SearXNG, started in this job, because that is the one backend a
+# non-browser client can rely on: you host it. DuckDuckGo is in the fan-out too and is expected to
+# report a bot wall, which the canary prints rather than fails on — the point is that it is
+# *reported*, not silently empty.
+#
+# Red means one of:
+#   - a silent empty result set, or a failure with no reason (a code regression);
+#   - SearXNG answered but produced nothing usable (a parsing regression, or an engine-side break);
+#   - the SearXNG JSON API stopped responding or changed shape.
+#
+# Deliberately not on `push`: a nightly cadence is what "scheduled" means, and a canary that runs on
+# every commit becomes one more green tick people learn to ignore. Use `workflow_dispatch` to check
+# a suspicious change immediately.
+
+on:
+  schedule:
+    # 06:00 UTC daily.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  canary:
+    name: live search
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start a SearXNG to search against
+        run: |
+          mkdir -p /tmp/searxng
+          docker run -d --name searxng -p 127.0.0.1:8888:8080 \
+            -v /tmp/searxng:/etc/searxng searxng/searxng:latest
+
+          wait_for_searxng() {
+            for _ in $(seq 1 60); do
+              if curl -fsS -m 3 http://127.0.0.1:8888/ >/dev/null 2>&1; then return 0; fi
+              sleep 1
+            done
+            return 1
+          }
+
+          wait_for_searxng || { echo "::error::SearXNG never came up"; docker logs searxng | tail -30; exit 1; }
+
+          # The image ships an HTML-only settings file. JSON is what the backend speaks, and it has
+          # to be enabled on the volume the container generated, as root, then reloaded.
+          docker exec -u 0 searxng sh -c \
+            'grep -q "^search:" /etc/searxng/settings.yml || printf "\nsearch:\n  formats:\n    - html\n    - json\n" >> /etc/searxng/settings.yml'
+          docker restart searxng >/dev/null
+          wait_for_searxng || { echo "::error::SearXNG did not come back after enabling JSON"; exit 1; }
+
+          # Assert the API shape *here*, so a test failure downstream means the harness, not the
+          # container that never answered.
+          curl -fsS -m 20 "http://127.0.0.1:8888/search?q=canary+readiness&format=json" | head -c 200
+          echo
+          echo "SearXNG is answering JSON on 8888"
+
+      # `HX_SEARCH_EXPECT_RESULTS=searxng` is what turns this from a report into an assertion: the
+      # backend that is configured here must return results. DuckDuckGo is asked as well and is
+      # allowed to report a bot wall.
+      - name: The canary, against the real internet
+        env:
+          HX_SEARXNG_URL: http://127.0.0.1:8888
+          HX_SEARCH_EXPECT_RESULTS: searxng
+        run: cargo test -p hx-search --test search_live --locked -- --ignored --test-threads=1 --nocapture
+
+      - name: What the backends said
+        # Runs even when the canary fails: the diagnosis is the whole point of a canary.
+        if: always()
+        run: docker logs searxng 2>&1 | tail -40
