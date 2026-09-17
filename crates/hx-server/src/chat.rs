@@ -463,13 +463,22 @@ async fn write_events(
                 tracing::warn!(error = %err, "could not record usage");
             }
         }
-        if let Err(err) = state.store.append_event(&session, &event, now) {
-            tracing::warn!(error = %err, "could not record an event");
-        }
+        // The sequence number comes back from `append_event` (it is assigned inside the store's
+        // transaction, never here), and it is what a resuming WebSocket client uses to say "start me
+        // after this event". Publishing it with the event means the live bus and the store agree about
+        // where this event sits, so a client that reconnects can dedupe by it without guessing.
+        let seq = match state.store.append_event(&session, &event, now) {
+            Ok(seq) => seq,
+            Err(err) => {
+                tracing::warn!(error = %err, "could not record an event");
+                continue;
+            }
+        };
         // And out live: this is the same event a late reader gets from the store, tagged with the
-        // session so an SSE subscriber driving more than one run can tell them apart.
+        // session (so an SSE subscriber driving more than one run can tell them apart) and its seq.
         let _ = state.event_bus.send(crate::state::LiveEvent {
             session: session.clone(),
+            seq,
             event,
         });
     }

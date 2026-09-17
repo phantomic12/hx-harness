@@ -65,7 +65,7 @@ $ curl -s localhost:7717/v1/status | jq .pools
 | Daemon (`hxd`) + HTTP API + CLI (`hx`) | **Done**, runnable |
 | Tools (`hx-tools`) + the agent loop (`hx-agent`) | **Built** — seven tools, and a loop that classifies every call against the capability token and then the approval policy; 26 tests pin the gate down against a scripted model (`crates/hx-agent/tests/loop.rs`). `delete` moves a named path to the XDG trash rather than unlinking it, and a destructive prompt carries what will be gone — the resolved path, its entry count, its bytes — because the tool measures the target before anyone is asked |
 | Sessions (`hx-store`) | **Built** — SQLite: create, resume, list, rename, delete, export (JSON/Markdown), events, usage totals. A transcript that ended mid-call is *repaired*, not sent to a provider that would reject it |
-| Web UI, Tauri desktop/mobile, chat connectors | **Not started** |
+| Web UI, Tauri desktop/mobile, chat connectors | **Not started** — the per-session WebSocket event stream (M2's first half) is built and tested; the browser UI, the PTY/terminal attach, and the connectors are not |
 | MCP client, browser-automation pool | **Not started** |
 | The loop wired into `hxd` and `hx`: `POST /v1/chat`, `hx chat`, session routes over `hx-store` | **Built** — one request runs the loop against a session: the prompt is stored before the model is called, the role decides the model, credentials come from a `store:name` reference, events are written as they happen, and a transcript that ended mid-call is repaired before it is sent. Twenty tests drive the **real loop over the real HTTP surface**; model replies are scripted and sandbox engine calls use a recording runtime. `hx chat --sandbox-profile dev` selects a configured shell boundary; missing or failed boundaries never fall back to host execution |
 
@@ -229,11 +229,13 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
   non-streaming parser uses. The daemon publishes every `AgentEvent` at `POST /v1/chat/stream` as
   SSE, tagged with its session, ending in a named `done` (or `error`) event carrying the reply; and
   `hx chat --stream` renders a run as it happens — turns, tool calls and text deltas live on stderr,
-  the reply on stdout. The Anthropic adapter still completes whole and replays its deltas through the
-  default `Provider::stream`, and **Anthropic streams for real too**: `stream: true`, named SSE
-  events reassembled across reads, `input_json_delta` fragments accumulated and parsed only when the
-  block stops, cumulative usage taken from the last `message_delta`, and a mid-stream `error` event
-  raised rather than returned as a short answer. Context
+  the reply on stdout. **A per-session WebSocket event stream** (`GET /v1/sessions/{id}/ws`) is
+  built too: any number of clients attach to one session and receive its events live after its stored
+  history, and a reconnecting client sends `{"since_seq": N}` to resume exactly from there — the
+  two-clients-on-one-session multiplex M2 requires. **Anthropic streams for real too**: `stream: true`,
+  named SSE events reassembled across reads, `input_json_delta` fragments accumulated and parsed only
+  when the block stops, cumulative usage taken from the last `message_delta`, and a mid-stream `error`
+  event raised rather than returned as a short answer. Context
   compaction is **built** too: a long session is elided at the `compact_at_tokens` threshold (head +
   an explicit marker + tail, never splitting a tool call from its result) for the model while the
   stored audit trail is untouched.
@@ -244,9 +246,13 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
   L3 is verified where gVisor is installed — the CI job installs it, and `HX_DOCKER_REQUIRE_L3`
   turns a skip into a failure so the strongest claim in the ladder cannot quietly stop being
   tested.
-- **Egress filtering.** A sandbox has a network or it does not. There is no proxy and no firewall
-  rule behind `egress`, so an allowlist is *refused* (`SpecError::EgressNotEnforced`) rather than
-  silently ignored — a profile that says four hostnames must not mean the whole internet.
+- **Egress filtering.** **Enforced** for hostname allowlists: the sandbox is created on an internal
+  Docker network with no gateway, and the only route out is a proxy sidecar that admits a `CONNECT`
+  target only if the allowlist matches. A profile that names four hostnames reaches those four and
+  nothing else. A sandbox with no allowlist still has no network at all. CIDRs and raw IPs are still
+  *refused* (`SpecError::EgressNotEnforced`) — the proxy decides a `CONNECT` target by name, so
+  accepting an address would be a half-enforced allowlist that looks permitted and never connects.
+  The three live tests for this have not yet been run against a real Docker daemon.
 - **Keyless scraping that survives a bot wall.** DuckDuckGo, Mojeek and public SearXNG instances
   now serve a challenge to a plain HTTP client — a TLS-fingerprint problem, not a markup one, and
   one no amount of parsing fixes. The harness reports it per backend rather than returning an empty

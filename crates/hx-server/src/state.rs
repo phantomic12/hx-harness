@@ -24,14 +24,21 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::broadcast;
 use tokio::sync::Mutex as AsyncMutex;
 
-/// One event on the live bus, tagged with the session it belongs to.
+/// One event on the live bus, tagged with the session it belongs to and its store sequence.
 ///
-/// Tagged so a client subscribed to more than one run can tell them apart without the daemon
-/// opening one channel per session. The session filters the bus; the event is the same
-/// [`AgentEvent`] the store records, so a live surface renders the same thing a late reader does.
+/// Tagged so a client subscribed to more than one run can tell them apart without the daemon opening
+/// one channel per session. The session filters the bus; the event is the same [`AgentEvent`] the
+/// store records, so a live surface renders the same thing a late reader does.
+///
+/// `seq` is the position the event was (or will be) stored at, assigned by the store's
+/// `append_event`. It is what makes the stream **resumable**: a client that reconnects says "start me
+/// at seq N", and the server replays the store from there and then skips any live event whose seq it
+/// already sent. Without it a client could only reconnect by receiving duplicates (re-fetch the whole
+/// store and miss what happened in between) or by missing exactly the events emitted in the gap.
 #[derive(Clone)]
 pub struct LiveEvent {
     pub session: SessionId,
+    pub seq: u64,
     pub event: AgentEvent,
 }
 

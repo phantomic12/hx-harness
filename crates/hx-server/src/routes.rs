@@ -48,6 +48,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/sessions/{id}/export", get(export_session))
         .route("/v1/sessions/{id}/events", get(session_events))
         .route("/v1/sessions/{id}/audit", get(session_audit))
+        .route("/v1/sessions/{id}/ws", get(crate::stream_ws::session_ws))
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{id}", post(answer_approval))
         .with_state(state)
