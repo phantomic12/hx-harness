@@ -32,6 +32,13 @@ pub struct Store {
     conn: Mutex<Connection>,
     /// `None` for an in-memory store, which is how every test in this crate runs.
     path: Option<PathBuf>,
+    /// The secret the audit chain is keyed with, or the fact that there is none.
+    ///
+    /// Held here rather than read per write, so a store's chain cannot change mode mid-life: a
+    /// database whose earlier rows were written unkeyed and whose later rows were keyed would fail
+    /// to verify at the seam, and the report would look like tampering rather than like a
+    /// misconfiguration.
+    chain_key: audit::ChainKey,
 }
 
 impl Store {
@@ -70,6 +77,22 @@ impl Store {
         Self::open(dir.join(DATABASE_FILE))
     }
 
+    /// Open the database with an explicit key for the audit chain.
+    ///
+    /// The daemon uses this so the key comes from its environment; `from_config` leaves the chain
+    /// unkeyed, which is what the tests and a fresh checkout get.
+    pub fn from_config_with_key(config: &Config, key: audit::ChainKey) -> Result<Self> {
+        let dir = expand_home(&config.daemon.data_dir);
+        let mut store = Self::open(dir.join(DATABASE_FILE))?;
+        store.chain_key = key;
+        Ok(store)
+    }
+
+    /// The secret an audit-write is keyed with, and whether there is one.
+    pub fn chain_key(&self) -> &audit::ChainKey {
+        &self.chain_key
+    }
+
     fn configure(conn: Connection, path: Option<PathBuf>) -> Result<Self> {
         let mut conn = conn;
         conn.busy_timeout(BUSY_TIMEOUT)
@@ -102,6 +125,7 @@ impl Store {
         Ok(Self {
             conn: Mutex::new(conn),
             path,
+            chain_key: audit::ChainKey::Unkeyed,
         })
     }
 
@@ -448,7 +472,8 @@ impl Store {
             let previous = previous.unwrap_or_else(|| audit::GENESIS.to_string());
 
             let at_text = stamp(at);
-            let digest = audit::digest(
+            let digest = audit::digest_for(
+                &self.chain_key,
                 &previous,
                 &audit::EventLink {
                     session_id: session.as_str(),
@@ -502,7 +527,7 @@ impl Store {
         for row in rows {
             events.push(row.map_err(|err| fail("could not read an audit row", err))?);
         }
-        audit::verify_events(session.as_str(), &events)
+        audit::verify_events(&self.chain_key, session.as_str(), &events)
     }
 
     /// How many of this session's events carry no digest — rows written before the chain existed.

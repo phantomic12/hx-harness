@@ -558,18 +558,25 @@ async fn session_audit(
     let total = state.store.total_events(&session)?;
     let checked = total.saturating_sub(unchecked as u64);
 
+    // Which guarantee is being reported travels with the verdict. An unkeyed chain catches an
+    // inconsistent edit and cannot catch a rewrite, so `intact` alone would be read as the stronger
+    // claim — naming the mode is what stops the weaker guarantee being taken for the stronger one.
+    let keyed = state.store.chain_key().is_keyed();
+
     match state.store.verify_audit(&session)? {
         None => Ok(Json(serde_json::json!({
             "session_id": session.as_str(),
             "status": "intact",
             "verified": checked,
             "unchained": unchecked,
+            "keyed": keyed,
         }))),
         Some(broken) => Ok(Json(serde_json::json!({
             "session_id": session.as_str(),
             "status": "broken",
             "verified": checked,
             "unchained": unchecked,
+            "keyed": keyed,
             "seq": broken.seq,
             "stored": broken.stored,
             "expected": broken.expected,

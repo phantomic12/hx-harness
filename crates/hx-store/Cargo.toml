@@ -8,6 +8,10 @@ publish.workspace = true
 [dependencies]
 hx-core.workspace = true
 sha2 = { workspace = true }
+hmac.workspace = true
+# hmac 0.13 is built on digest 0.11, so it cannot be paired with the sha2 0.10 the chain has used
+# since it landed. Naming 0.11 here pins the pair that actually type-checks together.
+sha2_11 = { package = "sha2", version = "0.11" }
 chrono.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

@@ -1155,6 +1155,21 @@ pub fn render_audit(report: &serde_json::Value, json: bool) -> String {
             "  {unchained} event(s) predate the chain and were NOT checked"
         );
     }
+
+    // Which guarantee the verdict carries. Without this line `intact` reads as "nobody could have
+    // rewritten this", which an unkeyed chain cannot support.
+    match report["keyed"].as_bool() {
+        Some(true) => {
+            let _ = writeln!(out, "  keyed: a rewrite would need the chain key");
+        }
+        Some(false) => {
+            let _ = writeln!(
+                out,
+                "  UNKEYED: this detects an inconsistent edit, not a rewrite by someone with the key"
+            );
+        }
+        None => {}
+    }
     out
 }
 

@@ -102,6 +102,18 @@ pub struct DaemonConfig {
     pub data_dir: String,
     #[serde(default)]
     pub log_json: bool,
+    /// Environment variable holding the key the audit chain is written with.
+    ///
+    /// A variable name rather than the secret itself, so the key does not sit in a config file that
+    /// is committed, copied between machines, or read by anything that can read the repo. Empty or
+    /// unset leaves the chain unkeyed, which is reported rather than assumed: an unkeyed chain still
+    /// catches an inconsistent edit and cannot catch a rewrite.
+    #[serde(default = "default_audit_key_env")]
+    pub audit_key_env: String,
+}
+
+fn default_audit_key_env() -> String {
+    "HX_AUDIT_KEY".to_string()
 }
 
 impl Default for DaemonConfig {
@@ -111,6 +123,7 @@ impl Default for DaemonConfig {
             http_addr: default_http_addr(),
             data_dir: default_data_dir(),
             log_json: false,
+            audit_key_env: default_audit_key_env(),
         }
     }
 }
