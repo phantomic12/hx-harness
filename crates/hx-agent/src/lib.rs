@@ -26,6 +26,7 @@
 pub mod agent;
 pub mod approver;
 pub mod compact;
+pub mod context;
 pub mod model;
 pub mod queue;
 
@@ -34,5 +35,6 @@ pub use approver::{
     AlwaysAllow, AlwaysDeny, ApprovalDecision, Approver, DenyWithReason, ScriptedApprover,
 };
 pub use compact::{compact_at, Compacted};
+pub use context::{ContextBuilder, ContextFacts};
 pub use model::{DirectProvider, ModelCall, RouterModel};
 pub use queue::{ApprovalQueue, RefusingApprover, SessionScopedQueue};
