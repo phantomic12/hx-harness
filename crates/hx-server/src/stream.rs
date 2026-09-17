@@ -70,7 +70,7 @@ pub async fn chat_stream(
             tokio::select! {
                 biased;
                 received = rx.recv() => match received {
-                    Ok(LiveEvent { session, event }) => {
+                    Ok(LiveEvent { session, event, .. }) => {
                         let payload = json!({
                             "session": session.as_str(),
                             "event": event,

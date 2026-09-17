@@ -106,14 +106,24 @@ killed an idle daemon while looking like a pass).
 
 **Goal:** everything the TUI does, in a browser, at the same time, on the same session.
 
+- ✅ **Per-session WebSocket event stream** — `GET /v1/sessions/{id}/ws` upgrades to a stream that
+  sends the session's stored events first, then its live ones, as `{"seq","session","event"}` JSON
+  frames sharing one filtered broadcast bus (a client gets only its own session's events). A reconnecting
+  client sends `{"since_seq": N}` as its first message and the server replays exactly `seq > N` from the
+  store — no duplicates, no gaps — because every live event carries the store sequence `chat::write_events`
+  assigned it. Tested end to end in `crates/hx-server/tests/ws_api.rs` against a real socket: two
+  clients on one session both receive the same events, and a reconnecting client proves no-dup/no-gap.
 - `hx-server`: axum, REST + `/ws/agent/:session` + `/ws/term/:id` + `/ws/events`
-- Server-side PTY via `portable-pty`, attach/detach, scrollback retained in `hxd`
+- Server-side PTY via `portable-pty`, attach/detach, scrollback retained in `hxd` — **not yet**;
+  the events half above is done, the PTY/terminal attach over the same WebSocket is M2's second half.
 - Frontend: xterm.js terminal, chat/stream pane, workspace file tree, diff/review pane
 - **Two clients on one session simultaneously** (TUI + browser) — this is the real test that
   the daemon/client split is honest and not cosmetic
 
 **Exit criteria:** open a browser terminal to a shell, run a command, watch the same bytes in
-the TUI; then send an agent prompt from the browser and see it stream in both.
+the TUI; then send an agent prompt from the browser and see it stream in both. **The events half is
+proven** (two WebSocket clients, and a browser SSE run plus a WebSocket client, both see the same
+session stream); the *terminal* half — the shell attach — is what remains.
 
 ---
 

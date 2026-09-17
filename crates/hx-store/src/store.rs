@@ -539,6 +539,39 @@ impl Store {
         Ok(events)
     }
 
+    /// The events with `seq` strictly greater than `after`, as `(seq, event)` pairs, in order.
+    ///
+    /// This is the replay half of a resumable stream. A WebSocket client reports the last sequence it
+    /// has seen and the server returns everything after it, so a reconnection neither duplicates what the
+    /// client already rendered nor skips the events emitted while it was away. The seq travels back so
+    /// the caller can both send events *and* tell a live event that is already in the batch apart from
+    /// a genuinely new one.
+    ///
+    /// `after = 0` replays the whole stream — the contract for a fresh client that has nothing yet.
+    pub fn events_from(&self, session: &SessionId, after: u64) -> Result<Vec<(u64, AgentEvent)>> {
+        let conn = self.lock();
+        let mut statement = conn
+            .prepare(
+                "SELECT seq, payload FROM events WHERE session_id = ?1 AND seq > ?2 ORDER BY seq",
+            )
+            .map_err(|err| fail("could not prepare the event query", err))?;
+
+        let rows = statement
+            .query_map(rusqlite::params![session.as_str(), after as i64], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+            })
+            .map_err(|err| fail("could not read the events", err))?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            let (seq, payload) = row.map_err(|err| fail("could not read an event row", err))?;
+            let event = serde_json::from_str::<AgentEvent>(&payload)
+                .map_err(|err| HxError::Store(format!("a stored event no longer parses: {err}")))?;
+            events.push((seq, event));
+        }
+        Ok(events)
+    }
+
     /// How many events of one kind a session recorded — the audit-ish query, for now.
     /// How many events a session has, whatever their kind.
     ///
