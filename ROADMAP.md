@@ -70,8 +70,10 @@ Those get real tests in M1 against a live endpoint.
 - ◐ **Compaction at a token threshold** — `compact_at_tokens` is honoured: when a transcript's
   estimated tokens pass the threshold, the middle is elided for the model (head + an explicit marker +
   tail, never splitting a tool call from its result) while the stored audit trail is untouched. The
-  general "context builder" — a separable module assembling system + tools + messages — is still inline
-  in the loop, which is the remaining half of this item.
+  The general context builder has landed too: `hx_agent::context::ContextBuilder` owns what a turn
+  sends — which transcript (the audit trail, or a compacted view of it), whether tools are offered,
+  whether a system prompt exists — so the loop is control flow and the request's *shape* has one
+  home. Both halves of this item are done.
 - ✅ `hxd` runs, `hx` connects to it: `hx chat` sends the prompt to the daemon over the configured
   HTTP address and prints the run's report (over HTTP rather than the unix socket, which the config
   also names and nothing uses yet); `hx sessions` / `hx session <id> [--export md]` read back what the

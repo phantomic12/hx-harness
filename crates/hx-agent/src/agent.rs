@@ -21,11 +21,11 @@
 //! Streaming (a turn arrives whole and is emitted as one `TextDelta`) and cost accounting (usage
 //! is reported in tokens; the price table is the router's business). Each is a visible gap rather
 //! than a silent one. Compaction is *not* on that list: a long transcript is handed to
-//! [`compact_at`] before the request is built, so a session that grows past its configured window
-//! stays sendable instead of being refused by the provider.
+//! [`crate::context::ContextBuilder`] before the request is built, so a session that grows past its
+//! configured window stays sendable instead of being refused by the provider.
 
 use crate::approver::{ApprovalDecision, Approver};
-use crate::compact::compact_at;
+use crate::context::{ContextBuilder, ContextFacts};
 use crate::model::ModelCall;
 use hx_core::approval::{ActionRequest, ApprovalSession, RiskClass, Verdict};
 use hx_core::capability::{Action, CapabilityToken, Decision, Resource};
@@ -33,7 +33,7 @@ use hx_core::error::Result;
 use hx_core::event::{AgentEvent, StopReason};
 use hx_core::ids::{AgentId, ToolCallId};
 use hx_core::message::{Message, Part};
-use hx_provider::{ChatRequest, ToolSpec, Usage};
+use hx_provider::{ToolSpec, Usage};
 use hx_tools::{ToolContext, ToolError, ToolRegistry};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -137,6 +137,19 @@ impl AgentLoop {
         }
     }
 
+    /// Assemble the builder this run uses to turn a transcript into a request.
+    ///
+    /// Built from the run's own facts rather than passed in, so a caller cannot hand the loop a
+    /// builder whose system prompt disagrees with `with_system_prompt` — one source, one answer.
+    fn context_builder(&self, tool_specs: Vec<hx_provider::ToolSpec>) -> ContextBuilder {
+        ContextBuilder::new(ContextFacts {
+            system: self.system.clone(),
+            tools: tool_specs,
+            max_tokens: self.limits.max_tokens,
+            compact_at_tokens: self.limits.compact_at_tokens,
+        })
+    }
+
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
         self
@@ -201,6 +214,8 @@ impl AgentLoop {
         let mut tool_calls = 0u32;
         let mut refusals = 0u32;
         let specs = self.tool_specs();
+        // -- turn assembly: fixed facts once, the transcript per turn.
+        let context = self.context_builder(specs.clone());
 
         for turn in 1..=self.limits.max_turns {
             if let Some(deadline) = self.limits.deadline {
@@ -226,24 +241,10 @@ impl AgentLoop {
                 turn,
             });
 
-            // The transcript is the audit trail and is never shrunk here; what the model is handed
-            // is a separate decision. A long conversation gets its middle elided (head and tail
-            // kept, with an explicit marker) so the request stays inside the model's window instead
-            // of growing without bound until the provider refuses it.
-            let to_send = if self.limits.compact_at_tokens > 0 {
-                compact_at(transcript, self.limits.compact_at_tokens).messages
-            } else {
-                transcript.clone()
-            };
-
-            let mut request = ChatRequest::new(self.model.model(), to_send)
-                .with_max_tokens(self.limits.max_tokens);
-            if let Some(system) = &self.system {
-                request = request.with_system(system.clone());
-            }
-            if !specs.is_empty() {
-                request = request.with_tools(specs.clone());
-            }
+            // What goes on the wire is `ContextBuilder`'s decision, not the loop's: which transcript
+            // (the audit trail is never shrunk here — a compacted *view* may be sent), whether tools
+            // are offered, and whether a system prompt exists at all. See `crate::context`.
+            let request = context.request(&self.model.model(), transcript);
 
             let response = match self.model.complete(request).await {
                 Ok(response) => response,
