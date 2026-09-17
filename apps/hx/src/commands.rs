@@ -176,7 +176,7 @@ pub fn render_policy(config: &Config, source: &str) -> String {
             writeln!(
                 out,
                 "      ({shipped_in_deny} of the {} shipped catastrophe rules; the rest were removed \
-                 in this config)",
+                 in this config — `inherit_denials: true` would put them back)",
                 shipped.len()
             )
         } else {
@@ -911,11 +911,49 @@ agent:
             deny < ask && ask < allow,
             "deny first, allow last: {rendered}"
         );
-        assert!(rendered.contains("   1. tool shell, matching *rm -rf /var*, risk destructive"));
-        assert!(rendered.contains("   2. tool shell, matching git push*  # publishes to the world"));
-        assert!(rendered.contains("   3. tool shell, matching cargo test*"));
+        // The config's *own* deny rules come before the shipped floor (a file's words are the ones that
+        // explain the refusal), and every rule is numbered in the order it is checked. The order is
+        // asserted by locating lines rather than by hard-coded indices, because the floor's size is the
+        // floor's business — hard-coded numbering is exactly what broke when it became additive.
+        let line_of = |needle: &str| {
+            rendered
+                .lines()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no line for {needle:?}: {rendered}"))
+                .to_string()
+        };
+        let num = |line: &str| {
+            line.trim_start()
+                .split('.')
+                .next()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap()
+        };
+
+        let own_deny = line_of("matching *rm -rf /var*, risk destructive");
+        assert_eq!(
+            num(&own_deny),
+            1,
+            "the config's own rule is checked first: {rendered}"
+        );
+
+        let floor_rule = line_of("recursive delete of the root directory");
         assert!(
-            rendered.contains("   4. tool shell, matching npm test*, confined: true (a sandbox only)"),
+            num(&floor_rule) > num(&own_deny),
+            "and the shipped floor is behind it: {rendered}"
+        );
+
+        let ask_line = line_of("matching git push*  # publishes to the world");
+        assert!(
+            num(&ask_line) > num(&floor_rule),
+            "`ask` is checked after the whole deny list: {rendered}"
+        );
+
+        let allow_line = line_of("matching cargo test*");
+        let confined_line = line_of("matching npm test*, confined: true (a sandbox only)");
+        assert!(
+            num(&allow_line) > num(&ask_line) && num(&confined_line) == num(&allow_line) + 1,
             "§4's axis is part of the ladder, so a reader can see which rules need a boundary: {rendered}"
         );
 
@@ -925,9 +963,9 @@ agent:
         assert!(rendered.contains("budget   20"), "{rendered}");
         assert!(
             rendered.contains(
-                "(none of the shipped catastrophe set: this config's `deny` list replaced it)"
+                "(all 32 shipped catastrophe rules, from `default_denials()`)"
             ),
-            "a config that replaced the floor must be told so, not told a count: {rendered}"
+            "a config that writes its own deny list keeps the floor, and the report says so: {rendered}"
         );
     }
 
@@ -936,11 +974,14 @@ agent:
         // The blank policy is what a library caller gets, and it is the one shape where a prompt with a
         // pattern in it will be asked about instead of refused. A report that left the sections empty
         // would read as "nothing is allowed"; the truth is "nothing is decided here".
+        // `inherit_denials: false` is the only way to get here now, and that is the point: a config has
+        // to say the words to drop the catastrophe set, and the report can then be honest about it.
         let yaml = format!(
             "{CONFIG}
 agent:
   approval:
     level: yolo
+    inherit_denials: false
 "
         );
         let config = Config::from_yaml(&yaml).unwrap();

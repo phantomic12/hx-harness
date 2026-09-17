@@ -1757,6 +1757,42 @@ pub struct ApprovalPolicy {
     /// list lives in one and not the other — a library caller or a test must not inherit opinions.
     #[serde(default)]
     pub refuse_unenumerable_deletions: bool,
+
+    /// Whether the shipped catastrophe set is in force on top of whatever this policy says.
+    ///
+    /// This field exists because of a trap that a config file walks into by accident. A config is
+    /// deserialised *into* a policy, so any list it writes replaces the list the deployment started
+    /// with: `agent: {approval: {level: yolo}}` —
+    /// the shortest thing an operator writes to stop being prompted — silently removed all thirty-two
+    /// catastrophe rules with it. That is the worst possible shape for a safety default: the looser the
+    /// setting, the more the floor mattered.
+    ///
+    /// So the floor is not a list that can be replaced by omission. It is *layered on* unless the file
+    /// says otherwise, and this field says otherwise:
+    ///
+    /// - `true` (the default, and what [`ApprovalPolicy::deployment_default`] ships): the shipped rules
+    ///   are prepended to `deny`, and `refuse_unenumerable_deletions` is on.
+    /// - `false`: exactly what the file wrote and nothing else. An operator who means it writes that
+    ///   word, and *that act is the review*.
+    ///
+    /// It is `Option` rather than `bool` so a **library** policy can say "not applicable" instead of
+    /// "off": `ApprovalPolicy::default()` has no floor to inherit and must not acquire one, and a caller
+    /// building a policy in code should not have the deny list grow a dozen rules it never asked for.
+    #[serde(
+        default = "inherit_denials_by_default",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub inherit_denials: Option<bool>,
+}
+
+/// The serde default for [`ApprovalPolicy::inherit_denials`]: a policy that came from a *file* inherits
+/// the floor, and one built in code (`Option`'s own `None`) does not.
+///
+/// This is the whole distinction the field needs, and it is a subtle one: `Default` says "not applicable"
+/// and deserialisation says "yes", because those are the two different questions being asked. A config
+/// that spells out an `approval:` block is a deployment; `ApprovalPolicy::default()` is a library caller.
+fn inherit_denials_by_default() -> Option<bool> {
+    Some(true)
 }
 
 impl Default for ApprovalPolicy {
@@ -1776,6 +1812,10 @@ impl Default for ApprovalPolicy {
             deny: Vec::new(),
             ask: Vec::new(),
             refuse_unenumerable_deletions: false,
+            // Not `Some(true)`: a policy built in code has no deployment floor to inherit, and growing a
+            // library caller's deny list by fourteen rules it never wrote would be a different trap from
+            // the one this field closes.
+            inherit_denials: None,
         }
     }
 }
@@ -1788,11 +1828,75 @@ impl ApprovalPolicy {
     /// outcome is unrecoverable (`/`, a block device, a pipe from the network into a shell). An
     /// operator who genuinely wants one can delete the rule, and that act is the review.
     pub fn deployment_default() -> Self {
-        Self {
-            deny: default_denials(),
-            refuse_unenumerable_deletions: true,
-            ..Self::default()
+        // Resolved, not merely flagged: this is the type an embedder constructs *without* a config file,
+        // so the floor has to be in the value rather than promised by a loader it never calls.
+        Self::default().with_floor_for_deployment()
+    }
+
+    /// The same fold as [`ApprovalPolicy::with_floor`], for the one policy that is a deployment by
+    /// definition. Kept separate so `with_floor` can stay a method that only acts when asked.
+    fn with_floor_for_deployment(mut self) -> Self {
+        self.inherit_denials = Some(true);
+        self.with_floor()
+    }
+
+    /// Fold the shipped floor into this policy, if it is meant to be there.
+    ///
+    /// Called by every path that builds a policy *from configuration* — `Config::from_yaml`,
+    /// `AgentConfig`'s serde default, and the daemon when it applies a request's autonomy level. It is
+    /// idempotent: a policy that already carries the floor gets nothing twice, so it is safe to call on
+    /// a policy that came through [`ApprovalPolicy::deployment_default`] and safe to call again.
+    ///
+    /// The rules are **appended after the operator's own**, and the order is not cosmetic: `deny` is
+    /// checked first and the first match wins, so a rule the file wrote wins the note and the shipped rule
+    /// behind it is the backstop. Both stay in force, and the file's own order is preserved.
+    pub fn with_floor(mut self) -> Self {
+        if self.inherit_denials != Some(true) {
+            return self;
         }
+        // The operator's own rules stay first: `deny` is a first-match list, so a rule the file wrote for
+        // the same command is the one whose note explains the refusal, and the shipped rule is the
+        // backstop behind it. Prepending the floor ahead of them would replace the operator's words with
+        // the crate's, which is the opposite of what a floor is for.
+        //
+        // Ordering aside, this is a *union*, and getting that wrong is a trap this function fell into
+        // first time round: an earlier version built a fresh list by keeping only the rules the floor did
+        // not already contain, which meant calling `with_floor()` on a policy that already had the floor
+        // produced an **empty** deny list. Since the daemon calls it on every run, the catastrophe set
+        // was silently dropped before `set_level` was even reached — a bug a test could only see by
+        // asserting on a *run*, not on a policy.
+        let shipped = default_denials();
+        // The file's own rules first, then the floor — and *all* of the floor, whether or not it was
+        // already there. Filtering the floor by "not already present" is what emptied this list on the
+        // second call: after the first fold every shipped rule is present, so nothing was added and
+        // everything the file wrote had already been filtered out. A union, written as a union.
+        let mut merged: Vec<Rule> = self
+            .deny
+            .iter()
+            .filter(|rule| !shipped.contains(rule))
+            .cloned()
+            .collect();
+        merged.extend(shipped);
+        self.deny = merged;
+        // The refusal of an unenumerable delete is part of the floor rather than a separate knob: it is
+        // the same decision, expressed as a property of the command instead of a pattern that cannot
+        // tell `rm -rf /` from `rm -rf /tmp/build`.
+        self.refuse_unenumerable_deletions = true;
+        self
+    }
+
+    /// Drop the floor, deliberately — `inherit_denials: false` in a config, resolved.
+    pub fn without_floor(mut self) -> Self {
+        self.inherit_denials = Some(false);
+        self.deny.retain(|rule| !default_denials().contains(rule));
+        self.refuse_unenumerable_deletions = false;
+        self
+    }
+
+    /// Whether the shipped floor is currently in force.
+    pub fn has_floor(&self) -> bool {
+        let shipped = default_denials();
+        !shipped.is_empty() && shipped.iter().all(|rule| self.deny.contains(rule))
     }
 }
 

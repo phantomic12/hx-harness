@@ -22,7 +22,7 @@ exist before anything can hide behind an integration test.
   TTL reaping, rollback on a failed start
 - `hx-server` + `hxd` — axum route surface and the daemon binary
 
-**Status: 684 tests green, clippy clean (0 warnings).** M0 closed at 324 of them: core 83, provider
+**Status: 690 tests green, clippy clean (0 warnings).** M0 closed at 324 of them: core 83, provider
 61, sandbox 53, search 45, remote 33, secrets 27, server 11, cli 11 — `hx-tools`, `hx-agent` and
 `hx-store` came after M0 and are covered in the M1/M2 sections.
 

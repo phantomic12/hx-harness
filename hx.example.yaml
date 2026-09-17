@@ -132,8 +132,17 @@ sandbox_profiles:
 # refusals, not prompts, because "yes" is not answerable from a command line. See
 # `hx-core/src/approval.rs::default_denials()` for the exact list, and `docs/approvals.md` for why.
 #
-# Writing an `approval:` block REPLACES that set — a partial block is not merged into it, so keep the
-# rules you still want, or leave this section out. The shape follows:
+# The floor is **layered on**, not replaced: a config that writes an `approval:` block still gets the
+# catastrophe set, so the shortest thing you can write to stop being prompted
+# (`approval: {level: yolo}`) no longer removes it. A `deny:` list of your own is checked *first* — your
+# words explain the refusal and the shipped rule is the backstop behind it. To drop the floor entirely
+# you have to say so in so many words, and `hx policy` will then report it as dropped:
+#
+#   agent:
+#     approval:
+#       inherit_denials: false   # the catastrophe set is not applied; this is the review
+#
+# The shape of the block follows:
 #
 # agent:
 #   approval:

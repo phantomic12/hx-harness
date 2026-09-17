@@ -41,8 +41,16 @@ pub struct Config {
 }
 
 impl Config {
+    /// Parse a configuration, folding the shipped approval floor into whatever it says.
+    ///
+    /// The fold happens *here*, at the boundary between a file and a policy, rather than in the policy's
+    /// `Deserialize`: a config is the only thing that inherits the floor, and doing it in `Deserialize`
+    /// would hand it to every in-code policy that happens to round-trip through YAML. See
+    /// [`ApprovalPolicy::inherit_denials`] for why the floor is layered rather than defaulted.
     pub fn from_yaml(yaml: &str) -> Result<Self> {
-        Ok(serde_yaml::from_str(yaml)?)
+        let mut config: Self = serde_yaml::from_str(yaml)?;
+        config.agent.approval = config.agent.approval.with_floor();
+        Ok(config)
     }
 
     /// Resolve the pool a role should use, following `inherits` chains.
@@ -588,7 +596,7 @@ fn default_pool_name() -> String {
 /// opinion. A deployment gets the floor — `balanced`, with the catastrophe set denied — and can still
 /// delete a rule it disagrees with, in writing, which is the review.
 fn deployment_approval() -> ApprovalPolicy {
-    ApprovalPolicy::deployment_default()
+    ApprovalPolicy::deployment_default().with_floor()
 }
 
 #[cfg(test)]
@@ -791,6 +799,99 @@ roles:
             ..Default::default()
         }
         .is_unbounded());
+    }
+
+    /// The trap this field exists to close: the *shortest* config an operator writes to stop being
+    /// prompted used to remove the entire catastrophe set with it, because a config deserialises into a
+    /// policy and a list that is written replaces a list that was there.
+    ///
+    /// The looser the setting, the more the floor mattered — which is the worst shape a safety default can
+    /// have, so the floor is layered on unless the file says otherwise. These are the three shapes.
+    #[test]
+    fn a_config_that_writes_a_policy_still_gets_the_shipped_floor() {
+        for yaml in [
+            // The one that used to be dangerous: loosens the level and mentions nothing else.
+            "agent:\n  approval:\n    level: yolo\n",
+            // Writing its own deny list. It replaces *its own* rules, not the floor.
+            "agent:\n  approval:\n    deny:\n      - { tool: shell, command: \"*my-own-rule*\" }\n",
+            // And writing every other field, which is what a careful operator does.
+            "agent:\n  approval:\n    level: trusting\n    ceiling: mutate\n    unattended_budget: 10\n             \n    allow:\n      - { tool: shell, command: \"cargo test*\" }\n",
+        ] {
+            let config = Config::from_yaml(yaml).expect("must parse");
+            let policy = &config.agent.approval;
+            assert!(
+                policy.has_floor(),
+                "the floor must survive this config: {yaml}\n{policy:?}"
+            );
+            assert!(
+                policy.refuse_unenumerable_deletions,
+                "and so must the refusal of a delete nobody can enumerate: {yaml}"
+            );
+
+            // The behaviour, not the bookkeeping: a yolo chat still refuses the catastrophe.
+            let mut session = crate::approval::ApprovalSession::new(policy.clone());
+            let verdict = session.decide(
+                &crate::approval::ActionRequest::shell("rm -rf /etc"),
+                chrono::Utc::now(),
+            );
+            assert!(verdict.is_denied(), "in {yaml}: {verdict:?}");
+        }
+    }
+
+    #[test]
+    fn the_floor_is_dropped_only_when_the_file_says_so_in_so_many_words() {
+        let yaml = "agent:\n  approval:\n    level: yolo\n    inherit_denials: false\n";
+        let config = Config::from_yaml(yaml).unwrap();
+        let policy = &config.agent.approval;
+
+        assert!(!policy.has_floor());
+        assert!(!policy.refuse_unenumerable_deletions);
+
+        // Which is a real choice with a real consequence, and it is the operator's to make — stated in the
+        // file, reviewable in a diff, and visible in `hx policy` (which prints "none of the shipped
+        // catastrophe set: this config's `deny` list replaced it").
+        let mut session = crate::approval::ApprovalSession::new(policy.clone());
+        let verdict = session.decide(
+            &crate::approval::ActionRequest::shell("rm -rf /etc"),
+            chrono::Utc::now(),
+        );
+        assert!(!verdict.is_denied(), "{verdict:?}");
+    }
+
+    #[test]
+    fn a_config_own_rule_for_the_same_command_wins_over_the_shipped_one() {
+        // Prepend, not append: `deny` is a first-match list, so the operator's rule has to come first for
+        // the note they wrote to be the one that explains the refusal. Both stay in force.
+        let yaml = "agent:\n  approval:\n    deny:\n      - { tool: shell, command: \"rm -rf /\", note: \"no — ask the team first\" }\n";
+        let config = Config::from_yaml(yaml).unwrap();
+        let policy = &config.agent.approval;
+
+        let mut session = crate::approval::ApprovalSession::new(policy.clone());
+        let verdict = session.decide(
+            &crate::approval::ActionRequest::shell("rm -rf /"),
+            chrono::Utc::now(),
+        );
+        assert!(verdict.is_denied());
+        assert!(
+            verdict.why().contains("ask the team first"),
+            "the operator's own words, not the shipped note: {verdict:?}"
+        );
+        assert!(
+            policy.has_floor(),
+            "and the rest of the floor is still there"
+        );
+    }
+
+    #[test]
+    fn a_library_policy_built_in_code_never_acquires_the_floor() {
+        // `ApprovalPolicy::default()` is what a test or an embedder builds. Folding a deployment's
+        // opinions into it would replace one trap with another — a library caller's blank policy would
+        // suddenly refuse fourteen commands it never heard of.
+        let policy = crate::approval::ApprovalPolicy::default();
+        assert!(policy.deny.is_empty());
+        assert_eq!(policy.inherit_denials, None);
+        assert!(!policy.has_floor());
+        assert!(!policy.clone().with_floor().has_floor(), "None is not true");
     }
 
     /// The file we tell people to copy has to parse against the schema we actually have.

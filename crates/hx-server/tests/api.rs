@@ -489,6 +489,66 @@ async fn the_same_command_runs_when_the_request_asks_for_yolo() {
 }
 
 #[tokio::test]
+async fn yolo_asks_nobody_but_it_cannot_lift_the_shipped_floor() {
+    // The hole this closes was live: a request with `autonomy: "yolo"` used to be able to run
+    // `rm -rf /etc`, because the *level* was applied to a policy that never carried the catastrophe set
+    // (and, before that, because writing an `approval:` block replaced it). The two are different
+    // questions — the level decides what is *asked*, the floor decides what is *refused* — and no level
+    // may answer the second.
+    let h = harness(vec![]).await;
+    let cwd = h.workspace.display().to_string();
+    h.model.push(Ok(calls(vec![(
+        "c1",
+        "shell",
+        serde_json::json!({ "cmd": "rm -rf /etc", "workdir": cwd }),
+    )])));
+    h.model.push(Ok(answer("understood")));
+
+    let mut body = h.body("clean up the machine");
+    body["autonomy"] = serde_json::json!("yolo");
+
+    let (status, reply) = chat(&h.state, body).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(
+        reply["refusals"], 1,
+        "a yolo run still refuses the catastrophe set: {reply}"
+    );
+    assert_eq!(reply["tool_calls"], 0, "{reply}");
+
+    let said = h.said(reply["session_id"].as_str().unwrap());
+    assert!(
+        said.contains("recursive delete of /etc"),
+        "and the reason is the shipped one, so the model can read why: {said}"
+    );
+}
+
+#[tokio::test]
+async fn an_ordinary_destructive_command_is_still_questioned_and_not_refused() {
+    // The other side of the same coin, and the reason the floor is a list of named paths rather than a
+    // pattern: a cleanup in `/tmp` is a question nobody can answer from a rule, so `yolo` runs it and a
+    // cautious run asks about it — but neither *refuses* it.
+    let h = harness(vec![]).await;
+    let cwd = h.workspace.display().to_string();
+    h.model.push(Ok(calls(vec![(
+        "c1",
+        "shell",
+        serde_json::json!({ "cmd": "rm -rf /tmp/hx-does-not-exist", "workdir": cwd }),
+    )])));
+    h.model.push(Ok(answer("done")));
+
+    let mut body = h.body("clean the temp dir");
+    body["autonomy"] = serde_json::json!("yolo");
+
+    let (status, reply) = chat(&h.state, body).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(
+        reply["refusals"], 0,
+        "an ordinary cleanup is not a catastrophe: {reply}"
+    );
+    assert_eq!(reply["tool_calls"], 1, "{reply}");
+}
+
+#[tokio::test]
 async fn a_relative_path_from_the_model_is_read_against_the_workspace() {
     // What a real model does: asked to read a file "in this workspace", it writes a relative path.
     // The capability token holds an absolute workspace path, so without the join *every* call it

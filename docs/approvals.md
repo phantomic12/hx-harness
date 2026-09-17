@@ -252,7 +252,27 @@ says, and both are the kind that only a test written from the document can find:
    write. `AgentConfig::default()` now calls `deployment_approval()`, and
    `the_shipped_example_config_parses_and_carries_the_floor` pins it against the file people copy.
 
-Known, and next: a config that writes its own `approval:` block still **replaces** the shipped deny set
-rather than adding to it, so `agent: approval: {level: yolo}` quietly removes the floor. The fix is to
-make the shipped rules additive with an explicit opt-out, which is a change to the policy model rather
-than to the delete tool — `hx.example.yaml` states the trap plainly in the meantime.
+### The third defect, and the one that mattered most
+
+**A config that wrote a policy replaced the floor.** A config deserialises *into* a policy, so any list it
+wrote replaced the list the deployment started with — and `agent: {approval: {level: yolo}}`, the shortest
+thing an operator writes to stop being prompted, silently removed all thirty-two catastrophe rules with it.
+The looser the setting, the more the floor mattered, which is the worst possible shape for a safety default.
+
+The floor is therefore **not a list that can be replaced by omission**. `inherit_denials` is a field on
+`ApprovalPolicy` whose serde default is `true` and whose type default is `None`, because those are two
+different questions: a policy that came from a *file* is a deployment and inherits the floor, while
+`ApprovalPolicy::default()` is a library caller and must not acquire fourteen rules it never wrote.
+`with_floor()` folds the shipped rules in (the file's own rules first, so *its* note is the one that
+explains a refusal), and `Config::from_yaml` — the boundary between a file and a policy — is where it runs.
+Dropping the floor now takes the words `inherit_denials: false`, and `hx policy` reports that as
+*"none of the shipped catastrophe set: this config's `deny` list replaced it"*.
+
+Two bugs were found by the test that asserts a **run**, not a policy, refuses `rm -rf /etc` under `yolo`:
+
+1. `with_floor()` was not idempotent. It rebuilt the deny list by keeping only the rules the floor did not
+   already contain, so folding an already-floored policy produced an **empty** list — and since the daemon
+   folds on every run, the catastrophe set was dropped silently before `set_level` was ever reached. The
+   unit test that called the policy directly never saw it; the API test that ran a command did.
+2. `deployment_default()` set the flag but did not resolve it, so the one constructor an embedder calls
+   without a config file promised a floor it did not carry.

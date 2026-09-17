@@ -242,7 +242,12 @@ pub async fn run_chat(
     state.store.append(&session_id, &prompt, now)?;
 
     let host = state.local_host().await?;
-    let mut approvals = ApprovalSession::new(state.config.agent.approval.clone());
+    // `with_floor()` again, and not because the config forgot: a request may arrive with a policy that
+    // never went through `Config::from_yaml` (a test's `AppState::from_parts`, a future hot-reload), and the
+    // fold is idempotent. The order that matters is here — `set_level` changes the *threshold*, and the
+    // floor is a list of refusals that no level can lift, so folding after it is what keeps
+    // `autonomy: "yolo"` from being a way to drop the catastrophe set.
+    let mut approvals = ApprovalSession::new(state.config.agent.approval.clone().with_floor());
     approvals.set_level(level);
 
     // Who answers a prompt, in the order of how much waiting is warranted.

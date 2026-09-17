@@ -194,7 +194,7 @@ $ ./target/release/hxd --bind 127.0.0.1:7717
 ```
 
 ```console
-$ cargo test --workspace         # 684 tests, 0 failed, 22 ignored live tests
+$ cargo test --workspace         # 690 tests, 0 failed, 22 ignored live tests
 $ cargo test -p hx-sandbox --test docker_live -- --ignored   # needs a container engine
 $ cargo test -p hx-remote --test ssh_live -- --ignored       # needs an SSH server
 $ HX_SEARXNG_URL=... HX_SEARCH_EXPECT_RESULTS=searxng \
