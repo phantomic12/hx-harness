@@ -126,8 +126,14 @@ enum Command {
     /// Show the effective approval ladder: what runs free, what is asked about, and what is refused.
     ///
     /// Reads the configuration, so it shows what a *new* run will do. A live session's level can
-    /// differ (`--autonomy`, `allow for this chat`), which the output says rather than hides.
-    Policy,
+    /// differ (`--autonomy`, `allow for this chat`), which the output says rather than hides. Also
+    /// shows the project's own grants from the checkout's `.hx/allow.toml`, so the provenance of
+    /// every rule (shipped floor, config, or project file) is visible.
+    Policy {
+        /// The checkout whose `.hx/allow.toml` to report. Defaults to the current directory.
+        #[arg(long)]
+        workspace: Option<String>,
+    },
 
     /// Check the configuration and the environment.
     Doctor,
@@ -255,10 +261,31 @@ async fn main() -> Result<()> {
             print!("{}", commands::render_pools(&router));
         }
 
-        Command::Policy => {
+        Command::Policy { workspace } => {
+            let root = workspace
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let allow_path = root.join(hx_core::allowlist::ALLOW_FILE);
+            // A broken `.hx/allow.toml` is the first thing a reader of `hx policy` needs to know
+            // about: a run will refuse to start on it (fail closed), so a report that hid it would be
+            // describing a policy the daemon will never run.
+            let (grants, shown_path) = match hx_core::allowlist::AllowFile::load(&allow_path) {
+                Ok(list) => (list.into_rules(), Some(allow_path.display().to_string())),
+                Err(hx_core::allowlist::AllowlistError::NotFound(_)) => (Vec::new(), None),
+                Err(err) => {
+                    eprintln!("! {err}");
+                    (Vec::new(), Some(allow_path.display().to_string()))
+                }
+            };
             print!(
                 "{}",
-                commands::render_policy(&config, &cli.config.display().to_string())
+                commands::render_policy(
+                    &config,
+                    &cli.config.display().to_string(),
+                    &grants,
+                    shown_path.as_deref()
+                )
             );
         }
 

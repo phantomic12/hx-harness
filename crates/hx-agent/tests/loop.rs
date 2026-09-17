@@ -424,6 +424,59 @@ async fn a_capability_denial_cannot_be_approved_away() {
 }
 
 #[tokio::test]
+async fn a_file_sourced_project_grant_cannot_widen_a_capability_denial() {
+    // The same ordering property as `a_capability_denial_cannot_be_approved_away`, but with the
+    // approval coming from a real `.hx/allow.toml` — the attacker-influenceable file §5 warns about.
+    // A file lives in a repo, so it can be edited by anyone who can touch the repo; this test is the
+    // proof that the most such a file can do is widen the *policy*, and that the capability decided
+    // first still refuses the call and still notifies nobody. If this fails, a file has become a way
+    // around a capability denial, which is the exact hole §5 says a file must not be.
+    let dir = std::env::temp_dir().join(format!("hx-loop-grant-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join(".hx")).unwrap();
+    std::fs::write(
+        dir.join(".hx").join("allow.toml"),
+        "[[allow]]\ntool = \"shell\"\ncommand = \"echo hi*\"\n",
+    )
+    .unwrap();
+
+    let mut policy = ApprovalPolicy::paranoid();
+    let list = hx_core::allowlist::AllowFile::load(&dir.join(".hx").join("allow.toml")).unwrap();
+    policy.allow.append(&mut list.into_rules());
+
+    let approver = Arc::new(ScriptedApprover::new(vec![ApprovalDecision::allow_once()]));
+    let h = harness_on(
+        FakeHost::unix(),
+        vec![
+            Ok(reply_with(vec![(
+                "tc_1",
+                "shell",
+                json!({ "cmd": "echo hi" }),
+            )])),
+            Ok(reply("understood")),
+        ],
+        // No `Process` grant at all, so the capability layer denies the shell call outright.
+        vec![],
+        policy,
+        approver.clone(),
+    );
+
+    let mut transcript = transcript_start();
+    let outcome = h.agent_loop.run(&mut transcript, &h.ctx).await.unwrap();
+
+    assert_eq!(outcome.refusals, 1);
+    assert_eq!(outcome.tool_calls, 0);
+    assert!(
+        approver.seen().is_empty(),
+        "a file grant must not turn a capability refusal into a prompt"
+    );
+    assert!(
+        h.host.commands().is_empty(),
+        "and it must not let the command reach the host"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn a_denied_call_does_not_stop_its_sibling() {
     // Two calls in one turn, the first refused. The second must still run: a model that asks for
     // one bad thing alongside a good one should not lose the good one.
