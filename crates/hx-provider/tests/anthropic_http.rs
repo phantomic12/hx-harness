@@ -513,3 +513,147 @@ async fn every_request_sends_the_anthropic_version_header_even_without_a_key_tur
     let head = stub.captured().await.head.to_ascii_lowercase();
     assert!(head.contains("anthropic-version: 2023-06-01"), "{head}");
 }
+
+/// A body of named SSE events, as the API sends for a streamed turn that calls one tool.
+///
+/// Taken from the shapes in the streaming docs: `input_json_delta` carries *partial JSON*, so the
+/// fragments here are deliberately split mid-token — a client that parsed them per delta would fail
+/// on this body, which is the point.
+fn tool_call_stream_body() -> String {
+    [
+        r#"event: message_start"#,
+        r#"data: {"type":"message_start","message":{"id":"msg_1","model":"claude-opus-4","usage":{"input_tokens":42,"output_tokens":1}}}"#,
+        "",
+        r#"event: content_block_start"#,
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        "",
+        r#"event: ping"#,
+        r#"data: {"type":"ping"}"#,
+        "",
+        r#"event: content_block_delta"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Let me look"}}"#,
+        "",
+        r#"event: content_block_stop"#,
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        "",
+        r#"event: content_block_start"#,
+        r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_9","name":"read_file","input":{}}}"#,
+        "",
+        r#"event: content_block_delta"#,
+        r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"pa"}}"#,
+        "",
+        r#"event: content_block_delta"#,
+        r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"th\":\"Cargo"}}"#,
+        "",
+        r#"event: content_block_delta"#,
+        r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":".toml\"}"}}"#,
+        "",
+        r#"event: content_block_stop"#,
+        r#"data: {"type":"content_block_stop","index":1}"#,
+        "",
+        r#"event: message_delta"#,
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":31}}"#,
+        "",
+        r#"event: message_stop"#,
+        r#"data: {"type":"message_stop"}"#,
+        "",
+    ]
+    .join("\n")
+}
+
+#[tokio::test]
+async fn a_streamed_turn_asks_for_a_stream_and_sends_the_same_body_otherwise() {
+    // Streaming must not silently become the default for the non-streaming path, and the two bodies
+    // must not drift: reusing `build_body` is what keeps them the same request with one flag added.
+    let stub = stub(
+        200,
+        "content-type: text/event-stream\r\n",
+        &tool_call_stream_body(),
+    )
+    .await;
+    let provider = stub.provider();
+
+    let mut deltas = Vec::new();
+    let reply = provider
+        .stream(request(), &key(), &mut |delta| {
+            deltas.push(delta);
+            Ok(())
+        })
+        .await
+        .expect("the streamed turn succeeds");
+
+    let captured = stub.captured().await;
+    assert_eq!(captured.request_line, "POST /v1/messages HTTP/1.1");
+    assert_eq!(
+        captured.body["stream"], true,
+        "the streaming call asks for a stream: {}",
+        captured.body
+    );
+
+    // The same body the non-streaming call builds, so the two cannot drift apart.
+    let expected = hx_provider::anthropic::build_body(&request()).unwrap();
+    let mut without_flag = captured.body.clone();
+    without_flag.as_object_mut().unwrap().remove("stream");
+    assert_eq!(without_flag, expected, "only the stream flag was added");
+
+    // Text arrived as deltas rather than in one lump, which is the whole point.
+    let texts: Vec<String> = deltas
+        .iter()
+        .filter_map(|d| match d {
+            hx_provider::StreamDelta::Text(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, vec!["Let me look".to_string()]);
+
+    // And the assembled reply is the same shape a non-streaming call produces.
+    assert_eq!(reply.message.text(), "Let me look");
+    assert_eq!(reply.finish, FinishReason::ToolUse);
+    assert_eq!(reply.model, "claude-opus-4");
+    assert_eq!(reply.usage.input_tokens, 42);
+    assert_eq!(reply.usage.output_tokens, 31);
+
+    let call = reply
+        .message
+        .tool_calls()
+        .next()
+        .expect("the tool call is complete");
+    match call {
+        Part::ToolCall {
+            id,
+            name,
+            arguments,
+        } => {
+            assert_eq!(id.as_str(), "toolu_9");
+            assert_eq!(name, "read_file");
+            // Reassembled from three partial-JSON fragments.
+            assert_eq!(arguments["path"], "Cargo.toml");
+        }
+        other => panic!("expected a tool call, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_stream_that_fails_after_the_headers_is_an_error_not_a_short_answer() {
+    // The API documents mid-stream errors after a 200. Returning the partial text as a finished
+    // reply would look like the model deciding to stop early.
+    let body = [
+        r#"event: message_start"#,
+        r#"data: {"type":"message_start","message":{"model":"claude-opus-4","usage":{"input_tokens":5,"output_tokens":1}}}"#,
+        "",
+        r#"event: error"#,
+        r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        "",
+    ]
+    .join("\n");
+
+    let stub = stub(200, "content-type: text/event-stream\r\n", &body).await;
+    let provider = stub.provider();
+
+    let err = provider
+        .stream(request(), &key(), &mut |_| Ok(()))
+        .await
+        .expect_err("a mid-stream error is a failure");
+    let message = format!("{err}");
+    assert!(message.contains("Overloaded"), "{message}");
+}

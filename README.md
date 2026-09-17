@@ -230,7 +230,10 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
   SSE, tagged with its session, ending in a named `done` (or `error`) event carrying the reply; and
   `hx chat --stream` renders a run as it happens — turns, tool calls and text deltas live on stderr,
   the reply on stdout. The Anthropic adapter still completes whole and replays its deltas through the
-  default `Provider::stream`, so nothing is broken there but nothing streams either. Context
+  default `Provider::stream`, and **Anthropic streams for real too**: `stream: true`, named SSE
+  events reassembled across reads, `input_json_delta` fragments accumulated and parsed only when the
+  block stops, cumulative usage taken from the last `message_delta`, and a mid-stream `error` event
+  raised rather than returned as a short answer. Context
   compaction is **built** too: a long session is elided at the `compact_at_tokens` threshold (head +
   an explicit marker + tail, never splitting a tool call from its result) for the model while the
   stored audit trail is untouched.
