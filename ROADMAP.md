@@ -65,7 +65,11 @@ Those get real tests in M1 against a live endpoint.
   failed call rather than a quiet fallback to the machine. Requests select a profile with
   `sandbox_profile` (`hx chat --sandbox-profile`); invalid or unavailable boundaries fail before the
   model runs. Still open in that document: a persisted project-scoped allowlist (§5)
-- Context builder + compaction at a token threshold
+- ◐ **Compaction at a token threshold** — `compact_at_tokens` is honoured: when a transcript's
+  estimated tokens pass the threshold, the middle is elided for the model (head + an explicit marker +
+  tail, never splitting a tool call from its result) while the stored audit trail is untouched. The
+  general "context builder" — a separable module assembling system + tools + messages — is still inline
+  in the loop, which is the remaining half of this item.
 - ✅ `hxd` runs, `hx` connects to it: `hx chat` sends the prompt to the daemon over the configured
   HTTP address and prints the run's report (over HTTP rather than the unix socket, which the config
   also names and nothing uses yet); `hx sessions` / `hx session <id> [--export md]` read back what the

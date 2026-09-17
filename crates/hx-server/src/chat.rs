@@ -308,6 +308,10 @@ pub async fn run_chat(
         limits.deadline = Some(std::time::Duration::from_secs(
             request.deadline_secs.unwrap_or(DEFAULT_DEADLINE_SECS),
         ));
+        // The compaction threshold is a config property of the agent, read here so the loop's
+        // copy (`Limits.compact_at_tokens`) stays in one place: what a config says and what a run
+        // does must not quietly diverge.
+        limits.compact_at_tokens = state.config.agent.compact_at_tokens;
         limits
     };
 

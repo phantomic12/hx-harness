@@ -223,8 +223,10 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
   repository a team can diff — is not written yet. Until it is, a remembered approval outlives
   nothing. The `confined` axis (§4), chat profile selection, and `hx policy` (§6) are built.
   Shell confinement does not confine file tools or make the writable workspace mount disposable.
-- **Streaming and context compaction.** A turn arrives whole, so a run is one long wait per turn and a
-  long session is still sent as-is. Both are stated gaps, not hidden ones.
+- **Streaming.** A turn arrives whole, so a run is one long wait per turn. Context compaction is
+  **built**: a long session is elided at the `compact_at_tokens` threshold (head + an explicit marker
+  + tail, never splitting a tool call from its result) for the model while the stored audit trail is
+  untouched. Streaming remains a stated gap, compaction no longer is.
 - **Nothing in `ci.yml` reaches another machine.** That file is in-process unit tests; the tests
   that open a socket — a real Docker daemon, a real `sshd` — live in
   `.github/workflows/integration.yml` and are `#[ignore]`d by default, so a local `cargo test` stays
