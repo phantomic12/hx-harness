@@ -123,8 +123,10 @@ the TUI; then send an agent prompt from the browser and see it stream in both.
 - Capability tokens wired into the policy engine. Approval and capability are two independent
   checks on one path: the level decides whether to *ask*, the token decides whether "yes" is
   even legal. A denied capability is an auditable event, not a prompt the user can approve away.
-- Hash-chained audit log — every ask, answer, auto-allow and denial, with the risk class and
-  reason string that produced it
+- ✅ Hash-chained audit log — every event row carries a digest over its content and its
+  predecessor, so an edited or deleted row is detectable (`hx-store/src/audit.rs`). Verified against a
+  real V1 database: 348 pre-chain events kept and reported as unchained, new events chained. It is not
+  a signature — see that module's doc block for exactly what it does not prove.
 - Web UI: container pane, and an approval queue showing the risk class, the reason, and the
   remaining unattended budget
 

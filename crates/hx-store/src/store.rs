@@ -1,5 +1,6 @@
 //! The store itself: one SQLite database, opened once and shared.
 
+use crate::audit;
 use crate::schema::{self, fail};
 use crate::session::{
     parse_stamp, role_column, stamp, ExportFormat, NewSession, Session, SessionRecord,
@@ -422,13 +423,91 @@ impl Store {
         self.with_tx(|tx| {
             let seq = Self::next_seq(tx, "events", session)?;
             Self::touch(tx, session, at)?;
+
+            // The chain is extended inside the same transaction as the row, so a crash cannot leave
+            // an event whose digest was never written — which would look like tampering on the next
+            // verify. Read the predecessor in this transaction, not from a cached "last digest":
+            // two writers would otherwise both chain from the same row and one of them would be
+            // permanently unverifiable.
+            let previous: Option<String> = tx
+                .query_row(
+                    "SELECT digest FROM events WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1",
+                    [session.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|err| fail("could not read the previous event's digest", err))?;
+            let previous = previous.unwrap_or_else(|| audit::GENESIS.to_string());
+
+            let at_text = stamp(at);
+            let digest = audit::digest(
+                &previous,
+                &audit::EventLink {
+                    session_id: session.as_str(),
+                    seq,
+                    at: &at_text,
+                    kind: &kind,
+                    payload: &payload,
+                },
+            );
+
             tx.execute(
-                "INSERT INTO events (session_id, seq, at, kind, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![session.as_str(), seq, stamp(at), kind, payload],
+                "INSERT INTO events (session_id, seq, at, kind, payload, digest) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![session.as_str(), seq, at_text, kind, payload, digest],
             )
             .map_err(|err| fail("could not append the event", err))?;
             Ok(seq as u64)
         })
+    }
+
+    /// Walk this session's audit chain and report the first break, if any.
+    ///
+    /// Returns `Ok(None)` for a chain that holds *and* for a session whose events predate the chain
+    /// — an upgraded database keeps its history rather than being refused, and its old rows carry no
+    /// digest to check. The distinction is visible through [`Store::unchained_events`], which is what
+    /// a caller reporting "verified" needs in order to say how much of the log was actually verified.
+    pub fn verify_audit(&self, session: &SessionId) -> Result<Option<audit::Break>> {
+        let conn = self.lock();
+        // The row's content travels with its digest: a verifier handed only digests can compare
+        // them to each other but cannot recompute anything, so it would certify an edited row.
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, at, kind, payload, digest FROM events \
+                 WHERE session_id = ?1 ORDER BY seq ASC",
+            )
+            .map_err(|err| fail("could not prepare the audit read", err))?;
+
+        let rows = stmt
+            .query_map([session.as_str()], |row| {
+                Ok(audit::StoredEvent {
+                    seq: row.get(0)?,
+                    at: row.get(1)?,
+                    kind: row.get(2)?,
+                    payload: row.get(3)?,
+                    digest: row.get(4)?,
+                })
+            })
+            .map_err(|err| fail("could not read the audit chain", err))?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row.map_err(|err| fail("could not read an audit row", err))?);
+        }
+        audit::verify_events(session.as_str(), &events)
+    }
+
+    /// How many of this session's events carry no digest — rows written before the chain existed.
+    pub fn unchained_events(&self, session: &SessionId) -> Result<usize> {
+        let conn = self.lock();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND digest IS NULL",
+                [session.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|err| fail("could not count unchained events", err))?;
+        Ok(count as usize)
     }
 
     /// The event stream, in order.
@@ -1015,6 +1094,132 @@ mod tests {
         let session = store.create(NewSession::new(), at(0)).unwrap().id;
         let totals = store.totals(&session).unwrap();
         assert_eq!(totals, Totals::default());
+    }
+
+    #[test]
+    fn a_real_write_chain_verifies_and_an_edited_row_does_not() {
+        // The module tests prove the arithmetic; this proves the *store* builds the chain, and that
+        // tampering is caught in the place an attacker would actually do it — a direct UPDATE against
+        // the database, which no amount of in-process care can prevent.
+        let store = store();
+        let session = store.create(NewSession::new(), at(0)).unwrap().id;
+        let agent = AgentId::from("agt_1");
+
+        let mut events = Vec::new();
+        for turn in 1..=4 {
+            events.push(AgentEvent::TurnStarted {
+                agent: agent.clone(),
+                turn,
+            });
+            store
+                .append_event(&session, events.last().unwrap(), at(turn as i64))
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.unchained_events(&session).unwrap(),
+            0,
+            "every row is chained"
+        );
+        assert_eq!(
+            store.verify_audit(&session).unwrap(),
+            None,
+            "an honest log verifies"
+        );
+
+        // Rewrite a row the way someone covering their tracks would: straight SQL, no store method.
+        // The digest column belongs to the old content, so the chain must notice.
+        let conn = store.lock();
+        conn.execute(
+            "UPDATE events SET payload = ?1 WHERE session_id = ?2 AND seq = 3",
+            params![
+                "{\"event\":\"TurnStarted\",\"agent\":\"agt_1\",\"turn\":99}",
+                session.as_str()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let found = store
+            .verify_audit(&session)
+            .unwrap()
+            .expect("the edited row is caught");
+        assert_eq!(
+            found.seq,
+            3,
+            "at the row that was edited: {}",
+            found.explain()
+        );
+        assert!(
+            found.explain().contains("edited after it was written"),
+            "{}",
+            found.explain()
+        );
+    }
+
+    #[test]
+    fn an_event_written_after_a_tampered_one_still_chains_from_it() {
+        // A chain is append-only: the next row is built from whatever is stored, so tampering is
+        // *detected* rather than prevented. This pins that behaviour deliberately — a store that
+        // refused to append to a broken chain would be a denial of service on the audit log itself,
+        // and an attacker could silence the record entirely by corrupting one row.
+        let store = store();
+        let session = store.create(NewSession::new(), at(0)).unwrap().id;
+        let agent = AgentId::from("agt_1");
+        let first = AgentEvent::TurnStarted {
+            agent: agent.clone(),
+            turn: 1,
+        };
+        store.append_event(&session, &first, at(0)).unwrap();
+
+        {
+            let conn = store.lock();
+            conn.execute(
+                "UPDATE events SET digest = 'deadbeef' WHERE session_id = ?1 AND seq = 1",
+                [session.as_str()],
+            )
+            .unwrap();
+        }
+
+        // Appending still works, and the break is still reported at row 1 — the corruption is not
+        // laundered into a chain that verifies.
+        let second = AgentEvent::TurnFinished {
+            agent,
+            turn: 1,
+            stop: StopReason::Completed,
+        };
+        store.append_event(&session, &second, at(1)).unwrap();
+        let found = store.verify_audit(&session).unwrap().expect("still broken");
+        assert_eq!(found.seq, 1);
+    }
+
+    #[test]
+    fn a_row_from_before_the_chain_existed_is_reported_rather_than_silently_trusted() {
+        // An upgraded database keeps its history. Those rows carry no digest, and the honest answer
+        // is to say how many were not verified — a report that claims "verified" over rows it never
+        // checked is the failure mode this counter exists to prevent.
+        let store = store();
+        let session = store.create(NewSession::new(), at(0)).unwrap().id;
+        let agent = AgentId::from("agt_1");
+        store
+            .append_event(&session, &AgentEvent::TurnStarted { agent, turn: 1 }, at(0))
+            .unwrap();
+
+        {
+            let conn = store.lock();
+            conn.execute(
+                "UPDATE events SET digest = NULL WHERE session_id = ?1",
+                [session.as_str()],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(store.unchained_events(&session).unwrap(), 1);
+        assert_eq!(
+            store.verify_audit(&session).unwrap(),
+            None,
+            "nothing contradicts nothing"
+        );
     }
 
     #[test]

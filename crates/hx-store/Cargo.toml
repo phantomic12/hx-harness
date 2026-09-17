@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 hx-core.workspace = true
+sha2 = { workspace = true }
 chrono.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

@@ -28,6 +28,25 @@ those 24 ignored tests are the ones that have reached another process, and the o
 could catch a protocol mistake. They now run in CI, which is the difference between "verified once"
 and "stays verified".
 
+## The audit chain (hermetic + verified on a real database)
+
+`crates/hx-store/src/audit.rs` gives every event row a digest over (its sequence, timestamp, kind,
+payload, session id) and the previous row's digest. **The first version of the verifier only compared
+each stored digest to the previous stored digest — a property true of any list of strings, so it
+detected nothing.** Three tests failed and caught it: a verifier that cannot fail certifies an edited
+log as intact. `verify_events` now recomputes each row's digest from the row's own content, and takes
+content + digest rather than digests alone.
+
+Verified on a real database (a copy of a V1 store with 348 events): opening it with this build
+migrated the schema to V2, added the `digest` column, kept all 348 rows (all reported as *unchained*
+rather than as tampered with), and a subsequent run chained its 4 new events. That is the upgrade path
+an existing deployment takes.
+
+What it does not prove: it is hash chaining, not a signature. An attacker who rewrites the whole chain
+from a chosen point forward produces one that verifies, because the only secret involved is the
+construction. Detecting *that* needs a key held outside the database — `hx-secrets`' business and an
+open step.
+
 ## Chat sandbox wiring verification
 
 `cargo fmt --all --check`, strict workspace clippy, and `cargo test --workspace --locked` pass.

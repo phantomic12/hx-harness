@@ -38,6 +38,7 @@
 //! on the way *out* to a model or a chat platform, and a transcript that silently differs from what
 //! happened is worse than one that contains a secret the vault already knows how to mask.
 
+pub mod audit;
 pub mod schema;
 pub mod session;
 pub mod store;

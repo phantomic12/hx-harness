@@ -24,10 +24,18 @@ use hx_core::error::{HxError, Result};
 use rusqlite::Connection;
 
 /// The schema this build writes and understands.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// `(version, sql)`, applied in order. Never edit an applied migration: add another.
-pub(crate) const MIGRATIONS: &[(i64, &str)] = &[(1, V1)];
+pub(crate) const MIGRATIONS: &[(i64, &str)] = &[(1, V1), (2, V2)];
+
+/// Adding a column is what makes the chain retrofittable: a database written before this migration
+/// keeps its rows and gets a NULL digest for each, which `verify` reports as unchained rather than as
+/// tampered with. Refusing to open an old database would be the other defensible choice and was
+/// rejected: an audit log that disappears when the tool is upgraded is a worse audit log.
+const V2: &str = r#"
+ALTER TABLE events ADD COLUMN digest TEXT;
+"#;
 
 const V1: &str = r#"
 CREATE TABLE sessions (
