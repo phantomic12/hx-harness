@@ -22,10 +22,9 @@
 //!   concurrency ceiling is the manager's own — a second `spawn` for the same key would be refused by the
 //!   manager rather than by a rule here, which is the correct place for that decision.
 //!
-//! Expansion is next, not now (see `docs/approvals.md` §4): a run whose requests *always* want a
-//! boundary should be handed one at construction, the way `hx sandbox` commands already work. The
-//! mechanism is the same in both cases, which is why this is written against the manager rather than
-//! against a single handle.
+//! Chat requests select a profile explicitly and receive this boundary before their model is called.
+//! Only shell dispatch uses it; file tools keep their host context. This is not whole-agent isolation,
+//! and the mounted checkout remains writable on the host.
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -266,10 +265,8 @@ async fn find_existing(manager: &SandboxManager, spec: &SandboxSpec) -> Option<S
 #[async_trait]
 impl SandboxExec for SandboxFor {
     async fn exec(&self, command: &str, workdir: Option<&str>) -> Result<ExecOutput> {
-        // `command` arrives as a whole shell line already quoted for a POSIX shell, so it is *not* quoted
-        // here: quoting it would run the escaping literally. That is safe only because the direction of
-        // this call is fixed — the line is built by `ShellTool` from parsed arguments and never from a
-        // string the model composed as a single argument.
+        // The command is shell source, not one shell argument. Pass it unchanged; only the separate
+        // workdir is translated. Embedding a host-side `cd` here would name a path absent in the box.
         let dir = match workdir {
             Some(path) => Some(self.translate(path)?),
             None => None,

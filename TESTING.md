@@ -4,7 +4,7 @@ Status: 2026-09-16. Companion to `ROADMAP.md` (which tracks features); this file
 
 ```console
 $ cargo test --workspace
-690 tests, 0 failed                       # 15 hermetic HTTP + 4 that reopen the database + 14 that run the loop over HTTP
+695 tests, 0 failed                       # includes 20 chat API tests and 4 database reopen tests
 22 ignored                               # live: Docker, SSH, search, a real model
 
 # The 22 that need a real server, run by `.github/workflows/integration.yml`
@@ -25,6 +25,19 @@ The counts matter in both directions. A green `cargo test` alone still means **t
 those 22 ignored tests are the ones that have reached another process, and the only ones here that
 could catch a protocol mistake. They now run in CI, which is the difference between "verified once"
 and "stays verified".
+
+## Chat sandbox wiring verification
+
+`cargo fmt --all --check`, strict workspace clippy, and `cargo test --workspace --locked` pass.
+Four added HTTP tests cover unknown profile (400), absent engine (503), failed startup (502), and
+successful shell dispatch through the real manager with a recording runtime. They assert no model
+call or session on startup rejection, exact command source without a host-side `cd`, translated
+`/workspace`, and no host marker. A shell test covers an explicit relative workdir separately from
+command source. CLI help exposes `--sandbox-profile`.
+
+This is hermetic evidence, not a live container run. Docker is not installed on this development host;
+the new chat path has not yet been exercised against a real engine. The historical live results below
+remain evidence for their named suites, not for this new wiring.
 
 ## The four tiers
 

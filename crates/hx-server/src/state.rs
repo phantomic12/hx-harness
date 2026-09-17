@@ -52,6 +52,8 @@ pub struct AppState {
     pub chats: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     /// `None` when no container engine was reachable at startup.
     pub sandboxes: Option<Arc<SandboxManager>>,
+    /// Reuse one shell boundary per profile and checkout across chat requests.
+    pub chat_sandboxes: crate::sandbox::SandboxCache,
     pub started_at: DateTime<Utc>,
     /// Why the sandbox manager is absent, so status can explain rather than just say "null".
     pub sandbox_unavailable_reason: Option<String>,
@@ -171,6 +173,7 @@ impl AppState {
             search: parts.search,
             chats: Mutex::new(HashMap::new()),
             sandboxes: parts.sandboxes,
+            chat_sandboxes: crate::sandbox::SandboxCache::new(),
             started_at: parts.started_at,
             sandbox_unavailable_reason: parts.sandbox_unavailable_reason,
             vault_unlocked: false,

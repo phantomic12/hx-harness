@@ -140,11 +140,18 @@ Two properties are the whole point, and both are asserted:
   host`, above the `after:` line — it qualifies what follows, because a promise about what a sandbox will
   do is not a promise about the machine.
 
-Not built yet: a *request* that asks for confinement. `SandboxFor` is opened per checkout through
-`SandboxCache` (keyed on profile + host workspace path, so two runs in one checkout share a container and
-two checkouts never do), and the manager's TTL reaper plus a drop-guard own its lifetime — but nothing in
-the chat request path reaches for it yet. The wiring is the next step, and it is deliberately small: the
-mechanism above is what it needed.
+Chat requests now select a boundary with `sandbox_profile`; the CLI exposes it as
+`hx chat "run tests" --sandbox-profile dev --workspace /absolute/checkout`.
+The daemon resolves the configured profile before creating a session or calling the model, adopts the
+workspace owner, and opens it through `SandboxCache`. Unknown profiles return 400; an absent engine
+returns 503; a failed start returns 502. None falls back to the host. Selection is per request, including
+resumed requests; omitting it keeps host execution. Only shell calls are confined: file tools still use
+the host and declare that fact to the approval layer. The workspace remains a writable host bind mount.
+
+The shell sends command source and workdir separately. Embedding `cd /host/checkout` in the command
+would defeat mount translation even though the engine received `/workspace` as its working directory.
+HTTP tests assert the exact engine command and translated directory, not merely that `exec` was called.
+Live Docker verification of this chat path remains outstanding; these tests use a recording runtime.
 
 ## 5. Where "remember" lives, and for how long
 

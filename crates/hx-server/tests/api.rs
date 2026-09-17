@@ -134,6 +134,192 @@ fn calls(list: Vec<(&str, &str, serde_json::Value)>) -> ChatResponse {
     }
 }
 
+#[tokio::test]
+async fn an_unknown_chat_sandbox_is_rejected_before_a_session_or_model_call() {
+    // A misspelt boundary must never become an unconfined run.
+    let h = harness(vec![Ok(answer("must not run"))]).await;
+    let (status, reply) = chat(
+        &h.state,
+        serde_json::json!({
+            "prompt": "hello", "sandbox_profile": "missing", "workspace": h.workspace
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{reply}");
+    assert!(reply.to_string().contains("missing"), "{reply}");
+    assert!(h.model.seen().is_empty());
+    assert_eq!(h.state.store.count().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn a_chat_that_requests_a_sandbox_cannot_run_when_the_engine_is_absent() {
+    // An explicit boundary is a requirement, not a hint that can be discarded.
+    let mut h = harness(vec![Ok(answer("must not run"))]).await;
+    Arc::get_mut(&mut h.state)
+        .unwrap()
+        .config
+        .sandbox_profiles
+        .insert(
+            "dev".into(),
+            hx_core::config::SandboxProfile {
+                image: "alpine:3.22".into(),
+                ..Default::default()
+            },
+        );
+    let (status, reply) = chat(
+        &h.state,
+        serde_json::json!({
+            "prompt": "hello", "sandbox_profile": "dev", "workspace": h.workspace
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{reply}");
+    assert!(
+        reply.to_string().contains("no container engine in a test"),
+        "{reply}"
+    );
+    assert!(h.model.seen().is_empty());
+    assert_eq!(h.state.store.count().unwrap(), 0);
+}
+
+/// Records engine calls behind the real manager; never executes a command on the host.
+#[derive(Default)]
+struct ChatSandboxRuntime {
+    fail_start: bool,
+    specs: Mutex<Vec<hx_sandbox::SandboxSpec>>,
+    execs: Mutex<Vec<(String, Option<String>)>>,
+}
+
+#[async_trait]
+impl hx_sandbox::SandboxRuntime for ChatSandboxRuntime {
+    fn name(&self) -> &str {
+        "chat-test"
+    }
+    async fn available(&self) -> bool {
+        true
+    }
+    async fn create(
+        &self,
+        id: &hx_core::ids::SandboxId,
+        spec: &hx_sandbox::SandboxSpec,
+        _settings: &hx_sandbox::HostSettings,
+    ) -> Result<String> {
+        self.specs.lock().unwrap().push(spec.clone());
+        Ok(id.to_string())
+    }
+    async fn start(&self, _id: &str) -> Result<()> {
+        if self.fail_start {
+            return Err(HxError::Sandbox("test engine cannot start".into()));
+        }
+        Ok(())
+    }
+    async fn stop(&self, _id: &str, _grace: i64) -> Result<()> {
+        Ok(())
+    }
+    async fn remove(&self, _id: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn exec(
+        &self,
+        _id: &str,
+        command: &str,
+        workdir: Option<&str>,
+    ) -> Result<hx_sandbox::SandboxExecOutput> {
+        self.execs
+            .lock()
+            .unwrap()
+            .push((command.into(), workdir.map(str::to_string)));
+        Ok(hx_sandbox::SandboxExecOutput {
+            stdout: "only-the-sandbox-returned-this".into(),
+            stderr: String::new(),
+            exit_code: 0,
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_chat_profile_sends_shell_to_the_sandbox_instead_of_the_host() {
+    // A successful HTTP response alone proves nothing: assert the engine call, translated cwd,
+    // mounted checkout, returned tool output, and absence of the host-side marker.
+    let mut h = harness(vec![]).await;
+    let runtime = Arc::new(ChatSandboxRuntime::default());
+    let state = Arc::get_mut(&mut h.state).unwrap();
+    state.config.sandbox_profiles.insert(
+        "dev".into(),
+        hx_core::config::SandboxProfile {
+            image: "alpine:3.22".into(),
+            ..Default::default()
+        },
+    );
+    state.sandboxes = Some(Arc::new(SandboxManager::new(runtime.clone(), 4)));
+    h.model.push(Ok(calls(vec![(
+        "inside",
+        "shell",
+        serde_json::json!({
+            "cmd": "printf host-ran > host-marker", "workdir": h.workspace
+        }),
+    )])));
+    h.model.push(Ok(answer("done")));
+    let (status, reply) = chat(
+        &h.state,
+        serde_json::json!({
+            "prompt": "run command", "sandbox_profile": "dev", "workspace": h.workspace,
+            "autonomy": "yolo"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply["tool_calls"], 1, "{reply}");
+    let execs = runtime.execs.lock().unwrap();
+    assert_eq!(execs.len(), 1);
+    assert_eq!(execs[0].0, "printf host-ran > host-marker");
+    assert_eq!(execs[0].1.as_deref(), Some("/workspace"));
+    let specs = runtime.specs.lock().unwrap();
+    assert_eq!(specs.len(), 1);
+    assert_eq!(specs[0].profile, "dev");
+    assert_eq!(specs[0].workspace_host_path, h.workspace.to_str().unwrap());
+    assert!(!h.workspace.join("host-marker").exists());
+    let seen = h.model.seen();
+    assert!(seen[1]
+        .messages
+        .iter()
+        .any(|m| m.text().contains("only-the-sandbox-returned-this")));
+}
+
+#[tokio::test]
+async fn a_chat_sandbox_start_failure_leaves_no_session_and_never_calls_the_model() {
+    // Startup failure must be surfaced before the run can accidentally execute on the host.
+    let mut h = harness(vec![Ok(answer("must not run"))]).await;
+    let runtime = Arc::new(ChatSandboxRuntime {
+        fail_start: true,
+        ..Default::default()
+    });
+    let state = Arc::get_mut(&mut h.state).unwrap();
+    state.config.sandbox_profiles.insert(
+        "dev".into(),
+        hx_core::config::SandboxProfile {
+            image: "alpine:3.22".into(),
+            ..Default::default()
+        },
+    );
+    state.sandboxes = Some(Arc::new(SandboxManager::new(runtime.clone(), 4)));
+    let (status, reply) = chat(
+        &h.state,
+        serde_json::json!({
+            "prompt": "run command", "sandbox_profile": "dev", "workspace": h.workspace
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{reply}");
+    assert!(
+        reply.to_string().contains("test engine cannot start"),
+        "{reply}"
+    );
+    assert!(h.model.seen().is_empty());
+    assert!(runtime.execs.lock().unwrap().is_empty());
+    assert_eq!(h.state.store.count().unwrap(), 0);
+}
+
 // -- the harness ---------------------------------------------------------------------------------
 
 const CONFIG: &str = r#"

@@ -10,8 +10,8 @@
 //!
 //! ## Decisions worth arguing with
 //!
-//! **A missing client is a refusal, not a yes.** There is no approval channel over HTTP yet, so an
-//! action that needs a human is denied with the reason and the escape hatch named. Autonomy is the
+//! **A missing client is a refusal, not a yes.** The approval queue waits for a client over HTTP;
+//! silence expires into a denial, and a request can choose not to wait. Autonomy is the
 //! request field that decides whether a prompt happens at all: `yolo` runs unattended because the
 //! operator asked for it in this request, and it can still be capped by the policy's `ceiling` —
 //! which is the property that makes a per-request grant safe to allow.
@@ -19,11 +19,9 @@
 //! **The prompt is stored before the model is called.** A request whose run dies has still been
 //! asked; a transcript that loses the question makes the interruption unexplainable.
 //!
-//! **Events are stored as they happen; messages are stored when the run returns.** The loop borrows
-//! its transcript, so messages cannot be written from outside it — a kill mid-run therefore keeps
-//! the events (a client can redraw the run) and the repaired dangling tool call, but loses the
-//! in-flight turn's messages. Writing each message as it is produced needs the loop to hand messages
-//! out as it appends them; that is a follow-up, and `ROADMAP.md` says so instead of pretending.
+//! **Events and messages are stored as they happen.** The transcript sink persists each append so a
+//! killed run can be repaired without losing completed tool results. An explicitly selected sandbox
+//! must start before any prompt is persisted; startup failure never becomes host execution.
 
 use crate::state::AppState;
 use chrono::{DateTime, Utc};
@@ -117,6 +115,10 @@ pub struct ChatRequest {
     /// The directory the run may read and write. Defaults to the daemon's working directory.
     #[serde(default)]
     pub workspace: Option<String>,
+    /// Confine shell calls to this configured sandbox profile. Other tools still use the host.
+    /// Absent means host execution; a named boundary that cannot start fails the request.
+    #[serde(default)]
+    pub sandbox_profile: Option<String>,
     /// `paranoid`, `balanced`, `trusting`, `yolo`. Defaults to the configured policy's level.
     #[serde(default)]
     pub autonomy: Option<String>,
@@ -206,6 +208,36 @@ pub async fn run_chat(
     // The model call a role resolves to, before anything is written: a role that does not exist is a
     // configuration mistake, and a request that cannot run should not leave a session behind for it.
     let model = state.models.for_role(&role)?;
+
+    // Resolve the requested boundary before persisting a prompt or calling the model. A failed
+    // start must never turn a request for confinement into a host run.
+    let sandbox = if let Some(name) = &request.sandbox_profile {
+        let profile = state
+            .config
+            .sandbox_profiles
+            .get(name)
+            .ok_or_else(|| HxError::Config(format!("no sandbox profile named '{name}'")))?;
+        let manager = state.sandboxes.as_ref().ok_or_else(|| {
+            HxError::Sandbox(
+                state
+                    .sandbox_unavailable_reason
+                    .clone()
+                    .unwrap_or_else(|| "sandboxes are unavailable".into()),
+            )
+        })?;
+        let mut spec = hx_sandbox::SandboxSpec::from_profile(name, profile);
+        spec.workspace_host_path = workspace.clone();
+        spec.adopt_workspace_owner()
+            .map_err(|err| HxError::Sandbox(err.to_string()))?;
+        Some(
+            state
+                .chat_sandboxes
+                .get(manager, &spec, std::time::Duration::from_secs(900))
+                .await?,
+        )
+    } else {
+        None
+    };
 
     // One run per session at a time. Two requests on one session would interleave into a transcript
     // neither of them wrote, which is the kind of corruption that looks like a model that "forgot".
@@ -314,7 +346,10 @@ pub async fn run_chat(
     // against. A run whose tools do not know its workspace denies the paths the model naturally
     // writes (`Cargo.toml`), and a shell command with no directory of its own runs wherever the
     // daemon happens to be.
-    let ctx = ToolContext::new(host).in_workspace(workspace.clone());
+    let mut ctx = ToolContext::new(host).in_workspace(workspace.clone());
+    if let Some(sandbox) = sandbox {
+        ctx = ctx.with_sandbox(sandbox);
+    }
 
     let run = loop_.run(&mut transcript, &ctx).await;
     // The sender lives in the loop, which is dropped here — that is what ends the writer.

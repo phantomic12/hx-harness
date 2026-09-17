@@ -62,9 +62,9 @@ Those get real tests in M1 against a live endpoint.
   (`hx approvals` / `hx approve`), and `hx policy` prints the ladder in force, in the order it is
   checked (§6), and **`confined` as a second axis (§4)**: a rule can require that a call run inside a
   boundary, `shell` runs it there when its context has one, and a boundary that cannot be entered is a
-  failed call rather than a quiet fallback to the machine. Still open in that document: a request that
-  *asks for* confinement (the mechanism is in place; nothing in the chat path reaches for it yet) and a
-  persisted project-scoped allowlist (§5)
+  failed call rather than a quiet fallback to the machine. Requests select a profile with
+  `sandbox_profile` (`hx chat --sandbox-profile`); invalid or unavailable boundaries fail before the
+  model runs. Still open in that document: a persisted project-scoped allowlist (§5)
 - Context builder + compaction at a token threshold
 - ✅ `hxd` runs, `hx` connects to it: `hx chat` sends the prompt to the daemon over the configured
   HTTP address and prints the run's report (over HTTP rather than the unix socket, which the config
@@ -77,8 +77,7 @@ Those get real tests in M1 against a live endpoint.
   prompt is stored before the model is called, events are written as they happen, and `/v1/sessions*`
   reads sessions, transcripts, events and exports back. Messages and events are written as the run
   produces them, so a killed daemon leaves a session that says what happened — the difference between
-  "restartable" and "resumable". Still to come: an approval channel (so a client can answer a prompt
-  instead of the daemon refusing it) and a WebSocket event stream
+  "restartable" and "resumable". The approval channel is built; a WebSocket event stream remains open.
 
 **Exit criteria:** a multi-step task (5+ tool calls) completes end-to-end; killing the TUI and
 reconnecting resumes the session mid-flight.

@@ -335,6 +335,25 @@ async fn chat(
         }
     }
 
+    if let Some(name) = &request.sandbox_profile {
+        if !state.config.sandbox_profiles.contains_key(name) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "no sandbox profile named '{name}'; configured profiles: {:?}",
+                    state.config.sandbox_profiles.keys().collect::<Vec<_>>()
+                ),
+            ));
+        }
+    }
+
+    if request.sandbox_profile.is_some() && state.sandboxes.is_none() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            sandbox_unavailable_message(&state),
+        ));
+    }
+
     Ok(Json(
         crate::chat::run_chat(&state, request, chrono::Utc::now()).await?,
     ))

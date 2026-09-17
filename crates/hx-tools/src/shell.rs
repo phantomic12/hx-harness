@@ -135,16 +135,28 @@ impl Tool for ShellTool {
                 .clamp(1, MAX_TIMEOUT_SECS),
         );
 
-        let line = Self::command_line(&parsed, ctx.workspace.as_deref(), |arg| shell.quote(arg));
-
         // Which of the two places this runs in is decided by the context, not here: the capability check
         // and the approval both already happened against `Tool::confinement`, and running on the host
-        // anyway would make the answer to that question false after the fact. The quoting above is the
-        // host's shell, which is the right one either way — a sandbox runs the line through a POSIX shell
-        // of its own, and quoting exists to stop a path with a `;` in it from becoming a second command.
+        // anyway would make the answer to that question false after the fact. Only host execution
+        // embeds a quoted `cd`; the sandbox receives its working directory as a separate argument.
         let (output, where_it_ran) = match &ctx.sandbox {
             Some(sandbox) => {
-                let output = match sandbox.exec(&line, ctx.workspace.as_deref()).await {
+                // Pass the command without a host-side `cd`: the sandbox adapter translates the
+                // separate workdir into its mount. An embedded host path does not exist inside it.
+                let workdir = parsed
+                    .workdir
+                    .as_deref()
+                    .filter(|dir| !dir.trim().is_empty())
+                    .map(|dir| crate::resolve_path(dir, ctx.workspace.as_deref()));
+                let workdir = workdir.as_deref().or(ctx.workspace.as_deref());
+                let result =
+                    match tokio::time::timeout(timeout, sandbox.exec(&parsed.cmd, workdir)).await {
+                        Ok(output) => output,
+                        Err(_) => Err(hx_core::error::HxError::Sandbox(
+                            "command timed out; it may still be running inside the sandbox".into(),
+                        )),
+                    };
+                let output = match result {
                     Ok(output) => output,
                     Err(err) => {
                         // A boundary that cannot be entered is the failure that matters most for an
@@ -158,6 +170,8 @@ impl Tool for ShellTool {
                 (output, Some(sandbox.describe()))
             }
             None => {
+                let line =
+                    Self::command_line(&parsed, ctx.workspace.as_deref(), |arg| shell.quote(arg));
                 let output = match ctx.host.exec(&line, timeout).await {
                     Ok(output) => output,
                     Err(err) => {
@@ -245,7 +259,7 @@ mod tests {
 
         assert!(outcome.ok, "{}", outcome.content);
         assert_eq!(sandbox.runs().len(), 1);
-        assert_eq!(sandbox.runs()[0].0, "cd '/w' && cargo test");
+        assert_eq!(sandbox.runs()[0].0, "cargo test");
         assert_eq!(sandbox.runs()[0].1.as_deref(), Some("/w"));
         assert!(
             host.commands().is_empty(),
@@ -261,6 +275,26 @@ mod tests {
             ShellTool.confinement(&json!({}), &ctx),
             Confinement::Sandbox
         );
+    }
+
+    #[tokio::test]
+    async fn a_confined_workdir_is_resolved_separately_from_the_command() {
+        // The adapter owns mount translation; shell must not bury a host path in shell source.
+        let host = Arc::new(FakeHost::unix());
+        let sandbox = Arc::new(FakeSandbox::answering("ok", 0));
+        let ctx = ToolContext::new(host.clone())
+            .in_workspace("/w")
+            .with_sandbox(sandbox.clone());
+        let output = ShellTool
+            .call(json!({"cmd": "pwd", "workdir": "sub dir"}), &ctx)
+            .await
+            .unwrap();
+        assert!(output.ok);
+        assert_eq!(
+            sandbox.runs(),
+            vec![("pwd".into(), Some("/w/sub dir".into()))]
+        );
+        assert!(host.commands().is_empty());
     }
 
     #[tokio::test]

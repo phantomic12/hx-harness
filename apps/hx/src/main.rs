@@ -59,11 +59,14 @@ enum Command {
         #[arg(long)]
         workspace: Option<String>,
 
+        /// Confine shell calls to this daemon sandbox profile; other tools still use the host.
+        #[arg(long)]
+        sandbox_profile: Option<String>,
+
         /// `paranoid`, `cautious`, `balanced`, `trusting` or `yolo`.
         ///
-        /// This is what decides whether a risky call can be answered at all: over HTTP nobody is
-        /// attached to answer a prompt, so anything above the level's threshold is refused unless the
-        /// level is `yolo`.
+        /// Calls above the threshold wait for an answer through `hx approvals` / `hx approve`.
+        /// The shipped deny floor still applies at every level.
         #[arg(long)]
         autonomy: Option<String>,
 
@@ -188,6 +191,7 @@ async fn main() -> Result<()> {
             session,
             role,
             workspace,
+            sandbox_profile,
             autonomy,
             max_turns,
             json,
@@ -204,6 +208,9 @@ async fn main() -> Result<()> {
             }
             if let Some(workspace) = workspace {
                 body["workspace"] = serde_json::json!(workspace);
+            }
+            if let Some(profile) = sandbox_profile {
+                body["sandbox_profile"] = serde_json::json!(profile);
             }
             if let Some(autonomy) = autonomy {
                 body["autonomy"] = serde_json::json!(autonomy);

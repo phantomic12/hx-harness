@@ -66,7 +66,7 @@ $ curl -s localhost:7717/v1/status | jq .pools
 | Sessions (`hx-store`) | **Built** — SQLite: create, resume, list, rename, delete, export (JSON/Markdown), events, usage totals. A transcript that ended mid-call is *repaired*, not sent to a provider that would reject it |
 | Web UI, Tauri desktop/mobile, chat connectors | **Not started** |
 | MCP client, browser-automation pool | **Not started** |
-| The loop wired into `hxd` and `hx`: `POST /v1/chat`, `hx chat`, session routes over `hx-store` | **Built** — one request runs the loop against a session: the prompt is stored before the model is called, the role decides the model, credentials come from a `store:name` reference, events are written as they happen, and a transcript that ended mid-call is repaired before it is sent. Eight tests drive the **real loop over the real HTTP surface**, scripted only in the model |
+| The loop wired into `hxd` and `hx`: `POST /v1/chat`, `hx chat`, session routes over `hx-store` | **Built** — one request runs the loop against a session: the prompt is stored before the model is called, the role decides the model, credentials come from a `store:name` reference, events are written as they happen, and a transcript that ended mid-call is repaired before it is sent. Twenty tests drive the **real loop over the real HTTP surface**; model replies are scripted and sandbox engine calls use a recording runtime. `hx chat --sandbox-profile dev` selects a configured shell boundary; missing or failed boundaries never fall back to host execution |
 
 ---
 
@@ -194,7 +194,7 @@ $ ./target/release/hxd --bind 127.0.0.1:7717
 ```
 
 ```console
-$ cargo test --workspace         # 690 tests, 0 failed, 22 ignored live tests
+$ cargo test --workspace         # 695 tests, 0 failed, 22 ignored live tests
 $ cargo test -p hx-sandbox --test docker_live -- --ignored   # needs a container engine
 $ cargo test -p hx-remote --test ssh_live -- --ignored       # needs an SSH server
 $ HX_SEARXNG_URL=... HX_SEARCH_EXPECT_RESULTS=searxng \
@@ -221,8 +221,8 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
 - **Project-scoped allowlists are not persisted.** "Always allow this" is remembered in memory for the
   rest of the run, and `docs/approvals.md` §5's reviewable `.hx/allow.toml` — the file in the
   repository a team can diff — is not written yet. Until it is, a remembered approval outlives
-  nothing. The `confined` axis (§4) and `hx policy`, which would print the effective ladder (§6), are
-  also designed and unbuilt, so a policy is readable in the code and not from the command line.
+  nothing. The `confined` axis (§4), chat profile selection, and `hx policy` (§6) are built.
+  Shell confinement does not confine file tools or make the writable workspace mount disposable.
 - **Streaming and context compaction.** A turn arrives whole, so a run is one long wait per turn and a
   long session is still sent as-is. Both are stated gaps, not hidden ones.
 - **Nothing in `ci.yml` reaches another machine.** That file is in-process unit tests; the tests
