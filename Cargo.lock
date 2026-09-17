@@ -1446,11 +1446,13 @@ name = "hx-store"
 version = "0.0.1"
 dependencies = [
  "chrono",
+ "hmac",
  "hx-core",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
 ]
 

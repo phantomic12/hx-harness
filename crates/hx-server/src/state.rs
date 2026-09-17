@@ -125,7 +125,16 @@ impl AppState {
             })?;
         let providers = Arc::new(ProviderRegistry::from_config(&config, provider_client)?);
 
-        let store = Arc::new(Store::from_config(&config)?);
+        // The chain's key comes from the environment, named by the config rather than stored in it:
+        // a key in a committed file is a key an attacker already has.
+        let chain_key = hx_store::audit::ChainKey::from_env(&config.daemon.audit_key_env);
+        if !chain_key.is_keyed() {
+            tracing::warn!(
+                var = %config.daemon.audit_key_env,
+                "no audit chain key is set: the chain detects an inconsistent edit but not a rewrite"
+            );
+        }
+        let store = Arc::new(Store::from_config_with_key(&config, chain_key)?);
 
         // Until the vault is unlocked this resolves `env:` references only. That is stated rather
         // than implied: `hx status` reports which stores are configured, so a `vault:` reference
