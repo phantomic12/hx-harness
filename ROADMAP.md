@@ -129,6 +129,11 @@ the TUI; then send an agent prompt from the browser and see it stream in both.
   predecessor, so an edited or deleted row is detectable (`hx-store/src/audit.rs`). Verified against a
   real V1 database: 348 pre-chain events kept and reported as unchained, new events chained. It is not
   a signature — see that module's doc block for exactly what it does not prove.
+- ✅ The check is reachable: `hx audit <session>` and `GET /v1/sessions/{id}/audit`, exiting 2 on a
+  break. Three answers kept distinct — `intact`, `broken` (naming the row and both digests), and the
+  count of rows written before the chain existed, which is never folded into `intact`. Verified live
+  against a daemon: 8 chained events report intact, one row rewritten with raw SQL reports TRAIL
+  ALTERED at that row.
 - Web UI: container pane, and an approval queue showing the risk class, the reason, and the
   remaining unattended budget
 
