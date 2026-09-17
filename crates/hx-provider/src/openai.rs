@@ -14,11 +14,17 @@
 //!
 //! ## What is deliberately not supported yet
 //!
-//! Image parts, streaming, and tool-choice control. Each is a real feature rather than a
-//! hypothetical, and each fails loudly instead of being silently dropped: an image part is an
-//! error naming the adapter, not a message that quietly loses its picture.
+//! Image parts and tool-choice control. Each is a real feature rather than a hypothetical, and each
+//! fails loudly instead of being silently dropped: an image part is an error naming the adapter, not a
+//! message that quietly loses its picture. Streaming is **supported**: [`OpenAiCompatible::stream`]
+//! upgrades the request to `stream: true` and replays the vendor's SSE chunks as
+//! [`crate::StreamDelta`], folding unmerged tool-call fragments with the same rule
+//! [`merge_tool_call_fragments`] uses for a single-shot body.
 
-use crate::provider::{ChatRequest, ChatResponse, FinishReason, Provider, ToolSpec, Usage};
+use crate::provider::{
+    ChatRequest, ChatResponse, FinishReason, Provider, StreamDelta, ToolSpec, Usage,
+};
+use futures::StreamExt;
 use hx_core::config::ProviderKind;
 use hx_core::error::{HxError, Result};
 use hx_core::ids::{ProviderId, ToolCallId};
@@ -147,6 +153,253 @@ impl Provider for OpenAiCompatible {
     async fn complete(&self, req: ChatRequest, key: &Secret) -> Result<ChatResponse> {
         self.complete_raw(&req, key).await
     }
+
+    async fn stream(
+        &self,
+        req: ChatRequest,
+        key: &Secret,
+        on_delta: &mut (dyn FnMut(StreamDelta) -> Result<()> + Send),
+    ) -> Result<ChatResponse> {
+        let url = chat_completions_url(&self.base_url);
+        let body = stream_body(&req)?;
+
+        let mut request = self
+            .client
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .header(reqwest::header::ACCEPT, "application/json")
+            .body(body.to_string());
+
+        if self.send_auth {
+            request = request.bearer_auth(key.expose());
+        }
+
+        let response = request.send().await.map_err(|err| {
+            if err.is_timeout() {
+                HxError::Provider(format!(
+                    "{}: request to {url} timed out after {:?}",
+                    self.id, err
+                ))
+            } else {
+                HxError::Provider(format!("{}: could not reach {url}: {err}", self.id))
+            }
+        })?;
+
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok());
+
+        if !status.is_success() {
+            let text = response
+                .text()
+                .await
+                .unwrap_or_else(|err| format!("<could not read: {err}>"));
+            return Err(classify_error(
+                &self.id,
+                status.as_u16(),
+                retry_after,
+                &text,
+            ));
+        }
+
+        // Every `data:` line is one chunk; `data: [DONE]` closes the stream. A chunk may be
+        // split across TCP segments, so each chunk object is accumulated whole before being parsed.
+        let mut accumulator = StreamAccumulator::default();
+        let mut raw = String::new();
+        let mut bytes = response.bytes_stream();
+        while let Some(part) = bytes.next().await {
+            let part = part.map_err(|err| {
+                HxError::Provider(format!("{}: the stream was interrupted: {err}", self.id))
+            })?;
+            raw.push_str(&String::from_utf8_lossy(&part));
+            while let Some(event) = take_sse_event(&mut raw) {
+                let line = event.trim();
+                if line == "[DONE]" {
+                    break;
+                }
+                if line.is_empty() {
+                    continue;
+                }
+                let chunk: Value = match serde_json::from_str(line) {
+                    Ok(chunk) => chunk,
+                    Err(err) => {
+                        return Err(HxError::Provider(format!(
+                            "{}: a streamed chunk was not JSON ({err}): {}",
+                            self.id,
+                            truncate(line)
+                        )))
+                    }
+                };
+                for delta in apply_chunk(&mut accumulator, &chunk) {
+                    on_delta(delta)?;
+                }
+            }
+        }
+
+        let response = finish_stream(&self.id, &accumulator, &req.model)?;
+        Ok(response)
+    }
+}
+
+/// The request body for a streaming call: the non-streaming body with `stream: true`.
+///
+/// Built from [`build_body`] rather than duplicated, so the two paths cannot drift on message
+/// shaping. The one deliberate difference is the stream flag; everything else — tool calls as
+/// strings, null assistant content — is shared.
+fn stream_body(req: &ChatRequest) -> Result<Value> {
+    let mut body = build_body(req)?;
+    body["stream"] = Value::Bool(true);
+    Ok(body)
+}
+
+/// The accumulated, in-flight state of one streamed turn.
+///
+/// Pure by design: [`apply_chunk`] mutates this and returns the deltas to emit, so the
+/// vendor's chunk shape is asserted against literals rather than only discovered across a socket.
+#[derive(Default)]
+pub struct StreamAccumulator {
+    /// The text so far, concatenated in order. Not emitted here; the deltas carry the pieces.
+    pub text: String,
+    /// The reasoning/text-in-thinking so far, if the vendor sends it separately.
+    pub reasoning: String,
+    /// Tool-call fragments, in arrival order. Merged by [`merge_tool_call_fragments`] when a
+    /// call finishes, using the same rule a single-shot body uses.
+    pub calls: Vec<Value>,
+    /// Whether the turn ended with a tool call.
+    pub tool_use: bool,
+}
+
+/// Parse a vendor chunk and return the deltas it contributes.
+pub fn apply_chunk(acc: &mut StreamAccumulator, chunk: &Value) -> Vec<StreamDelta> {
+    let mut out = Vec::new();
+    let Some(choice) = chunk.get("choices").and_then(|c| c.get(0)) else {
+        return out;
+    };
+
+    if let Some(content) = choice
+        .get("delta")
+        .and_then(|d| d.get("content"))
+        .and_then(Value::as_str)
+    {
+        if !content.is_empty() {
+            acc.text.push_str(content);
+            out.push(StreamDelta::Text(content.to_string()));
+        }
+    }
+
+    if let Some(reasoning) = choice
+        .get("delta")
+        .and_then(|d| d.get("reasoning_content"))
+        .and_then(Value::as_str)
+    {
+        if !reasoning.is_empty() {
+            acc.reasoning.push_str(reasoning);
+            out.push(StreamDelta::Reasoning(reasoning.to_string()));
+        }
+    }
+
+    // Tool-call fragments are accumulated, not emitted, then merged and emitted whole when the call
+    // finishes. A fragment's `arguments` is itself a piece of the final JSON; the whole arguments
+    // string is only valid after every fragment for that call has arrived.
+    if let Some(calls) = choice
+        .get("delta")
+        .and_then(|d| d.get("tool_calls"))
+        .and_then(Value::as_array)
+    {
+        acc.calls.extend(calls.iter().cloned());
+    }
+
+    if let Some(finish) = choice.get("finish_reason").and_then(Value::as_str) {
+        if finish == "tool_calls" {
+            acc.tool_use = true;
+            for call in merge_tool_call_fragments(&acc.calls) {
+                if call.id.is_empty() || call.name.is_empty() {
+                    continue;
+                }
+                let arguments = match serde_json::from_str::<Value>(call.arguments.as_str()) {
+                    Ok(value) => value,
+                    Err(_) => json!({ "__malformed_arguments": call.arguments }),
+                };
+                out.push(StreamDelta::ToolCall {
+                    id: call.id,
+                    name: call.name,
+                    arguments,
+                });
+            }
+        }
+    }
+
+    out
+}
+
+/// Assemble the whole reply from a finished accumulator.
+///
+/// Reachable from every streaming path that does not go through the network, which is what makes the
+/// provider layer's streamed turn *also* return a full [`ChatResponse`]: a live client gets the
+/// deltas and the store still gets the transcript row.
+fn finish_stream(
+    id: &ProviderId,
+    acc: &StreamAccumulator,
+    requested_model: &str,
+) -> Result<ChatResponse> {
+    let mut parts = Vec::new();
+    if !acc.text.is_empty() {
+        parts.push(Part::text(acc.text.clone()));
+    }
+    if acc.tool_use {
+        for call in merge_tool_call_fragments(&acc.calls) {
+            let arguments = match serde_json::from_str::<Value>(call.arguments.as_str()) {
+                Ok(value) => value,
+                Err(_) => json!({ "__malformed_arguments": call.arguments }),
+            };
+            parts.push(Part::ToolCall {
+                id: ToolCallId::from_raw(call.id),
+                name: call.name,
+                arguments,
+            });
+        }
+    }
+    if parts.is_empty() {
+        return Err(HxError::Provider(format!(
+            "{id}: the streamed turn produced neither text nor a tool call"
+        )));
+    }
+
+    let finish = if acc.tool_use {
+        FinishReason::ToolUse
+    } else {
+        FinishReason::Stop
+    };
+
+    Ok(ChatResponse {
+        message: Message::new(Role::Assistant, parts),
+        usage: Usage::default(),
+        finish,
+        model: requested_model.to_string(),
+        raw: None,
+    })
+}
+
+/// Pull the next complete SSE event (one `data:` line per the OpenAI stream) out of a buffer.
+///
+/// The vendor separates events with a blank line (`\n\n`). A chunk split across TCP segments has
+/// no blank line yet in the buffer, so this waits for the terminator rather than halfway JSON. The
+/// buffer keeps any remainder, which is the next event waiting for its own terminator.
+fn take_sse_event(raw: &mut String) -> Option<String> {
+    let sep = raw.find("\n\n")?;
+    let event = raw[..sep].to_string();
+    raw.drain(..sep + 2);
+    let data = event
+        .lines()
+        .find_map(|line| line.strip_prefix("data:"))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    Some(data)
 }
 
 /// The chat-completions URL for an API root.
@@ -1026,5 +1279,127 @@ mod tests {
     #[test]
     fn the_client_builds_with_a_timeout() {
         assert!(http_client().is_ok());
+    }
+
+    // ---- streaming ------------------------------------------------------------------------------
+
+    #[test]
+    fn a_stream_body_is_the_single_shot_body_with_stream_on() {
+        let req = ChatRequest::new("gpt-5", vec![Message::user("hi")]);
+        let streamed = stream_body(&req).unwrap();
+        assert_eq!(streamed["stream"], true);
+        assert_eq!(streamed["messages"][0]["content"], "hi");
+        // And the single-shot body is the default, so an adapter that does not think about the flag
+        // does not accidentally stream (the pitfall the repo paid for).
+        assert_eq!(build_body(&req).unwrap()["stream"], false);
+    }
+
+    #[test]
+    fn sse_events_are_split_on_a_blank_line_and_survive_a_split_chunk() {
+        // The whole point of reassembling events before parsing: the vendor can hand half a chunk
+        // in one TCP segment and the other half in the next, and parsing a half-JSON object would
+        // error. Reassemble first, then parse.
+        let mut raw = String::new();
+        assert_eq!(take_sse_event(&mut raw), None, "nothing yet");
+
+        raw.push_str("data: {\"a\":1}\n\n");
+        assert_eq!(take_sse_event(&mut raw).as_deref(), Some("{\"a\":1}"));
+
+        // A chunk split across segments has no blank line until the second segment arrives.
+        raw.push_str("data: {\"b\":");
+        assert_eq!(take_sse_event(&mut raw), None, "no terminator yet");
+        raw.push_str("2}\n\n");
+        assert_eq!(take_sse_event(&mut raw).as_deref(), Some("{\"b\":2}"));
+        assert!(raw.is_empty(), "nothing left over: {raw:?}");
+    }
+
+    #[test]
+    fn a_streamed_text_turn_emits_text_deltas_in_order_and_builds_the_reply() {
+        // A live surface needs the pieces as they arrive; the store still needs the whole message.
+        let mut acc = StreamAccumulator::default();
+        let mut deltas = Vec::new();
+        for piece in ["hello ", "there"] {
+            deltas.extend(apply_chunk(
+                &mut acc,
+                &json!({"choices": [{"delta": {"content": piece}}]}),
+            ));
+        }
+        assert_eq!(
+            deltas,
+            vec![
+                StreamDelta::Text("hello ".into()),
+                StreamDelta::Text("there".into())
+            ]
+        );
+        assert_eq!(acc.text, "hello there");
+
+        let response = finish_stream(&id(), &acc, "gpt-5").unwrap();
+        assert_eq!(response.message.text(), "hello there");
+        assert_eq!(response.finish, FinishReason::Stop);
+    }
+
+    #[test]
+    fn a_proxy_that_streams_tool_deltas_in_a_non_streaming_body_is_merged() {
+        // The real failure mode paid for with the single-shot path, replayed as streamed chunks:
+        // an OpenAI-compatible proxy streams upstream and hands the deltas over as nameless
+        // fragments. Read literally that is seven tool calls (one naked shell call plus six JSON
+        // scraps); merged by the same rule, it is one `read_file` with `{"path":"Cargo.toml"}`.
+        let chunks = [
+            json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "read_file_0#abc", "type": "function", "function": {"name": "read_file", "arguments": ""}}]}}]}),
+            json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{"}}]}}]}),
+            json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "\"path\": \""}}]}}]}),
+            json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "Cargo"}}]}}]}),
+            json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": ".toml"}}]}}]}),
+            json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "\""}}]}}]}),
+            json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "}"}}]}}]}),
+            json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+        ];
+
+        let mut acc = StreamAccumulator::default();
+        let mut deltas = Vec::new();
+        for chunk in &chunks {
+            deltas.extend(apply_chunk(&mut acc, chunk));
+        }
+
+        // One merged call, not seven: the fragments became `{"path": "Cargo.toml"}`.
+        assert_eq!(deltas.len(), 1, "{deltas:?}");
+        match &deltas[0] {
+            StreamDelta::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                assert_eq!(id, "read_file_0#abc");
+                assert_eq!(name, "read_file");
+                assert_eq!(arguments["path"], "Cargo.toml");
+            }
+            other => panic!("expected a merged tool call, got {other:?}"),
+        }
+        assert!(acc.tool_use);
+
+        let response = finish_stream(&id(), &acc, "gpt-5").unwrap();
+        assert_eq!(response.finish, FinishReason::ToolUse);
+        let calls: Vec<&Part> = response.message.tool_calls().collect();
+        match calls[0] {
+            Part::ToolCall {
+                name, arguments, ..
+            } => {
+                assert_eq!(name, "read_file");
+                assert_eq!(arguments["path"], "Cargo.toml");
+            }
+            other => panic!("expected a tool call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stream_from_an_empty_turn_is_an_error_rather_than_a_blank_reply() {
+        // A stream that produced nothing is not a valid turn: a reply with neither text nor a call
+        // would be handed to the loop as a silent no-op.
+        let acc = StreamAccumulator::default();
+        let err = finish_stream(&id(), &acc, "gpt-5").unwrap_err();
+        assert!(
+            err.to_string().contains("neither text nor a tool call"),
+            "{err}"
+        );
     }
 }
