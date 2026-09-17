@@ -65,7 +65,8 @@ Those get real tests in M1 against a live endpoint.
   boundary, `shell` runs it there when its context has one, and a boundary that cannot be entered is a
   failed call rather than a quiet fallback to the machine. Requests select a profile with
   `sandbox_profile` (`hx chat --sandbox-profile`); invalid or unavailable boundaries fail before the
-  model runs. Still open in that document: a persisted project-scoped allowlist (§5)
+  model runs. `docs/approvals.md` §5's project-scoped allowlist has landed: `.hx/allow.toml` is a
+  reviewable file in the checkout, loaded per run and scoped to that workspace alone
 - ◐ **Compaction at a token threshold** — `compact_at_tokens` is honoured: when a transcript's
   estimated tokens pass the threshold, the middle is elided for the model (head + an explicit marker +
   tail, never splitting a tool call from its result) while the stored audit trail is untouched. The

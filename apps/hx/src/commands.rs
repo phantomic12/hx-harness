@@ -47,11 +47,23 @@ pub fn render_pools(router: &ModelRouter) -> String {
 /// the ceiling, the budget, the rules in the order they are checked, and which options a prompt may
 /// offer at each tier — because "balanced" on its own tells nobody whether `git push` is prompted for.
 ///
+/// Provenance is part of the report, not a footnote: a rule's origin (the shipped floor, the config,
+/// or the project's `.hx/allow.toml`) is printed with it, because a reader cannot review a policy
+/// they cannot tell apart from a policy nobody wrote. Project grants (`project_grants`, loaded from the
+/// checkout's `.hx/allow.toml` by the caller) are folded into `allow` and marked `from .hx/allow.toml`,
+/// so a reader can see which allows came with the software, which the operator wrote, and which a project
+/// granted.
+///
 /// Two honest limits, both stated in the output rather than implied. It reads the *configuration*, so
 /// it cannot see a session's live level (`--autonomy` on a chat, or an `allow for this chat` answer);
 /// and it cannot know what the classifier will call a command, which is why the tiers are shown by
 /// risk class and not by example.
-pub fn render_policy(config: &Config, source: &str) -> String {
+pub fn render_policy(
+    config: &Config,
+    source: &str,
+    project_grants: &[hx_core::approval::Rule],
+    allow_path: Option<&str>,
+) -> String {
     let policy = &config.agent.approval;
     let mut out = String::new();
 
@@ -137,6 +149,32 @@ pub fn render_policy(config: &Config, source: &str) -> String {
              call, and its targets stay unknown to whoever answers"
         }
     );
+
+    // The project's own grants, from this checkout's `.hx/allow.toml` (`docs/approvals.md` §5).
+    // Shown apart from the operator's config both because that is their provenance and because a grant from
+    // the file is a reviewed, diffable change that deserves its own read.
+    match allow_path {
+        Some(path) => {
+            let _ = writeln!(out, "  grants   {path}");
+            if project_grants.is_empty() {
+                let _ = writeln!(out, "             this checkout grants nothing");
+            } else {
+                for grant in project_grants {
+                    let _ = writeln!(
+                        out,
+                        "             {}   # from .hx/allow.toml",
+                        describe_rule(grant)
+                    );
+                }
+            }
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "  grants   none — this checkout has no `.hx/allow.toml`"
+            );
+        }
+    }
 
     // The rule layer, in the order it fires. The order *is* the semantics (`deny → ask → allow`), so
     // printing the lists in the struct's order would be a different policy from the one in force.
@@ -834,7 +872,7 @@ hosts:
     fn the_policy_report_says_what_this_level_does_with_each_risk_class() {
         // "balanced" is the config's word for it and tells nobody whether `git push` is prompted for.
         // The report has to answer that in the terms the classifier uses, or it is decoration.
-        let rendered = render_policy(&config(), "hx.yaml");
+        let rendered = render_policy(&config(), "hx.yaml", &[], None);
 
         assert!(
             rendered.contains("approval policy from hx.yaml"),
@@ -856,7 +894,7 @@ hosts:
     fn the_policy_report_shows_the_shipped_floor_and_where_it_came_from() {
         // The question this answers is "what did I allow?" — and `deny: 31 rules` is not an answer
         // unless a reader can tell which of them they wrote and which came with the software.
-        let rendered = render_policy(&config(), "hx.yaml");
+        let rendered = render_policy(&config(), "hx.yaml", &[], None);
         let shipped = hx_core::approval::default_denials().len();
 
         assert!(
@@ -876,6 +914,53 @@ hosts:
         assert!(
             rendered.contains("ceiling  none"),
             "and where the ceiling is absent, say so: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_policy_report_shows_project_grants_and_their_source() {
+        // Provenance is the point of the whole file (§5): a reader has to be able to tell a rule
+        // that came with the software from a rule the operator wrote from a grant the *project* made.
+        // The grants live in `.hx/allow.toml`, and a policy report that merged them into the allow
+        // list without saying so would be asking a reader to review a policy they cannot attribute. A
+        // real file on disk provides the grants, so the report is fed what a checkout would really carry.
+        let dir = std::env::temp_dir().join(format!("hx-policy-grant-{}", std::process::id()));
+        let path = dir.join(".hx").join("allow.toml");
+        std::fs::create_dir_all(dir.join(".hx")).unwrap();
+        std::fs::write(
+            &path,
+            "[[allow]]\ntool = \"shell\"\ncommand = \"cargo test*\"\nnote = \"the test loop\"\n",
+        )
+        .unwrap();
+        let list = hx_core::allowlist::AllowFile::load(&path).unwrap();
+
+        let rendered = render_policy(
+            &config(),
+            "hx.yaml",
+            &list.into_rules(),
+            Some(path.display().to_string().as_str()),
+        );
+
+        assert!(
+            rendered.contains("grants"),
+            "a project grants line exists: {rendered}"
+        );
+        assert!(
+            rendered.contains("matching cargo test*") && rendered.contains("from .hx/allow.toml"),
+            "the grant names what it covers and says where it came from: {rendered}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_policy_report_says_when_the_checkout_grants_nothing() {
+        // An absent `.hx/allow.toml` is not an error, but a reader still needs to know there is no
+        // project grant in force — "nothing granted" and "nothing shown" are different, and only the
+        // former is safe to rely on.
+        let rendered = render_policy(&config(), "hx.yaml", &[], None);
+        assert!(
+            rendered.contains("this checkout has no `.hx/allow.toml`"),
+            "an absent file says so, naming the file a reader would create: {rendered}"
         );
     }
 
@@ -902,7 +987,7 @@ agent:
 "
         );
         let config = Config::from_yaml(&yaml).unwrap();
-        let rendered = render_policy(&config, "hx.yaml");
+        let rendered = render_policy(&config, "hx.yaml", &[], None);
 
         let deny = rendered.find("  deny — ").unwrap();
         let ask = rendered.find("\n  ask — ").unwrap();
@@ -985,7 +1070,7 @@ agent:
 "
         );
         let config = Config::from_yaml(&yaml).unwrap();
-        let rendered = render_policy(&config, "hx.yaml");
+        let rendered = render_policy(&config, "hx.yaml", &[], None);
 
         assert_eq!(rendered.matches("(none)").count(), 3, "{rendered}");
         assert!(

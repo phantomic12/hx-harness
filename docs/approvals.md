@@ -200,6 +200,7 @@ line rather than in a test nobody ran.
 | 4 | `delete` tool that trashes, and the enumerable-target requirement for `Destructive` | `hx-tools`, `hx-core` prompt text | medium | **done** |
 | 5 | `confined` on `ActionRequest` and in rules | `hx-core`, `hx-agent` (sandbox-aware dispatch) | medium | **done** |
 | 6 | `hx policy` renderer | `apps/hx` | small | **done** |
+| 7 | Project-scoped `.hx/allow.toml` (§5), shown by `hx policy` | `hx-core/src/allowlist.rs`, `hx-server/src/chat.rs`, `apps/hx` | medium | **done** |
 
 Steps 1–2 are the upgrade that makes an *unattended* daemon useful: today the choice is prompt-for-
 everything or `--autonomy yolo`, and an allowlist is what splits that into a real third option. Steps

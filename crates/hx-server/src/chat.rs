@@ -279,7 +279,30 @@ pub async fn run_chat(
     // fold is idempotent. The order that matters is here — `set_level` changes the *threshold*, and the
     // floor is a list of refusals that no level can lift, so folding after it is what keeps
     // `autonomy: "yolo"` from being a way to drop the catastrophe set.
-    let mut approvals = ApprovalSession::new(state.config.agent.approval.clone().with_floor());
+    let mut policy = state.config.agent.approval.clone().with_floor();
+    // Then the project's own grants, from `.hx/allow.toml` in *this* checkout (`docs/approvals.md`
+    // §5). Loading here, from the run's resolved workspace, is what scopes a grant to one repository: a
+    // grant written in one worktree is folded only for a run whose workspace is that worktree. A malformed
+    // allowlist is a hard error, not a silent skip — a policy somebody was relying on being dropped is
+    // exactly the fail-open this must not do.
+    match hx_core::allowlist::AllowFile::load(
+        &std::path::Path::new(&workspace).join(hx_core::allowlist::ALLOW_FILE),
+    ) {
+        Ok(list) => {
+            let mut rules = list.into_rules();
+            policy.allow.append(&mut rules);
+        }
+        Err(hx_core::allowlist::AllowlistError::NotFound(_)) => {}
+        Err(err) => {
+            return Err(HxError::Config(format!(
+                "cannot use {}: {err}",
+                std::path::Path::new(&workspace)
+                    .join(hx_core::allowlist::ALLOW_FILE)
+                    .display()
+            )))
+        }
+    }
+    let mut approvals = ApprovalSession::new(policy);
     approvals.set_level(level);
 
     // Who answers a prompt, in the order of how much waiting is warranted.
