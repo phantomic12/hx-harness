@@ -78,6 +78,74 @@ pub async fn chat(client: &reqwest::Client, base: &str, body: &Value) -> anyhow:
     Ok(reply)
 }
 
+/// Run a chat and hand each event to `on_event` as it arrives, returning the reply.
+///
+/// Unlike [`chat`], this does not buffer the whole response: it asks the daemon for the SSE form and
+/// parses frames off the socket, so a caller can render a turn while it is still running.
+pub async fn chat_stream(
+    client: &reqwest::Client,
+    base: &str,
+    body: &Value,
+    mut on_event: impl FnMut(&crate::stream::Streamed),
+) -> anyhow::Result<Value> {
+    use futures::StreamExt;
+
+    let response = client
+        .post(format!("{base}/v1/chat/stream"))
+        .json(body)
+        .send()
+        .await
+        .map_err(|err| anyhow::anyhow!("connecting to {base}: {err}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        bail!("the daemon refused the run ({status}): {text}");
+    }
+
+    let mut parser = crate::stream::SseParser::new();
+    let mut pending = String::new();
+    let mut bytes = response.bytes_stream();
+    let mut outcome: Option<Value> = None;
+
+    while let Some(chunk) = bytes.next().await {
+        let chunk = chunk.map_err(|err| anyhow::anyhow!("reading the run's stream: {err}"))?;
+        pending.push_str(&String::from_utf8_lossy(&chunk));
+
+        // Only whole lines are parsed: a frame split across two TCP chunks must not be parsed as
+        // half a frame, which is the same rule the provider's stream reader follows.
+        while let Some(newline) = pending.find('\n') {
+            let line: String = pending.drain(..=newline).collect();
+            let line = line.strip_suffix('\n').unwrap_or(&line);
+            if let Some(frame) = parser.apply_line(line) {
+                match &frame {
+                    crate::stream::Streamed::Done(payload) => {
+                        // The `done` event wraps the reply (`{"reply": {...}}`) so that the terminal
+                        // frame is distinguishable from a run event on the wire; `/v1/chat` returns
+                        // the reply flat. Unwrapping here keeps both paths handing the same shape to
+                        // `render_chat`, which is what stops this command from printing `session ?`.
+                        outcome = Some(match payload.get("reply") {
+                            Some(inner) => inner.clone(),
+                            None => payload.clone(),
+                        });
+                    }
+                    crate::stream::Streamed::Failed(message) => {
+                        bail!("the run failed: {message}")
+                    }
+                    crate::stream::Streamed::Event { .. } => {}
+                }
+                on_event(&frame);
+            }
+        }
+    }
+
+    // A stream that ends without a reply is a dropped connection, not a completed run: saying so is
+    // the difference between a failed run and a silent empty success.
+    outcome.ok_or_else(|| {
+        anyhow::anyhow!("the daemon's stream ended without a reply (connection dropped mid-run)")
+    })
+}
+
 /// The sessions the daemon knows about.
 pub async fn sessions(client: &reqwest::Client, base: &str, limit: usize) -> anyhow::Result<Value> {
     let (_, list) = send(

@@ -41,6 +41,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/sandboxes/{id}", delete(destroy_sandbox))
         .route("/v1/sandboxes/{id}/exec", post(exec_sandbox))
         .route("/v1/chat", post(chat))
+        .route("/v1/chat/stream", post(crate::stream::chat_stream))
         .route("/v1/sessions", get(list_sessions))
         .route("/v1/sessions/{id}", get(get_session).delete(delete_session))
         .route("/v1/sessions/{id}/rename", post(rename_session))

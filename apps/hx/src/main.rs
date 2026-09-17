@@ -10,6 +10,7 @@
 
 mod commands;
 mod daemon;
+mod stream;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -77,6 +78,12 @@ enum Command {
         /// Print the daemon's reply as JSON instead of a summary.
         #[arg(long)]
         json: bool,
+
+        /// Show the run as it happens: each turn and tool call as it starts, and text as it arrives.
+        ///
+        /// Off by default so scripted use keeps its current one-shot output.
+        #[arg(long)]
+        stream: bool,
     },
 
     /// List the daemon's sessions.
@@ -201,6 +208,7 @@ async fn main() -> Result<()> {
             autonomy,
             max_turns,
             json,
+            stream,
         } => {
             let base = daemon::base_url(&config, cli.daemon.as_deref());
             let mut body = serde_json::json!({ "prompt": prompt, "max_turns": max_turns });
@@ -223,7 +231,35 @@ async fn main() -> Result<()> {
             }
 
             let client = reqwest::Client::new();
-            let reply = daemon::chat(&client, &base, &body).await?;
+            let reply = if stream {
+                // Progress goes to stderr, the reply to stdout: piping `hx chat` through something
+                // else must not drag "turn 3" lines into the parsed output.
+                let mut last_delta = false;
+                daemon::chat_stream(&client, &base, &body, |frame| match frame {
+                    stream::Streamed::Event { event, .. } => {
+                        if let Some(line) = stream::progress_line(event) {
+                            if last_delta {
+                                eprintln!();
+                                last_delta = false;
+                            }
+                            eprintln!("{line}");
+                        } else if let Some(text) = event["text"].as_str() {
+                            // Text is printed as it arrives, without a trailing newline per chunk —
+                            // a delta is a fragment, and a newline after each would shatter a word
+                            // into pieces down the screen.
+                            eprint!("{text}");
+                            last_delta = true;
+                        }
+                    }
+                    stream::Streamed::Done(_) | stream::Streamed::Failed(_) => {}
+                })
+                .await?
+            } else {
+                daemon::chat(&client, &base, &body).await?
+            };
+            if stream {
+                eprintln!();
+            }
             print!("{}", commands::render_chat(&reply, json));
 
             // A run that did not complete is not a success: `stop` says whether the text above is an

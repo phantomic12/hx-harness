@@ -22,3 +22,4 @@ tokio.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 reqwest.workspace = true
+futures.workspace = true

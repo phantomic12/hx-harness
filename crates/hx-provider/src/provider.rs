@@ -166,6 +166,25 @@ pub fn cost_usd(price: &Price, usage: &Usage) -> f64 {
     input + cached_cost + output
 }
 
+/// One provider delta: the smallest piece of a turn a client can render.
+///
+/// A text delta is a token-or-so of answer, appended by a live surface; a tool-call delta is
+/// a whole call whose argument fragments have already been merged ([`crate::openai`] normalises
+/// unmerged fragments with the same rule the single-shot path uses). Reasoning is kept separate so a
+/// client can hide it. There is deliberately no "done" delta: the terminal event is the
+/// returned [`ChatResponse`] itself, which carries usage and the finish reason.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StreamDelta {
+    Text(String),
+    Reasoning(String),
+    /// A finished tool call, id and name resolved and arguments merged from their fragments.
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: serde_json::Value,
+    },
+}
+
 /// Every vendor adapter implements this.
 #[async_trait]
 pub trait Provider: Send + Sync {
@@ -176,9 +195,45 @@ pub trait Provider: Send + Sync {
     /// Model ids this provider advertises, used to expand globs in pool membership.
     fn models(&self) -> &[String];
 
-    /// Single-shot completion. Streaming arrives as a separate method in a later milestone so
-    /// that the non-streaming path can be correct and well-tested first.
+    /// Single-shot completion: one request, one whole reply.
     async fn complete(&self, req: ChatRequest, key: &Secret) -> Result<ChatResponse>;
+
+    /// Stream a turn, invoking `on_delta` as each piece arrives, and return the reply whole.
+    ///
+    /// The default is a *real* implementation, not a stub: it completes the turn and replays it as
+    /// one text delta plus one delta per merged tool call. That is what lets a caller depend on
+    /// streaming without every adapter having written an SSE parser, and it is exactly as live as the
+    /// turn it wraps — an adapter that streams really calls `on_delta` as fragments arrive. The
+    /// only difference from `complete` a caller must not rely on is that deltas may come out in
+    /// pieces.
+    async fn stream(
+        &self,
+        req: ChatRequest,
+        key: &Secret,
+        on_delta: &mut (dyn FnMut(StreamDelta) -> Result<()> + Send),
+    ) -> Result<ChatResponse> {
+        let response = self.complete(req, key).await?;
+        let text = response.message.text();
+        if !text.is_empty() {
+            on_delta(StreamDelta::Text(text))?;
+        }
+        for call in response.message.tool_calls() {
+            if let hx_core::message::Part::ToolCall {
+                id,
+                name,
+                arguments,
+                ..
+            } = call
+            {
+                on_delta(StreamDelta::ToolCall {
+                    id: id.as_str().to_string(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                })?;
+            }
+        }
+        Ok(response)
+    }
 }
 
 /// Providers available to the daemon, keyed by id.
