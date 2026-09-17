@@ -1432,6 +1432,7 @@ dependencies = [
  "hx-tools",
  "indexmap",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

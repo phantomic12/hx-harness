@@ -47,6 +47,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/sessions/{id}/rename", post(rename_session))
         .route("/v1/sessions/{id}/export", get(export_session))
         .route("/v1/sessions/{id}/events", get(session_events))
+        .route("/v1/sessions/{id}/audit", get(session_audit))
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{id}", post(answer_approval))
         .with_state(state)
@@ -535,6 +536,47 @@ async fn session_events(
     Ok(Json(state.store.events(&SessionId::from_raw(id))?))
 }
 
+/// Whether a session's stored trail still matches the digests recorded with it.
+///
+/// Three distinct answers, and collapsing any two of them would make the endpoint lie:
+///
+/// - `intact` — every event was checked and none had been altered.
+/// - `broken` — a row's content no longer matches its digest, or a sequence number is missing. This
+///   is the claim the chain exists to make, and it names the row so a reader can go and look.
+/// - `unchained` — N events predate the chain and were **not** checked. Reporting these as `intact`
+///   would claim verification that did not happen; reporting them as `broken` would accuse an
+///   untouched database. The count is returned so a caller can say how much was actually verified.
+async fn session_audit(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let session = SessionId::from_raw(id);
+    let unchecked = state.store.unchained_events(&session)?;
+    // Counted in SQL, not through `events()`: that parses each row, so a row whose payload was
+    // edited — the exact case this endpoint exists to report — fails to parse and would turn the
+    // answer into a 500 instead of a verdict.
+    let total = state.store.total_events(&session)?;
+    let checked = total.saturating_sub(unchecked as u64);
+
+    match state.store.verify_audit(&session)? {
+        None => Ok(Json(serde_json::json!({
+            "session_id": session.as_str(),
+            "status": "intact",
+            "verified": checked,
+            "unchained": unchecked,
+        }))),
+        Some(broken) => Ok(Json(serde_json::json!({
+            "session_id": session.as_str(),
+            "status": "broken",
+            "verified": checked,
+            "unchained": unchecked,
+            "seq": broken.seq,
+            "stored": broken.stored,
+            "expected": broken.expected,
+        }))),
+    }
+}
+
 fn sandbox_unavailable_message(state: &AppState) -> String {
     match &state.sandbox_unavailable_reason {
         Some(reason) => format!("sandboxes are unavailable: {reason}"),
@@ -871,6 +913,142 @@ search:
 
         assert_eq!(denied.status(), StatusCode::FORBIDDEN);
         assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// A state whose store has three chained events on `ses_a`.
+    ///
+    /// Real writes through `append_event`, not hand-inserted rows: the chain is computed the way the
+    /// daemon computes it, so a test that edits a row afterwards is tampering with a genuine trail.
+    async fn harness_with_events() -> (Arc<AppState>, String) {
+        let state = test_state().await;
+        // `create` mints the id, so events are written under the id it returned rather than a name
+        // invented here — a hardcoded id would silently write events for a session that is not the
+        // one the route is asked about, and the test would pass while checking nothing.
+        let created = state
+            .store
+            .create(
+                hx_store::NewSession {
+                    agent: Some(hx_core::ids::AgentId::from("agt_1")),
+                    ..Default::default()
+                },
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        let session = created.id.clone();
+        let id = session.as_str().to_string();
+        for turn in 1..=3u32 {
+            state
+                .store
+                .append_event(
+                    &session,
+                    &hx_core::event::AgentEvent::TurnStarted {
+                        agent: hx_core::ids::AgentId::from("agt_1"),
+                        turn,
+                    },
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+        }
+        (state, id)
+    }
+
+    #[tokio::test]
+    async fn a_session_that_was_not_touched_reports_intact() {
+        let (state, id) = harness_with_events().await;
+        let (status, report) = get(Arc::clone(&state), &format!("/v1/sessions/{id}/audit")).await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        assert_eq!(report["status"], "intact", "{report}");
+        assert!(report["verified"].as_u64().unwrap_or(0) > 0, "{report}");
+        assert_eq!(report["unchained"], 0, "{report}");
+    }
+
+    #[tokio::test]
+    async fn an_edited_event_is_reported_as_broken_and_names_the_row() {
+        // The whole point of the chain, checked over HTTP rather than in the store's own tests: the
+        // row's payload is edited behind the daemon's back, exactly as someone with sqlite3 would.
+        let (state, id) = harness_with_events().await;
+        let db = format!("{}/hx.db", state.config.daemon.data_dir);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            &format!(
+                "UPDATE events SET payload = '{{\"tampered\":true}}' WHERE session_id = '{id}' AND seq = 2"
+            ),
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let (status, report) = get(Arc::clone(&state), &format!("/v1/sessions/{id}/audit")).await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        assert_eq!(report["status"], "broken", "{report}");
+        assert_eq!(report["seq"], 2, "the broken row is named: {report}");
+        assert!(
+            report["expected"].as_str().is_some() && report["stored"].as_str().is_some(),
+            "both digests travel, so a reader can see they differ: {report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchained_prefix_is_reported_by_count_and_a_break_after_it_is_still_found() {
+        // A database upgraded from V1 has a prefix with no digest. That prefix cannot be verified, so
+        // the count says how much was actually checked rather than letting `verified` cover it.
+        //
+        // Clearing the digests also breaks the chain *after* it, and that is correct rather than a
+        // false accusation: the next row's digest was computed from the cleared row's, so the store
+        // can no longer tell "this prefix predates the chain" from "someone cleared it". Refusing to
+        // call the result `intact` is the honest answer to that ambiguity — the alternative is to
+        // report `intact` for a log that may have been rewritten.
+        let (state, id) = harness_with_events().await;
+        let db = format!("{}/hx.db", state.config.daemon.data_dir);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            &format!("UPDATE events SET digest = NULL WHERE session_id = '{id}' AND seq <= 2"),
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let (_status, report) = get(Arc::clone(&state), &format!("/v1/sessions/{id}/audit")).await;
+        assert_eq!(report["unchained"], 2, "{report}");
+        assert_eq!(
+            report["verified"], 1,
+            "only the last row could be checked: {report}"
+        );
+        assert_eq!(
+            report["status"], "broken",
+            "a cleared prefix is not certified as intact: {report}"
+        );
+        assert_eq!(report["seq"], 3, "the row the chain breaks at: {report}");
+    }
+
+    #[tokio::test]
+    async fn a_prefix_that_never_had_a_digest_still_reads_intact() {
+        // The upgrade case proper: rows written before the chain existed, with the *rest* of the log
+        // chained normally. Nothing was altered, so this must not be reported as a break.
+        let (state, id) = harness_with_events().await;
+        let db = format!("{}/hx.db", state.config.daemon.data_dir);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        // Rewrite the first row as an unchained one and re-chain the rest from genesis, which is
+        // what an upgraded database looks like: a chained suffix hanging off an unchained prefix.
+        conn.execute(
+            &format!("DELETE FROM events WHERE session_id = '{id}' AND seq > 1"),
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            &format!("UPDATE events SET digest = NULL WHERE session_id = '{id}' AND seq = 1"),
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let (_status, report) = get(Arc::clone(&state), &format!("/v1/sessions/{id}/audit")).await;
+        assert_eq!(
+            report["status"], "intact",
+            "one unchained row, nothing altered: {report}"
+        );
+        assert_eq!(report["unchained"], 1, "{report}");
+        assert_eq!(report["verified"], 0, "{report}");
     }
 
     #[test]

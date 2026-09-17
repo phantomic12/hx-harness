@@ -28,6 +28,9 @@ futures.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The audit tests tamper with a stored row through raw SQL on purpose: a tamper test that recomputed
+# the digest with the same helper that made it would be agreeing with itself.
+rusqlite.workspace = true
 async-trait.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
