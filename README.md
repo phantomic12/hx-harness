@@ -224,10 +224,16 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
   repository a team can diff — is not written yet. Until it is, a remembered approval outlives
   nothing. The `confined` axis (§4), chat profile selection, and `hx policy` (§6) are built.
   Shell confinement does not confine file tools or make the writable workspace mount disposable.
-- **Streaming.** A turn arrives whole, so a run is one long wait per turn. Context compaction is
-  **built**: a long session is elided at the `compact_at_tokens` threshold (head + an explicit marker
-  + tail, never splitting a tool call from its result) for the model while the stored audit trail is
-  untouched. Streaming remains a stated gap, compaction no longer is.
+- **Streaming.** **Built** for the OpenAI-compatible provider: a turn is sent with `stream: true`
+  and deltas are emitted as they arrive, with tool-call fragments merged by the same rule the
+  non-streaming parser uses. The daemon publishes every `AgentEvent` at `POST /v1/chat/stream` as
+  SSE, tagged with its session, ending in a named `done` (or `error`) event carrying the reply; and
+  `hx chat --stream` renders a run as it happens — turns, tool calls and text deltas live on stderr,
+  the reply on stdout. The Anthropic adapter still completes whole and replays its deltas through the
+  default `Provider::stream`, so nothing is broken there but nothing streams either. Context
+  compaction is **built** too: a long session is elided at the `compact_at_tokens` threshold (head +
+  an explicit marker + tail, never splitting a tool call from its result) for the model while the
+  stored audit trail is untouched.
 - **Nothing in `ci.yml` reaches another machine.** That file is in-process unit tests; the tests
   that open a socket — a real Docker daemon, a real `sshd` — live in
   `.github/workflows/integration.yml` and are `#[ignore]`d by default, so a local `cargo test` stays

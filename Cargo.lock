@@ -1260,6 +1260,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "futures",
  "hx-core",
  "hx-provider",
  "hx-remote",
