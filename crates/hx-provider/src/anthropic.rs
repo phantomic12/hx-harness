@@ -32,7 +32,9 @@
 //! That leniency is the deliberate exception; the request side refuses unknown input rather than dropping it.
 
 use crate::openai::classify_error;
-use crate::provider::{ChatRequest, ChatResponse, FinishReason, Provider, ToolSpec, Usage};
+use crate::provider::{
+    ChatRequest, ChatResponse, FinishReason, Provider, StreamDelta, ToolSpec, Usage,
+};
 use hx_core::config::ProviderKind;
 use hx_core::error::{HxError, Result};
 use hx_core::ids::{ProviderId, ToolCallId};
@@ -164,6 +166,108 @@ impl Provider for AnthropicMessages {
 
     async fn complete(&self, req: ChatRequest, key: &Secret) -> Result<ChatResponse> {
         self.complete_raw(&req, key).await
+    }
+
+    /// Stream a turn, emitting deltas as they arrive.
+    ///
+    /// Anthropic's stream is a sequence of *named* events rather than a per-chunk delta, so the
+    /// request asks for `stream: true` and the body is then read as SSE frames, each handed to
+    /// [`crate::anthropic_stream::apply_event`]. Frames are assembled across TCP reads before being
+    /// parsed: a half-frame parsed as JSON fails, and the failure looks like a provider fault rather
+    /// than a client that did not buffer.
+    async fn stream(
+        &self,
+        req: ChatRequest,
+        key: &Secret,
+        on_delta: &mut (dyn FnMut(StreamDelta) -> Result<()> + Send),
+    ) -> Result<ChatResponse> {
+        use futures::StreamExt;
+
+        let url = messages_url(&self.base_url);
+        let mut body = build_body(&req)?;
+        body["stream"] = json!(true);
+
+        let response = self
+            .client
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .header(
+                HeaderName::from_static("x-api-key"),
+                HeaderValue::from_str(key.expose()).map_err(|err| {
+                    HxError::Provider(format!(
+                        "{}: the credential is not a valid header value: {err}",
+                        self.id
+                    ))
+                })?,
+            )
+            .header(
+                HeaderName::from_static("anthropic-version"),
+                HeaderValue::from_static(ANTHROPIC_VERSION),
+            )
+            .json(&body)
+            .send()
+            .await
+            .map_err(|err| {
+                if err.is_timeout() {
+                    HxError::Provider(format!(
+                        "{}: request to {url} timed out after {:?}",
+                        self.id, err
+                    ))
+                } else {
+                    HxError::Provider(format!("{}: could not reach {url}: {err}", self.id))
+                }
+            })?;
+
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok());
+
+        if !status.is_success() {
+            let text = response
+                .text()
+                .await
+                .unwrap_or_else(|err| format!("<could not read: {err}>"));
+            return Err(classify_error(
+                &self.id,
+                status.as_u16(),
+                retry_after,
+                &text,
+            ));
+        }
+
+        let mut acc = crate::anthropic_stream::StreamAccumulator::default();
+        let mut pending = String::new();
+        let mut bytes = response.bytes_stream();
+
+        while let Some(part) = bytes.next().await {
+            let part = part.map_err(|err| {
+                HxError::Provider(format!("{}: the stream was interrupted: {err}", self.id))
+            })?;
+            pending.push_str(&String::from_utf8_lossy(&part));
+
+            // Whole frames only: a frame split across two reads must not be parsed in halves.
+            while let Some(split) = crate::anthropic_stream::take_sse_frame(&mut pending) {
+                let (event_name, data) = split;
+                for delta in crate::anthropic_stream::apply_event(&mut acc, &event_name, &data)? {
+                    on_delta(delta)?;
+                }
+            }
+        }
+
+        // Anything left without a terminating blank line is still an event if it carries data:
+        // dropping it would lose the last frame of a stream that ended without a trailing newline.
+        if let Some((event_name, data)) = crate::anthropic_stream::take_trailing_frame(&mut pending)
+        {
+            for delta in crate::anthropic_stream::apply_event(&mut acc, &event_name, &data)? {
+                on_delta(delta)?;
+            }
+        }
+
+        crate::anthropic_stream::finish_stream(acc, &req.model)
     }
 }
 

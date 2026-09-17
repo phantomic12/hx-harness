@@ -52,7 +52,8 @@ Those get real tests in M1 against a live endpoint.
 - ✅ Provider adapter for Anthropic Messages API — landed with a hermetic HTTP suite (top-level `system`,
   `x-api-key` + `anthropic-version`, `tool_use`/`tool_result` blocks) and a live suite
 - ✅ Streaming over SSE, token deltas into the TUI — provider-level deltas (OpenAI-compatible;
-  Anthropic replays through the default), `POST /v1/chat/stream`, and `hx chat --stream` rendering
+  Anthropic too: named events, `input_json_delta` fragments parsed only at the block stop),
+  `POST /v1/chat/stream`, and `hx chat --stream` rendering
   turns, tool calls and text live
 - ✅ Tool dispatch: `shell`, `read_file`, `write_file`, `patch`, `delete`, `search`, `todo` — each
   declares the resource and action it needs; none decides whether it is allowed

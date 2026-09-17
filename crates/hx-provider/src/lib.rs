@@ -46,6 +46,7 @@
 //! adapters are async.
 
 pub mod anthropic;
+pub mod anthropic_stream;
 pub mod limits;
 pub mod openai;
 pub mod pool;
