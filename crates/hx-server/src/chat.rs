@@ -466,6 +466,12 @@ async fn write_events(
         if let Err(err) = state.store.append_event(&session, &event, now) {
             tracing::warn!(error = %err, "could not record an event");
         }
+        // And out live: this is the same event a late reader gets from the store, tagged with the
+        // session so an SSE subscriber driving more than one run can tell them apart.
+        let _ = state.event_bus.send(crate::state::LiveEvent {
+            session: session.clone(),
+            event,
+        });
     }
     cost
 }

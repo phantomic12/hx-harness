@@ -9,7 +9,8 @@ use chrono::{DateTime, Utc};
 use hx_agent::ApprovalQueue;
 use hx_core::config::{Config, HostConfig};
 use hx_core::error::{HxError, Result};
-use hx_core::ids::HostId;
+use hx_core::event::AgentEvent;
+use hx_core::ids::{HostId, SessionId};
 use hx_provider::{ModelRouter, ProviderRegistry};
 use hx_remote::LocalHost;
 use hx_sandbox::SandboxManager;
@@ -20,7 +21,19 @@ use hx_tools::ToolRegistry;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
+use tokio::sync::broadcast;
 use tokio::sync::Mutex as AsyncMutex;
+
+/// One event on the live bus, tagged with the session it belongs to.
+///
+/// Tagged so a client subscribed to more than one run can tell them apart without the daemon
+/// opening one channel per session. The session filters the bus; the event is the same
+/// [`AgentEvent`] the store records, so a live surface renders the same thing a late reader does.
+#[derive(Clone)]
+pub struct LiveEvent {
+    pub session: SessionId,
+    pub event: AgentEvent,
+}
 
 /// Everything the HTTP surface needs.
 pub struct AppState {
@@ -50,6 +63,12 @@ pub struct AppState {
     /// One lock per session, held for the duration of a run: two requests on one session would
     /// otherwise interleave into a transcript neither of them wrote.
     pub chats: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    /// Live events, broadcast to SSE subscribers as a run produces them.
+    ///
+    /// Events are also persisted, so this is the *live* half of the same stream a late reader gets
+    /// from the store. One bus, tagged by session, is all the multiplex a live surface needs; a
+    /// per-session channel per subscriber would be a second mechanism solving the same problem.
+    pub event_bus: broadcast::Sender<LiveEvent>,
     /// `None` when no container engine was reachable at startup.
     pub sandboxes: Option<Arc<SandboxManager>>,
     /// Reuse one shell boundary per profile and checkout across chat requests.
@@ -172,6 +191,10 @@ impl AppState {
             approvals: parts.approvals,
             search: parts.search,
             chats: Mutex::new(HashMap::new()),
+            // Capacity generous enough that a burst of token deltas does not drop a subscriber;
+            // a slow reader is *supposed* to lag (reconnecting redraws from the store), but a
+            // normal live client must not lose events it was awake for.
+            event_bus: broadcast::channel(2048).0,
             sandboxes: parts.sandboxes,
             chat_sandboxes: crate::sandbox::SandboxCache::new(),
             started_at: parts.started_at,

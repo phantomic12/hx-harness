@@ -24,6 +24,7 @@ tracing.workspace = true
 chrono.workspace = true
 indexmap.workspace = true
 reqwest.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
