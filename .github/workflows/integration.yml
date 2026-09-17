@@ -68,6 +68,14 @@ jobs:
           HX_DOCKER_REQUIRE_L3: "1"
         run: cargo test -p hx-sandbox --test docker_live --locked -- --ignored --test-threads=1 --nocapture
 
+      # The ladder proves the engine accepts a spec. This proves the *chat path* reaches it: a
+      # request that names a profile runs its command inside a real container, writes through the
+      # bind mount as the workspace's owner, and is told the sandbox path rather than the host's.
+      # A recording runtime cannot see any of that — an embedded `cd /host/checkout` in the command
+      # line passed every hermetic test while the command could not have run inside the container.
+      - name: The chat path, against a real container
+        run: cargo test -p hx-server --test chat_live --locked -- --ignored --test-threads=1 --nocapture
+
   # A real sshd, a real key, a real handshake. The port is deliberately not 22: the bracketed
   # `[host]:port` form in `known_hosts` is the part most likely to be wrong, and this is the only
   # place it is exercised end to end.

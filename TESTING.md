@@ -5,9 +5,9 @@ Status: 2026-09-16. Companion to `ROADMAP.md` (which tracks features); this file
 ```console
 $ cargo test --workspace
 695 tests, 0 failed                       # includes 20 chat API tests and 4 database reopen tests
-22 ignored                               # live: Docker, SSH, search, a real model
+24 ignored                               # live: Docker, SSH, search, a real model
 
-# The 22 that need a real server, run by `.github/workflows/integration.yml`
+# The 24 that need a real server, run by `.github/workflows/integration.yml`
 # and `.github/workflows/canary.yml`:
 $ cargo test -p hx-sandbox --test docker_live -- --ignored --test-threads=1
 9 passed; 0 failed                       # a real Docker daemon, with gVisor installed
@@ -16,13 +16,15 @@ $ HX_OPENAI_TEST_BASE_URL=… HX_OPENAI_TEST_MODEL=… HX_OPENAI_TEST_KEY=… \
 4 passed; 0 failed                       # a real model, through a real gateway
 $ cargo test -p hx-remote --test ssh_live -- --ignored --test-threads=1
 5 passed; 0 failed                       # a real sshd, real key auth
+$ cargo test -p hx-server --test chat_live -- --ignored --test-threads=1
+2 passed; 0 failed                       # a real container, through POST /v1/chat
 $ HX_SEARXNG_URL=http://127.0.0.1:8888 HX_SEARCH_EXPECT_RESULTS=searxng \
   cargo test -p hx-search --test search_live -- --ignored --test-threads=1
 4 passed; 0 failed                       # a real SearXNG, real internet
 ```
 
 The counts matter in both directions. A green `cargo test` alone still means **the logic is right**;
-those 22 ignored tests are the ones that have reached another process, and the only ones here that
+those 24 ignored tests are the ones that have reached another process, and the only ones here that
 could catch a protocol mistake. They now run in CI, which is the difference between "verified once"
 and "stays verified".
 
@@ -98,6 +100,24 @@ rather than accepted and ignored, and the example config no longer claims a cons
 keep. The first failing run also happened to demonstrate the rollback invariant against a real
 engine: seven spawns failed at *start* after a successful create, and every one reported
 `it has been removed`.
+
+**The chat path, against a real container engine** (`crates/hx-server/tests/chat_live.rs`)
+
+Two tests that drive `POST /v1/chat` with a scripted model and a real Docker daemon. `tests/api.rs`
+proves the wiring with a *recording* runtime — the manager is real, the command is asserted exactly —
+but a recording runtime cannot see whether that command can actually run where it is sent. That gap is
+not hypothetical: the first version of this wiring built the command line with `cd '/host/checkout' &&
+…` embedded in the shell source, so the container received a path that does not exist inside it while
+the adapter was dutifully translating the separate workdir argument into `/workspace`. Every hermetic
+test passed.
+
+| What ran | Observed |
+|---|---|
+| A request that names a profile, with a shell call | The command ran inside a real container: `printf … > proof.txt && pwd && id -u` produced a file that appears on the **host** through the bind mount, with the container's own contents |
+| What the model was told | `/workspace` — not the host checkout path — plus `ran in sandbox …`, so the model is not handed a path that only exists outside the box |
+| Which user it ran as | Non-root: the adopted workspace owner, which is what makes the bind writable on a host whose uid is not 1000 |
+| A second request in the same checkout | Reused the same container id rather than starting a second one — the cache is keyed on profile + host workspace path, so a boundary is paid for once per checkout |
+| A request naming an unknown profile | `400`, naming the profile, with **no** container started and **no** session created — a misspelt boundary is never a quiet unconfined run |
 
 **A real model, through a real gateway** (`crates/hx-provider/tests/openai_live.rs`)
 
@@ -399,7 +419,7 @@ all until `AgentConfig::default()` was fixed.
 ## Running the suite
 
 ```bash
-cargo test --workspace          # 690 tests, 0 failed, 22 ignored live tests
+cargo test --workspace          # 695 tests, 0 failed, 24 ignored live tests
 cargo test -p hx-store          # 42 — migrations, the transcript, and 4 that reopen the file
 cargo test -p hx-agent          # 42 — the loop's gate, the routed model call, the transcript sink
 cargo test -p hx-tools          # 91 — requirements, bounded output, the two-phase registry, workspace resolution, the trash
