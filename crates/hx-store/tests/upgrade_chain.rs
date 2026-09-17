@@ -59,4 +59,36 @@ fn events_written_after_an_upgrade_are_chained() {
             .unwrap(),
         0
     );
+
+    // The case that shipped broken: appending to an *old* session whose last row predates the
+    // chain, so the predecessor's digest is NULL. Reading it as `Option<String>` made rusqlite fail
+    // with `Invalid column type Null`, which rejected every write on an upgraded database — and a
+    // test that only ever appends to a *new* session never reaches it.
+    let old = hx_core::ids::SessionId::from_raw("ses_old");
+    store
+        .append_event(
+            &old,
+            &AgentEvent::TurnFinished {
+                agent: AgentId::from("agt_1"),
+                turn: 1,
+                stop: hx_core::event::StopReason::Completed,
+            },
+            chrono::Utc::now(),
+        )
+        .expect("appending after an unchained row must work");
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let old_chained: i64 = conn
+        .query_row(
+            "SELECT COUNT(digest) FROM events WHERE session_id = 'ses_old'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_chained, 1, "the old session's new event is chained");
+    assert_eq!(
+        store.unchained_events(&old).unwrap(),
+        1,
+        "and its pre-chain row is still reported as unchained"
+    );
 }

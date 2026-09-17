@@ -429,14 +429,22 @@ impl Store {
             // verify. Read the predecessor in this transaction, not from a cached "last digest":
             // two writers would otherwise both chain from the same row and one of them would be
             // permanently unverifiable.
+            //
+            // `Option<Option<String>>` and not `Option<String>`: the outer one is "no previous row",
+            // the inner one is "that row's digest is NULL". Both occur — the second for every row
+            // written before the chain existed — and collapsing them into one `Option` makes
+            // rusqlite fail the read with `Invalid column type Null`, which rejects *every write* on
+            // an upgraded database. That bug shipped once; the test below is the shape that catches
+            // it, and it must run against a migrated database rather than a fresh one.
             let previous: Option<String> = tx
                 .query_row(
                     "SELECT digest FROM events WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1",
                     [session.as_str()],
-                    |row| row.get(0),
+                    |row| row.get::<_, Option<String>>(0),
                 )
                 .optional()
-                .map_err(|err| fail("could not read the previous event's digest", err))?;
+                .map_err(|err| fail("could not read the previous event's digest", err))?
+                .flatten();
             let previous = previous.unwrap_or_else(|| audit::GENESIS.to_string());
 
             let at_text = stamp(at);
