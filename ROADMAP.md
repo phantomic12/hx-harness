@@ -86,7 +86,15 @@ Those get real tests in M1 against a live endpoint.
   "restartable" and "resumable". The approval channel is built; a WebSocket event stream remains open.
 
 **Exit criteria:** a multi-step task (5+ tool calls) completes end-to-end; killing the TUI and
-reconnecting resumes the session mid-flight.
+reconnecting resumes the session mid-flight. **Both met against a real model** (2026-09-17): a task
+(“read the sources, add `divide()`, add its test, run pytest”) completed in 12 turns and 14 tool calls
+— 9 shell, 3 read_file, 2 patch — with 0 refusals, and the `pytest` output it reported was re-run
+independently (`2 passed`). For the second half, the daemon was `kill -9`d the moment a tool result
+reached disk: 3 messages and 5 events survived, the client saw `RemoteDisconnected`, and restarting
+the daemon resumed that same session id — 3 → 19 messages, unchanged `created_at` — to a correct
+answer. The evidence is `~/.hx/kill-test.sh`, whose session-picker was fixed to consider only
+sessions created *after* the run starts (it previously latched onto the previous run's session and
+killed an idle daemon while looking like a pass).
 
 ---
 
