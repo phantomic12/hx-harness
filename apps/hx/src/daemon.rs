@@ -146,6 +146,17 @@ pub async fn chat_stream(
     })
 }
 
+/// Whether a session's stored trail still matches its recorded digests.
+pub async fn audit(client: &reqwest::Client, base: &str, id: &str) -> anyhow::Result<Value> {
+    let (_, report) = send(
+        client.get(format!("{base}/v1/sessions/{id}/audit")),
+        base,
+        "the audit check",
+    )
+    .await?;
+    Ok(report)
+}
+
 /// The sessions the daemon knows about.
 pub async fn sessions(client: &reqwest::Client, base: &str, limit: usize) -> anyhow::Result<Value> {
     let (_, list) = send(

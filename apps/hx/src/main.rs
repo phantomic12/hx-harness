@@ -101,6 +101,19 @@ enum Command {
         export: String,
     },
 
+    /// Check that a session's stored trail has not been altered.
+    ///
+    /// Verifies each event against the digest recorded beside it. Exits non-zero when a row's
+    /// content no longer matches, so a script can gate on it.
+    Audit {
+        /// The session to check.
+        id: String,
+
+        /// Print the daemon's answer as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Show the approval questions a run is waiting on.
     Approvals {
         /// Only the questions belonging to this session.
@@ -265,6 +278,18 @@ async fn main() -> Result<()> {
             // A run that did not complete is not a success: `stop` says whether the text above is an
             // answer or the beginning of one, and a script needs to be able to tell.
             if reply["stop"].as_str() != Some("completed") {
+                std::process::exit(2);
+            }
+        }
+
+        Command::Audit { id, json } => {
+            let base = daemon::base_url(&config, cli.daemon.as_deref());
+            let report = daemon::audit(&reqwest::Client::new(), &base, &id).await?;
+            print!("{}", commands::render_audit(&report, json));
+
+            // A broken chain is not a success. Exit 2 the way an incomplete run does, so `hx audit`
+            // can be used in a script or a cron without parsing its output.
+            if report["status"].as_str() == Some("broken") {
                 std::process::exit(2);
             }
         }

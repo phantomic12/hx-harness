@@ -540,6 +540,22 @@ impl Store {
     }
 
     /// How many events of one kind a session recorded — the audit-ish query, for now.
+    /// How many events a session has, whatever their kind.
+    ///
+    /// Counted in SQL rather than by loading and parsing them: a row whose payload was edited does
+    /// not parse, and the audit endpoint has to be able to report that row rather than fail on it.
+    pub fn total_events(&self, session: &SessionId) -> Result<u64> {
+        let conn = self.lock();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE session_id = ?1",
+                params![session.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|err| fail("could not count events", err))?;
+        Ok(count as u64)
+    }
+
     pub fn event_count(&self, session: &SessionId, kind: &str) -> Result<u64> {
         let conn = self.lock();
         let count: i64 = conn

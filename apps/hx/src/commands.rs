@@ -1099,6 +1099,65 @@ agent:
 ///
 /// The numbers come before the answer, because a run that stopped early explains itself that way:
 /// `stop` is the first thing that says whether the text below is an answer or a fragment of one.
+/// Render the result of checking a session's trail.
+///
+/// The three outcomes are worded so they cannot be confused: `intact` is a claim that every event was
+/// checked, and when some were not, the count says so rather than letting the word cover them.
+pub fn render_audit(report: &serde_json::Value, json: bool) -> String {
+    if json {
+        return match serde_json::to_string_pretty(report) {
+            Ok(pretty) => format!("{pretty}\n"),
+            Err(err) => format!("{{\"error\":\"could not serialise the report: {err}\"}}\n"),
+        };
+    }
+
+    let session = report["session_id"].as_str().unwrap_or("?");
+    let verified = report["verified"].as_u64().unwrap_or(0);
+    let unchained = report["unchained"].as_u64().unwrap_or(0);
+    let mut out = String::new();
+
+    match report["status"].as_str().unwrap_or("?") {
+        "intact" => {
+            let _ = writeln!(out, "session {session}: trail intact");
+            let _ = writeln!(out, "  {verified} event(s) verified against their digests");
+        }
+        "broken" => {
+            let _ = writeln!(out, "session {session}: TRAIL ALTERED");
+            let _ = writeln!(
+                out,
+                "  event {} does not match the digest stored with it",
+                report["seq"].as_i64().unwrap_or(-1)
+            );
+            let _ = writeln!(
+                out,
+                "  expected {}",
+                &report["expected"].as_str().unwrap_or("?")
+                    [..16.min(report["expected"].as_str().unwrap_or("?").len())]
+            );
+            let _ = writeln!(
+                out,
+                "  stored   {}",
+                &report["stored"].as_str().unwrap_or("?")
+                    [..16.min(report["stored"].as_str().unwrap_or("?").len())]
+            );
+            let _ = writeln!(out, "  {verified} event(s) checked before the break");
+        }
+        other => {
+            let _ = writeln!(out, "session {session}: unexpected status {other}");
+        }
+    }
+
+    // Said separately and unconditionally: an `intact` verdict covers only the events that carried a
+    // digest, and a reader who is not told how many did not would over-trust it.
+    if unchained > 0 {
+        let _ = writeln!(
+            out,
+            "  {unchained} event(s) predate the chain and were NOT checked"
+        );
+    }
+    out
+}
+
 pub fn render_chat(reply: &serde_json::Value, json: bool) -> String {
     if json {
         return match serde_json::to_string_pretty(reply) {
@@ -1432,5 +1491,76 @@ mod run_tests {
         });
         let rendered = render_session(&value);
         assert!(!rendered.contains("no result"), "{rendered}");
+    }
+
+    #[test]
+    fn an_intact_trail_says_what_was_verified() {
+        let rendered = render_audit(
+            &serde_json::json!({
+                "session_id": "ses_1",
+                "status": "intact",
+                "verified": 12,
+                "unchained": 0
+            }),
+            false,
+        );
+        assert!(rendered.contains("intact"), "{rendered}");
+        assert!(rendered.contains("12 event(s) verified"), "{rendered}");
+        // Nothing about unchecked rows when there are none: a line saying "0 were not checked" is
+        // noise that trains a reader to skip the line that matters.
+        assert!(!rendered.contains("NOT checked"), "{rendered}");
+    }
+
+    #[test]
+    fn a_broken_trail_is_impossible_to_read_as_fine() {
+        let rendered = render_audit(
+            &serde_json::json!({
+                "session_id": "ses_1",
+                "status": "broken",
+                "verified": 3,
+                "unchained": 0,
+                "seq": 4,
+                "expected": "aaaa1111bbbb2222cccc3333dddd4444",
+                "stored": "99998888777766665555444433332222"
+            }),
+            false,
+        );
+        assert!(rendered.contains("ALTERED"), "{rendered}");
+        assert!(rendered.contains("event 4"), "names the row: {rendered}");
+        assert!(
+            rendered.contains("aaaa1111"),
+            "shows what it should be: {rendered}"
+        );
+        assert!(rendered.contains("99998888"), "and what it is: {rendered}");
+        // The word `intact` must not appear anywhere in a tamper report.
+        assert!(!rendered.contains("intact"), "{rendered}");
+    }
+
+    #[test]
+    fn unchecked_rows_are_stated_even_when_the_rest_is_intact() {
+        // The line that stops `intact` from being read as "everything was verified": over a database
+        // upgraded from V1 the prefix has no digest, so the verdict covers only part of the log.
+        let rendered = render_audit(
+            &serde_json::json!({
+                "session_id": "ses_1",
+                "status": "intact",
+                "verified": 5,
+                "unchained": 40
+            }),
+            false,
+        );
+        assert!(rendered.contains("intact"), "{rendered}");
+        assert!(
+            rendered.contains("40 event(s) predate the chain"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn the_audit_report_can_be_asked_for_as_json() {
+        let report = serde_json::json!({"session_id": "ses_1", "status": "intact", "verified": 2, "unchained": 0});
+        let rendered = render_audit(&report, true);
+        // Pretty-printed JSON, so a caller piping it to `jq` gets a document rather than prose.
+        assert!(rendered.contains("\"session_id\": \"ses_1\""), "{rendered}");
     }
 }
