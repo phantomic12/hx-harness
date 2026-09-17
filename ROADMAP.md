@@ -49,7 +49,8 @@ Those get real tests in M1 against a live endpoint.
 
 - ✅ `Provider` impl for OpenAI-compatible endpoints (covers ~80% of providers) — landed with a
   hermetic HTTP suite and a live suite (text, usage, tool calls, transcript)
-- Provider adapter for Anthropic Messages API
+- ✅ Provider adapter for Anthropic Messages API — landed with a hermetic HTTP suite (top-level `system`,
+  `x-api-key` + `anthropic-version`, `tool_use`/`tool_result` blocks) and a live suite
 - Streaming over SSE, token deltas into the TUI
 - ✅ Tool dispatch: `shell`, `read_file`, `write_file`, `patch`, `delete`, `search`, `todo` — each
   declares the resource and action it needs; none decides whether it is allowed

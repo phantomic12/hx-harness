@@ -6,8 +6,9 @@
 //! `OpenAI`-compatible chat-completions is the single highest-leverage adapter to write first:
 //! it covers OpenAI itself, Azure OpenAI, OpenRouter, Together, Groq, Fireworks, vLLM, llama.cpp
 //! server, Ollama, LiteLLM, and most gateways. Anthropic and Google have bespoke wire formats
-//! and get their own modules.
+//! and get their own modules; [`crate::AnthropicMessages`] covers the Anthropic Messages API.
 
+use crate::anthropic::AnthropicMessages;
 use crate::openai::OpenAiCompatible;
 use async_trait::async_trait;
 use hx_core::config::{Config, Price, ProviderKind};
@@ -239,18 +240,17 @@ impl ProviderRegistry {
                     )
                     .without_auth(),
                 ),
-                ProviderKind::Anthropic => {
-                    return Err(HxError::Config(format!(
-                        "provider '{name}' is configured as `anthropic`, but the Anthropic Messages \
-                         adapter does not exist yet (ROADMAP.md M1). Point it at an OpenAI-compatible \
-                         gateway, or leave it out of the config until the adapter lands."
-                    )))
-                }
+                ProviderKind::Anthropic => Arc::new(AnthropicMessages::new(
+                    id.clone(),
+                    base_url,
+                    pc.models.clone(),
+                    client.clone(),
+                )),
                 ProviderKind::Google => {
                     return Err(HxError::Config(format!(
-                        "provider '{name}' is configured as `google`, which has its own wire format \
+                    "provider '{name}' is configured as `google`, which has its own wire format \
                          and no adapter yet. Use an OpenAI-compatible gateway in the meantime."
-                    )))
+                )))
                 }
             };
 
@@ -451,12 +451,18 @@ mod tests {
                 "https://openrouter.ai/api/v1",
             ),
             ("local", ProviderKind::Ollama, "http://127.0.0.1:11434"),
+            (
+                "anthropic-main",
+                ProviderKind::Anthropic,
+                "https://api.anthropic.com",
+            ),
         ]);
         let registry = ProviderRegistry::from_config(&config, client()).unwrap();
 
-        assert_eq!(registry.len(), 2);
+        assert_eq!(registry.len(), 3);
         assert!(registry.get(&ProviderId::from("openrouter")).is_some());
         assert!(registry.get(&ProviderId::from("local")).is_some());
+        assert!(registry.get(&ProviderId::from("anthropic-main")).is_some());
         // The adapter advertises the models the config listed, so `resolve` can check them.
         assert_eq!(
             registry
@@ -465,6 +471,20 @@ mod tests {
                 .models(),
             ["openrouter-model"]
         );
+    }
+
+    #[test]
+    fn an_anthropic_provider_builds_the_messages_adapter() {
+        // Anthropic has its own wire format; the factory must route `kind: anthropic` to its own
+        // adapter and report its identity, not to the OpenAI-compatible one.
+        let config = config_with(vec![(
+            "anthropic",
+            ProviderKind::Anthropic,
+            "https://api.anthropic.com",
+        )]);
+        let registry = ProviderRegistry::from_config(&config, client()).unwrap();
+        let provider = registry.get(&ProviderId::from("anthropic")).unwrap();
+        assert_eq!(provider.kind(), ProviderKind::Anthropic);
     }
 
     #[test]
@@ -483,22 +503,6 @@ mod tests {
             api_root_for_ollama("http://127.0.0.1:11434/v1"),
             "http://127.0.0.1:11434/v1",
             "already an API root: appending again would 404"
-        );
-    }
-
-    #[test]
-    fn an_anthropic_provider_is_refused_by_name_rather_than_spoken_to_in_the_wrong_protocol() {
-        let config = config_with(vec![(
-            "anthropic",
-            ProviderKind::Anthropic,
-            "https://api.anthropic.com",
-        )]);
-        let err = ProviderRegistry::from_config(&config, client()).unwrap_err();
-        let text = err.to_string();
-        assert!(text.contains("anthropic"), "{text}");
-        assert!(
-            text.contains("does not exist yet"),
-            "the refusal should say why, and that it is temporary: {text}"
         );
     }
 
