@@ -18,11 +18,14 @@
 //!
 //! ## What this deliberately does not do yet
 //!
-//! Streaming (a turn arrives whole and is emitted as one `TextDelta`), compaction (a long
-//! transcript is sent as-is), and cost accounting (usage is reported in tokens; the price table is
-//! the router's business). Each is a visible gap rather than a silent one.
+//! Streaming (a turn arrives whole and is emitted as one `TextDelta`) and cost accounting (usage
+//! is reported in tokens; the price table is the router's business). Each is a visible gap rather
+//! than a silent one. Compaction is *not* on that list: a long transcript is handed to
+//! [`compact_at`] before the request is built, so a session that grows past its configured window
+//! stays sendable instead of being refused by the provider.
 
 use crate::approver::{ApprovalDecision, Approver};
+use crate::compact::compact_at;
 use crate::model::ModelCall;
 use hx_core::approval::{ActionRequest, ApprovalSession, RiskClass, Verdict};
 use hx_core::capability::{Action, CapabilityToken, Decision, Resource};
@@ -45,6 +48,10 @@ pub struct Limits {
     pub deadline: Option<Duration>,
     /// Output tokens requested per turn.
     pub max_tokens: u32,
+    /// Compaction threshold, in estimated tokens. When the transcript the loop hands the model
+    /// exceeds this estimate, the middle is elided (head and tail kept) so a long session stays
+    /// sendable. `0` disables compaction. This is the loop's copy of `AgentConfig.compact_at_tokens`.
+    pub compact_at_tokens: usize,
 }
 
 impl Default for Limits {
@@ -54,6 +61,9 @@ impl Default for Limits {
             max_turns: 24,
             deadline: Some(Duration::from_secs(600)),
             max_tokens: 4096,
+            // Matches the config default; a session that grows past ~120k estimated tokens gets
+            // its middle elided rather than being refused by the provider.
+            compact_at_tokens: 120_000,
         }
     }
 }
@@ -216,7 +226,17 @@ impl AgentLoop {
                 turn,
             });
 
-            let mut request = ChatRequest::new(self.model.model(), transcript.clone())
+            // The transcript is the audit trail and is never shrunk here; what the model is handed
+            // is a separate decision. A long conversation gets its middle elided (head and tail
+            // kept, with an explicit marker) so the request stays inside the model's window instead
+            // of growing without bound until the provider refuses it.
+            let to_send = if self.limits.compact_at_tokens > 0 {
+                compact_at(transcript, self.limits.compact_at_tokens).messages
+            } else {
+                transcript.clone()
+            };
+
+            let mut request = ChatRequest::new(self.model.model(), to_send)
                 .with_max_tokens(self.limits.max_tokens);
             if let Some(system) = &self.system {
                 request = request.with_system(system.clone());

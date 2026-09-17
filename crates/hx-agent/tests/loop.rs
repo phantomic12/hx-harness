@@ -796,6 +796,7 @@ async fn max_turns_stops_a_model_that_will_not_stop() {
             max_turns: 3,
             deadline: None,
             max_tokens: 512,
+            ..Limits::default()
         }),
         ..h
     };
@@ -821,6 +822,7 @@ async fn an_exhausted_deadline_stops_before_the_first_turn() {
             max_turns: 4,
             deadline: Some(Duration::ZERO),
             max_tokens: 512,
+            ..Limits::default()
         }),
         ..h
     };
@@ -1042,6 +1044,71 @@ async fn every_message_the_run_produces_reaches_the_sink_as_it_is_produced() {
     assert!(
         recorded.iter().any(|m| m.text().contains("hi")),
         "{recorded:#?}"
+    );
+}
+
+#[tokio::test]
+async fn a_long_session_is_compacted_for_the_model_but_never_from_the_audit() {
+    // The whole point of the threshold: a transcript that has grown past it is elided *for the
+    // model* so the request stays inside the model's window, while the loop's transcript — the audit
+    // the store keeps — still holds every message. Dropping one of the two halves would either
+    // re-introduce the unbounded-request bug this key exists to fix, or silently edit the record a
+    // human audits.
+    let model = ScriptedModel::new(vec![Ok(reply("all done"))]);
+    let mut transcript = transcript_start();
+    // A large middle that pushes the estimate far past any small threshold: each assistant turn is
+    // thousands of tokens, so the transcript as a whole is un-sendable.
+    for i in 0..40 {
+        transcript.push(Message::assistant(format!(
+            "step {i}: {}",
+            "x".repeat(2000)
+        )));
+    }
+    transcript.push(Message::assistant("the end"));
+
+    let agent_loop = AgentLoop::new(
+        agent(),
+        model.clone(),
+        Arc::new(tools()),
+        token(vec![]),
+        ApprovalSession::new(ApprovalPolicy::paranoid()),
+        Arc::new(AlwaysDeny),
+    )
+    .with_limits(Limits {
+        max_turns: 1,
+        compact_at_tokens: 1, // far under the transcript's estimate, so compaction fires
+        ..Limits::default()
+    });
+
+    let ctx = ToolContext::new(Arc::new(FakeHost::unix()));
+    let outcome = agent_loop.run(&mut transcript, &ctx).await.unwrap();
+    assert_eq!(outcome.stop, StopReason::Completed);
+
+    let sent = model.seen();
+    assert_eq!(sent.len(), 1);
+    let sent = &sent[0].messages;
+
+    // The audit trail is whole — every message the run started with, plus the answer the loop appended.
+    assert_eq!(transcript.len(), 43, "the record must keep every message");
+    assert_eq!(
+        transcript[..42].len(),
+        42,
+        "the original 42 are all present"
+    );
+
+    // What the model was handed is a strict subset: head(2) + marker(1) + tail(12) = 15, far
+    // smaller than the record, and the marker says the elision happened and names its scale.
+    // 42 original messages, 14 kept from the record (head+tail), so 28 were elided.
+    assert!(sent.len() < transcript.len(), "the request must be smaller");
+    assert_eq!(sent.len(), 15, "head + marker + tail");
+    let marker = sent
+        .iter()
+        .find(|m| m.text().contains("elided"))
+        .expect("the request must contain the explicit elision marker");
+    assert!(
+        marker.text().contains("28"),
+        "the marker names how much was elided: {}",
+        marker.text()
     );
 }
 
