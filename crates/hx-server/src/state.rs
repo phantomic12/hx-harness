@@ -70,6 +70,10 @@ pub struct AppState {
     /// One lock per session, held for the duration of a run: two requests on one session would
     /// otherwise interleave into a transcript neither of them wrote.
     pub chats: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    /// The server-side terminals. Owned by the daemon, not by a connection: a shell outlives the
+    /// client that opened it, which is what lets two clients attach to one terminal and see the
+    /// same bytes.
+    pub terminals: Arc<crate::terminal::Terminals>,
     /// Live events, broadcast to SSE subscribers as a run produces them.
     ///
     /// Events are also persisted, so this is the *live* half of the same stream a late reader gets
@@ -207,6 +211,7 @@ impl AppState {
             approvals: parts.approvals,
             search: parts.search,
             chats: Mutex::new(HashMap::new()),
+            terminals: Arc::new(crate::terminal::Terminals::new()),
             // Capacity generous enough that a burst of token deltas does not drop a subscriber;
             // a slow reader is *supposed* to lag (reconnecting redraws from the store), but a
             // normal live client must not lose events it was awake for.

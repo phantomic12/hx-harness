@@ -49,6 +49,14 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/sessions/{id}/events", get(session_events))
         .route("/v1/sessions/{id}/audit", get(session_audit))
         .route("/v1/sessions/{id}/ws", get(crate::stream_ws::session_ws))
+        // The terminal has its own socket: an attach is a join, not an open, and input travels
+        // back up it. See `crate::terminal_ws` for why it is not a frame on the session stream.
+        .route(
+            "/v1/terminals/{id}/ws",
+            get(crate::terminal_ws::terminal_ws),
+        )
+        .route("/v1/terminals", get(list_terminals).post(create_terminal))
+        .route("/v1/terminals/{id}", delete(kill_terminal))
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{id}", post(answer_approval))
         .with_state(state)
@@ -419,6 +427,74 @@ async fn delete_session(
     let deleted = state.store.delete(&SessionId::from_raw(id))?;
     if !deleted {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "no such session"));
+    }
+    Ok(Json(serde_json::json!({ "deleted": true })))
+}
+
+/// What a client asks for when it wants a new terminal.
+#[derive(Debug, Deserialize)]
+struct CreateTerminalBody {
+    /// The id to register the terminal under. Required: a client that forgets it would otherwise
+    /// get a generated id it cannot attach to again after reconnecting.
+    id: String,
+    /// The shell, if the caller wants something other than the configured default.
+    #[serde(default)]
+    shell: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default = "default_cols")]
+    cols: u16,
+    #[serde(default = "default_rows")]
+    rows: u16,
+}
+
+fn default_cols() -> u16 {
+    80
+}
+
+fn default_rows() -> u16 {
+    24
+}
+
+/// `POST /v1/terminals` — start a terminal. A client attaches to it with `GET /v1/terminals/{id}/ws`.
+async fn create_terminal(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateTerminalBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if body.id.trim().is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "a terminal id cannot be empty",
+        ));
+    }
+    // The shell comes from config, never from the request, unless the caller names one explicitly.
+    // Defaulting to the configured shell keeps the terminal consistent with what the daemon is set
+    // up to run rather than to whatever `/bin/sh` happens to be.
+    let shell = body
+        .shell
+        .unwrap_or_else(|| state.config.terminal.shell.clone());
+    state
+        .terminals
+        .create(&body.id, &shell, &body.args, body.cols, body.rows)?;
+    Ok(Json(serde_json::json!({ "id": body.id, "created": true })))
+}
+
+/// `GET /v1/terminals` — the live terminals.
+async fn list_terminals(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "terminals": state.terminals.ids() }))
+}
+
+/// `DELETE /v1/terminals/{id}` — drop a terminal.
+///
+/// This ends the daemon's reference to the shell, which closes the pty and so hangs up the shell
+/// the way a real terminal closing does — it is not a polite "please exit". A caller that wants the
+/// shell to shut down cleanly should type `exit` through the socket.
+async fn kill_terminal(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !state.terminals.remove(&id) {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "no such terminal"));
     }
     Ok(Json(serde_json::json!({ "deleted": true })))
 }

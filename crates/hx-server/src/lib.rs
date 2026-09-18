@@ -21,6 +21,8 @@ pub mod sandbox;
 pub mod state;
 pub mod stream;
 pub mod stream_ws;
+pub mod terminal;
+pub mod terminal_ws;
 
 pub use chat::{ChatReply, ChatRequest, ModelFactory, RouterModels};
 pub use routes::{app, status_for, ApiError};
