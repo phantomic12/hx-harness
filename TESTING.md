@@ -318,6 +318,23 @@ quietly stop being tested.
 guards have never met a real server. It needs a Windows box with an SSH server and a key, which is
 environment work rather than code work.
 
+◐ **WinRM is unverified against a real host, and currently fails.** `hx-remote` carries a hand-rolled
+NTLMv2 implementation (`src/ntlm.rs`) and a WinRM transport (`src/winrm.rs`). The NTLM half is
+measured against published values — RFC 1320's MD4 vectors, the published NT hash for a known
+password, and a real Windows challenge parsed from the wire — and the transport's envelope is proven
+good: the exact envelope it builds, sent through an independent client's transport to a Windows 10
+guest, creates a shell and returns a ShellId. What does **not** work is the client's own HTTP
+exchange, which still fails on `create-shell` with a 500 from WSMan.
+
+`tests/winrm_live.rs` is the suite that measures this. It is `#[ignore]`d, so the default gate does not
+run it; `HX_WINRM_HOST`, `HX_WINRM_USER` and `HX_WINRM_PASSWORD` point it at a host, with
+`HX_WINRM_PORT` for a non-default port. **It fails today** — do not read a green `cargo test
+--workspace` as a working WinRM connection. `docs` in the skill record the measured protocol facts
+(flag values, message layout, the request shape) and the capture tooling, so this can be resumed
+rather than rediscovered.
+
+Do not advertise WinRM as working until that suite is green against a real Windows host.
+
 ## Tier C — a real model through the daemon (manual, recorded)
 
 The suites above fake the model. This is the row that proves the harness drives one, and it is run by
