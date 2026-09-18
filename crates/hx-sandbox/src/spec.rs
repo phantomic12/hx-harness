@@ -27,6 +27,39 @@ use thiserror::Error;
 
 pub use hx_core::config::{IsolationLevel, SandboxProfile};
 
+/// Whether an egress allowlist entry can actually be enforced by the proxy.
+///
+/// The proxy matches a `CONNECT` target by hostname (exact or `*.domain` suffix). A CIDR or a
+/// raw IP is not a hostname, so the proxy cannot decide it — such an entry must be refused at
+/// validation rather than quietly half-enforced. This is the one shape that genuinely remains
+/// unenforceable by the current mechanism, and it is why [`SpecError::EgressNotEnforced`] still
+/// exists.
+fn is_proxy_enforceable(entry: &str) -> bool {
+    let entry = entry.trim().trim_end_matches('.');
+    if entry.is_empty() {
+        return false;
+    }
+    let host = if let Some(domain) = entry.strip_prefix("*.") {
+        domain
+    } else {
+        entry
+    };
+    // A hostname is letters/digits/hyphens separated by dots; anything else (a slash, a colon, a
+    // space) is a CIDR or an address and cannot be matched by name.
+    let looks_like_a_hostname = host.split('.').all(|label| {
+        !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    });
+    if !looks_like_a_hostname {
+        return false;
+    }
+    // ...and the letter-shape test above is not sufficient on its own: a dotted IPv4 address is
+    // entirely digits, dots and hyphens, so `10.0.0.1` passes it while being an address the proxy
+    // cannot decide by name. Matching it as a "hostname" would produce an allowlist entry that is
+    // silently never satisfied — a destination the operator believes they permitted and that no
+    // connection ever reaches. `IpAddr::from_str` is the definitive test, so it is the one used.
+    host.parse::<std::net::IpAddr>().is_err()
+}
+
 /// The user a sandbox runs as. Never root: a container escape from uid 0 is a much shorter path
 /// to the host than one from an unprivileged user.
 pub const SANDBOX_UID: &str = "1000:1000";
@@ -57,12 +90,14 @@ pub struct SandboxSpec {
     pub workspace_mb: u64,
     /// Hard lifetime. A sandbox that nobody reaps is a resource leak with a nice name.
     pub ttl_secs: u64,
-    /// Egress allowlist — hostnames or CIDRs. Empty means no egress.
+    /// Egress allowlist — hostnames or `*.domain` globs the sandbox may reach. Empty means no
+    /// egress.
     ///
-    /// **Not enforceable yet.** There is no proxy and no netfilter rule behind it, so a sandbox
-    /// either has a network or does not; an allowlist would be a promise nothing keeps. Setting one
-    /// is therefore refused by [`SandboxSpec::validate`] rather than quietly ignored — see
-    /// [`SpecError::EgressNotEnforced`].
+    /// Enforced by placing the sandbox on an internal Docker network (no gateway) and routing its
+    /// outbound traffic through a proxy sidecar that admits only these destinations — see
+    /// [`crate::egress`]. An entry that is not a hostname or a `*.domain` globe (a CIDR, an
+    /// IP) cannot be enforced through that proxy, so such an allowlist is refused by
+    /// [`SandboxSpec::validate`] rather than quietly accepted.
     pub egress_allow: Vec<String>,
     pub network: bool,
     pub readonly_rootfs: bool,
@@ -188,11 +223,16 @@ impl SandboxSpec {
         if !self.network && !self.egress_allow.is_empty() {
             return Err(SpecError::EgressWithoutNetwork(self.egress_allow.clone()));
         }
-        // And with networking *on* it is worse than a mistake: nothing enforces the list. Refusing
-        // is the only honest answer, because the alternative is a sandbox that reaches the whole
-        // internet while its profile says four hostnames — and the profile is what gets reviewed.
+        // With networking *on*, a non-empty allowlist is enforced: the sandbox rides an internal
+        // network whose only exit is a proxy that admits exactly these destinations (see `crate::egress`).
+        // But only a hostname or a `*.domain` globe can be matched by that proxy; a CIDR or a raw IP
+        // cannot be checked against an unresolved CONNECT target, so an allowlist that needs one is refused
+        // rather than silently half-enforced.
         if self.network && !self.egress_allow.is_empty() {
-            return Err(SpecError::EgressNotEnforced(self.egress_allow.clone()));
+            if let Some(unenforceable) = self.egress_allow.iter().find(|e| !is_proxy_enforceable(e))
+            {
+                return Err(SpecError::EgressNotEnforced(vec![unenforceable.clone()]));
+            }
         }
         Ok(())
     }
@@ -385,9 +425,9 @@ pub enum SpecError {
     EgressWithoutNetwork(Vec<String>),
 
     #[error(
-        "egress allowlist {0:?} cannot be enforced: this build has no egress proxy or firewall \
-         rule, so the sandbox would reach the whole internet while the profile claims {0:?}. Set \
-         `network: false` for no egress, or drop the allowlist to accept an unrestricted one."
+        "egress allowlist entry {0:?} cannot be enforced: the egress proxy matches destinations \
+         by hostname, and {0:?} is not a hostname or a `*.domain` globe. Write the destination \
+         as a hostname, or as `*.domain` to allow every subdomain."
     )]
     EgressNotEnforced(Vec<String>),
 
@@ -749,25 +789,39 @@ mod tests {
     }
 
     #[test]
-    fn an_egress_allowlist_that_cannot_be_enforced_is_refused() {
-        // The setting had no enforcement behind it: the container got a full bridge network while
-        // the profile — the thing a reviewer reads — claimed four hostnames. Refusing is the only
-        // honest option until an egress proxy exists.
+    fn a_hostname_or_domain_allowlist_is_now_accepted_and_enforced() {
+        // The setting used to be refused wholesale because nothing enforced it; it is now enforced
+        // by the internal-network + proxy mechanism. A plain hostname or `*.domain` allowlist must
+        // therefore validate cleanly — refusing it now would be refusing the enforced middle ground the
+        // operator asked for.
         let mut s = spec(IsolationLevel::L1);
         s.network = true;
-        s.egress_allow = vec!["crates.io".into(), "github.com".into()];
+        s.egress_allow = vec!["crates.io".into(), "*.crates.io".into()];
+        assert_eq!(s.validate(), Ok(()));
+    }
 
-        let err = s.validate().unwrap_err();
-        assert_eq!(
-            err,
-            SpecError::EgressNotEnforced(vec!["crates.io".into(), "github.com".into()])
-        );
-        let message = err.to_string();
-        assert!(message.contains("cannot be enforced"), "{message}");
-        assert!(
-            message.contains("network: false") && message.contains("drop the allowlist"),
-            "the error has to say what to do instead: {message}"
-        );
+    #[test]
+    fn an_allowlist_entry_the_proxy_cannot_match_is_refused() {
+        // The proxy matches a CONNECT target by hostname. A CIDR or a raw IP cannot be decided
+        // by name, so accepting it would be a half-enforced allowlist — the one shape that
+        // genuinely remains unenforceable, and the reason `EgressNotEnforced` still exists.
+        for bad in ["10.0.0.0/8", "10.0.0.1", "1.2.3.4:443"] {
+            let mut s = spec(IsolationLevel::L1);
+            s.network = true;
+            s.egress_allow = vec![bad.into()];
+            let err = s.validate().unwrap_err();
+            assert_eq!(
+                err,
+                SpecError::EgressNotEnforced(vec![bad.to_string()]),
+                "{bad}"
+            );
+            let message = err.to_string();
+            assert!(message.contains("cannot be enforced"), "{message}");
+            assert!(
+                message.contains("hostname") && message.contains("*.domain"),
+                "the error has to say what shape is allowed: {message}"
+            );
+        }
     }
 
     #[test]

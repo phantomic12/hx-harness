@@ -5,6 +5,7 @@
 //! applies. A field dropped in translation is a security setting silently not enforced, so the
 //! mapping is asserted field by field.
 
+use crate::egress::{self, EgressProxy};
 use crate::runtime::{SandboxExecOutput, SandboxRuntime};
 use crate::spec::{HostSettings, SandboxSpec};
 use async_trait::async_trait;
@@ -24,6 +25,8 @@ use futures::StreamExt;
 use hx_core::error::{HxError, Result};
 use hx_core::ids::SandboxId;
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// How long to wait for a container to stop before killing it.
@@ -33,6 +36,27 @@ const STOP_GRACE_SECS: i64 = 10;
 pub struct DockerRuntime {
     docker: Docker,
     prefix: String,
+    /// The host path of the compiled egress proxy binary, bind-mounted into each proxy sidecar.
+    ///
+    /// Resolved by [`default_proxy_bin`] and overridable with [`DockerRuntime::with_proxy_bin`],
+    /// which a test needs because `CARGO_BIN_EXE_*` is only defined for integration-test targets.
+    proxy_bin: PathBuf,
+    /// runtime_id -> the egress network/sidecar that container owns, so a `remove` (destroy,
+    /// reap, or rollback) tears the enforcement down with the sandbox.
+    egress: Mutex<HashMap<String, EgressProxy>>,
+}
+
+/// Where the egress proxy binary is expected to live beside the daemon.
+///
+/// `env!("CARGO_BIN_EXE_hx-egress-proxy")` is *not* usable here: Cargo defines those variables only
+/// for integration-test targets, so referring to it in library code fails to compile ("environment
+/// variable not defined at compile time"). The sibling-of-current-exe rule is what actually holds for
+/// a packaged build, and a test overrides it with `with_proxy_bin`.
+fn default_proxy_bin() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("hx-egress-proxy")))
+        .unwrap_or_else(|| PathBuf::from("hx-egress-proxy"))
 }
 
 impl DockerRuntime {
@@ -46,6 +70,8 @@ impl DockerRuntime {
         Ok(Self {
             docker,
             prefix: "hx".to_string(),
+            proxy_bin: default_proxy_bin(),
+            egress: Mutex::new(HashMap::new()),
         })
     }
 
@@ -53,7 +79,21 @@ impl DockerRuntime {
         Self {
             docker,
             prefix: "hx".to_string(),
+            proxy_bin: default_proxy_bin(),
+            egress: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Point the runtime at a proxy binary that lives somewhere other than the default location.
+    ///
+    /// Exists because there is no reliable way to find the sibling binary from inside the library:
+    /// `CARGO_BIN_EXE_*` is only set for *integration test* targets, not for the lib, so a test can
+    /// name the path (`with_proxy_bin(env!("CARGO_BIN_EXE_hx-egress-proxy"))`) while the daemon uses
+    /// the default. Guessing a path here would fail at the worst moment — the first sandbox that
+    /// asked for an egress allowlist.
+    pub fn with_proxy_bin(mut self, path: PathBuf) -> Self {
+        self.proxy_bin = path;
+        self
     }
 
     fn container_name(&self, id: &SandboxId) -> String {
@@ -155,9 +195,26 @@ impl SandboxRuntime for DockerRuntime {
         settings: &HostSettings,
     ) -> Result<String> {
         let name = self.container_name(id);
-        let body = to_container_config(spec, settings);
 
-        let response = self
+        // Egress is a property of *this* container's network placement, so it cannot live in the
+        // pure `host_settings()` mapping (which has no Docker client and no per-sandbox names). When
+        // the spec asks for a non-empty allowlist, create the internal network + proxy sidecar first
+        // and then place the sandbox on that internal network instead of the plain bridge.
+        let egress = if spec.network && !spec.egress_allow.is_empty() {
+            Some(egress::setup(&self.docker, &name, &spec.egress_allow, &self.proxy_bin).await?)
+        } else {
+            None
+        };
+
+        let mut effective = settings.clone();
+        if let Some(proxy) = &egress {
+            // The sandbox rides only the internal network — no gateway, so the *only* way out is
+            // the proxy sidecar, which enforces the allowlist. See `crate::egress`.
+            effective.network_mode = proxy.network.clone();
+        }
+        let body = to_container_config(spec, &effective);
+
+        let response = match self
             .docker
             .create_container(
                 // In the generated API `name` is `Option<String>` and `platform` is a plain
@@ -169,12 +226,30 @@ impl SandboxRuntime for DockerRuntime {
                 body,
             )
             .await
-            .map_err(|e| {
-                HxError::Sandbox(format!(
-                    "could not create sandbox '{name}' from image '{}': {e}",
+        {
+            Ok(response) => response,
+            Err(err) => {
+                // If the sandbox itself cannot be created, the proxy and network just made for it
+                // must not be left behind. This is a `match` rather than a `map_err` because the
+                // rollback has to *await*: written as a closure it compiled to a `let _ =` on an
+                // un-awaited future, which dropped the work on the floor and leaked a proxy
+                // container on every failed create.
+                if let Some(proxy) = egress {
+                    egress::teardown(&self.docker, &proxy).await;
+                }
+                return Err(HxError::Sandbox(format!(
+                    "could not create sandbox '{name}' from image '{}': {err}",
                     spec.image
-                ))
-            })?;
+                )));
+            }
+        };
+
+        if let Some(proxy) = egress {
+            self.egress
+                .lock()
+                .expect("egress map lock")
+                .insert(name.clone(), proxy);
+        }
 
         // The runtime handle is the container *name*, not `response.id`. The name is stable
         // across restarts, greppable in `docker ps`, and is what `start`/`stop`/`inspect` and the
@@ -227,7 +302,23 @@ impl SandboxRuntime for DockerRuntime {
                 }),
             )
             .await
-            .map_err(|e| HxError::Sandbox(format!("could not remove {runtime_id}: {e}")))
+            .map_err(|e| HxError::Sandbox(format!("could not remove {runtime_id}: {e}")))?;
+
+        // Tear down whatever egress enforcement this sandbox owned. Done *after* the container is
+        // gone so the internal network is guaranteed empty and the network removal actually frees it.
+        //
+        // The map entry is lifted out into its own binding first. Holding the lock across the
+        // `teardown` await would make this future `!Send`, because a `std::sync::MutexGuard` is not
+        // `Send` — and a `!Send` future cannot be spawned, which turns a teardown into a compile
+        // error at every call site rather than a runtime problem here.
+        let owned = {
+            let mut map = self.egress.lock().expect("egress map lock");
+            map.remove(runtime_id)
+        };
+        if let Some(proxy) = owned {
+            egress::teardown(&self.docker, &proxy).await;
+        }
+        Ok(())
     }
 
     async fn exec(

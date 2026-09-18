@@ -666,3 +666,163 @@ async fn l3_runs_inside_a_guest_kernel() {
 
     live.manager.destroy(handle.id.as_str()).await.unwrap();
 }
+
+// ---------------------------------------------------------------------------------------------
+// Egress allowlists, against a real proxy sidecar
+// ---------------------------------------------------------------------------------------------
+//
+// These are the tests that make the `egress` field mean something. A test that only asserted the
+// network was created would pass with no enforcement at all — the property is that a destination
+// *not* on the list cannot be reached and one on the list can, so both halves are attempted for real.
+
+/// A live manager whose egress proxy binary is this package's own, resolved the way Cargo provides it.
+///
+/// `CARGO_BIN_EXE_*` is only defined for integration-test targets, which is exactly why the runtime
+/// takes the path as a parameter instead of guessing it.
+async fn live_with_proxy() -> Option<Live> {
+    let mut live = live(8).await?;
+
+    let proxy = env!("CARGO_BIN_EXE_hx-egress-proxy");
+    if !std::path::Path::new(proxy).exists() {
+        eprintln!("skipped: the egress proxy binary was not built at {proxy}");
+        return None;
+    }
+
+    // Rebuild the manager with the proxy path, since the runtime is what carries it.
+    let runtime = match DockerRuntime::connect().await {
+        Ok(runtime) => Arc::new(runtime.with_proxy_bin(proxy.into())),
+        Err(err) => {
+            eprintln!("skipped: could not create a Docker client: {err}");
+            return None;
+        }
+    };
+    live.manager = Arc::new(SandboxManager::new(runtime, 8));
+    Some(live)
+}
+
+/// A spec with an egress allowlist and networking on, which is what turns the proxy on.
+fn egress_spec(live: &Live, allow: &[&str]) -> SandboxSpec {
+    let mut spec = writable_spec(live, IsolationLevel::L1, 3600, 128);
+    spec.network = true;
+    spec.egress_allow = allow.iter().map(|s| s.to_string()).collect();
+    spec
+}
+
+#[tokio::test]
+#[ignore = "needs a real Docker daemon"]
+async fn an_allowed_host_is_reachable_and_a_denied_one_is_not() {
+    // The claim the whole mechanism exists to make, tested the only way that counts: by attempting
+    // both connections inside a real sandbox and observing what happens.
+    let Some(live) = live_with_proxy().await else {
+        return;
+    };
+
+    let spec = egress_spec(&live, &["example.com"]);
+    let handle = live
+        .manager
+        .spawn(&spec, Utc::now())
+        .await
+        .expect("the daemon accepts an egress allowlist");
+    let _cleanup = Cleanup::new(&live.manager, handle.id.as_str());
+
+    // The image has no curl/wget by default; `bash`'s /dev/tcp is the portable probe. A successful
+    // connect prints CONNECTED, a refused or filtered one prints BLOCKED.
+    let probe = |host: &str| {
+        format!(
+            "timeout 8 bash -c 'exec 3<>/dev/tcp/{host}/443 && echo CONNECTED || echo BLOCKED' \
+             || echo BLOCKED"
+        )
+    };
+
+    let allowed = exec(&live.manager, handle.id.as_str(), &probe("example.com")).await;
+    assert!(
+        allowed.stdout.contains("CONNECTED"),
+        "an allowed host must be reachable through the proxy: {allowed:?}"
+    );
+
+    // Denied by the proxy's allowlist. This is the half that a network-only implementation would
+    // get wrong: with just an internal network everything is blocked, so the denied case would pass
+    // for the wrong reason and the allowed case would fail.
+    let denied = exec(&live.manager, handle.id.as_str(), &probe("malware.test")).await;
+    assert!(
+        denied.stdout.contains("BLOCKED"),
+        "a denied host must not be reachable: {denied:?}"
+    );
+
+    live.manager.destroy(handle.id.as_str()).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs a real Docker daemon"]
+async fn a_wildcard_entry_admits_the_subdomain_but_not_the_apex() {
+    // `*.example.com` is a real pattern in allowlists, and the proxy's matching rule is the thing
+    // that decides whether it means what a reader expects.
+    let Some(live) = live_with_proxy().await else {
+        return;
+    };
+
+    let spec = egress_spec(&live, &["*.example.com"]);
+    let handle = live
+        .manager
+        .spawn(&spec, Utc::now())
+        .await
+        .expect("the daemon accepts a wildcard allowlist");
+    let _cleanup = Cleanup::new(&live.manager, handle.id.as_str());
+
+    let probe = |host: &str| {
+        format!(
+            "timeout 8 bash -c 'exec 3<>/dev/tcp/{host}/443 && echo CONNECTED || echo BLOCKED' \
+             || echo BLOCKED"
+        )
+    };
+
+    let sub = exec(&live.manager, handle.id.as_str(), &probe("www.example.com")).await;
+    assert!(
+        sub.stdout.contains("CONNECTED"),
+        "a subdomain of the wildcard must be reachable: {sub:?}"
+    );
+
+    let apex = exec(&live.manager, handle.id.as_str(), &probe("example.com")).await;
+    assert!(
+        apex.stdout.contains("BLOCKED"),
+        "the apex is not `*.example.com`, so it must not match: {apex:?}"
+    );
+
+    live.manager.destroy(handle.id.as_str()).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs a real Docker daemon"]
+async fn no_allowlist_means_no_network_at_all() {
+    // The existing behaviour must survive: an empty allowlist is not "allow everything", it is the
+    // original no-network sandbox. Loosening this would be a security regression disguised as a
+    // new feature.
+    let Some(live) = live_with_proxy().await else {
+        return;
+    };
+
+    let mut spec = writable_spec(&live, IsolationLevel::L1, 3600, 128);
+    spec.network = false;
+    spec.egress_allow = Vec::new();
+
+    let handle = live
+        .manager
+        .spawn(&spec, Utc::now())
+        .await
+        .expect("the daemon accepts a network-less sandbox");
+    let _cleanup = Cleanup::new(&live.manager, handle.id.as_str());
+
+    let probe = exec(
+        &live.manager,
+        handle.id.as_str(),
+        "timeout 8 bash -c 'exec 3<>/dev/tcp/example.com/443 && echo CONNECTED || echo BLOCKED' \
+         || echo BLOCKED",
+    )
+    .await;
+    assert!(
+        probe.stdout.contains("BLOCKED"),
+        "a sandbox with no allowlist must reach nothing: {probe:?}"
+    );
+
+    live.manager.destroy(handle.id.as_str()).await.unwrap();
+}
