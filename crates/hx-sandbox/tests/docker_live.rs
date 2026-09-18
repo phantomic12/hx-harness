@@ -725,19 +725,30 @@ async fn an_allowed_host_is_reachable_and_a_denied_one_is_not() {
         .expect("the daemon accepts an egress allowlist");
     let _cleanup = Cleanup::new(&live.manager, handle.id.as_str());
 
-    // The image has no curl/wget by default; `bash`'s /dev/tcp is the portable probe. A successful
-    // connect prints CONNECTED, a refused or filtered one prints BLOCKED.
+    // The probe goes *through the proxy*, which is what a real tool inside the sandbox does: the
+    // environment carries `HTTP_PROXY`, so a client honours it without being told. Probing with a
+    // raw connection instead would test the one path the design deliberately does not use — the
+    // internal network has no DNS and no route, so a direct connect fails for reasons that say
+    // nothing about the allowlist.
+    //
+    // `bash`'s /dev/tcp speaks raw TCP, which cannot speak HTTP CONNECT, so a `CONNECT` line is
+    // written by hand. The reply's status line is the verdict: 200 means the proxy agreed to relay,
+    // 403 means the allowlist refused it.
     let probe = |host: &str| {
         format!(
-            "timeout 8 bash -c 'exec 3<>/dev/tcp/{host}/443 && echo CONNECTED || echo BLOCKED' \
-             || echo BLOCKED"
+            "timeout 10 bash -c 'exec 3<>/dev/tcp/{alias}/{port}; \
+             printf \"CONNECT {host}:443 HTTP/1.1\\r\\nHost: {host}:443\\r\\n\\r\\n\" >&3; \
+             head -c 12 <&3' || echo BLOCKED",
+            alias = "hxproxy",
+            port = 3128,
+            host = host
         )
     };
 
     let allowed = exec(&live.manager, handle.id.as_str(), &probe("example.com")).await;
     assert!(
-        allowed.stdout.contains("CONNECTED"),
-        "an allowed host must be reachable through the proxy: {allowed:?}"
+        allowed.stdout.contains("200"),
+        "an allowed host must be relayed by the proxy: {allowed:?}"
     );
 
     // Denied by the proxy's allowlist. This is the half that a network-only implementation would
@@ -745,8 +756,12 @@ async fn an_allowed_host_is_reachable_and_a_denied_one_is_not() {
     // for the wrong reason and the allowed case would fail.
     let denied = exec(&live.manager, handle.id.as_str(), &probe("malware.test")).await;
     assert!(
-        denied.stdout.contains("BLOCKED"),
-        "a denied host must not be reachable: {denied:?}"
+        !denied.stdout.contains("200"),
+        "a denied host must not be relayed: {denied:?}"
+    );
+    assert!(
+        denied.stdout.contains("403") || denied.stdout.contains("BLOCKED"),
+        "the refusal must be the allowlist's, not a network failure: {denied:?}"
     );
 
     live.manager.destroy(handle.id.as_str()).await.unwrap();
@@ -771,20 +786,22 @@ async fn a_wildcard_entry_admits_the_subdomain_but_not_the_apex() {
 
     let probe = |host: &str| {
         format!(
-            "timeout 8 bash -c 'exec 3<>/dev/tcp/{host}/443 && echo CONNECTED || echo BLOCKED' \
-             || echo BLOCKED"
+            "timeout 10 bash -c 'exec 3<>/dev/tcp/hxproxy/3128; \
+             printf \"CONNECT {host}:443 HTTP/1.1\\r\\nHost: {host}:443\\r\\n\\r\\n\" >&3; \
+             head -c 12 <&3' || echo BLOCKED",
+            host = host
         )
     };
 
     let sub = exec(&live.manager, handle.id.as_str(), &probe("www.example.com")).await;
     assert!(
-        sub.stdout.contains("CONNECTED"),
-        "a subdomain of the wildcard must be reachable: {sub:?}"
+        sub.stdout.contains("200"),
+        "a subdomain of the wildcard must be relayed: {sub:?}"
     );
 
     let apex = exec(&live.manager, handle.id.as_str(), &probe("example.com")).await;
     assert!(
-        apex.stdout.contains("BLOCKED"),
+        !apex.stdout.contains("200"),
         "the apex is not `*.example.com`, so it must not match: {apex:?}"
     );
 

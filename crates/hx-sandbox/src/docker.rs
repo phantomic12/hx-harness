@@ -117,6 +117,11 @@ pub fn to_host_config(settings: &HostSettings) -> HostConfig {
         },
         security_opt: Some(settings.security_opt.clone()),
         network_mode: Some(settings.network_mode.clone()),
+        dns: if settings.dns.is_empty() {
+            None
+        } else {
+            Some(settings.dns.clone())
+        },
         pids_limit: Some(settings.pids_limit),
         nano_cpus: Some(settings.nano_cpus),
         memory: Some(settings.memory_bytes),
@@ -211,8 +216,27 @@ impl SandboxRuntime for DockerRuntime {
             // The sandbox rides only the internal network — no gateway, so the *only* way out is
             // the proxy sidecar, which enforces the allowlist. See `crate::egress`.
             effective.network_mode = proxy.network.clone();
+            // No `dns` override. Docker's `Dns` field takes IP addresses, not `host:port`, so a
+            // sidecar cannot be named as the resolver — the attempt is rejected by the daemon with
+            // `ParseAddr("hxproxy:3128")`, which is how this was found. It is also unnecessary: the
+            // sandbox resolves the *proxy* by its network alias through Docker's embedded DNS on
+            // the user-defined network, and every other name is resolved by the proxy itself, which
+            // sits on the bridge with the host's normal resolution.
         }
-        let body = to_container_config(spec, &effective);
+        let mut spec = spec.clone();
+        if let Some(proxy) = &egress {
+            // Point the tools *inside* the sandbox at the proxy. Without this the sidecar exists,
+            // admits what it should, and nothing ever talks to it: every client in the sandbox
+            // tries the direct route, which the internal network has already denied.
+            let url = proxy.url();
+            for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+                spec.env.push((key.to_string(), url.clone()));
+            }
+            // `NO_PROXY` must not swallow the alias itself, or a tool reaching the proxy by name
+            // would be sent direct and blocked.
+            spec.env.push(("NO_PROXY".to_string(), String::new()));
+        }
+        let body = to_container_config(&spec, &effective);
 
         let response = match self
             .docker

@@ -252,7 +252,9 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
   nothing else. A sandbox with no allowlist still has no network at all. CIDRs and raw IPs are still
   *refused* (`SpecError::EgressNotEnforced`) — the proxy decides a `CONNECT` target by name, so
   accepting an address would be a half-enforced allowlist that looks permitted and never connects.
-  The three live tests for this have not yet been run against a real Docker daemon.
+  The live tests run against a real Docker daemon: an allowed host is relayed and a denied one is
+  refused, a wildcard admits the subdomain but not the apex, and a sandbox with no allowlist has no
+  network at all.
 - **Keyless scraping that survives a bot wall.** DuckDuckGo, Mojeek and public SearXNG instances
   now serve a challenge to a plain HTTP client — a TLS-fingerprint problem, not a markup one, and
   one no amount of parsing fixes. The harness reports it per backend rather than returning an empty

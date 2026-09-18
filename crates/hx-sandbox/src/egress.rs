@@ -47,10 +47,15 @@ use bollard::Docker;
 use hx_core::error::{HxError, Result};
 
 /// The port the proxy listens on inside its sidecar, on the internal network.
+///
+/// 3128 is the conventional proxy port, and it has to stay in step with the proxy binary's
+/// `LISTEN_ADDR`. A mismatch would leave the sandbox holding a proxy variable that points at nothing,
+/// which surfaces inside the sandbox as a connection error rather than as anything naming the cause.
 pub const PROXY_PORT: u16 = 3128;
 /// The name the sidecar is known by on the internal network — a fixed, non-colliding alias the
 /// sandbox can resolve without knowing the sidecar's generated container id.
 pub const PROXY_ALIAS: &str = "hxproxy";
+
 /// The default-bridge network every sandbox proxy rides on to reach the internet.
 const OUTER_NETWORK: &str = "bridge";
 /// The image the proxy sidecar runs. Ubuntu 24.04 is used both for the sandbox and here, so a
@@ -65,6 +70,18 @@ pub struct EgressProxy {
     pub network: String,
     /// The proxy sidecar container's name.
     pub container: String,
+    /// `host:port` of the proxy as seen *from the sandbox*, i.e. by its network alias.
+    ///
+    /// Not the container name and not an IP: the alias is stable across restarts of the sidecar,
+    /// which the container name would not be, and an IP would change with the network.
+    pub endpoint: String,
+}
+
+impl EgressProxy {
+    /// The proxy URL to hand a tool inside the sandbox.
+    pub fn url(&self) -> String {
+        format!("http://{}", self.endpoint)
+    }
 }
 
 /// Create the internal network and the proxy sidecar for one sandbox.
@@ -112,7 +129,13 @@ pub async fn setup(
         cmd: Some(vec!["/hx-egress-proxy".to_string()]),
         env: Some(vec![format!("HX_EGRESS_ALLOW={allow_env}")]),
         host_config: Some(HostConfig {
-            network_mode: Some(network.clone()),
+            // `network_mode` is deliberately left unset — and it must not be set to `"none"`
+            // either. Docker refuses to connect a container to a user network once its network
+            // mode is fixed, with "container cannot be connected to multiple networks with one of
+            // the networks in private (none) mode"; the sidecar then sits on no useful network,
+            // never registers its alias, and the sandbox's `HTTP_PROXY` names a host that does not
+            // resolve. Omitting the field lets the default (bridge) apply, after which both
+            // networks are joined below.
             // Mount the proxy binary at a fixed path. Read-only-visible in the container; it is
             // the enforcement code, so the sandbox (which shares no mounts with the sidecar anyway)
             // must never be able to modify it.
@@ -167,7 +190,11 @@ pub async fn setup(
 
     // Alias the sidecar on the internal network so the sandbox can resolve it as `PROXY_ALIAS`
     // without knowing the generated container id.
-    let _ = docker
+    //
+    // The error is *not* discarded. An unaliased sidecar is unreachable by name, so the sandbox's
+    // `HTTP_PROXY` points at nothing and every tool inside it fails to connect — a total egress
+    // outage whose cause is a swallowed error 40 lines away. Failing the create names it instead.
+    if let Err(e) = docker
         .connect_network(
             &network,
             NetworkConnectRequest {
@@ -178,7 +205,23 @@ pub async fn setup(
                 }),
             },
         )
-        .await;
+        .await
+    {
+        let _ = docker
+            .remove_container(
+                container.as_str(),
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        let _ = docker.remove_network(&network).await;
+        return Err(HxError::Sandbox(format!(
+            "the egress proxy '{container}' could not be aliased as '{PROXY_ALIAS}' on \
+             '{network}': {e}"
+        )));
+    }
 
     // 3. Start the proxy. It needs to be up before the sandbox is attached, or the sandbox's
     //    first request races a not-yet-listening socket.
@@ -201,7 +244,11 @@ pub async fn setup(
         )));
     }
 
-    Ok(EgressProxy { network, container })
+    Ok(EgressProxy {
+        network,
+        container,
+        endpoint: format!("{PROXY_ALIAS}:{PROXY_PORT}"),
+    })
 }
 
 /// Remove the proxy sidecar and the internal network for a sandbox.

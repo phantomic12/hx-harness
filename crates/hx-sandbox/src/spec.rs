@@ -264,6 +264,7 @@ impl SandboxSpec {
             userns_mode: None,
             tmpfs: Vec::new(),
             binds: Vec::new(),
+            dns: Vec::new(),
         };
 
         match self.isolation {
@@ -360,6 +361,14 @@ pub struct HostSettings {
     pub userns_mode: Option<String>,
     pub tmpfs: Vec<(String, String)>,
     pub binds: Vec<String>,
+    /// `HostConfig.Dns`: name servers the container uses, by IP.
+    ///
+    /// Empty means the engine default, which is what every sandbox uses today: Docker's `Dns` field
+    /// accepts addresses and not `host:port`, so a proxy sidecar cannot be named here. Kept as a
+    /// field because an IP-address resolver is a legitimate future need, and an empty one is a
+    /// no-op rather than a wrong answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns: Vec<String>,
 }
 
 impl HostSettings {
