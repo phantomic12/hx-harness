@@ -38,6 +38,33 @@ pub struct Config {
     pub search: SearchConfig,
     #[serde(default)]
     pub agent: AgentConfig,
+    #[serde(default)]
+    pub terminal: TerminalConfig,
+}
+
+/// The server-side terminal: what a client's `POST /v1/terminals` runs when it does not say.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TerminalConfig {
+    /// The shell a new terminal starts.
+    ///
+    /// Configurable rather than hardcoded because the right answer depends on the machine: a
+    /// daemon on a minimal image has no `bash`, and one on a developer host usually wants it.
+    #[serde(default = "default_terminal_shell")]
+    pub shell: String,
+}
+
+fn default_terminal_shell() -> String {
+    // `$SHELL` if the daemon inherited one, else `/bin/sh`, which POSIX guarantees exists. Reading
+    // the environment here rather than at spawn keeps the default visible in a dumped config.
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self {
+            shell: default_terminal_shell(),
+        }
+    }
 }
 
 impl Config {
