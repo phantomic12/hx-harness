@@ -29,10 +29,30 @@ use hx_search::{Recency, SearchQuery};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+/// The web client: one self-contained page.
+///
+/// `include_str!` rather than a runtime read, so the binary is the whole daemon and a deployment
+/// cannot half-succeed (a working API with a missing UI, or a UI from an older build).
+const WEB_CLIENT: &str = include_str!("../static/index.html");
+
+async fn web_client() -> impl IntoResponse {
+    // `text/html` and not `text/plain`, or a browser renders the source. No cache header games: the
+    // page is small, and a stale front end against a newer daemon is exactly the mismatch this
+    // embedding is meant to make impossible.
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        WEB_CLIENT,
+    )
+}
+
 /// Build the application router.
 pub fn app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        // The web client, served at the root. Embedded in the binary rather than read from a path:
+        // a daemon that needs a `--static-dir` to be useful is one that is broken by default, and a
+        // front end that can drift from the build that serves it is worse.
+        .route("/", get(web_client))
         .route("/v1/status", get(status))
         .route("/v1/pools", get(pools))
         .route("/v1/hosts", get(hosts))
