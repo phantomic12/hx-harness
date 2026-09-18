@@ -11,3 +11,4 @@
 .idea/
 .vscode/
 *.swp
+tmp/
