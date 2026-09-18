@@ -259,7 +259,29 @@ def main():
         "the page does not render either sandbox state",
     )
 
-    # 11. Deleting the terminal, as the page does not do but a cleanup must.
+    # 11. The hosts pane's endpoint, and that the served page actually renders hosts. `/v1/hosts`
+    # returns HostSummary entries (id, kind, address, description, configured) — not os/shell, which
+    # the daemon does not expose over HTTP, so the page must render the fields it does return and
+    # say so when a host is declared but not configured rather than drawing an empty list.
+    status, body = http("GET", "/v1/hosts")
+    ok = status == 200 and isinstance(json.loads(body or "[]"), list)
+    check("GET /v1/hosts returns a list", ok, f"{status} {body[:160]}")
+    status, body = http("GET", "/v1/hosts")
+    hosts = json.loads(body or "[]")
+    if hosts:
+        first = hosts[0]
+        check(
+            "each host carries id/kind/configured",
+            all(k in first for k in ("id", "kind", "configured")),
+            f"missing keys: {list(first.keys())}",
+        )
+    else:
+        print("SKIP  host shape (no hosts returned by this daemon)")
+    _, page = http("GET", "/")
+    for marker in ("/v1/hosts", "id=\"hosts\"", "No hosts are configured."):
+        check(f"the page renders the hosts pane ({marker})", marker in page, "missing from the served page")
+
+    # 12. Deleting the terminal, as the page does not do but a cleanup must.
     status, _ = http("DELETE", "/v1/terminals/ui-term")
     check("DELETE /v1/terminals/{id}", status == 200, str(status))
 

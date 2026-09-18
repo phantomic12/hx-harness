@@ -144,4 +144,8 @@ async fn the_root_serves_the_web_client_as_html() {
         body.contains("/v1/sessions/") && body.contains("since_seq"),
         "the page must resume the session stream rather than restart it"
     );
+    assert!(
+        body.contains("/v1/hosts") && body.contains("No hosts are configured."),
+        "the page must render the hosts pane from the real /v1/hosts route"
+    );
 }
