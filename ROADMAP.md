@@ -114,17 +114,34 @@ killed an idle daemon while looking like a pass).
   store — no duplicates, no gaps — because every live event carries the store sequence `chat::write_events`
   assigned it. Tested end to end in `crates/hx-server/tests/ws_api.rs` against a real socket: two
   clients on one session both receive the same events, and a reconnecting client proves no-dup/no-gap.
-- `hx-server`: axum, REST + `/ws/agent/:session` + `/ws/term/:id` + `/ws/events`
-- Server-side PTY via `portable-pty`, attach/detach, scrollback retained in `hxd` — **not yet**;
-  the events half above is done, the PTY/terminal attach over the same WebSocket is M2's second half.
-- Frontend: xterm.js terminal, chat/stream pane, workspace file tree, diff/review pane
+- ✅ **A server-side terminal** — `POST /v1/terminals`, `GET /v1/terminals/{id}/ws`, `DELETE
+  /v1/terminals/{id}`. The PTY lives in `hxd` and outlives every client, so an attach is a *join*: a
+  browser and a TUI reach one shell and see the same bytes, and closing either leaves it running.
+  Output arrives as scrollback-then-live as separate frames, base64 because a terminal is
+  byte-oriented; scrollback is capped on write so a runaway producer cannot exhaust memory; the
+  shell exiting is its own frame, because a stream that simply stops is indistinguishable from a
+  hung shell. Per the roadmap's own preference for a self-contained service this uses `nix` (already
+  in the lock, and a PTY is four libc calls) rather than `portable-pty`, which is not vendored.
+- `hx-server`: axum, REST + `/v1/sessions/{id}/ws` + `/v1/terminals/{id}/ws`
+- ✅ **A web client** — one self-contained page served by the daemon at `/` (`include_str!`, so the
+  binary is the whole daemon and a deploy cannot half-succeed), xterm.js on a CDN, no build step.
+  It is a client in the strict sense: the terminal is created once under a fixed id and reattached,
+  so a refresh rejoins the running shell; the session socket resumes with `since_seq` so a reconnect
+  renders the gap rather than the whole history.
+- Frontend, still to come: a workspace file tree, a diff/review pane, and the approval queue
 - **Two clients on one session simultaneously** (TUI + browser) — this is the real test that
   the daemon/client split is honest and not cosmetic
 
 **Exit criteria:** open a browser terminal to a shell, run a command, watch the same bytes in
-the TUI; then send an agent prompt from the browser and see it stream in both. **The events half is
-proven** (two WebSocket clients, and a browser SSE run plus a WebSocket client, both see the same
-session stream); the *terminal* half — the shell attach — is what remains.
+the TUI; then send an agent prompt from the browser and see it stream in both. **Both halves are
+proven at the protocol level.** The events half: two WebSocket clients on one session, and a browser
+SSE run plus a WebSocket client, seeing the same stream (`tests/ws_api.rs`). The terminal half: two
+clients on one shell receiving the same bytes, a late client sent the scrollback, and a detached
+client leaving the shell running (`tests/terminal_api.rs` for the socket, `tests/terminal.rs` for the
+PTY, and `scripts/check_web_client.py` against a live daemon, which drives the exact frames the page
+sends). What is *not* yet exercised is a real TUI and a real browser against one session at the same
+moment: the browser stack was unavailable, so the page's protocol was driven directly rather than
+through a rendered page.
 
 ---
 

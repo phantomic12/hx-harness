@@ -65,11 +65,25 @@ $ curl -s localhost:7717/v1/status | jq .pools
 | Daemon (`hxd`) + HTTP API + CLI (`hx`) | **Done**, runnable |
 | Tools (`hx-tools`) + the agent loop (`hx-agent`) | **Built** — seven tools, and a loop that classifies every call against the capability token and then the approval policy; 26 tests pin the gate down against a scripted model (`crates/hx-agent/tests/loop.rs`). `delete` moves a named path to the XDG trash rather than unlinking it, and a destructive prompt carries what will be gone — the resolved path, its entry count, its bytes — because the tool measures the target before anyone is asked |
 | Sessions (`hx-store`) | **Built** — SQLite: create, resume, list, rename, delete, export (JSON/Markdown), events, usage totals. A transcript that ended mid-call is *repaired*, not sent to a provider that would reject it |
-| Web UI, Tauri desktop/mobile, chat connectors | **Not started** — the per-session WebSocket event stream (M2's first half) is built and tested; the browser UI, the PTY/terminal attach, and the connectors are not |
+| Web UI, Tauri desktop/mobile, chat connectors | **Partly built** — the daemon serves a browser client at `/` (terminal + session stream, no build step), the per-session WebSocket event stream is built and tested, and the server-side terminal is built and tested. The file tree, the diff pane, the approval queue, Tauri, and the connectors are not built |
 | MCP client, browser-automation pool | **Not started** |
 | The loop wired into `hxd` and `hx`: `POST /v1/chat`, `hx chat`, session routes over `hx-store` | **Built** — one request runs the loop against a session: the prompt is stored before the model is called, the role decides the model, credentials come from a `store:name` reference, events are written as they happen, and a transcript that ended mid-call is repaired before it is sent. Twenty tests drive the **real loop over the real HTTP surface**; model replies are scripted and sandbox engine calls use a recording runtime. `hx chat --sandbox-profile dev` selects a configured shell boundary; missing or failed boundaries never fall back to host execution |
 
 ---
+
+## The terminal is the daemon's, not the client's
+
+`POST /v1/terminals` starts a shell in `hxd`; `GET /v1/terminals/{id}/ws` attaches to it. An attach
+is a *join*, not an open: the PTY outlives every client, so a browser and a TUI can be on one shell
+at the same time and see the same bytes, and closing either one leaves it running. That is the
+concrete form of the split this project is built around, and it is why the terminal is not a frame on
+the session event stream — that stream is an ordered, stored, resumable, one-way log, and a terminal
+is none of those things.
+
+Output is base64 in both directions because a terminal is byte-oriented: escape sequences and partial
+UTF-8 sequences split across reads have to survive exactly, and a JSON string cannot carry them. The
+scrollback is capped on write, so a runaway producer cannot exhaust memory, and the shell exiting is
+sent as its own frame — a stream that simply stops is indistinguishable from a hung shell.
 
 ## The one thing to understand first
 
