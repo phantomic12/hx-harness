@@ -78,6 +78,34 @@
   }
   .composer button:disabled { opacity: .5; cursor: default; }
   .error { color: var(--bad); font-size: 12px; padding: 0 12px 8px; }
+  .scroll { flex: 1; overflow-y: auto; min-height: 0; }
+  .approval { border-bottom: 1px solid var(--line); padding: 10px 12px; }
+  .approval .risk {
+    display: inline-block; font-size: 10px; text-transform: uppercase; letter-spacing: .6px;
+    font-weight: 700; padding: 2px 6px; border-radius: 3px; margin-bottom: 6px;
+  }
+  .risk.low { background: rgba(125,220,138,.15); color: var(--good); }
+  .risk.medium { background: rgba(255,208,110,.15); color: #ffd06e; }
+  .risk.high, .risk.critical { background: rgba(255,128,128,.18); color: var(--bad); }
+  .approval .tool { font-weight: 600; }
+  .approval .summary { color: var(--text); margin: 4px 0; font-size: 13px; }
+  .approval .reason { color: var(--dim); font-size: 12px; }
+  .approval .undo { color: var(--dim); font-size: 12px; font-style: italic; margin-top: 3px; }
+  .approval .opts { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+  .approval .opts button {
+    font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 4px; cursor: pointer;
+    background: transparent; color: var(--text); border: 1px solid var(--line);
+  }
+  .approval .opts button:hover { border-color: var(--accent); }
+  .approval .opts button.deny { color: var(--bad); }
+  .approval .opts button.deny:hover { border-color: var(--bad); }
+  .empty { color: var(--dim); font-size: 12px; padding: 12px; }
+  .sandbox {
+    padding: 6px 12px; font-size: 12px; color: var(--dim);
+    border-bottom: 1px solid var(--line); flex: none;
+  }
+  .sandbox .live { color: var(--good); }
+  .sandbox .off { color: var(--bad); }
 </style>
 </head>
 <body>
@@ -89,6 +117,12 @@
   <section class="pane">
     <h2>terminal<span><button id="new-term">new</button></span></h2>
     <div id="terminal"></div>
+  </section>
+  <section class="pane">
+    <h2>approvals<span id="approval-count"></span></h2>
+    <div id="sandbox-status" class="sandbox"></div>
+    <div id="approvals" class="scroll"></div>
+    <div class="error" id="approval-error"></div>
   </section>
   <section class="pane">
     <h2>session<span id="session-label"></span></h2>
@@ -351,6 +385,168 @@ async function sendPrompt() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Approvals
+
+// Polled rather than pushed. An approval is rare and a second of latency costs nothing, while a
+// push channel would be a second socket to keep alive and reconnect for something that mostly has
+// nothing to say. If this ever polls a busy daemon, that trade should be revisited — not before.
+const APPROVAL_POLL_MS = 2000;
+let approvalTimer = null;
+
+/// The sandbox state, shown above the approval list.
+///
+/// It sits here because the two are read together: an approval is often *about* running something,
+/// and whether the daemon can run it at all — no container engine, or every slot taken — is the
+/// context that decides how to answer. Hidden when unavailable is the wrong call: "sandboxes are
+/// off" is exactly what a person needs to know before wondering why their build never starts.
+async function pollSandboxes() {
+  const host = $("sandbox-status");
+  try {
+    // `/v1/status`, not `/v1/sandboxes`: the latter returns the list of *live containers*, while
+    // the summary this strip renders — availability, slots, the reason — is part of the status
+    // snapshot. Reading the list route would leave the strip permanently blank, which looks the
+    // same as a daemon with no container engine.
+    const res = await fetch(`${API}/v1/status`);
+    if (!res.ok) throw new Error(`${res.status}`);
+    const s = (await res.json()).sandboxes || {};
+    host.innerHTML = "";
+    const span = document.createElement("span");
+    if (s.available) {
+      span.className = "live";
+      const slots = s.free_slots === undefined || s.free_slots === null ? "?" : s.free_slots;
+      const max = s.max_concurrent === undefined || s.max_concurrent === null ? "?" : s.max_concurrent;
+      span.textContent = `sandboxes: ${s.live} live, ${slots}/${max} slots free`;
+    } else {
+      span.className = "off";
+      // The reason is shown verbatim. "unavailable" alone sends someone to read logs; the daemon
+      // already knows why — a missing socket, no engine — and that sentence is the whole value here.
+      span.textContent = `sandboxes unavailable${s.reason ? `: ${s.reason}` : ""}`;
+    }
+    host.appendChild(span);
+  } catch (e) {
+    host.textContent = `sandbox state unknown: ${e.message || e}`;
+  }
+}
+
+async function pollApprovals() {
+  try {
+    const res = await fetch(`${API}/v1/approvals`);
+    if (!res.ok) throw new Error(`${res.status}`);
+    const items = await res.json();
+    renderApprovals(Array.isArray(items) ? items : []);
+    $("approval-error").textContent = "";
+  } catch (e) {
+    $("approval-error").textContent = `approvals unavailable: ${e.message || e}`;
+  }
+}
+
+function renderApprovals(items) {
+  const host = $("approvals");
+  $("approval-count").textContent = items.length ? `${items.length}` : "";
+  // Rebuilt wholesale: the list is small and every field can change, so a diff would be more
+  // machinery than the thing it optimises.
+  host.innerHTML = "";
+  if (items.length === 0) {
+    const p = document.createElement("div");
+    p.className = "empty";
+    p.textContent = "Nothing waiting.";
+    host.appendChild(p);
+    return;
+  }
+  for (const req of items) host.appendChild(renderApproval(req));
+}
+
+function renderApproval(req) {
+  const el = document.createElement("div");
+  el.className = "approval";
+
+  const risk = document.createElement("span");
+  const riskClass = (req.risk || "medium").toString().toLowerCase();
+  risk.className = `risk ${riskClass}`;
+  // The risk class is a *string* here because the serialised enum may be a name or a tagged object;
+  // rendering it plainly beats rendering `undefined` for a shape this does not recognise.
+  risk.textContent = riskClass;
+  el.appendChild(risk);
+
+  const tool = document.createElement("div");
+  tool.className = "tool";
+  tool.textContent = req.tool || "tool";
+  el.appendChild(tool);
+
+  const summary = document.createElement("div");
+  summary.className = "summary";
+  summary.textContent = req.summary || "";
+  el.appendChild(summary);
+
+  const reason = document.createElement("div");
+  reason.className = "reason";
+  // The reason is the point of the pane: a prompt with no reason is one a person cannot answer
+  // without guessing, and guessing is how a "yes" gets given to something nobody understood.
+  reason.textContent = req.reason || "no reason given";
+  el.appendChild(reason);
+
+  if (req.undo) {
+    const undo = document.createElement("div");
+    undo.className = "undo";
+    undo.textContent = `undo: ${req.undo}`;
+    el.appendChild(undo);
+  } else if (req.reversible === false) {
+    const undo = document.createElement("div");
+    undo.className = "undo";
+    // Said explicitly, because "no undo line" must not read as "there is nothing more to know".
+    undo.textContent = "this cannot be undone";
+    el.appendChild(undo);
+  }
+
+  const opts = document.createElement("div");
+  opts.className = "opts";
+  // The wire values the daemon's route accepts, with the label a person reads. Kept as an explicit
+  // table rather than passing through whatever the request carried: the route rejects anything
+  // outside `once|chat|always|deny`, so sending the serialised option back would turn a working
+  // button into a 400 depending on which enum shape the daemon happened to serialise.
+  const OPTIONS = [
+    { value: "once", label: "Allow once" },
+    { value: "chat", label: "Allow for this chat" },
+    { value: "always", label: "Always allow" },
+    { value: "deny", label: "Deny" },
+  ];
+  // Only the options the daemon actually offered, so the pane cannot present a choice the policy
+  // engine does not intend to honour.
+  const offered = new Set(
+    (req.options || []).map((o) =>
+      (typeof o === "string" ? o : o.option || o.value || o.label || "").toString().toLowerCase()
+    )
+  );
+  const known = (v) => offered.size === 0 || [...offered].some((o) => o.includes(v));
+  for (const option of OPTIONS) {
+    if (!known(option.value)) continue;
+    const btn = document.createElement("button");
+    btn.textContent = option.label;
+    if (option.value === "deny") btn.className = "deny";
+    btn.addEventListener("click", () => answerApproval(req.id, option.value));
+    opts.appendChild(btn);
+  }
+  el.appendChild(opts);
+  return el;
+}
+
+async function answerApproval(id, option) {
+  try {
+    const res = await fetch(`${API}/v1/approvals/${encodeURIComponent(id)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ option, by: "web" }),
+    });
+    if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+    // Answered immediately rather than waiting for the next poll, so the card does not sit there
+    // looking unanswered after it has been decided.
+    await pollApprovals();
+  } catch (e) {
+    $("approval-error").textContent = `could not answer: ${e.message || e}`;
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Boot
 
 (async function main() {
@@ -364,6 +560,14 @@ async function sendPrompt() {
     try { await ensureTerminal(); } catch (e) { showError(String(e.message || e)); }
   }
   try { await ensureSession(); } catch (e) { showError(String(e.message || e)); }
+  // Polled for the page's lifetime: an approval can arrive with no other activity, so there is no
+  // event to hang the refresh off.
+  await Promise.all([pollApprovals(), pollSandboxes()]);
+  approvalTimer = setInterval(() => {
+    pollApprovals();
+    pollSandboxes();
+  }, APPROVAL_POLL_MS);
+  window.addEventListener("beforeunload", () => clearInterval(approvalTimer));
 })();
 
 $("prompt").addEventListener("keydown", (e) => { if (e.key === "Enter") sendPrompt(); });

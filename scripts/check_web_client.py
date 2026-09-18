@@ -219,7 +219,47 @@ def main():
     b.close()
     c.close()
 
-    # 8. Deleting the terminal, as the page does not do but a cleanup must.
+    # 8. The approvals pane's endpoint. The page polls this and renders what it says, so the shape
+    # matters: a list (possibly empty), not an error. An empty list is the normal state and must
+    # read as "nothing waiting" rather than as a failure.
+    status, body = http("GET", "/v1/approvals")
+    ok = status == 200 and isinstance(json.loads(body or "[]"), list)
+    check("GET /v1/approvals returns a list", ok, f"{status} {body[:120]}")
+
+    # 9. The approval page carries the risk/reason/undo fields the pane renders. Asserted against
+    # the served page because a pane that cannot show *why* something is being asked for is a pane
+    # that gets answered by guessing.
+    _, page = http("GET", "/")
+    for field in ("risk", "reason", "undo", "reversible"):
+        check(f"the page renders the approval's {field}", field in page, "missing from the served page")
+
+    # 10. The container pane's endpoint, and that the served page renders its two states. The
+    # "unavailable" branch matters as much as the live one: a daemon with no container engine must
+    # say so, not show an empty list that reads as "nothing running".
+    # The summary lives on `/v1/status`; `/v1/sandboxes` is the list of live containers. Asserted
+    # against the route the page actually reads, because reading the wrong one is a bug that shows
+    # up as a blank strip rather than as an error.
+    status, body = http("GET", "/v1/status")
+    payload = json.loads(body or "{}").get("sandboxes")
+    check(
+        "GET /v1/status reports sandbox availability",
+        status == 200 and isinstance(payload, dict) and "available" in payload,
+        f"{status} {body[:160]}",
+    )
+    status, body = http("GET", "/v1/sandboxes")
+    check(
+        "GET /v1/sandboxes returns the live list",
+        status == 200 and isinstance(json.loads(body or "[]"), list),
+        f"{status} {body[:120]}",
+    )
+    _, page = http("GET", "/")
+    check(
+        "the page renders the sandbox state",
+        "sandboxes unavailable" in page and "slots free" in page,
+        "the page does not render either sandbox state",
+    )
+
+    # 11. Deleting the terminal, as the page does not do but a cleanup must.
     status, _ = http("DELETE", "/v1/terminals/ui-term")
     check("DELETE /v1/terminals/{id}", status == 200, str(status))
 
