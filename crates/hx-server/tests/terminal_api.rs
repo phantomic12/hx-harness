@@ -155,6 +155,23 @@ where
     panic!("never saw {what}; frames seen were {seen:?}");
 }
 
+/// Whether a single frame's decoded payload contains `needle`.
+///
+/// Used as a `read_until` predicate so a test waits for the *content* it asserts on rather than for
+/// the first frame of a type. A shell prints its own initialisation before any command output, so
+/// "an output frame arrived" is not the same as "the thing I am about to assert on has arrived" —
+/// the difference is a test that passes on a warm machine and fails on a loaded one.
+fn marker_present(frame: &serde_json::Value, needle: &str) -> bool {
+    use base64::Engine as _;
+    let Some(data) = frame["data"].as_str() else {
+        return false;
+    };
+    base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map(|bytes| String::from_utf8_lossy(&bytes).contains(needle))
+        .unwrap_or(false)
+}
+
 /// Decode the base64 `data` of the first frame of `kind`, concatenated.
 fn data_of(frames: &[serde_json::Value], kind: &str) -> String {
     use base64::Engine as _;
@@ -215,12 +232,16 @@ async fn two_clients_attach_to_one_terminal_and_both_see_the_same_bytes() {
     .await
     .expect("input must be sent");
 
+    // Read until the *marker*, not merely until an `output` frame: a busybox/dash shell emits its
+    // own initialisation (bracketed-paste mode is `\x1b[?2004h`) before it echoes anything, so
+    // stopping at the first output frame is a race against how fast the shell starts — it passes on
+    // a warm machine and fails on a loaded one.
     let a_saw = read_until(&mut a, "client A to see the echo", |f| {
-        f["type"] == "output"
+        f["type"] == "output" && marker_present(f, "both-clients-see-this")
     })
     .await;
     let b_saw = read_until(&mut b, "client B to see the echo", |f| {
-        f["type"] == "output"
+        f["type"] == "output" && marker_present(f, "both-clients-see-this")
     })
     .await;
 
@@ -272,19 +293,14 @@ async fn a_late_client_is_sent_the_scrollback_before_any_live_output() {
     // Read until the *marker* appears, not merely until a frame of type `output` does: a pty echoes
     // the typed command back before the command's own output, so stopping at the first output frame
     // would assert against the echo of the input rather than on what the shell printed.
+    // Wait for the marker itself, not for an `output` frame and not for the echo: the shell prints
+    // its own initialisation first and echoes the typed line next, so a test that asserts on the
+    // first frame is asserting on neither of the things it cares about.
     let frames = read_until(&mut first, "the command's output", |f| {
-        f["type"] == "output"
+        f["type"] == "output" && marker_present(f, "before-you-arrived")
     })
     .await;
-    let mut text = data_of(&frames, "output");
-    while !text.contains("before-you-arrived") {
-        let more = read_until(&mut first, "the command's output", |f| {
-            f["type"] == "output"
-        })
-        .await;
-        text.push_str(&data_of(&more, "output"));
-    }
-    assert!(text.contains("before-you-arrived"), "saw {text:?}");
+    assert!(data_of(&frames, "output").contains("before-you-arrived"));
     drop(first);
 
     // A client attaching *after* the output exists is sent it as scrollback — not as live output,
@@ -396,7 +412,7 @@ async fn a_detached_client_leaves_the_shell_running_for_the_next_one() {
             .await
             .expect("input");
         let frames = read_until(&mut first, "the first session's output", |f| {
-            f["type"] == "output"
+            f["type"] == "output" && marker_present(f, "first-session")
         })
         .await;
         assert!(data_of(&frames, "output").contains("first-session"));
