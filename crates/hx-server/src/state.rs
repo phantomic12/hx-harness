@@ -327,6 +327,111 @@ impl AppState {
         ))
     }
 
+    /// Resolve a host id to something that can be driven.
+    ///
+    /// Delegates to [`crate::hosts::resolve`], which reads the credential from the vault at connect
+    /// time. This is the only way a route or tool obtains a remote handle.
+    pub async fn resolve_host(&self, id: &str) -> Result<Arc<dyn hx_remote::Host>> {
+        crate::hosts::resolve(&self.config, &self.secrets, id).await
+    }
+
+    /// Whether a command on `id` would be refused, and why.
+    ///
+    /// `None` means the policy does not deny it. This is *not* "it is allowed": an [`Verdict::Ask`]
+    /// returns `None` here, because a prompt is not a refusal and the caller decides what to do with
+    /// it. The distinction matters on the HTTP surface, where there is no one to answer a prompt —
+    /// see [`AppState::host_denial_for`], which is what the routes use.
+    pub fn host_denial(&self, id: &str) -> Option<String> {
+        // Resolving the *name* is itself subject to policy: a host that is not in the allow list at
+        // all cannot be looked at, let alone reached.
+        self.policy_verdict_for(host_lookup_request(id))
+            .and_then(|v| match v {
+                hx_core::approval::Verdict::Deny { why } => Some(why),
+                _ => None,
+            })
+    }
+
+    /// Whether `action` on `id` would be refused, and why, for a route that can only allow or deny.
+    ///
+    /// A [`Verdict::Ask`] is reported as a denial *with an explanation*, because these routes have no
+    /// approver attached: the request arrives over HTTP and the response goes back to it, so there is
+    /// nobody positioned to answer a prompt. Refusing is the honest outcome — an `Ask` that silently
+    /// proceeded would be the policy failing open, and an `Ask` that hung would be a request that
+    /// never returns. The message says which knob would allow it, so the operator can act rather than
+    /// guess.
+    pub fn host_denial_for(&self, id: &str, action: hx_core::capability::Action) -> Option<String> {
+        self.host_denial_request(id, host_action_request(id, action))
+    }
+
+    /// Whether running `command` on `id` would be refused, and why.
+    ///
+    /// The command goes through the *real* classifier (`ActionRequest::shell`), the same one an agent
+    /// run uses, so `ls` and `rm -rf /` are classified differently here exactly as they are there.
+    /// Hand-picking a risk class per route would have made every command on every host equally
+    /// dangerous, which is both wrong and useless: it refuses `hostname` at the default autonomy
+    /// level.
+    pub fn host_command_denial(&self, id: &str, command: &str) -> Option<String> {
+        let mut request = hx_core::approval::ActionRequest::shell(command);
+        // The command runs *on the host*, which is what the confinement axis reports. A rule written
+        // as `confined: true` therefore does not silently authorise this.
+        request.confined = hx_core::approval::Confinement::Host;
+        request.tool = "shell".to_string();
+        request.summary = format!("{command} (on host {id})");
+        self.host_denial_request(id, request)
+    }
+
+    /// Evaluate a prepared request against the policy, turning any non-allow into a reason.
+    fn host_denial_request(
+        &self,
+        id: &str,
+        request: hx_core::approval::ActionRequest,
+    ) -> Option<String> {
+        let label = request.risk.label();
+        match self.policy_verdict_for(request)? {
+            hx_core::approval::Verdict::Allow { .. } => None,
+            hx_core::approval::Verdict::Deny { why } => Some(why),
+            hx_core::approval::Verdict::Ask(_) => Some(format!(
+                "host {id:?} requires approval ({label}) but no approver is attached to this route; \
+                 allow it in the policy or run the command through a chat session, where a prompt can \
+                 be answered"
+            )),
+        }
+    }
+
+    /// Evaluate one request against the configured policy.
+    ///
+    /// The policy is rebuilt per call rather than cached: `.hx/allow.toml` is read from the
+    /// workspace at use time on the agent path, and a cached policy here would mean an edit to the
+    /// allowlist needed a daemon restart to take effect — the difference between a policy and a
+    /// suggestion. The fold is cheap.
+    fn policy_verdict_for(
+        &self,
+        request: hx_core::approval::ActionRequest,
+    ) -> Option<hx_core::approval::Verdict> {
+        let mut policy = self.config.agent.approval.clone().with_floor();
+        // The project allowlist, folded the same way `chat.rs` folds it. A malformed file is a hard
+        // error there and is treated as one here too: silently dropping a policy somebody relies on
+        // is the fail-open this must not do. The difference is that a route has to *report* it
+        // rather than abort a run, so it becomes a denial with the parse error in it.
+        let allow_path =
+            std::path::Path::new(&self.default_workspace()).join(hx_core::allowlist::ALLOW_FILE);
+        match hx_core::allowlist::AllowFile::load(&allow_path) {
+            Ok(list) => {
+                let mut rules = list.into_rules();
+                policy.allow.append(&mut rules);
+            }
+            Err(hx_core::allowlist::AllowlistError::NotFound(_)) => {}
+            Err(err) => {
+                return Some(hx_core::approval::Verdict::Deny {
+                    why: format!("cannot use {}: {err}", allow_path.display()),
+                })
+            }
+        }
+
+        let mut session = hx_core::approval::ApprovalSession::new(policy);
+        Some(session.decide(&request, chrono::Utc::now()))
+    }
+
     /// One combined snapshot for `/v1/status` and `hx status`.
     pub async fn status(&self, now: DateTime<Utc>) -> StatusReport {
         let router_status = self.router().status();
@@ -435,4 +540,62 @@ pub struct StatusReport {
     pub search_backends: Vec<String>,
     pub sandboxes: SandboxSummary,
     pub hosts: Vec<HostSummary>,
+}
+
+// ---------------------------------------------------------------------------
+// Host policy requests
+// ---------------------------------------------------------------------------
+//
+// A host route has to answer "may this be used?" through the same machinery an agent run uses, or
+// the policy would hold for the agent and not for the browser — and the browser is the surface a
+// person is more likely to point at a machine by accident.
+//
+// The requests below are built with `ActionRequest::tool` rather than a bespoke struct so the risk
+// classes, the rule keys, and the allow/deny matching are the agent's, not a second implementation
+// that could drift.
+
+/// The request for "may I look at this host at all".
+fn host_lookup_request(id: &str) -> hx_core::approval::ActionRequest {
+    hx_core::approval::ActionRequest::tool(
+        "host",
+        format!("look at host {id}"),
+        // Listing and describing is observation. It is `Read` even for a host whose credentials
+        // exist: no command runs and no byte of the remote filesystem is touched, so a policy that
+        // permits reading is enough to see the machine is there.
+        hx_core::approval::RiskClass::Read,
+        "reading host metadata",
+    )
+}
+
+/// The request for "may I do `action` to this host".
+///
+/// `Execute` is the strongest of the three actions the host routes need, so it maps to the risk class
+/// a shell command would carry. Read and write map to the matching class and no higher: a policy that
+/// allows reading a host should not be forced to allow running commands on it to browse a directory.
+fn host_action_request(
+    id: &str,
+    action: hx_core::capability::Action,
+) -> hx_core::approval::ActionRequest {
+    use hx_core::approval::{ActionRequest, RiskClass};
+    let label = action_label(action);
+    let (risk, reason) = match action {
+        hx_core::capability::Action::Read => (RiskClass::Read, "reading from a remote machine"),
+        hx_core::capability::Action::Write => (RiskClass::Mutate, "writing to a remote machine"),
+        _ => (RiskClass::External, "running a command on a remote machine"),
+    };
+    ActionRequest::tool("shell", format!("{label} on host {id}"), risk, reason)
+}
+
+/// A stable human name for an action, for messages a person reads.
+pub(crate) fn action_label(action: hx_core::capability::Action) -> &'static str {
+    use hx_core::capability::Action;
+    match action {
+        Action::Read => "read",
+        Action::Write => "write",
+        Action::Execute => "execute",
+        Action::Connect => "connect",
+        Action::Spawn => "spawn",
+        Action::Delete => "delete",
+        Action::Admin => "admin",
+    }
 }
