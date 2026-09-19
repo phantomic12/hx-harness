@@ -53,3 +53,4 @@ pub use host::{
 pub use known_hosts::{HostKeyVerdict, KnownHosts};
 pub use local::LocalHost;
 pub use ssh::{HostKeyDecision, HostKeyPolicy, SshAuth, SshHost};
+pub use winrm::{WinRmAuth, WinRmHost};

@@ -56,6 +56,15 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/pools", get(pools))
         .route("/v1/hosts", get(hosts))
+        // A host is a machine, not just a row: the detail route reports what it is (OS, shell, home,
+        // whether it has a PTY), which is what a client needs before it offers to browse or run.
+        .route("/v1/hosts/{id}", get(host_detail))
+        .route("/v1/hosts/{id}/files", get(host_list_dir))
+        .route(
+            "/v1/hosts/{id}/file",
+            get(host_read_file).put(host_write_file),
+        )
+        .route("/v1/hosts/{id}/exec", post(host_exec))
         .route("/v1/search", post(search))
         .route("/v1/sandboxes", get(list_sandboxes).post(spawn_sandbox))
         .route("/v1/sandboxes/{id}", delete(destroy_sandbox))
@@ -702,6 +711,414 @@ async fn session_audit(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hosts: the machine behind a name
+// ---------------------------------------------------------------------------
+//
+// These routes are the client-facing half of `crate::hosts`. They exist so the browser, the TUI, and
+// the CLI all reach a remote machine the same way, and so a machine the daemon can *talk* to is also
+// a machine a person can look at.
+//
+// Every one of them resolves the host through `crate::hosts::resolve`, which means the credential
+// comes from the vault at connect time and the transport is chosen from configuration rather than
+// from the URL. The route names a host; it never names a transport.
+
+/// A host, described well enough for a client to decide what to offer.
+#[derive(Debug, Serialize)]
+pub struct HostDetail {
+    pub id: String,
+    pub kind: String,
+    pub address: Option<String>,
+    pub configured: bool,
+    /// `None` when the machine could not be reached. Presence means the daemon actually connected,
+    /// so a client can trust `os`/`shell` rather than guessing from the name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub home_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_sftp: Option<bool>,
+    /// Why the machine could not be reached, when it could not. Present instead of a 5xx so a client
+    /// can still list hosts and show the one broken entry with its reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unreachable: Option<String>,
+    /// Whether a command would be refused by policy. Informational: the refusal itself is real and
+    /// happens on the exec route.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub denied: Option<String>,
+}
+
+async fn host_detail(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<HostDetail>, ApiError> {
+    let summary = state
+        .host_summaries()
+        .into_iter()
+        .find(|h| h.id == id)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                crate::hosts::unknown_host_message(&state.config, &id),
+            )
+        })?;
+
+    // A denial is reported *before* connecting. There is no point holding a handshake to a machine
+    // the caller may not use, and the reason is more useful than a connection error would be.
+    //
+    // The check is for `Read`, not for "lookup": describing a host means listing its directories and
+    // reading its files can follow, so it is the read capability that says whether this pane will
+    // work at all. A policy that denies shell but allows reading still shows the machine.
+    if let Some(reason) = state.host_denial_for(&id, hx_core::capability::Action::Read) {
+        return Ok(Json(HostDetail {
+            id: summary.id,
+            kind: summary.kind,
+            address: summary.address,
+            configured: summary.configured,
+            os: None,
+            shell: None,
+            arch: None,
+            home_dir: None,
+            has_sftp: None,
+            unreachable: None,
+            denied: Some(reason),
+        }));
+    }
+
+    match state.resolve_host(&id).await {
+        Ok(host) => {
+            let caps = host.caps();
+            Ok(Json(HostDetail {
+                id: summary.id,
+                kind: summary.kind,
+                address: summary.address,
+                configured: summary.configured,
+                os: Some(format!("{:?}", caps.os).to_lowercase()),
+                shell: Some(format!("{:?}", caps.shell).to_lowercase()),
+                arch: caps.arch.clone(),
+                home_dir: caps.home_dir.clone(),
+                has_sftp: Some(caps.has_sftp),
+                unreachable: None,
+                denied: None,
+            }))
+        }
+        Err(err) => Ok(Json(HostDetail {
+            id: summary.id,
+            kind: summary.kind,
+            address: summary.address,
+            configured: summary.configured,
+            os: None,
+            shell: None,
+            arch: None,
+            home_dir: None,
+            has_sftp: None,
+            unreachable: Some(err.to_string()),
+            denied: None,
+        })),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListDirQuery {
+    /// The directory to list. Absent means the host's home directory, which is the natural landing
+    /// spot and saves every client from having to discover it first.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DirListing {
+    pub host: String,
+    /// The path actually listed, after the home-directory default was applied. Echoed because a
+    /// client that asked for nothing needs to know where it ended up.
+    pub path: String,
+    pub entries: Vec<EntryOut>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EntryOut {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+async fn host_list_dir(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<ListDirQuery>,
+) -> Result<Json<DirListing>, ApiError> {
+    let host = resolve_for_use(&state, &id, hx_core::capability::Action::Read).await?;
+    // No path given: the home directory, which the caps already carry. A host with no known home
+    // gets an explicit error rather than an empty listing against a guess.
+    let path = match query.path {
+        Some(p) if !p.trim().is_empty() => p,
+        _ => host.caps().home_dir.clone().ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("host {id:?} has no known home directory; pass ?path="),
+            )
+        })?,
+    };
+
+    let entries = host
+        .list_dir(&path)
+        .await
+        .map_err(ApiError::from)?
+        .into_iter()
+        .map(|e| EntryOut {
+            name: e.name,
+            path: e.path,
+            is_dir: e.is_dir,
+            size: e.size,
+        })
+        .collect();
+
+    Ok(Json(DirListing {
+        host: id,
+        path,
+        entries,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FileQuery {
+    pub path: String,
+}
+
+/// A file's bytes, as text or base64.
+///
+/// `encoding` is reported rather than assumed. A binary file returned as lossy UTF-8 would look like
+/// a *corrupt* file to a client, so bytes that are not valid UTF-8 come back base64 and the client is
+/// told which it got. Text is the common case and stays readable in a plain `curl`.
+#[derive(Debug, Serialize)]
+pub struct FileBody {
+    pub host: String,
+    pub path: String,
+    pub size: u64,
+    pub encoding: String,
+    pub contents: String,
+}
+
+async fn host_read_file(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<FileQuery>,
+) -> Result<Json<FileBody>, ApiError> {
+    let host = resolve_for_use(&state, &id, hx_core::capability::Action::Read).await?;
+    let bytes = host.read_file(&query.path).await.map_err(ApiError::from)?;
+
+    let (encoding, contents) = match String::from_utf8(bytes.clone()) {
+        Ok(text) => ("utf-8".to_string(), text),
+        Err(_) => ("base64".to_string(), base64_encode(&bytes)),
+    };
+
+    Ok(Json(FileBody {
+        host: id,
+        path: query.path,
+        size: bytes.len() as u64,
+        encoding,
+        contents,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WriteFileBody {
+    pub path: String,
+    pub contents: String,
+    /// How to read `contents`. Defaults to utf-8, which is what a person editing a file produces;
+    /// a client round-tripping a binary file sends back `base64`.
+    #[serde(default)]
+    pub encoding: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WriteFileReply {
+    pub host: String,
+    pub path: String,
+    pub written: u64,
+}
+
+async fn host_write_file(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<WriteFileBody>,
+) -> Result<Json<WriteFileReply>, ApiError> {
+    let host = resolve_for_use(&state, &id, hx_core::capability::Action::Write).await?;
+
+    let bytes = match body.encoding.as_deref().unwrap_or("utf-8") {
+        "utf-8" | "utf8" => body.contents.into_bytes(),
+        "base64" => base64_decode(&body.contents).map_err(|e| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("contents are not valid base64: {e}"),
+            )
+        })?,
+        other => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("unknown encoding {other:?}; use \"utf-8\" or \"base64\""),
+            ))
+        }
+    };
+
+    let written = bytes.len() as u64;
+    host.write_file(&body.path, &bytes)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(WriteFileReply {
+        host: id,
+        path: body.path,
+        written,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HostExecBody {
+    pub command: String,
+    /// Seconds. Defaults to 30: a route that can be pointed at any machine should not be able to hold
+    /// a request open indefinitely by default.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HostExecReply {
+    pub host: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
+    pub duration_ms: u64,
+}
+
+async fn host_exec(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<HostExecBody>,
+) -> Result<Json<HostExecReply>, ApiError> {
+    // The command is classified first, through the same classifier an agent run uses, so `ls` is
+    // allowed and `rm -rf /` is not — a single risk class for "runs a command" would refuse both at
+    // the default autonomy level and be useless.
+    //
+    // The command *is* the gate, so there is no second check against a generic `Execute` action: that
+    // would be a coarser check running after a finer one, and at the default level it would refuse
+    // `hostname` on a machine the operator explicitly configured. The host-level read check still
+    // runs, so a host denied outright cannot be reached by any command.
+    if let Some(reason) = state.host_command_denial(&id, &body.command) {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, reason));
+    }
+    let host = resolve_for_use(&state, &id, hx_core::capability::Action::Read).await?;
+    let timeout = std::time::Duration::from_secs(body.timeout_secs.unwrap_or(30).clamp(1, 600));
+
+    let out = host
+        .exec(&body.command, timeout)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(HostExecReply {
+        host: id,
+        stdout: out.stdout,
+        stderr: out.stderr,
+        exit_code: out.exit_code,
+        duration_ms: out.duration_ms,
+    }))
+}
+
+/// Resolve a host for a specific action, enforcing the capability and reporting denials as 403.
+///
+/// One place for the check rather than one per handler: three routes that each spelled this out would
+/// be three chances to forget it, and a route that forgets it is a hole in the policy.
+async fn resolve_for_use(
+    state: &AppState,
+    id: &str,
+    action: hx_core::capability::Action,
+) -> Result<Arc<dyn hx_remote::Host>, ApiError> {
+    if let Some(reason) = state.host_denial_for(id, action) {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, reason));
+    }
+    state.resolve_host(id).await.map_err(ApiError::from)
+}
+
+/// Base64, hand-rolled rather than pulling a dependency in for two functions.
+///
+/// The workspace keeps its dependency list small on purpose; this is the standard alphabet with
+/// padding, which is all a file round-trip needs.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        // Padding is what makes the length a multiple of four, and a decoder relies on it.
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn base64_decode(input: &str) -> std::result::Result<Vec<u8>, String> {
+    let cleaned: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    // Tolerated on decode but never produced on encode: whitespace is what a wrapped base64 blob
+    // carries, and refusing it would make pasted content fail for no good reason.
+    fn value(b: u8) -> std::result::Result<u32, String> {
+        match b {
+            b'A'..=b'Z' => Ok(u32::from(b - b'A')),
+            b'a'..=b'z' => Ok(u32::from(b - b'a') + 26),
+            b'0'..=b'9' => Ok(u32::from(b - b'0') + 52),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            other => Err(format!("invalid base64 character {:?}", other as char)),
+        }
+    }
+
+    let mut out = Vec::with_capacity(cleaned.len() / 4 * 3);
+    for (i, chunk) in cleaned.chunks(4).enumerate() {
+        if chunk.len() < 2 {
+            // A single trailing character cannot encode a byte; one or two '=' with one character is
+            // truncated input, and silently dropping it would corrupt the file.
+            return Err(format!("truncated base64 group at position {}", i * 4));
+        }
+        let mut n: u32 = 0;
+        for (j, &b) in chunk.iter().enumerate() {
+            if b == b'=' {
+                // Padding must be at the end, and at most two of them.
+                if j < 2 || chunk[j..].iter().any(|&c| c != b'=') {
+                    return Err(format!("misplaced padding at position {}", i * 4 + j));
+                }
+                break;
+            }
+            n |= value(b)? << (18 - 6 * j);
+        }
+        out.push((n >> 16) as u8);
+        if chunk.len() > 2 && chunk[2] != b'=' {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 && chunk[3] != b'=' {
+            out.push(n as u8);
+        }
+    }
+    Ok(out)
+}
+
 fn sandbox_unavailable_message(state: &AppState) -> String {
     match &state.sandbox_unavailable_reason {
         Some(reason) => format!("sandboxes are unavailable: {reason}"),
@@ -1181,5 +1598,286 @@ search:
         let config = hx_core::config::Config::from_yaml(CONFIG).unwrap();
         assert!(has_profile(&config.sandbox_profiles, "dev"));
         assert!(!has_profile(&config.sandbox_profiles, "missing"));
+    }
+
+    // ---- hosts -----------------------------------------------------------
+    //
+    // These run against the *local* host, which is the one machine a hermetic test can actually
+    // drive: it needs no configuration, no credential, and no network. The remote transports are
+    // reached through the same `resolve_for_use`, so a bug in the gating or the plumbing shows up
+    // here rather than only on a machine with an SSH host to hand.
+
+    async fn put(
+        state: Arc<AppState>,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn host_detail_describes_the_local_machine() {
+        let state = test_state().await;
+        let (status, body) = get(state, "/v1/hosts/local").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["id"], "local");
+        // The daemon resolved the machine it runs on, so these are observed rather than guessed.
+        assert!(
+            body["os"].is_string(),
+            "the local host must report its OS: {body}"
+        );
+        assert!(body["shell"].is_string(), "{body}");
+        // Nothing denied by default: the shipped policy has an empty deny list, so a fresh install
+        // can browse its own files.
+        assert!(body.get("denied").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_host_is_a_404_that_lists_the_known_ones() {
+        let state = test_state().await;
+        let (status, body) = get(state, "/v1/hosts/nowhere").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let message = body["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("local"),
+            "must list the known hosts: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_the_home_directory_returns_real_entries() {
+        let state = test_state().await;
+        let (status, body) = get(state, "/v1/hosts/local/files").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // Asking for nothing lands in the home directory, and the response says where that was.
+        assert!(
+            body["path"].as_str().is_some_and(|p| !p.is_empty()),
+            "{body}"
+        );
+        assert!(body["entries"].is_array(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_file_round_trips_through_write_and_read() {
+        // The whole point of these routes: what goes in comes back out, byte for byte.
+        let state = test_state().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("round-trip.txt");
+        let path = path.display().to_string();
+
+        let (status, body) = put(
+            state.clone(),
+            "/v1/hosts/local/file",
+            serde_json::json!({ "path": path, "contents": "hello from the host pane\n" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["written"], 25);
+
+        let uri = format!("/v1/hosts/local/file?path={path}");
+        let (status, body) = get(state, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["encoding"], "utf-8");
+        assert_eq!(body["contents"], "hello from the host pane\n");
+        assert_eq!(body["size"], 25);
+    }
+
+    #[tokio::test]
+    async fn a_binary_file_comes_back_as_base64_rather_than_mangled_text() {
+        // A client that received lossy UTF-8 would write back a *different* file, so the encoding is
+        // reported and the bytes are preserved.
+        let state = test_state().await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("blob.bin");
+        std::fs::write(&path, [0xff, 0xfe, 0x00, 0x01, 0x80]).expect("write");
+        let path = path.display().to_string();
+
+        let (status, body) = get(state, &format!("/v1/hosts/local/file?path={path}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["encoding"], "base64", "{body}");
+        assert_eq!(body["contents"], "//4AAYA=", "{body}");
+    }
+
+    #[tokio::test]
+    async fn base64_round_trips_every_length_that_needs_padding() {
+        // 0, 1, and 2 bytes are the padding cases and the ones a hand-rolled encoder gets wrong.
+        for input in [vec![], vec![0x41], vec![0x41, 0x42], vec![0x41, 0x42, 0x43]] {
+            let encoded = base64_encode(&input);
+            assert_eq!(encoded.len() % 4, 0, "length must be a multiple of four");
+            let decoded = base64_decode(&encoded).expect("decodes");
+            assert_eq!(decoded, input, "round trip failed for {input:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn base64_round_trips_a_large_body() {
+        // The 6 KB-class boundary that bit the WinRM write path: a payload that needs several groups
+        // and hits every remainder.
+        let input: Vec<u8> = (0..6003u32).map(|i| (i % 251) as u8).collect();
+        let decoded = base64_decode(&base64_encode(&input)).expect("decodes");
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn malformed_base64_is_reported_rather_than_silently_truncated() {
+        // Silently dropping a bad group would write a shorter file than the caller sent, which is
+        // the failure that is hardest to notice.
+        assert!(
+            base64_decode("A").is_err(),
+            "a lone character cannot encode a byte"
+        );
+        assert!(base64_decode("A===A").is_err(), "padding then more data");
+        assert!(base64_decode("****").is_err(), "not base64 at all");
+        assert!(
+            base64_decode("AAAAA").is_err(),
+            "a group with a stray trailing character"
+        );
+    }
+
+    #[test]
+    fn a_three_character_group_is_two_bytes_and_not_an_error() {
+        // Not an edge case to reject: three characters with no padding is a legitimate encoding of
+        // two bytes, and treating it as truncated would refuse a valid file.
+        assert_eq!(base64_decode("AAA").unwrap(), vec![0x00, 0x00]);
+    }
+
+    #[test]
+    fn base64_decode_tolerates_whitespace_because_wrapped_blobs_carry_it() {
+        let wrapped = "aGVsbG8g\n  d29ybGQ=";
+        assert_eq!(base64_decode(wrapped).unwrap(), b"hello world");
+    }
+
+    #[tokio::test]
+    async fn writing_with_an_unknown_encoding_is_a_400_naming_the_valid_ones() {
+        let state = test_state().await;
+        let (status, body) = put(
+            state,
+            "/v1/hosts/local/file",
+            serde_json::json!({ "path": "/tmp/x", "contents": "a", "encoding": "rot13" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let message = body["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("utf-8") && message.contains("base64"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_runs_a_command_on_the_local_host() {
+        let state = test_state().await;
+        let (status, body) = post(
+            state,
+            "/v1/hosts/local/exec",
+            serde_json::json!({ "command": "printf host-pane-ok" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["stdout"], "host-pane-ok");
+        assert_eq!(body["exit_code"], 0);
+    }
+
+    #[tokio::test]
+    async fn exec_reports_a_failing_command_rather_than_making_it_a_transport_error() {
+        // A non-zero exit is a *result*. Turning it into a 5xx would tell the client the daemon
+        // broke, which is the wrong story and the wrong retry decision.
+        let state = test_state().await;
+        let (status, body) = post(
+            state,
+            "/v1/hosts/local/exec",
+            serde_json::json!({ "command": "exit 3" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["exit_code"], 3, "{body}");
+    }
+
+    #[tokio::test]
+    async fn exec_on_an_unknown_host_is_a_404() {
+        let state = test_state().await;
+        let (status, _) = post(
+            state,
+            "/v1/hosts/nope/exec",
+            serde_json::json!({ "command": "id" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_denied_host_is_refused_with_403_before_anything_runs() {
+        // The policy has to hold for the HTTP surface, not only for an agent run. A destructive
+        // command is denied at the default level, and the refusal must not reach the machine.
+        let mut config = hx_core::config::Config::from_yaml(CONFIG).expect("config parses");
+        let dir = tempfile::tempdir().expect("temp dir");
+        config.daemon.data_dir = dir.keep().display().to_string();
+        // A deny rule that matches the host tool: this is the operator's override, and the route
+        // must honour it.
+        config.agent.approval = hx_core::approval::ApprovalPolicy {
+            deny: vec![hx_core::approval::Rule::tool("shell")],
+            ..Default::default()
+        };
+
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let state = AppState::build(config, now).await.expect("state builds");
+
+        let (status, body) = post(
+            state.clone(),
+            "/v1/hosts/local/exec",
+            serde_json::json!({ "command": "printf should-not-run" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+        // And the read path is refused too, because the same rule covers it.
+        let (status, _) = get(state, "/v1/hosts/local/files").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_denied_host_still_appears_in_the_listing_with_its_reason() {
+        // The list must not hide a host just because it is denied: an operator needs to see that the
+        // machine is configured and *why* it is unusable, or the config looks broken.
+        let mut config = hx_core::config::Config::from_yaml(CONFIG).expect("config parses");
+        let dir = tempfile::tempdir().expect("temp dir");
+        config.daemon.data_dir = dir.keep().display().to_string();
+        config.agent.approval = hx_core::approval::ApprovalPolicy {
+            deny: vec![hx_core::approval::Rule::tool("shell")],
+            ..Default::default()
+        };
+
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let state = AppState::build(config, now).await.expect("state builds");
+
+        let (status, body) = get(state.clone(), "/v1/status").await;
+        assert_eq!(status, StatusCode::OK);
+        let hosts = body["hosts"].as_array().expect("hosts is a list");
+        assert!(
+            hosts.iter().any(|h| h["id"] == "local"),
+            "local stays listed: {body}"
+        );
+
+        let (status, body) = get(state, "/v1/hosts/local").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body["denied"].is_string(),
+            "the reason must be reported: {body}"
+        );
     }
 }

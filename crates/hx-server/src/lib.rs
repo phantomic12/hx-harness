@@ -16,6 +16,7 @@
 //! instead of waiting for an answer that cannot arrive. See `ROADMAP.md` — M1 and M2.
 
 pub mod chat;
+pub mod hosts;
 pub mod routes;
 pub mod sandbox;
 pub mod state;
