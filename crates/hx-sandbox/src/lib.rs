@@ -10,17 +10,24 @@
 //! - [`runtime`] — the lifecycle: create, start, exec, stop, remove, plus the concurrency cap
 //!   and TTL reaper that stop sandboxes accumulating.
 //! - [`docker`] — the `bollard`-backed engine implementation.
+//! - [`remote`] — a second runtime that reaches a Docker daemon on a *remote* host through a
+//!   tiny transport trait, when the engine is not the machine running the daemon.
 //!
 //! The design rule throughout: **the safe thing is the default, and loosening it is an explicit
 //! act.** Network off, capabilities dropped, non-root, bounded memory/CPU/PIDs, finite TTL.
 
 pub mod docker;
 pub mod egress;
+pub mod remote;
 pub mod runtime;
 pub mod spec;
 
 pub use docker::{logs, to_container_config, to_host_config, wait_for_engine, DockerRuntime};
 pub use egress::EgressProxy;
+pub use remote::{
+    create_command, exec_command, remove_command, start_command, stop_command, RemoteCommandOutput,
+    RemoteCommandRunner, RemoteSandboxRuntime,
+};
 pub use runtime::{SandboxExecOutput, SandboxHandle, SandboxManager, SandboxRuntime, SandboxState};
 pub use spec::{
     HostSettings, IsolationLevel, SandboxProfile, SandboxSpec, SpecError, DEFAULT_WORKSPACE_PATH,
