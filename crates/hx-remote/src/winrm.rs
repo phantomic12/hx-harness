@@ -122,7 +122,13 @@ impl WinRmHost {
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
-            .danger_accept_invalid_certs(false)
+            // Verification stays ON by default: a WinRM endpoint carries credentials and remote
+            // command execution, so silently accepting any certificate would turn a misconfigured
+            // or hostile DNS answer into a credential leak. `HX_WINRM_INSECURE=1` opts out for a
+            // test guest with a self-signed certificate, and the name says what it costs.
+            .danger_accept_invalid_certs(
+                std::env::var("HX_WINRM_INSECURE").is_ok_and(|v| v != "0" && !v.is_empty()),
+            )
             .build()
             .map_err(|e| HxError::Config(format!("could not build an HTTP client: {e}")))?;
 
@@ -455,17 +461,20 @@ impl WinRmHost {
 
     /// Run a command in the shell and collect its output.
     async fn run_in_shell(&self, shell_id: &str, command: &str) -> Result<ExecOutput> {
-        // `CommandLine` takes the program and its arguments as separate elements. Everything goes
-        // through `cmd.exe /c`, which is the Windows equivalent of `sh -c` and is what makes a
-        // caller's `dir && echo done` mean what it looks like.
+        // `CommandLine` spells the program and then the whole argument string in ONE `Arguments`
+        // element: `cmd /c "echo hi"` is `<Command>cmd</Command><Arguments>/c echo hi</Arguments>`.
+        // Splitting `/c` and the rest across two elements is rejected as invalid XML, which is what
+        // WSMan reports — the schema wants a single argument string, not argv.
         let body = format!(
-            r#"<rsp:CommandLine xmlns:rsp="{NS_SHELL}"><rsp:Command>cmd.exe</rsp:Command><rsp:Arguments>/c</rsp:Arguments><rsp:Arguments>{}</rsp:Arguments></rsp:CommandLine>"#,
+            r#"<rsp:CommandLine xmlns:rsp="{NS_SHELL}"><rsp:Command>cmd</rsp:Command><rsp:Arguments>/c {}</rsp:Arguments></rsp:CommandLine>"#,
             xml_escape(command)
         );
         let started = self
             .request(
                 "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Command",
-                NS_SHELL,
+                // The `cmd` sub-namespace, not the parent `/shell`. Windows rejects Command under
+                // the parent with "the XML is invalid" rather than naming the resource.
+                NS_SHELL_CMD,
                 shell_id,
                 &body,
             )
@@ -486,16 +495,28 @@ impl WinRmHost {
             let received = self
                 .request(
                     "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Receive",
-                    NS_SHELL,
-                    &format!("{shell_id}/CommandId={command_id}"),
-                    "",
+                    // The `cmd` resource, matching `Command`. WSMan pairs the Action with the
+                    // resource it was registered under and rejects the pair otherwise, with the
+                    // message "the Action URI is not compatible with the resource".
+                    NS_SHELL_CMD,
+                    // Only the shell is named here. Adding `CommandId` as a second selector makes
+                    // WSMan reject the whole request with "invalid selectors for the resource" — the
+                    // shell's `Receive` takes the shell and reports whichever command is running in
+                    // it, so `CommandId` is not a valid selector for this action at all.
+                    shell_id,
+                    // `Receive` needs a body naming the streams it wants, and this is where the
+                    // command is identified — as an attribute of `DesiredStream`, not a selector. An
+                    // empty body is rejected as not matching the schema.
+                    &format!(
+                        r#"<rsp:Receive xmlns:rsp="{NS_SHELL}"><rsp:DesiredStream CommandId="{command_id}">stdout stderr</rsp:DesiredStream></rsp:Receive>"#
+                    ),
                 )
                 .await?;
 
-            for chunk in extract_stream_text(&received, "stdout") {
+            for chunk in extract_stream_text(&received, "stdout", &command_id) {
                 stdout.push_str(&chunk);
             }
-            for chunk in extract_stream_text(&received, "stderr") {
+            for chunk in extract_stream_text(&received, "stderr", &command_id) {
                 stderr.push_str(&chunk);
             }
 
@@ -558,12 +579,18 @@ impl Host for WinRmHost {
     }
 
     async fn read_file(&self, path: &str) -> Result<Vec<u8>> {
-        // Base64 through PowerShell rather than a binary stream: WSMan's output is text, and
-        // anything that is not text would be mangled by the encoding round trip in between.
-        let escaped = path.replace('\'', "''");
+        // Base64 rather than a binary stream: WSMan's output is text, and anything that is not text
+        // would be mangled by the encoding round trip in between.
+        //
+        // `certutil` decodes and encodes base64 and is present on every Windows install, which makes
+        // it the cmd-shell equivalent of the PowerShell one-liner this replaced — `[Convert]` and
+        // `[IO.File]` are not available to `cmd.exe`.
         let out = self
             .exec(
-                &format!("[Convert]::ToBase64String([IO.File]::ReadAllBytes('{escaped}'))"),
+                &format!(
+                    "certutil -encode -f \"{path}\" \"%TEMP%\\hx-b64.tmp\" >nul && \
+                     type \"%TEMP%\\hx-b64.tmp\" && del /q \"%TEMP%\\hx-b64.tmp\""
+                ),
                 Duration::from_secs(120),
             )
             .await?;
@@ -573,24 +600,38 @@ impl Host for WinRmHost {
                 out.stderr.trim()
             )));
         }
+        // `certutil -encode` wraps its output in a BEGIN/END banner and breaks the payload across
+        // lines; stripping both is what leaves decodable base64.
+        let cleaned: String = out
+            .stdout
+            .lines()
+            .filter(|l| !l.starts_with("-----") && !l.trim().is_empty())
+            .collect();
         base64::engine::general_purpose::STANDARD
-            .decode(out.stdout.trim())
+            .decode(cleaned.trim())
             .map_err(|e| HxError::Remote(format!("'{path}' did not decode as base64: {e}")))
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> Result<()> {
         let encoded = base64::engine::general_purpose::STANDARD.encode(contents);
-        let escaped = path.replace('\'', "''");
         // The directory is created first: writing a file into a path whose parent does not exist
         // fails, and the caller asked to write a file, not to also arrange its directory.
+        //
+        // The base64 goes through a temp file because `certutil -decode` takes a path, not a string,
+        // and the temp file is removed whether or not the decode succeeds.
         let out = self
             .exec(
                 &format!(
-                    "$b=[Convert]::FromBase64String('{encoded}'); \
-                     $d=Split-Path -Parent '{escaped}'; \
-                     if ($d -and -not (Test-Path $d)) {{ New-Item -ItemType Directory -Force -Path $d | Out-Null }}; \
-                     [IO.File]::WriteAllBytes('{escaped}', $b); \
-                     Write-Output OK"
+                    // `&&` throughout rather than `&`. A chain of `&` runs every step regardless, and
+                    // `%ERRORLEVEL%` in such a line is expanded when the line is *parsed*, before the
+                    // decode has run — so a check written that way reports the previous command's
+                    // status. `&&` stops at the first failure and tests each command's own result.
+                    "if not exist \"{parent}\" mkdir \"{parent}\" && \
+                     >\"%TEMP%\\hx-b64.tmp\" echo {encoded} && \
+                     certutil -decode -f \"%TEMP%\\hx-b64.tmp\" \"{path}\" >nul && \
+                     del /q \"%TEMP%\\hx-b64.tmp\" && echo OK",
+                    parent = parent_dir(path),
+                    path = path,
                 ),
                 Duration::from_secs(180),
             )
@@ -606,15 +647,18 @@ impl Host for WinRmHost {
 
     async fn list_dir(&self, path: &str) -> Result<Vec<RemoteEntry>> {
         let escaped = path.replace('\'', "''");
-        // Machine-readable output rather than parsed `dir` formatting: a listing parsed out of
-        // column widths breaks on a long filename, and this has to survive one.
+        // Commands run through `cmd.exe`, not PowerShell, so this uses `dir` rather than
+        // `Get-ChildItem` — a PowerShell cmdlet is not on PATH for a cmd shell and the failure reads
+        // as "not recognized as an internal or external command", which names the cmdlet rather than
+        // the transport mismatch that actually caused it.
+        //
+        // `/a` includes hidden and system entries, `/b` gives bare names, and `/s` is deliberately
+        // absent so a subdirectory's contents are not folded into its parent's listing. `dir` has no
+        // switch for size-and-name in one machine-readable line, so the path is listed as names and
+        // each entry's attributes are asked for separately below.
         let out = self
             .exec(
-                &format!(
-                    "Get-ChildItem -LiteralPath '{escaped}' -Force | \
-                     ForEach-Object {{ \"{{0}}|{{1}}|{{2}}\" -f $_.Name, \
-                     $(if ($_.PSIsContainer) {{ 'd' }} else {{ 'f' }}), $_.Length }}"
-                ),
+                &format!("dir /a /b \"{escaped}\""),
                 Duration::from_secs(120),
             )
             .await?;
@@ -624,24 +668,63 @@ impl Host for WinRmHost {
                 out.stderr.trim()
             )));
         }
-        Ok(parse_listing(&out.stdout, path))
+        let mut entries = parse_listing(&out.stdout, path);
+
+        // A second pass fills in the size and the directory flag, because `dir /b` reports neither.
+        //
+        // The attributes are read into a temp file rather than echoed with a separator: a `|` in the
+        // command is a pipe even when escaped with `^`, because the escape does not survive the
+        // `cmd /c` nesting WSMan uses, and the shell then tries to run the attribute string as a
+        // command — which is the `'d----------' is not recognized` failure. A file needs no
+        // separator at all.
+        for entry in &mut entries {
+            let full = format!(r"{}\{}", path.trim_end_matches('\\'), entry.name);
+            let probe = self
+                .exec(
+                    "for %I in (\"{full}\") do @echo %~zI >\"%TEMP%\\hx-attrs.tmp\" 2>&1 & \
+                     for %I in (\"{full}\") do @echo %~aI >>\"%TEMP%\\hx-attrs.tmp\" & \
+                     type \"%TEMP%\\hx-attrs.tmp\" & del /q \"%TEMP%\\hx-attrs.tmp\""
+                        .replace("{full}", &full)
+                        .as_str(),
+                    Duration::from_secs(60),
+                )
+                .await?;
+            let mut lines = probe
+                .stdout
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty());
+            let size = lines.next().and_then(|s| s.parse::<u64>().ok());
+            let attrs = lines.next().unwrap_or_default();
+            if let Some(size) = size {
+                entry.size = size;
+            }
+            // Attributes come back as `d----------` for a directory and `--a--------` for a file, so
+            // the leading character is the directory flag.
+            entry.is_dir = attrs.starts_with('d');
+        }
+        Ok(entries)
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
-        let from_escaped = from.replace('\'', "''");
-        let to_escaped = to.replace('\'', "''");
-        // An existing destination is an error, never an overwrite — the same contract as the SSH
-        // transport, because the trash a delete leaves behind must not destroy what is already in
-        // it. `Move-Item -Force` would overwrite, so it is not used.
+        // `move` rather than `Move-Item`, because the shell is `cmd.exe`.
+        //
+        // The gate is `if not exist <destination> move ...`. Measured against the alternatives on a
+        // real host: `if exist X (echo ...) else (move ...)` returns exit code 1 and moves nothing,
+        // and a `goto` script across newlines in one `cmd /c` string stops before the move, silently,
+        // with exit code 0. Only this shape both moves the file and reports honestly.
+        //
+        // `move` without `/y` never overwrites: it would prompt, and a prompt with no console to
+        // answer it fails. The `if not exist` guard turns that into a clean error rather than a hung
+        // prompt, which is what keeps an existing destination intact.
         let out = self
             .exec(
                 &format!(
-                    "if (Test-Path -LiteralPath '{to_escaped}') {{ \
-                       Write-Error 'the destination already exists'; exit 1 }}; \
-                     $d=Split-Path -Parent '{to_escaped}'; \
-                     if ($d -and -not (Test-Path $d)) {{ New-Item -ItemType Directory -Force -Path $d | Out-Null }}; \
-                     Move-Item -LiteralPath '{from_escaped}' -Destination '{to_escaped}'; \
-                     Write-Output OK"
+                    "if not exist \"{parent}\" mkdir \"{parent}\" && \
+                     if not exist \"{to}\" move \"{from}\" \"{to}\" >nul && echo OK",
+                    to = to,
+                    from = from,
+                    parent = parent_dir(to),
                 ),
                 Duration::from_secs(120),
             )
@@ -700,18 +783,27 @@ fn build_envelope(action: &str, resource: &str, selector: &str, body: &str, to: 
         let shell = xml_escape(name);
         match value.split_once('=') {
             Some((k, v)) => format!(
-                r#"<wsman:SelectorSet><wsman:Selector Name="ShellId">{shell}</wsman:Selector><wsman:Selector Name="{k}">{}</wsman:Selector></wsman:SelectorSet>"#,
+                r#"<w:SelectorSet><w:Selector Name="ShellId">{shell}</w:Selector><w:Selector Name="{k}">{}</w:Selector></w:SelectorSet>"#,
                 xml_escape(v)
             ),
             None => format!(
-                r#"<wsman:SelectorSet><wsman:Selector Name="ShellId">{shell}</wsman:Selector></wsman:SelectorSet>"#
+                r#"<w:SelectorSet><w:Selector Name="ShellId">{shell}</w:Selector></w:SelectorSet>"#
             ),
         }
     } else {
         format!(
-            r#"<wsman:SelectorSet><wsman:Selector Name="ShellId">{}</wsman:Selector></wsman:SelectorSet>"#,
+            r#"<w:SelectorSet><w:Selector Name="ShellId">{}</w:Selector></w:SelectorSet>"#,
             xml_escape(selector)
         )
+    };
+
+    // The WinRS option set. It is not optional for `Command`: the action fails with "the XML is
+    // invalid" without it, and the two options are what tell WinRS to wire the command's stdin to a
+    // console and to run the string as given rather than re-wrapping it in another `cmd /c`.
+    let options = if action.ends_with("/windows/shell/Command") {
+        r#"<w:OptionSet><w:Option Name="WINRS_CONSOLEMODE_STDIN">TRUE</w:Option><w:Option Name="WINRS_SKIP_CMD_SHELL">FALSE</w:Option></w:OptionSet>"#.to_string()
+    } else {
+        String::new()
     };
 
     // The header set is not optional and not guessable: WSMan answers a request missing any of
@@ -741,6 +833,7 @@ fn build_envelope(action: &str, resource: &str, selector: &str, body: &str, to: 
     <w:ResourceURI mustUnderstand="true">{resource}</w:ResourceURI>
     <a:Action mustUnderstand="true">{action}</a:Action>
     {selectors}
+    {options}
   </env:Header>
   <env:Body>{body}</env:Body>
 </env:Envelope>"#,
@@ -755,6 +848,7 @@ fn build_envelope(action: &str, resource: &str, selector: &str, body: &str, to: 
         resource = resource,
         action = action,
         selectors = selectors,
+        options = options,
         body = body
     )
 }
@@ -782,16 +876,51 @@ fn random_uuid() -> String {
 /// WSMan schema fixes, and adding an XML crate for it would be a dependency the workspace does not
 /// otherwise need.
 fn extract_selector(xml: &str, name: &str) -> Option<String> {
+    // Two shapes carry these identifiers, and a caller cannot know which it got. A *selector* is an
+    // attribute — `<w:Selector Name="ShellId">value</w:Selector>` — which is how the request names an
+    // object. A *response* returns the identifier as an element instead, `<rsp:CommandId>value</
+    // rsp:CommandId>`, with the name in the tag. Looking only for the attribute form finds nothing in
+    // a CommandResponse, which is why the client reported no CommandId after the server accepted it.
     let needle = format!(r#"Name="{name}""#);
-    let start = xml.find(&needle)?;
-    let rest = &xml[start + needle.len()..];
-    let open = rest.find('>')? + 1;
-    let close = rest[open..].find('<')?;
-    let value = rest[open..open + close].trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
+    if let Some(start) = xml.find(&needle) {
+        let rest = &xml[start + needle.len()..];
+        if let Some(open) = rest.find('>') {
+            let value_start = open + 1;
+            if let Some(close) = rest[value_start..].find('<') {
+                let value = rest[value_start..value_start + close].trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+
+    // The element form, with any namespace prefix: `<rsp:CommandId>...</rsp:CommandId>`.
+    for open in [format!(":{name}>"), format!("<{name}>")] {
+        let mut search = xml;
+        while let Some(at) = search.find(&open) {
+            let value_start = at + open.len();
+            if let Some(close) = search[value_start..].find('<') {
+                let value = search[value_start..value_start + close].trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+            search = &search[value_start..];
+        }
+    }
+
+    None
+}
+
+/// The parent of a Windows path, for the `mkdir` that precedes a write or a move.
+///
+/// Windows accepts both separators, so the last of either ends the parent. A path with no separator
+/// has no parent to create, and the caller gets an empty string that `if not exist` treats as absent.
+fn parent_dir(path: &str) -> &str {
+    match path.rfind(['\\', '/']) {
+        Some(0) | None => "",
+        Some(at) => &path[..at],
     }
 }
 
@@ -800,13 +929,21 @@ fn extract_selector(xml: &str, name: &str) -> Option<String> {
 /// WSMan returns command output as base64-encoded UTF-16LE in `Stream` elements. Both steps are
 /// required: taking the base64 as ASCII produces text with an interleaved NUL between every
 /// character, which is the classic symptom of decoding only half the framing.
-fn extract_stream_text(xml: &str, stream: &str) -> Vec<String> {
+fn extract_stream_text(xml: &str, stream: &str, command_id: &str) -> Vec<String> {
     let mut out = Vec::new();
     let open_tag = format!(r#"Stream Name="{stream}""#);
     let mut rest = xml;
     while let Some(start) = rest.find(&open_tag) {
         let after = &rest[start..];
         let Some(gt) = after.find('>') else { break };
+        // Only this command's output. One shell can have more than one command in flight, and a
+        // `Receive` reports whatever the shell has, tagging each stream with the `CommandId` that
+        // produced it — so a stream belonging to another command is not this command's output.
+        let tag = &after[..gt];
+        if !command_id.is_empty() && !tag.contains(command_id) {
+            rest = &after[gt..];
+            continue;
+        }
         let content_start = gt + 1;
         let Some(end) = after[content_start..].find("</") else {
             break;
@@ -922,27 +1059,19 @@ fn normalise_newlines(s: &str) -> String {
 fn parse_listing(output: &str, parent: &str) -> Vec<RemoteEntry> {
     let mut entries = Vec::new();
     for line in output.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let parts: Vec<&str> = line.split('|').collect();
-        if parts.len() < 3 {
-            // A PowerShell warning or banner line, not an entry. Skipped rather than guessed at.
-            continue;
-        }
-        let name = parts[0].trim();
+        // `dir /a /b` prints one bare name per line and nothing else, so each non-empty line is an
+        // entry. Size and the directory flag are not in this output — they are filled in by the
+        // caller, which probes each entry once. This replaces a `name|d|size` form that only
+        // PowerShell could produce; keeping that shape here would have meant inventing fields.
+        let name = line.trim().trim_end_matches('\r');
         if name.is_empty() {
             continue;
         }
-        let is_dir = parts[1].trim() == "d";
-        let size = parts[2].trim().parse::<u64>().ok();
         entries.push(RemoteEntry {
             name: name.to_string(),
-            is_dir,
-            // A directory reports 0 rather than nothing: the field is a plain size, and callers
-            // distinguish a directory by `is_dir` rather than by an absent size.
-            size: if is_dir { 0 } else { size.unwrap_or(0) },
+            // Both are unknown from `/b` output and are corrected by the caller's probe.
+            is_dir: false,
+            size: 0,
             // Windows paths are backslash-separated and a drive root already ends in one.
             path: if parent.ends_with('\\') {
                 format!("{parent}{name}")
@@ -1029,8 +1158,8 @@ mod tests {
     fn a_shell_id_is_extracted_from_a_real_shaped_response() {
         let xml = r#"<?xml version="1.0"?><s:Envelope><s:Body>
             <x:ResourceCreated><a:ReferenceParameters>
-            <wsman:SelectorSet><wsman:Selector Name="ShellId">7a1f2b3c-4d5e-6f70-8192-a3b4c5d6e7f8</wsman:Selector>
-            </wsman:SelectorSet></a:ReferenceParameters></x:ResourceCreated></s:Body></s:Envelope>"#;
+            <w:SelectorSet><w:Selector Name="ShellId">7a1f2b3c-4d5e-6f70-8192-a3b4c5d6e7f8</w:Selector>
+            </w:SelectorSet></a:ReferenceParameters></x:ResourceCreated></s:Body></s:Envelope>"#;
         assert_eq!(
             extract_selector(xml, "ShellId").as_deref(),
             Some("7a1f2b3c-4d5e-6f70-8192-a3b4c5d6e7f8")
@@ -1048,7 +1177,7 @@ mod tests {
         let xml = format!(
             r#"<s:Envelope><s:Body><rsp:Stream Name="stdout" CommandId="c">{encoded}</rsp:Stream></s:Body></s:Envelope>"#
         );
-        let chunks = extract_stream_text(&xml, "stdout");
+        let chunks = extract_stream_text(&xml, "stdout", "c");
         assert_eq!(
             chunks.join(""),
             "hi\r\n",
@@ -1065,7 +1194,7 @@ mod tests {
         let encoded = base64::engine::general_purpose::STANDARD.encode(&utf8);
         let xml = format!(r#"<rsp:Stream Name="stdout">{encoded}</rsp:Stream>"#);
         assert_eq!(
-            extract_stream_text(&xml, "stdout").join(""),
+            extract_stream_text(&xml, "stdout", "").join(""),
             "plain ascii output\n"
         );
     }
@@ -1077,10 +1206,16 @@ mod tests {
         let xml = format!(
             r#"<rsp:Stream Name="stdout">{out}</rsp:Stream><rsp:Stream Name="stderr">{err}</rsp:Stream>"#
         );
-        assert_eq!(extract_stream_text(&xml, "stdout").join(""), "to stdout");
-        assert_eq!(extract_stream_text(&xml, "stderr").join(""), "to stderr");
+        assert_eq!(
+            extract_stream_text(&xml, "stdout", "").join(""),
+            "to stdout"
+        );
+        assert_eq!(
+            extract_stream_text(&xml, "stderr", "").join(""),
+            "to stderr"
+        );
         assert!(
-            extract_stream_text(&xml, "stdout")
+            extract_stream_text(&xml, "stdout", "")
                 .join("")
                 .find("stderr")
                 .is_none(),
@@ -1121,7 +1256,10 @@ mod tests {
 
     #[test]
     fn listing_lines_are_parsed_and_their_paths_joined_for_windows() {
-        let output = "Documents|d|0\r\nreport.txt|f|1024\r\n\r\n";
+        // `dir /a /b` prints one bare name per line. Size and the directory flag are absent by
+        // design — they are filled in by the caller's attribute probe — so this asserts the names and
+        // the joined paths, which is all the parse is responsible for.
+        let output = "Documents\r\nreport.txt\r\n\r\n";
         let entries = parse_listing(output, r"C:\Users\hxtest");
         assert_eq!(
             entries.len(),
@@ -1129,25 +1267,27 @@ mod tests {
             "a blank line is not an entry: {entries:?}"
         );
         assert_eq!(entries[0].name, "Documents");
-        assert!(entries[0].is_dir);
-        assert_eq!(entries[0].size, 0, "a directory reports no bytes");
         assert_eq!(entries[0].path, r"C:\Users\hxtest\Documents");
         assert_eq!(entries[1].path, r"C:\Users\hxtest\report.txt");
-        assert_eq!(entries[1].size, 1024);
 
         // A drive root already ends in a backslash; joining naively would produce `C:\\Users`.
-        let root = parse_listing("Users|d|0\r\n", r"C:\");
+        let root = parse_listing("Users\r\n", r"C:\");
         assert_eq!(root[0].path, r"C:\Users");
     }
 
     #[test]
-    fn a_banner_line_in_the_listing_is_skipped_rather_than_guessed_at() {
-        // PowerShell can emit warnings or a progress line before the entries. A parser that
-        // treated every line as an entry would invent files that do not exist.
-        let output = "WARNING: something happened\r\nreal.txt|f|5\r\n";
+    fn every_non_empty_listing_line_is_an_entry() {
+        // `dir /b` emits names only, so a line that is not blank is a name. This is the behaviour
+        // change from the `name|d|size` form: a name containing a `|` is now kept whole rather than
+        // being split into fields that do not exist.
+        let output = "real.txt\r\nodd|pipe.txt\r\n";
         let entries = parse_listing(output, r"C:\tmp");
-        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries.len(), 2, "{entries:?}");
         assert_eq!(entries[0].name, "real.txt");
+        assert_eq!(
+            entries[1].name, "odd|pipe.txt",
+            "a name is taken verbatim, not split on a separator the output does not use"
+        );
     }
 
     #[test]

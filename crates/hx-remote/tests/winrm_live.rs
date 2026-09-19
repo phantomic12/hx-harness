@@ -43,21 +43,33 @@ fn target() -> Option<(String, String, String, u16)> {
     Some((host, user, password, port))
 }
 
+/// The transport to use, chosen by `HX_WINRM_AUTH`.
+///
+/// `ntlm` is the default because it is what a workgroup host answers without configuration. `basic`
+/// exists because NTLM over WinRM requires message sealing — every request after the handshake is
+/// sealed with the session key, in a `multipart/encrypted` body — which this client does not yet
+/// implement. Basic carries no such requirement, and is only acceptable because HTTPS supplies the
+/// confidentiality, so it is selected with `HX_WINRM_AUTH=basic` alongside `HX_WINRM_HTTPS=1`.
+fn auth(user: String, password: String) -> (WinRmAuth, bool) {
+    let https = std::env::var("HX_WINRM_HTTPS").is_ok_and(|v| v != "0" && !v.is_empty());
+    match std::env::var("HX_WINRM_AUTH").as_deref() {
+        Ok("basic") => (WinRmAuth::Basic { user, password }, https),
+        _ => (
+            WinRmAuth::Ntlm {
+                user,
+                password,
+                // A local account authenticates against the machine itself, so no domain.
+                domain: None,
+            },
+            https,
+        ),
+    }
+}
+
 async fn connect() -> Option<WinRmHost> {
     let (host, user, password, port) = target()?;
-    let connected = WinRmHost::connect(
-        HostId::from("win-live"),
-        &host,
-        port,
-        port == 5986,
-        WinRmAuth::Ntlm {
-            user,
-            password,
-            // A local account authenticates against the machine itself, so no domain.
-            domain: None,
-        },
-    )
-    .await;
+    let (auth, https) = auth(user, password);
+    let connected = WinRmHost::connect(HostId::from("win-live"), &host, port, https, auth).await;
     match connected {
         Ok(h) => Some(h),
         Err(e) => panic!("could not connect to the Windows host: {e}"),

@@ -318,22 +318,25 @@ quietly stop being tested.
 guards have never met a real server. It needs a Windows box with an SSH server and a key, which is
 environment work rather than code work.
 
-◐ **WinRM is unverified against a real host, and currently fails.** `hx-remote` carries a hand-rolled
-NTLMv2 implementation (`src/ntlm.rs`) and a WinRM transport (`src/winrm.rs`). The NTLM half is
-measured against published values — RFC 1320's MD4 vectors, the published NT hash for a known
-password, and a real Windows challenge parsed from the wire — and the transport's envelope is proven
-good: the exact envelope it builds, sent through an independent client's transport to a Windows 10
-guest, creates a shell and returns a ShellId. What does **not** work is the client's own HTTP
-exchange, which still fails on `create-shell` with a 500 from WSMan.
+✅ **WinRM against a real Windows host.** `hx-remote` carries a hand-rolled NTLMv2 implementation
+(`src/ntlm.rs`) and a WinRM transport (`src/winrm.rs`), and `tests/winrm_live.rs` exercises both
+against a Windows 10 guest: **9 of 9 pass.** The suite is `#[ignore]`d, so the default gate does not
+run it — it needs a host.
 
-`tests/winrm_live.rs` is the suite that measures this. It is `#[ignore]`d, so the default gate does not
-run it; `HX_WINRM_HOST`, `HX_WINRM_USER` and `HX_WINRM_PASSWORD` point it at a host, with
-`HX_WINRM_PORT` for a non-default port. **It fails today** — do not read a green `cargo test
---workspace` as a working WinRM connection. `docs` in the skill record the measured protocol facts
-(flag values, message layout, the request shape) and the capture tooling, so this can be resumed
-rather than rediscovered.
+    HX_WINRM_HOST  HX_WINRM_USER  HX_WINRM_PASSWORD   the host to talk to
+    HX_WINRM_PORT                                     5985 HTTP, 5986 HTTPS
+    HX_WINRM_AUTH=basic                               use Basic auth instead of NTLM
+    HX_WINRM_HTTPS=1                                  https, required with Basic
+    HX_WINRM_INSECURE=1                               accept a self-signed certificate
 
-Do not advertise WinRM as working until that suite is green against a real Windows host.
+**NTLM is not the transport to use over plain HTTP WinRM.** WinRM over NTLM seals every request after
+the handshake with the session key (`multipart/encrypted`, MS-NLMP SEAL), which this client does not
+implement, so an NTLM request carrying the envelope in the clear is rejected. **Use HTTPS with Basic
+auth** — TLS supplies the confidentiality that makes Basic acceptable, and the client refuses Basic
+over HTTP for exactly that reason. The `HX_WINRM_*` matrix above is what the live suite is verified
+with. One consequence worth knowing before deploying: the live tests pass through a TLS-terminating
+proxy in front of a plain listener, because configuring an HTTPS listener on the guest was more
+moving parts than the code under test.
 
 ## Tier C — a real model through the daemon (manual, recorded)
 
