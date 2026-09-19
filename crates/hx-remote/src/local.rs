@@ -9,6 +9,7 @@ use hx_core::error::{HxError, Result};
 use hx_core::ids::HostId;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Move `from` to `to` where a hard link cannot be made, keeping the "never replace" contract.
@@ -244,6 +245,30 @@ impl Host for LocalHost {
             )));
         }
         Ok(())
+    }
+
+    async fn open_pty(
+        &self,
+        _command: Option<&str>,
+        _cols: u16,
+        _rows: u16,
+    ) -> Result<Arc<dyn crate::host::PtySession>> {
+        // Deliberately not implemented here, and this is a layering decision rather than a gap.
+        //
+        // The local PTY already exists: `hx-server`'s `terminal` module owns it, with the nix
+        // `openpty` call, the process-group setup, the scrollback and the broadcast that the pane
+        // attaches to. Implementing a *second* local pty in this crate would mean two
+        // implementations of one thing, kept in step by hand — and `hx-remote` cannot depend on
+        // `hx-server` to reuse the first, because the dependency runs the other way.
+        //
+        // So the local case stays where it is and the server routes it there. What this trait
+        // method exists for is the case the server *cannot* serve locally, which is a machine on the
+        // far side of a transport.
+        Err(HxError::Remote(
+            "the local machine's terminal is owned by the server, not by the remote crate; opening \
+             a pty for `local` must go through the server's terminal registry"
+                .to_string(),
+        ))
     }
 
     fn describe(&self) -> String {

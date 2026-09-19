@@ -35,6 +35,7 @@
 //! in an error. The authenticate message contains an HMAC over it rather than the value, so a
 //! transport error can be reported without redaction worries.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -785,6 +786,26 @@ impl Host for WinRmHost {
             )));
         }
         Ok(())
+    }
+
+    async fn open_pty(
+        &self,
+        _command: Option<&str>,
+        _cols: u16,
+        _rows: u16,
+    ) -> Result<Arc<dyn crate::host::PtySession>> {
+        // Refused, not stubbed. An interactive terminal needs a duplex, resize-capable stream, and
+        // WinRM has no such primitive: `WSMan` runs a command and collects its output. A
+        // `PtySession` that returned a fixed response would render a prompt nobody could type at,
+        // which is worse than an error because it looks like a working terminal.
+        //
+        // The honest alternatives are an SSH server on the Windows side or a dedicated agent, and
+        // both are decisions for the operator rather than something to fake here.
+        Err(HxError::Remote(format!(
+            "an interactive terminal is not available over WinRM; {} can run one-shot commands but \
+             the protocol has no duplex channel for a pty",
+            self.address
+        )))
     }
 
     fn describe(&self) -> String {

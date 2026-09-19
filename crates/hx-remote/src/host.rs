@@ -5,6 +5,7 @@ use hx_core::config::HostKind;
 use hx_core::error::Result;
 use hx_core::ids::HostId;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// What the far end is running.
@@ -242,6 +243,36 @@ pub struct RemoteEntry {
     pub size: u64,
 }
 
+/// A PTY attached to a machine, from either side of the transport.
+///
+/// Deliberately not `async fn exec` with a shell: an interactive terminal is a *stream*, not a
+/// request. Input arrives when the person types, output when the program prints, and the two are not
+/// related in time. A trait method that promised a reply could not express that.
+///
+/// The separation is what makes one route serve both a local and a remote terminal: the daemon's
+/// terminal pane already speaks this shape against a `portable-pty` master, and `SshHost` speaks it
+/// against an SSH channel. Neither side needs to know which it has.
+#[async_trait]
+pub trait PtySession: Send + Sync {
+    /// Type at the terminal. Bytes, not a string: a terminal is 8-bit clean, and a paste of UTF-8
+    /// must not be re-encoded on the way through.
+    async fn write(&self, data: &[u8]) -> Result<()>;
+
+    /// Tell the far side the window changed, so a full-screen program redraws.
+    async fn resize(&self, cols: u16, rows: u16) -> Result<()>;
+
+    /// The next chunk of output, or `None` once the session has ended.
+    ///
+    /// Pulled rather than pushed: a subscriber that cannot keep up must be able to apply backpressure
+    /// instead of having bytes accumulate in the transport. The caller owns the buffering decision,
+    /// which is what lets it keep the scrollback the pane needs.
+    async fn read(&self) -> Option<Vec<u8>>;
+
+    /// End the session. Idempotent: closing twice is not an error, because both a client disconnect
+    /// and a shutdown may race to do it.
+    async fn close(&self) -> Result<()>;
+}
+
 /// A machine the daemon can run commands on.
 ///
 /// Every method takes what it needs explicitly so implementations stay stateless with respect to
@@ -255,6 +286,22 @@ pub trait Host: Send + Sync {
 
     /// Run a command line under the host's shell.
     async fn exec(&self, command: &str, timeout: Duration) -> Result<ExecOutput>;
+
+    /// Open an interactive terminal on this machine.
+    ///
+    /// `command` is the shell to start. `None` asks for the machine's own default, which is the
+    /// right answer for a login shell and the wrong one to guess from the outside: on a POSIX host
+    /// that is `$SHELL` or `sh`, and on Windows it is PowerShell because that is what the rest of the
+    /// transport already builds command lines for.
+    ///
+    /// Returns an error rather than a degenerate session when the transport cannot do it — a
+    /// `PtySession` that silently never produced output would look like a hung machine.
+    async fn open_pty(
+        &self,
+        command: Option<&str>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Arc<dyn PtySession>>;
 
     async fn read_file(&self, path: &str) -> Result<Vec<u8>>;
 

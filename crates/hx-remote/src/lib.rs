@@ -48,9 +48,10 @@ pub mod ssh;
 pub mod winrm;
 
 pub use host::{
-    powershell_quote, shell_quote, ExecOutput, Host, HostCaps, RemoteEntry, RemoteOs, ShellKind,
+    powershell_quote, shell_quote, ExecOutput, Host, HostCaps, PtySession, RemoteEntry, RemoteOs,
+    ShellKind,
 };
 pub use known_hosts::{HostKeyVerdict, KnownHosts};
 pub use local::LocalHost;
-pub use ssh::{HostKeyDecision, HostKeyPolicy, SshAuth, SshHost};
+pub use ssh::{HostKeyDecision, HostKeyPolicy, SshAuth, SshHost, SshPty};
 pub use winrm::{WinRmAuth, WinRmHost};

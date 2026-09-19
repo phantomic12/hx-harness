@@ -290,6 +290,153 @@ pub struct SshHost {
     port: u16,
 }
 
+/// An interactive terminal on a remote machine, over an SSH channel.
+///
+/// ## Why a task sits between russh and the caller
+///
+/// russh delivers channel messages by *pushing* them out of `Channel::wait()`. [`PtySession::read`]
+/// is pull-based, because the caller has to be able to apply backpressure — a client that stops
+/// reading must stall the pty rather than have the daemon buffer megabytes of output nobody will
+/// see. This type reconciles the two: one task drains `wait()` into a bounded channel, and `read()`
+/// takes from it. The bound is the backpressure: once it is full the reader task blocks, the SSH
+/// window closes, and the remote program stops on its own.
+///
+/// ## Why stdin and stdout are separated
+///
+/// russh's `Channel` owns both halves and `wait()` needs `&mut`. The write half is split out and kept
+/// so a keystroke does not have to contend with the reader task for the same lock — typing into a
+/// busy terminal would otherwise wait behind a pending read.
+pub struct SshPty {
+    /// The write half of the channel. Behind a mutex because `write` takes `&mut self` and this is
+    /// reached through `&self`; the lock is held only for the duration of one write.
+    writer: tokio::sync::Mutex<russh::ChannelWriteHalf<russh::client::Msg>>,
+    /// Output from the reader task. Bounded — see the note above.
+    output: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    /// The reader task, kept so `close` can stop it.
+    ///
+    /// Aborting is the fix for a hang I hit and could not reason my way out of on paper. The reader
+    /// task owns the *only* live sender and sits parked in `reader.wait()`; after EOF the remote is
+    /// not obliged to send anything back, so the task never returns, the sender is never dropped,
+    /// and `read()` waits on a channel that cannot end. Dropping a cloned sender does nothing —
+    /// the task's own handle is still alive. Aborting the task drops it, which ends the receiver and
+    /// makes `read()` return `None`.
+    reader_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Set once `close` has run, so a second close is a no-op rather than an error.
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl SshPty {
+    /// Spawn the reader task and wrap the channel.
+    pub fn start(channel: russh::Channel<russh::client::Msg>) -> Self {
+        // `split()` yields the read half first — `(ChannelReadHalf, ChannelWriteHalf)`.
+        let (mut reader, writer) = channel.split();
+
+        // 256 chunks is the backpressure window. Deep enough that a burst of output does not stall a
+        // shell mid-redraw, shallow enough that a client which has stopped reading stops the remote
+        // program within a fraction of a megabyte.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+        let reader_task = tokio::spawn(async move {
+            while let Some(message) = reader.wait().await {
+                let data = match message {
+                    ChannelMsg::Data { data } => Some(data.as_ref().to_vec()),
+                    // Stream 1 is stderr. On a pty it is merged with stdout by the pty itself, so a
+                    // separate stream only appears from a transport that split it; showing it is
+                    // still right, and dropping it would lose the only copy of a message.
+                    ChannelMsg::ExtendedData { data, ext: 1 } => Some(data.as_ref().to_vec()),
+                    ChannelMsg::ExitStatus { .. } | ChannelMsg::Eof | ChannelMsg::Close => None,
+                    _ => continue,
+                };
+                match data {
+                    Some(bytes) if !bytes.is_empty() => {
+                        // `blocking_send` is wrong here (we are on an async runtime); `send` awaits,
+                        // which is exactly the stall that closes the window.
+                        if tx.send(bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(_) => continue,
+                    // End of output: dropping the sender ends the receiver, so `read()` returns
+                    // `None` and the caller learns the session finished.
+                    None => break,
+                }
+            }
+        });
+
+        Self {
+            writer: tokio::sync::Mutex::new(writer),
+            output: tokio::sync::Mutex::new(rx),
+            reader_task: tokio::sync::Mutex::new(Some(reader_task)),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait]
+impl crate::host::PtySession for SshPty {
+    async fn write(&self, data: &[u8]) -> Result<()> {
+        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(HxError::Remote("the terminal is closed".to_string()));
+        }
+        let writer = self.writer.lock().await;
+        writer
+            .data(data)
+            .await
+            .map_err(|e| HxError::Remote(format!("could not write to the terminal: {e}")))
+    }
+
+    async fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        if cols == 0 || rows == 0 {
+            // Same refusal as the local terminal: a zero dimension is a hidden viewport, and passing
+            // it on leaves a curses program with a window it cannot draw in.
+            return Ok(());
+        }
+        let writer = self.writer.lock().await;
+        writer
+            .window_change(u32::from(cols), u32::from(rows), 0, 0)
+            .await
+            .map_err(|e| HxError::Remote(format!("could not resize the terminal: {e}")))
+    }
+
+    async fn read(&self) -> Option<Vec<u8>> {
+        self.output.lock().await.recv().await
+    }
+
+    async fn close(&self) -> Result<()> {
+        // Idempotent: a client disconnect and a daemon shutdown can both reach here, and the second
+        // one is not an error.
+        if self.closed.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        let writer = self.writer.lock().await;
+        // EOF first so the remote shell sees end-of-input and can run its own cleanup, then close.
+        // Closing without EOF is a hangup, which is not the same thing and can leave a shell's
+        // history unwritten.
+        let _ = writer.eof().await;
+        let _ = writer.close().await;
+        drop(writer);
+
+        // Stop the reader task. It owns the last sender and may be parked in `wait()` forever, so
+        // aborting it is what ends the output stream — see the note on `reader_task`.
+        if let Some(task) = self.reader_task.lock().await.take() {
+            task.abort();
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for SshPty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The channel halves have no useful rendering; the state a log line needs is whether it is
+        // still open.
+        f.debug_struct("SshPty")
+            .field(
+                "closed",
+                &self.closed.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for SshHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Not derived: the session handle has no useful rendering, and there is nothing in this
@@ -690,6 +837,64 @@ impl Host for SshHost {
             )));
         }
         Ok(())
+    }
+
+    async fn open_pty(
+        &self,
+        command: Option<&str>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Arc<dyn crate::host::PtySession>> {
+        if !self.caps.is_unix() {
+            // Stated rather than attempted: an SSH PTY on Windows would start a shell whose dialect
+            // differs, and the pane would render a prompt that does not respond to what the client
+            // sends. The WinRM transport is the way to a Windows box.
+            return Err(HxError::Remote(format!(
+                "an interactive terminal over SSH is only implemented for POSIX hosts; {} is {:?}",
+                self.address, self.caps.os
+            )));
+        }
+
+        // A PTY is a *shell* session, not an `exec`: `shell(true)` starts the login shell, and
+        // `exec` on a pty channel would run one command and exit, which is the opposite of a
+        // terminal.
+        let channel = self
+            .session
+            .channel_open_session()
+            .await
+            .map_err(|e| HxError::Remote(format!("could not open an SSH channel: {e}")))?;
+
+        // The window size travels with the request, so the shell's first prompt is already the right
+        // size. Sending it afterwards would make every program redraw once on attach.
+        //
+        // `xterm-256color` rather than `dumb`: a pane that reports a dumb terminal makes the remote
+        // side drop colour and cursor addressing, and the client is a real terminal emulator.
+        channel
+            .request_pty(
+                true,
+                "xterm-256color",
+                u32::from(cols),
+                u32::from(rows),
+                0,
+                0,
+                &[],
+            )
+            .await
+            .map_err(|e| HxError::Remote(format!("the host refused a pty request: {e}")))?;
+
+        if let Some(command) = command {
+            channel
+                .exec(true, command.as_bytes().to_vec())
+                .await
+                .map_err(|e| HxError::Remote(format!("could not start {command:?}: {e}")))?;
+        } else {
+            channel
+                .request_shell(true)
+                .await
+                .map_err(|e| HxError::Remote(format!("the host refused a shell request: {e}")))?;
+        }
+
+        Ok(Arc::new(SshPty::start(channel)))
     }
 
     fn describe(&self) -> String {
