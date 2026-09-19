@@ -71,10 +71,11 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/sessions/{id}/ws", get(crate::stream_ws::session_ws))
         // The terminal has its own socket: an attach is a join, not an open, and input travels
         // back up it. See `crate::terminal_ws` for why it is not a frame on the session stream.
-        .route(
-            "/v1/terminals/{id}/ws",
-            get(crate::terminal_ws::terminal_ws),
-        )
+        //
+        // On a host with no PTY the route still exists and answers with a reason. A missing route
+        // would read as a client bug, and the honest statement here is that the daemon cannot do
+        // this rather than that it does not know the path.
+        .route("/v1/terminals/{id}/ws", get(terminal_ws_handler))
         .route("/v1/terminals", get(list_terminals).post(create_terminal))
         .route("/v1/terminals/{id}", delete(kill_terminal))
         .route("/v1/approvals", get(list_approvals))
@@ -474,6 +475,26 @@ fn default_cols() -> u16 {
 
 fn default_rows() -> u16 {
     24
+}
+
+/// The terminal WebSocket handler: the real one where a PTY exists, an honest refusal where it does
+/// not.
+///
+/// `terminal_ws` operates on a running terminal, and terminals do not exist on a host without a PTY,
+/// so that module is Unix-only and this picks the behaviour at compile time. The route exists either
+/// way: answering "not on this platform" is clearer to a client than a 404 that reads like a typo.
+#[cfg(unix)]
+use crate::terminal_ws::terminal_ws as terminal_ws_handler;
+
+#[cfg(not(unix))]
+async fn terminal_ws_handler(Path(id): Path<String>) -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "error": "terminals need a PTY, which this platform does not have",
+            "terminal": id,
+        })),
+    )
 }
 
 /// `POST /v1/terminals` — start a terminal. A client attaches to it with `GET /v1/terminals/{id}/ws`.

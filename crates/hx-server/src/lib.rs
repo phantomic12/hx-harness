@@ -22,6 +22,7 @@ pub mod state;
 pub mod stream;
 pub mod stream_ws;
 pub mod terminal;
+#[cfg(unix)]
 pub mod terminal_ws;
 
 pub use chat::{ChatReply, ChatRequest, ModelFactory, RouterModels};

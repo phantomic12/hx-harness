@@ -50,8 +50,10 @@ jobs:
         # a VM-backed runtime exists. Installing it here is what stops the strongest claim in the
         # ladder from quietly skipping — `HX_DOCKER_REQUIRE_L3` below turns a skip into a failure.
         run: |
-          curl -fsSL -o /tmp/runsc https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/runsc
-          curl -fsSL -o /tmp/runsc.sha512 https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/runsc.sha512
+          # `releases/release/latest/...` was removed upstream and now 404s. The current layout puts
+          # each binary under its own directory, and `runsc` is published there on every release.
+          curl -fsSL -o /tmp/runsc https://storage.googleapis.com/gvisor/releases/release/runsc/x86_64/runsc
+          curl -fsSL -o /tmp/runsc.sha512 https://storage.googleapis.com/gvisor/releases/release/runsc/x86_64/runsc.sha512
           (cd /tmp && sha512sum -c runsc.sha512)
           sudo install -m 0755 /tmp/runsc /usr/local/bin/runsc
           printf '%s\n' '{ "runtimes": { "runsc": { "path": "/usr/local/bin/runsc" } } }' | sudo tee /etc/docker/daemon.json

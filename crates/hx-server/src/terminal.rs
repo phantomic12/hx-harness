@@ -26,15 +26,25 @@
 //! program legitimately prints all have to survive. Decoding to `String` here would replace
 //! anything malformed and corrupt the stream a terminal is meant to interpret verbatim.
 
+// The Unix-only helpers below are dead code on a host with no PTY, which is expected: they
+// implement a feature that platform does not have. Allowing it once here is clearer than
+// guarding two dozen small items — and CI runs clippy with `-D warnings`, so a stray warning
+// is a build failure on Windows and macOS.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use hx_core::error::{HxError, Result};
+#[cfg(unix)]
 use nix::pty::{openpty, OpenptyResult};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, OwnedFd};
+#[cfg(unix)]
 use tokio::sync::broadcast;
 
 /// How much terminal output is retained for a client that attaches late or reattaches.
@@ -86,10 +96,12 @@ pub fn decode(data: &str) -> Result<Vec<u8>> {
 /// buffer, so the extra bookkeeping a ring would need buys nothing and gives more room to get the
 /// wrap-around wrong. Output arrives in the tens of KiB at most, so the copy on trim is not hot.
 #[derive(Debug, Default)]
+#[cfg(unix)]
 struct Scrollback {
     bytes: Vec<u8>,
 }
 
+#[cfg(unix)]
 impl Scrollback {
     fn push(&mut self, chunk: &[u8]) {
         self.bytes.extend_from_slice(chunk);
@@ -108,6 +120,10 @@ impl Scrollback {
 }
 
 /// One terminal: the PTY, its scrollback, and the broadcast of its output.
+///
+/// Unix-only. A PTY is a Unix device; on a host without one there is nothing honest to return, so
+/// [`Terminals`] reports that rather than pretending a terminal exists.
+#[cfg(unix)]
 pub struct Terminal {
     /// The master side of the PTY. Writing here is typing; reading here is what the shell printed.
     ///
@@ -122,6 +138,7 @@ pub struct Terminal {
     child_pid: Option<i32>,
 }
 
+#[cfg(unix)]
 impl Terminal {
     /// The retained scrollback, for a client attaching now.
     pub fn scrollback(&self) -> Vec<u8> {
@@ -184,6 +201,7 @@ impl Terminal {
 /// and publishes what it gets; the child is reaped on exit and an [`TerminalOutput::Exited`] is
 /// broadcast last, so a client learns the shell ended rather than seeing the stream simply stop —
 /// "no more output" and "the shell died" are different things to render.
+#[cfg(unix)]
 pub fn spawn(shell: &str, args: &[String], cols: u16, rows: u16) -> Result<Arc<Terminal>> {
     // `openpty` takes nix's own `Winsize`; the hand-rolled one below is for the `TIOCSWINSZ` ioctl
     // on a resize, which has no safe wrapper here.
@@ -312,11 +330,67 @@ pub fn spawn(shell: &str, args: &[String], cols: u16, rows: u16) -> Result<Arc<T
 /// A terminal is keyed by an opaque id rather than by session: a session may have more than one
 /// shell (a build in one, an editor in another), and the terminal must be reachable by a client
 /// that reconnects without knowing anything about the session.
+#[cfg(unix)]
 #[derive(Default)]
 pub struct Terminals {
     inner: Mutex<HashMap<String, Arc<Terminal>>>,
 }
 
+/// The terminal registry on a host with no PTY.
+///
+/// The type still exists, and says why it cannot do anything, because the daemon's state holds it
+/// unconditionally: removing it would push this platform difference up into every caller. `create`
+/// and `attach` fail with a reason that names the limit rather than a panic or a silent no-op — a
+/// terminal that appears to start and then produces nothing is worse than being told it will not.
+#[cfg(not(unix))]
+#[derive(Default)]
+pub struct Terminals;
+
+#[cfg(not(unix))]
+impl Terminals {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Always fails: there is no PTY to spawn a shell on.
+    pub fn create(
+        &self,
+        _id: &str,
+        _shell: &str,
+        _args: &[String],
+        _cols: u16,
+        _rows: u16,
+    ) -> Result<()> {
+        Err(HxError::Sandbox(
+            "terminals need a PTY, which this platform does not have".to_string(),
+        ))
+    }
+
+    /// Always reports the terminal as absent, for the same reason.
+    pub fn get(&self, _id: &str) -> Option<Arc<Terminal>> {
+        None
+    }
+
+    /// No terminals can exist here, so there are none to list.
+    pub fn ids(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Nothing can have been registered, so there is nothing to remove.
+    pub fn remove(&self, _id: &str) -> bool {
+        false
+    }
+}
+
+/// The terminal on a host with no PTY: a type that exists so callers compile, and that cannot be
+/// constructed, because there is never one to hand back.
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub struct Terminal {
+    _private: (),
+}
+
+#[cfg(unix)]
 impl Terminals {
     pub fn new() -> Self {
         Self::default()
@@ -369,6 +443,7 @@ impl Terminals {
     }
 }
 
+#[cfg(unix)]
 impl Terminal {
     /// The child's pid, for a caller that wants to signal it.
     pub fn child_pid(&self) -> Option<i32> {
@@ -428,6 +503,7 @@ unsafe fn libc_close(fd: i32) -> i32 {
     unsafe { close(fd) }
 }
 
+#[cfg(unix)]
 unsafe fn libc_dup2(oldfd: i32, newfd: i32) -> i32 {
     unsafe extern "C" {
         fn dup2(oldfd: i32, newfd: i32) -> i32;
@@ -439,6 +515,10 @@ unsafe fn libc_dup2(oldfd: i32, newfd: i32) -> i32 {
 mod tests {
     use super::*;
 
+    // A few tests in this module are about the wire format rather than the PTY, so they run
+    // everywhere: `encode`/`decode` are unguarded precisely because a client needs them on any
+    // platform. The rest drive `Scrollback` and `Terminals`, which only exist where a PTY does.
+    #[cfg(unix)]
     #[test]
     fn scrollback_keeps_only_the_most_recent_bytes() {
         let mut sb = Scrollback::default();
@@ -452,6 +532,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_single_write_larger_than_the_cap_is_trimmed_not_kept() {
         // The case a line-counting cap would miss: one enormous write.
@@ -469,6 +550,7 @@ mod tests {
         assert_eq!(decoded, raw);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_zero_dimension_resize_is_ignored_rather_than_applied() {
         // A hidden viewport reports 0x0; applying it leaves the shell in a state every curses
@@ -491,6 +573,7 @@ mod tests {
         assert!(matches!(err, HxError::Config(_)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_terminal_id_cannot_be_reused_while_it_is_live() {
         let terminals = Terminals::new();
@@ -506,6 +589,7 @@ mod tests {
         assert!(terminals.get("t1").is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_unknown_terminal_is_absent_rather_than_created_on_the_way_in() {
         let terminals = Terminals::new();
@@ -513,6 +597,7 @@ mod tests {
         assert!(terminals.ids().is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_real_shell_prints_and_its_output_is_retained() {
         // The end-to-end proof at the unit level: start a real shell, run a real command, and see
@@ -560,6 +645,7 @@ mod tests {
         terminals.remove("t");
     }
 
+    #[cfg(unix)]
     #[test]
     fn two_readers_on_one_terminal_see_the_same_bytes() {
         // M2's actual claim, at the level of the terminal: not one client, two.

@@ -11,6 +11,56 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+/// Move `from` to `to` where a hard link cannot be made, keeping the "never replace" contract.
+///
+/// A cross-device move cannot be a link, and `rename(2)` would replace silently. The destination is
+/// therefore created with `create_new` — which is atomic, and fails when the destination exists — and
+/// the bytes are copied into it. On a failed copy the partial destination is removed, so a caller
+/// never sees a truncated file at a path that was meant to hold a complete move.
+async fn copy_without_replacing(from: &str, to: &str, link_error: std::io::Error) -> Result<()> {
+    let mut source = tokio::fs::File::open(from)
+        .await
+        .map_err(|e| HxError::Remote(format!("could not read {from} to move it to {to}: {e}")))?;
+
+    // `create_new` is the atomic part: it is the only way to get a destination another process
+    // cannot have created in the meantime.
+    let mut destination = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(HxError::Remote(format!(
+                "{to} already exists; refusing to replace it"
+            )));
+        }
+        Err(e) => {
+            return Err(HxError::Remote(format!(
+                "could not create {to} (the move from {from} cannot be a link here: {link_error}): {e}"
+            )));
+        }
+    };
+
+    if let Err(e) = tokio::io::copy(&mut source, &mut destination).await {
+        drop(destination);
+        // Removed rather than left behind: a partial file at a path the caller believes holds a
+        // complete move is worse than no file, which at least reports the failure.
+        let _ = tokio::fs::remove_file(to).await;
+        return Err(HxError::Remote(format!(
+            "could not copy {from} to {to}: {e}"
+        )));
+    }
+
+    if let Err(e) = tokio::fs::remove_file(from).await {
+        return Err(HxError::Remote(format!(
+            "copied {from} to {to}, but could not remove the original: {e}"
+        )));
+    }
+    Ok(())
+}
+
 /// The local machine, driven through `std::process` rather than a shell round-trip.
 pub struct LocalHost {
     id: HostId,
@@ -166,19 +216,34 @@ impl Host for LocalHost {
             }
         }
 
-        // `rename(2)` replaces an existing destination silently, so the refusal has to be made here.
-        // It is a check and not a promise — nothing on this side can make it atomic, and the window
-        // is acceptable precisely because the caller's destination is a fresh trash name it just
-        // confirmed was free.
-        if tokio::fs::symlink_metadata(to).await.is_ok() {
-            return Err(HxError::Remote(format!(
-                "{to} already exists; refusing to replace it"
-            )));
+        // `rename(2)` replaces an existing destination silently, so the refusal has to be atomic —
+        // a check-then-rename lets another process create the destination in the window between the
+        // two, and the rename then overwrites it.
+        //
+        // `link(2)` refuses when the destination exists, and the kernel does that test and the
+        // creation in one step, so there is no window. The second step is `remove_file(from)`, which
+        // is what turns the hard link into a move: the destination is already durable at that point,
+        // so a failure there leaves the data at *both* paths rather than losing it.
+        match tokio::fs::hard_link(from, to).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(HxError::Remote(format!(
+                    "{to} already exists; refusing to replace it"
+                )));
+            }
+            Err(e) => {
+                // A cross-device move cannot be a hard link, and the no-replace property has to be
+                // kept, so the destination is created exclusively instead and the source copied in.
+                return copy_without_replacing(from, to, e).await;
+            }
         }
 
-        tokio::fs::rename(from, to)
-            .await
-            .map_err(|e| HxError::Remote(format!("could not move {from} to {to}: {e}")))
+        if let Err(e) = tokio::fs::remove_file(from).await {
+            return Err(HxError::Remote(format!(
+                "moved {from} to {to}, but could not remove the original: {e}"
+            )));
+        }
+        Ok(())
     }
 
     fn describe(&self) -> String {
@@ -309,5 +374,91 @@ mod tests {
     #[tokio::test]
     async fn describe_names_the_platform_and_shell() {
         assert_eq!(host().describe(), "local (linux, posix shell)");
+    }
+
+    #[tokio::test]
+    async fn a_rename_never_replaces_an_existing_destination() {
+        // The contract is "refuse", and the reason it must be atomic rather than a check-then-move is
+        // that the check is not a promise: another process can create the destination in between, and
+        // a `rename(2)` would then overwrite it silently. This asserts the refusal and, more
+        // importantly, that the destination is untouched afterwards.
+        let dir = tempdir();
+        let from = dir.join("src.txt");
+        let to = dir.join("dst.txt");
+        tokio::fs::write(&from, b"source contents").await.unwrap();
+        tokio::fs::write(&to, b"existing contents").await.unwrap();
+
+        let refused = host()
+            .rename(&from.to_string_lossy(), &to.to_string_lossy())
+            .await;
+        assert!(
+            refused.is_err(),
+            "moving onto an existing destination must be refused"
+        );
+        let message = format!("{:?}", refused.unwrap_err());
+        assert!(
+            message.contains("already exists"),
+            "the refusal must say why: {message}"
+        );
+
+        // The whole point: the existing file is intact, not overwritten.
+        assert_eq!(
+            tokio::fs::read(&to).await.unwrap(),
+            b"existing contents",
+            "the destination must be untouched by a refused move"
+        );
+        // And the source is still where it was, because nothing moved.
+        assert_eq!(
+            tokio::fs::read(&from).await.unwrap(),
+            b"source contents",
+            "a refused move must leave the source in place"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rename_to_a_free_name_moves_the_file() {
+        let dir = tempdir();
+        let from = dir.join("src.txt");
+        let to = dir.join("moved.txt");
+        tokio::fs::write(&from, b"payload").await.unwrap();
+
+        host()
+            .rename(&from.to_string_lossy(), &to.to_string_lossy())
+            .await
+            .expect("a free destination must move");
+
+        assert_eq!(tokio::fs::read(&to).await.unwrap(), b"payload");
+        assert!(
+            !from.exists(),
+            "a completed move must not leave the source behind"
+        );
+    }
+
+    /// A scratch directory that removes itself, so a failing assertion cannot leave files behind.
+    fn tempdir() -> TempDir {
+        let path = std::env::temp_dir().join(format!(
+            "hx-local-rename-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        TempDir { path }
+    }
+
+    struct TempDir {
+        path: std::path::PathBuf,
+    }
+
+    impl TempDir {
+        fn join(&self, name: &str) -> std::path::PathBuf {
+            self.path.join(name)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 }
