@@ -4,6 +4,7 @@ use crate::tool::{parse_args, Requirement, Tool, ToolContext, ToolError, ToolOut
 use async_trait::async_trait;
 use hx_core::approval::Confinement;
 use hx_core::capability::{Action, Resource};
+use hx_remote::host::ShellKind;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -47,6 +48,7 @@ impl ShellTool {
     fn command_line<F: Fn(&str) -> String>(
         args: &Args,
         workspace: Option<&str>,
+        shell: ShellKind,
         quote: F,
     ) -> String {
         let dir = match &args.workdir {
@@ -58,7 +60,9 @@ impl ShellTool {
         };
 
         match dir {
-            Some(dir) => format!("cd {} && {}", quote(&dir), args.cmd),
+            // The join is the shell's, not `&&`: PowerShell 5.1 rejects `&&`, so a line built that
+            // way failed on Windows before the command ran — for every `workdir`-qualified call.
+            Some(dir) => shell.chain(&format!("cd {}", quote(&dir)), &args.cmd),
             None => args.cmd.clone(),
         }
     }
@@ -170,8 +174,9 @@ impl Tool for ShellTool {
                 (output, Some(sandbox.describe()))
             }
             None => {
-                let line =
-                    Self::command_line(&parsed, ctx.workspace.as_deref(), |arg| shell.quote(arg));
+                let line = Self::command_line(&parsed, ctx.workspace.as_deref(), shell, |arg| {
+                    shell.quote(arg)
+                });
                 let output = match ctx.host.exec(&line, timeout).await {
                     Ok(output) => output,
                     Err(err) => {
@@ -386,7 +391,7 @@ mod tests {
             workdir: None,
             timeout_secs: None,
         };
-        let line = ShellTool::command_line(&args, Some("/ws"), shell_quote);
+        let line = ShellTool::command_line(&args, Some("/ws"), ShellKind::Posix, shell_quote);
         // `shell_quote` quotes unconditionally, so the expected line carries the quotes too.
         assert_eq!(line, "cd '/ws' && git status");
     }
@@ -398,7 +403,7 @@ mod tests {
             workdir: Some("/elsewhere".to_string()),
             timeout_secs: None,
         };
-        let line = ShellTool::command_line(&args, Some("/ws"), shell_quote);
+        let line = ShellTool::command_line(&args, Some("/ws"), ShellKind::Posix, shell_quote);
         assert_eq!(line, "cd '/elsewhere' && ls");
     }
 
@@ -409,7 +414,7 @@ mod tests {
             workdir: Some("/tmp/it's here".to_string()),
             timeout_secs: None,
         };
-        let line = ShellTool::command_line(&args, None, shell_quote);
+        let line = ShellTool::command_line(&args, None, ShellKind::Posix, shell_quote);
         assert!(line.starts_with("cd '/tmp/it'\\''s here' && "), "{line}");
         assert!(line.ends_with("ls -la"));
     }
@@ -421,7 +426,55 @@ mod tests {
             workdir: None,
             timeout_secs: None,
         };
-        assert_eq!(ShellTool::command_line(&args, None, shell_quote), "pwd");
+        assert_eq!(
+            ShellTool::command_line(&args, None, ShellKind::Posix, shell_quote),
+            "pwd"
+        );
+    }
+
+    #[test]
+    fn a_workdir_under_powershell_does_not_use_an_ampersand() {
+        // Regression test. `&&` is not a statement separator in Windows PowerShell 5.1, which is what
+        // `powershell` resolves to on a stock Windows host. A `cd <dir> && <cmd>` line therefore died
+        // with `The token '&&' is not a valid statement separator in this version` before the command
+        // ran — every `workdir`-qualified call on Windows, which is what the `api` tests caught.
+        let args = Args {
+            cmd: "git push".to_string(),
+            workdir: Some(r"C:\work".to_string()),
+            timeout_secs: None,
+        };
+        let line = ShellTool::command_line(&args, Some(r"C:\ws"), ShellKind::PowerShell, |arg| {
+            ShellKind::PowerShell.quote(arg)
+        });
+
+        assert!(
+            !line.contains("&&"),
+            "PowerShell 5.1 rejects `&&`, so the line must not contain one: {line}"
+        );
+        // It still has to gate the second statement on the first, or a failed `cd` would run the
+        // command in whatever directory the daemon happens to be in.
+        assert!(
+            line.contains("if ($?") || line.contains("if ("),
+            "the command must still run only when the `cd` succeeded: {line}"
+        );
+        assert!(
+            line.contains("git push"),
+            "the command must survive: {line}"
+        );
+    }
+
+    #[test]
+    fn a_workdir_under_cmd_still_uses_an_ampersand() {
+        // `cmd.exe` does support `&&`, so this must not be changed for the sake of the PowerShell
+        // case: the fix is per-shell, not a global switch away from `&&`.
+        let args = Args {
+            cmd: "dir".to_string(),
+            workdir: Some(r"C:\work".to_string()),
+            timeout_secs: None,
+        };
+        let line =
+            ShellTool::command_line(&args, None, ShellKind::Cmd, |arg| ShellKind::Cmd.quote(arg));
+        assert!(line.contains("&&"), "cmd.exe supports `&&`: {line}");
     }
 
     #[tokio::test]

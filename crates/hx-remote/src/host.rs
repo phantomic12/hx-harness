@@ -57,6 +57,30 @@ impl ShellKind {
             ShellKind::Cmd => vec!["cmd".into(), "/C".into(), command_line.into()],
         }
     }
+
+    /// Join two commands so the second runs only when the first succeeded.
+    ///
+    /// This is per-shell because `&&` is not universal. Windows PowerShell 5.1 — what `powershell`
+    /// resolves to on every Windows host without PowerShell 7 installed — rejects it outright with
+    /// `The token '&&' is not a valid statement separator in this version`, so a `cd <dir> && <cmd>`
+    /// built for a POSIX shell fails before the command is ever reached. That is what broke every
+    /// `workdir`-qualified command on Windows, in tests and in production alike.
+    ///
+    /// - POSIX `sh` uses `&&`.
+    /// - `cmd.exe` uses `&&`.
+    /// - PowerShell separates statements with `;`, and gates the second on the first with `if`.
+    pub fn chain(self, first: &str, second: &str) -> String {
+        match self {
+            ShellKind::Posix | ShellKind::Cmd => format!("{first} && {second}"),
+            // `;` alone runs the second statement whatever happened to the first, which is not the
+            // same thing: a `cd` into a directory that does not exist must not then run the command
+            // in the daemon's own working directory. `$?` is checked instead, so the second
+            // statement is skipped on failure exactly as `&&` would skip it.
+            ShellKind::PowerShell => {
+                format!("{first}; if ($? -eq $true) {{ {second} }}")
+            }
+        }
+    }
 }
 
 /// Wrap an argument in single quotes for a POSIX shell.
