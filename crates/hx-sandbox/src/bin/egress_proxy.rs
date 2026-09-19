@@ -38,8 +38,55 @@ use std::thread;
 
 const LISTEN_ADDR: &str = "0.0.0.0:3128";
 
+const USAGE: &str = "\
+hx-egress-proxy — the allowlist-enforcing egress proxy for a sandbox.
+
+Started by the daemon as the sidecar container's command; not normally run by
+hand. It listens on the internal network and forwards only CONNECT requests to
+destinations named in its allowlist.
+
+Environment:
+  HX_EGRESS_ALLOW   comma-separated `host` or `*.domain` entries, e.g.
+                    `crates.io,*.crates.io`. Absent or empty means nothing is
+                    allowed, which is the fail-closed default.
+
+Options:
+  -h, --help        print this and exit
+  -V, --version     print the version and exit
+
+It takes no other arguments: the listen address is fixed, because the network
+it must sit on is the whole reason it exists.
+";
+
 /// Run the proxy until killed. The caller (the sidecar's entrypoint) is the supervisor.
 fn main() {
+    // Checked *before* binding. A `--help` that opens port 3128 is worse than unhelpful: it
+    // occupies the port the real proxy needs, so the next sandbox's sidecar cannot start, and the
+    // failure surfaces as a sandbox with no egress rather than as a usage error. This was a real
+    // bug — the binary ignored its arguments entirely.
+    //
+    // The first argument decides everything: this binary takes no options that affect its work, so
+    // there is nothing to parse and no order to respect.
+    if let Some(arg) = env::args().nth(1) {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return;
+            }
+            "-V" | "--version" => {
+                println!("hx-egress-proxy {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
+            // Refused rather than ignored, for the same reason as `--help`: a typo silently
+            // producing a running proxy would make the operator think an option took effect.
+            other => {
+                eprintln!("hx-egress-proxy: unrecognised argument '{other}'");
+                eprint!("{USAGE}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     let allow = parse_allowlist(env::var("HX_EGRESS_ALLOW").unwrap_or_default());
 
     let listener = TcpListener::bind(LISTEN_ADDR).expect("proxy must bind the internal port");
