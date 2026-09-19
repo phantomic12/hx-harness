@@ -69,9 +69,18 @@ jobs:
           (cd /tmp && sha512sum -c gvisor.tar.zstd.sha512)
           mkdir -p /tmp/gvisor && tar --zstd -xf /tmp/gvisor.tar.zstd -C /tmp/gvisor
           sudo install -m 0755 /tmp/gvisor/runsc /usr/local/bin/runsc
-          # The shim has to be on PATH as well, or `docker` cannot start a container with this
-          # runtime: `runsc` alone is not enough.
+          # The shim and the sidecar binaries have to be installed too. A current `runsc` looks for
+          # `gvisor-bin/` next to itself and fails the container outright without it:
+          #
+          #   sidecar "gvisor_sentry" not usable (stat /usr/local/bin/gvisor-bin/gvisor_sentry:
+          #   no such file or directory) and --sidecar-usage-policy is set to STRICT
+          #
+          # which is a newer requirement than the 2022 build this job used to get, and reads as a
+          # broken runtime rather than an incomplete install.
           sudo install -m 0755 /tmp/gvisor/containerd-shim-runsc-v1 /usr/local/bin/containerd-shim-runsc-v1
+          sudo mkdir -p /usr/local/bin/gvisor-bin
+          sudo cp -a /tmp/gvisor/gvisor-bin/. /usr/local/bin/gvisor-bin/
+          sudo chmod 0755 /usr/local/bin/gvisor-bin/*
           # Merge into `daemon.json` rather than replacing it. Writing the key alone clobbers
           # whatever the installer put there — the default runtime and the shim paths `containerd`
           # needs — and `runsc` then fails to launch with `did not terminate successfully: exit
