@@ -532,6 +532,18 @@ impl Terminals {
         ))
     }
 
+    /// Always fails: there is no PTY here to give a remote machine either.
+    ///
+    /// A remote terminal needs a local pty to relay through — the pump, the scrollback and the
+    /// broadcast all live on this side — so this platform cannot serve one even though the machine
+    /// on the other end has a shell. The refusal names the local limit, because that is the part
+    /// that is missing; pointing at the remote host would be misleading.
+    pub fn create_remote(&self, _id: &str, _session: Arc<dyn hx_remote::PtySession>) -> Result<()> {
+        Err(HxError::Sandbox(
+            "terminals need a PTY, which this platform does not have".to_string(),
+        ))
+    }
+
     /// Always reports the terminal as absent, for the same reason.
     pub fn get(&self, _id: &str) -> Option<Arc<Terminal>> {
         None
