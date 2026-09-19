@@ -7,6 +7,11 @@
   },
   "packageRules": [
     {
+      "description": "sha2 is disabled, and must stay disabled. `hx-store` keeps TWO sha2 versions on purpose: the audit chain hashes with 0.10, and `sha2_11` aliases 0.11 because `hmac` 0.13 is built on digest 0.11 and cannot pair with 0.10. Bumping the workspace dep to 0.11 makes both names resolve to 0.11 while the chain's code still calls digest-0.10 traits — a type mismatch, not a resolution hiccup. It was proposed inside the non-major group and had to be closed. Moving the chain to digest 0.11 is a real change to `crates/hx-store/src/audit.rs` and its tests, so it belongs in a deliberate PR rather than a weekly one.",
+      "matchPackageNames": ["sha2"],
+      "enabled": false
+    },
+    {
       "description": "One PR for all non-major Rust updates. Un-grouped, this is a few hundred separate PRs for a 395-crate tree, which nobody reviews.",
       "matchManagers": ["cargo"],
       "matchUpdateTypes": ["minor", "patch"],
