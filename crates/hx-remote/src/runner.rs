@@ -218,7 +218,7 @@ mod tests {
                 shell: ShellKind::Posix,
                 arch: Some("x86_64".into()),
                 home_dir: None,
-                has_sftp: false,
+                has_sftp: None,
             },
         ))
     }

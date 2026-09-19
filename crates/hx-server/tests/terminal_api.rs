@@ -458,3 +458,101 @@ async fn a_detached_client_leaves_the_shell_running_for_the_next_one() {
         .send()
         .await;
 }
+
+#[tokio::test]
+async fn a_terminal_on_an_unknown_host_is_refused_with_the_known_names() {
+    // The route has to fail before it does anything useful, and say what it knows. A 500 here would
+    // read as a daemon bug when the real answer is "that machine is not configured".
+    let server = harness().await;
+    let base = format!("http://{}", server.addr);
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{base}/v1/terminals"))
+        .json(&serde_json::json!({ "id": "t-remote", "host": "nowhere" }))
+        .send()
+        .await
+        .expect("create");
+
+    assert_ne!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "a terminal on an unconfigured host must not be created"
+    );
+    let body = response.text().await.expect("body");
+    assert!(
+        body.contains("nowhere"),
+        "the refusal should name the host asked for; got {body}"
+    );
+
+    // And nothing was registered, so a client cannot then attach to a terminal that never existed.
+    let listed = client
+        .get(format!("{base}/v1/terminals"))
+        .send()
+        .await
+        .expect("list")
+        .text()
+        .await
+        .expect("body");
+    assert!(
+        !listed.contains("t-remote"),
+        "a refused terminal must not be registered; got {listed}"
+    );
+}
+
+#[tokio::test]
+async fn a_terminal_without_a_host_still_creates_locally() {
+    // The field is optional and defaults to this machine, so every existing caller keeps working.
+    let server = harness().await;
+    let base = format!("http://{}", server.addr);
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{base}/v1/terminals"))
+        .json(&serde_json::json!({ "id": "t-default", "shell": "/bin/sh" }))
+        .send()
+        .await
+        .expect("create");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "omitting the host must still mean the local machine"
+    );
+    let body = response.text().await.expect("body");
+    // No `host` echoed back, because the request did not name one.
+    assert!(
+        !body.contains("\"host\""),
+        "a local terminal should not claim a remote host; got {body}"
+    );
+
+    let _ = client
+        .delete(format!("{base}/v1/terminals/t-default"))
+        .send()
+        .await;
+}
+
+#[tokio::test]
+async fn naming_the_local_host_explicitly_takes_the_local_path() {
+    // `local` is the daemon's own machine. Routed to the remote branch it would be refused or would
+    // open a pointless connection to itself, so the filter that splits the two matters.
+    let server = harness().await;
+    let base = format!("http://{}", server.addr);
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{base}/v1/terminals"))
+        .json(&serde_json::json!({ "id": "t-local", "host": "local", "shell": "/bin/sh" }))
+        .send()
+        .await
+        .expect("create");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "`local` must be treated as this machine, not as a configured remote"
+    );
+
+    let _ = client
+        .delete(format!("{base}/v1/terminals/t-local"))
+        .send()
+        .await;
+}

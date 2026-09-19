@@ -61,6 +61,7 @@ $ curl -s localhost:7717/v1/status | jq .pools
 | Provider adapter: Anthropic Messages API (`/v1/messages`) | **Built** — top-level `system`, `x-api-key` + `anthropic-version` auth, `tool_use`/`tool_result` blocks, `stop_reason`; hermetic HTTP over a stub + a `#[ignore]`d live suite (`crates/hx-provider/tests/anthropic_live.rs`) |
 | Web search: self-hosted SearXNG + keyless DuckDuckGo, RRF fusion, per-backend failure reporting | **Built** — SearXNG verified end to end against a live instance; DuckDuckGo is bot-walled for a non-browser client and *says so* rather than returning nothing |
 | Remote hosts: local + SSH (real `russh`), host key verification, Windows/macOS/Linux capability detection | **Built** — connect, auth, exec and file transfer run against a real host (`crates/hx-remote/tests/ssh_live.rs`) |
+| A terminal on a remote host | **Built** — `Host::open_pty` returns a `PtySession` (a stream, not a request) and `SshHost` implements it over a real pty channel, so `POST /v1/terminals` with a `host` gives a client an interactive shell on another machine through the same WebSocket it already uses (`crates/hx-remote/tests/pty_live.rs`, `crates/hx-server/tests/terminal_remote_live.rs`). `LocalHost` and `WinRmHost` refuse with reasons rather than handing back a session that never speaks |
 | Sandboxes: L1/L2/L3 isolation ladder, Docker lifecycle, TTL reaper | **Built** — created, confined and reaped against a real daemon (`crates/hx-sandbox/tests/docker_live.rs`), running as the workspace's owner so the bind mount is writable; L3 verified inside gVisor, where the sandbox sees `4.19.0-gvisor` and not the host kernel |
 | Daemon (`hxd`) + HTTP API + CLI (`hx`) | **Done**, runnable |
 | Tools (`hx-tools`) + the agent loop (`hx-agent`) | **Built** — seven tools, and a loop that classifies every call against the capability token and then the approval policy; 26 tests pin the gate down against a scripted model (`crates/hx-agent/tests/loop.rs`). `delete` moves a named path to the XDG trash rather than unlinking it, and a destructive prompt carries what will be gone — the resolved path, its entry count, its bytes — because the tool measures the target before anyone is asked |
@@ -209,7 +210,7 @@ $ ./target/release/hxd --bind 127.0.0.1:7717
 ```
 
 ```console
-$ cargo test --workspace         # 695 tests, 0 failed, 24 ignored live tests
+$ cargo test --workspace         # 904 tests, 0 failed, 47 ignored live tests
 $ cargo test -p hx-sandbox --test docker_live -- --ignored   # needs a container engine
 $ cargo test -p hx-remote --test ssh_live -- --ignored       # needs an SSH server
 $ HX_SEARXNG_URL=... HX_SEARCH_EXPECT_RESULTS=searxng \

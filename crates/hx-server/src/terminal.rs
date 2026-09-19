@@ -123,19 +123,42 @@ impl Scrollback {
 ///
 /// Unix-only. A PTY is a Unix device; on a host without one there is nothing honest to return, so
 /// [`Terminals`] reports that rather than pretending a terminal exists.
+/// Where a terminal's bytes actually go.
+///
+/// A terminal is the same thing to a client whether it runs on this machine or another one, so the
+/// scrollback, the broadcast and the input path are shared and only the transport differs. That is
+/// what this enum is for: without it there would be two `Terminal` types and every caller would
+/// have to know which one it had.
+#[cfg(unix)]
+enum TerminalBackend {
+    /// A pty on this machine: the master fd, written to type and read for what the shell printed.
+    Local {
+        /// Held for the terminal's life. When it closes, the shell sees end-of-input.
+        master: Mutex<OwnedFd>,
+        /// The child's process id, for signalling. The child itself is reaped by the reader task.
+        child_pid: Option<i32>,
+    },
+    /// A pty on another machine, reached through a transport.
+    ///
+    /// There is no fd to read here — output arrives by a pump task instead — so a write is a call
+    /// on the session rather than a syscall. See [`Terminal::remote`].
+    Remote {
+        session: Arc<dyn hx_remote::PtySession>,
+        /// The pump task, held so the terminal can stop it. Aborting is how the stream ends, for
+        /// the same reason it is in the SSH implementation: nothing else can wake a task parked on
+        /// a session that will never speak again.
+        pump: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    },
+}
+
 #[cfg(unix)]
 pub struct Terminal {
-    /// The master side of the PTY. Writing here is typing; reading here is what the shell printed.
-    ///
-    /// Held for the terminal's life. When it closes, the shell sees end-of-input.
-    master: Mutex<OwnedFd>,
+    backend: TerminalBackend,
     scrollback: Mutex<Scrollback>,
     /// Output broadcast to attached clients. `broadcast` because several clients attach to one
     /// terminal and all must see the same bytes; a client that falls behind is told it lagged
     /// rather than silently skipping output.
     output: broadcast::Sender<TerminalOutput>,
-    /// The child's process id, for signalling. The child itself is reaped by the reader task.
-    child_pid: Option<i32>,
 }
 
 #[cfg(unix)]
@@ -155,18 +178,65 @@ impl Terminal {
         self.output.subscribe()
     }
 
+    /// Type at the terminal, from async code.
+    ///
+    /// The async twin of [`Terminal::write`], and the one callers on a runtime must use. The
+    /// synchronous version has to run the session's future to completion, which from inside a task
+    /// **deadlocks**: the SSH write needs the connection's own task to make progress, and blocking
+    /// this worker while awaiting it means nothing is left to drive it. That is not theoretical — it
+    /// is a hang this test suite caught, intermittently, which is the worst way to find it.
+    pub async fn write_async(&self, data: &[u8]) -> Result<()> {
+        match &self.backend {
+            TerminalBackend::Local { .. } => self.write(data),
+            TerminalBackend::Remote { session, .. } => session
+                .write(data)
+                .await
+                .map_err(|e| HxError::Sandbox(format!("could not write to the terminal: {e}"))),
+        }
+    }
+
+    /// Resize, from async code. The twin of [`Terminal::resize`], for the same reason.
+    pub async fn resize_async(&self, cols: u16, rows: u16) -> Result<()> {
+        if cols == 0 || rows == 0 {
+            // A hidden viewport reports 0x0; applying it breaks every curses program until the next
+            // resize. Checked here as well as in the sync version so the two agree.
+            return Ok(());
+        }
+        match &self.backend {
+            TerminalBackend::Local { .. } => self.resize(cols, rows),
+            TerminalBackend::Remote { session, .. } => session
+                .resize(cols, rows)
+                .await
+                .map_err(|e| HxError::Sandbox(format!("could not resize the terminal: {e}"))),
+        }
+    }
+
     /// Type at the terminal.
+    ///
+    /// Synchronous because a local pty master is a file descriptor and the terminal's own tests are
+    /// synchronous. **Not for use from async code** when the terminal may be remote — use
+    /// [`Terminal::write_async`], which cannot deadlock.
     pub fn write(&self, data: &[u8]) -> Result<()> {
-        let master = self
-            .master
-            .lock()
-            .map_err(|_| HxError::Sandbox("terminal master lock is poisoned".to_string()))?;
-        let mut file =
-            std::fs::File::from(master.try_clone().map_err(|e| {
-                HxError::Sandbox(format!("could not duplicate the pty master: {e}"))
-            })?);
-        file.write_all(data)
-            .map_err(|e| HxError::Sandbox(format!("could not write to the terminal: {e}")))
+        match &self.backend {
+            TerminalBackend::Local { master, .. } => {
+                let master = master.lock().map_err(|_| {
+                    HxError::Sandbox("terminal master lock is poisoned".to_string())
+                })?;
+                let mut file = std::fs::File::from(master.try_clone().map_err(|e| {
+                    HxError::Sandbox(format!("could not duplicate the pty master: {e}"))
+                })?);
+                file.write_all(data)
+                    .map_err(|e| HxError::Sandbox(format!("could not write to the terminal: {e}")))
+            }
+            TerminalBackend::Remote { session, .. } => {
+                // A blocking call on an async session. This is the one place the two shapes meet:
+                // the rest of the terminal interface is synchronous because a pty master is, and a
+                // remote write is a network round trip. The write itself is small — keystrokes.
+                let write = session.write(data);
+                blocking_on(write)
+                    .map_err(|e| HxError::Sandbox(format!("could not write to the terminal: {e}")))
+            }
+        }
     }
 
     /// Resize the terminal, so a full-screen program redraws to the client's viewport.
@@ -177,8 +247,16 @@ impl Terminal {
             // breaks every curses program until the next resize.
             return Ok(());
         }
-        let master = self
-            .master
+        let TerminalBackend::Local { master, .. } = &self.backend else {
+            // A remote resize travels over the transport instead of an ioctl.
+            let TerminalBackend::Remote { session, .. } = &self.backend else {
+                unreachable!("the backend was just matched as remote");
+            };
+            let resize = session.resize(cols, rows);
+            return blocking_on(resize)
+                .map_err(|e| HxError::Sandbox(format!("could not resize the terminal: {e}")));
+        };
+        let master = master
             .lock()
             .map_err(|_| HxError::Sandbox("terminal master lock is poisoned".to_string()))?;
         let winsize = libc_winsize(cols, rows);
@@ -193,6 +271,89 @@ impl Terminal {
         }
         Ok(())
     }
+}
+
+/// Run a future to completion from synchronous code, without stalling the runtime when it can help it.
+///
+/// `block_in_place` is the right tool on a multi-threaded runtime — it hands this worker's other
+/// tasks to another thread while we wait. It **panics** on a current-thread runtime, which is not a
+/// theoretical concern: a test, an embedded use, or `#[tokio::main(flavor = "current_thread")]` all
+/// produce one, and a terminal is not a reason for a daemon to abort. So the flavor is checked and
+/// only the multi-threaded case takes that path. On a single thread there is nothing to hand off to
+/// and blocking is simply what happens, which is acceptable for a keystroke.
+fn blocking_on<F, T>(future: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    if matches!(
+        Handle::try_current().map(|h| h.runtime_flavor()),
+        Ok(RuntimeFlavor::MultiThread)
+    ) {
+        return tokio::task::block_in_place(|| Handle::current().block_on(future));
+    }
+    // No runtime, or a single-threaded one: block directly.
+    futures::executor::block_on(future)
+}
+
+/// Adopt a pty that lives on another machine, presenting it like any other terminal.
+///
+/// A pump task reads the session and feeds the same scrollback and broadcast a local pty feeds, so
+/// every client of this terminal — the WebSocket handler, the scrollback snapshot, the resize path —
+/// works unchanged and does not know which machine it is talking to. That is the point of doing it
+/// here rather than in the route: one place absorbs the difference, rather than every caller.
+#[cfg(unix)]
+pub fn remote(session: Arc<dyn hx_remote::PtySession>) -> Result<Arc<Terminal>> {
+    let (output, _) = broadcast::channel(1024);
+    let terminal = Arc::new(Terminal {
+        backend: TerminalBackend::Remote {
+            session,
+            pump: Mutex::new(None),
+        },
+        scrollback: Mutex::new(Scrollback::default()),
+        output: output.clone(),
+    });
+
+    // The pump. `read()` is pull-based and ends with `None`, which is the session telling us the
+    // remote shell is gone — so this loop terminates on its own for the ordinary case, and the
+    // `Exited` frame is what a client needs in order to render "the shell ended" rather than a
+    // stream that simply stops.
+    let pump_terminal = Arc::clone(&terminal);
+    let TerminalBackend::Remote { session, .. } = &terminal.backend else {
+        unreachable!("just constructed as remote");
+    };
+    let session = Arc::clone(session);
+    let pump = tokio::spawn(async move {
+        while let Some(chunk) = session.read().await {
+            if chunk.is_empty() {
+                continue;
+            }
+            // Retained before broadcast, for the same reason as the local reader: a client that
+            // attaches during this chunk reads the scrollback and then subscribes, so anything
+            // retained is visible to it either way.
+            if let Ok(mut sb) = pump_terminal.scrollback.lock() {
+                sb.push(&chunk);
+            }
+            // A send error means no client is attached, which is normal — a terminal outlives its
+            // clients by design. The bytes are retained regardless.
+            let _ = pump_terminal.output.send(TerminalOutput::Output {
+                data: encode(&chunk),
+            });
+        }
+        // No exit code: an SSH channel reports a status for an `exec`, not for an interactive
+        // shell, and inventing 0 would claim a clean exit we did not observe.
+        let _ = pump_terminal
+            .output
+            .send(TerminalOutput::Exited { code: None });
+    });
+
+    if let TerminalBackend::Remote { pump: slot, .. } = &terminal.backend {
+        *slot
+            .lock()
+            .map_err(|_| HxError::Sandbox("terminal pump lock is poisoned".to_string()))? =
+            Some(pump);
+    }
+    Ok(terminal)
 }
 
 /// Start a terminal running `shell`, with output broadcast and retained.
@@ -266,22 +427,27 @@ pub fn spawn(shell: &str, args: &[String], cols: u16, rows: u16) -> Result<Arc<T
 
     let (output, _) = broadcast::channel(1024);
     let terminal = Arc::new(Terminal {
-        master: Mutex::new(master),
+        backend: TerminalBackend::Local {
+            master: Mutex::new(master),
+            child_pid: Some(child_pid),
+        },
         scrollback: Mutex::new(Scrollback::default()),
         output: output.clone(),
-        child_pid: Some(child_pid),
     });
 
     // The reader owns the child so it can reap it; the daemon must not leave a zombie for every
     // shell a client ever opened.
     let reader_terminal = Arc::clone(&terminal);
     let reader_output = output;
-    let master_fd = reader_terminal
-        .master
-        .lock()
-        .map_err(|_| HxError::Sandbox("terminal master lock is poisoned".to_string()))?
-        .try_clone()
-        .map_err(|e| HxError::Sandbox(format!("could not duplicate the pty master: {e}")))?;
+    let master_fd = match &reader_terminal.backend {
+        TerminalBackend::Local { master, .. } => master,
+        // Constructed as local two lines above; there is no other way to get here.
+        TerminalBackend::Remote { .. } => unreachable!("a local terminal has a local backend"),
+    }
+    .lock()
+    .map_err(|_| HxError::Sandbox("terminal master lock is poisoned".to_string()))?
+    .try_clone()
+    .map_err(|e| HxError::Sandbox(format!("could not duplicate the pty master: {e}")))?;
 
     // A dedicated OS thread, not `spawn_blocking`: a terminal's reader blocks for as long as the
     // shell lives, which is the lifetime of the daemon — not a bounded piece of work owed back to
@@ -366,6 +532,18 @@ impl Terminals {
         ))
     }
 
+    /// Always fails: there is no PTY here to give a remote machine either.
+    ///
+    /// A remote terminal needs a local pty to relay through — the pump, the scrollback and the
+    /// broadcast all live on this side — so this platform cannot serve one even though the machine
+    /// on the other end has a shell. The refusal names the local limit, because that is the part
+    /// that is missing; pointing at the remote host would be misleading.
+    pub fn create_remote(&self, _id: &str, _session: Arc<dyn hx_remote::PtySession>) -> Result<()> {
+        Err(HxError::Sandbox(
+            "terminals need a PTY, which this platform does not have".to_string(),
+        ))
+    }
+
     /// Always reports the terminal as absent, for the same reason.
     pub fn get(&self, _id: &str) -> Option<Arc<Terminal>> {
         None
@@ -420,6 +598,27 @@ impl Terminals {
         Ok(())
     }
 
+    /// Register a terminal that lives on another machine.
+    ///
+    /// Separate from [`Terminals::create`] rather than a flag on it, because the two take different
+    /// things: this one is handed a session that is already open, so it cannot fail for the reason
+    /// `create` can — there is no shell to start here, and a caller that has a session has already
+    /// dealt with whatever opening it involved.
+    pub fn create_remote(&self, id: &str, session: Arc<dyn hx_remote::PtySession>) -> Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| HxError::Sandbox("terminal registry lock is poisoned".to_string()))?;
+        if inner.contains_key(id) {
+            return Err(HxError::Config(format!(
+                "a terminal '{id}' already exists: attaching is the way to reach it, not creating \
+                 a second one under the same name"
+            )));
+        }
+        inner.insert(id.to_string(), remote(session)?);
+        Ok(())
+    }
+
     /// The terminal with this id, if it is live.
     pub fn get(&self, id: &str) -> Option<Arc<Terminal>> {
         self.inner.lock().ok()?.get(id).cloned()
@@ -436,18 +635,54 @@ impl Terminals {
     /// Remove a terminal from the registry. The shell is not killed here: its master fd closes when
     /// the last `Arc` drops, which sends the shell `SIGHUP` the way a real terminal closing does.
     pub fn remove(&self, id: &str) -> bool {
-        self.inner
-            .lock()
-            .map(|mut m| m.remove(id).is_some())
-            .unwrap_or(false)
+        let removed = self.inner.lock().map(|mut m| m.remove(id)).unwrap_or(None);
+        // A remote terminal has no fd to close, so dropping the `Arc` does not reach the far side:
+        // its pump has to be stopped or it keeps reading a session nobody is watching and the shell
+        // stays up after the client asked for it to go.
+        if let Some(terminal) = &removed {
+            terminal.stop_remote();
+        }
+        removed.is_some()
     }
 }
 
 #[cfg(unix)]
 impl Terminal {
     /// The child's pid, for a caller that wants to signal it.
+    ///
+    /// `None` on a remote terminal, which is the honest answer: there is no process here to signal,
+    /// and inventing a pid would point a `kill` at the wrong machine.
     pub fn child_pid(&self) -> Option<i32> {
-        self.child_pid
+        match &self.backend {
+            TerminalBackend::Local { child_pid, .. } => *child_pid,
+            TerminalBackend::Remote { .. } => None,
+        }
+    }
+
+    /// End a remote terminal: close the session and stop the pump.
+    ///
+    /// A no-op for a local terminal, whose end is the master fd closing when the last `Arc` drops.
+    /// Synchronous and best-effort by design — this runs from `remove`, which is called on a request
+    /// path and cannot await.
+    fn stop_remote(&self) {
+        let TerminalBackend::Remote { session, pump } = &self.backend else {
+            return;
+        };
+        let session = Arc::clone(session);
+        let pump = pump.lock().ok().and_then(|mut p| p.take());
+        // Closing a session is async, so it happens off this thread. A failure is not reportable
+        // here and not worth one: the caller asked for the terminal to go, and it does either way.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = session.close().await;
+                if let Some(pump) = pump {
+                    // Abort rather than await: the pump may be parked on a session that will never
+                    // speak again, which is exactly the case aborting is for. Awaiting it would
+                    // block this spawn forever.
+                    pump.abort();
+                }
+            });
+        }
     }
 }
 
@@ -636,13 +871,146 @@ mod tests {
         let OpenptyResult { master, slave } = openpty(None, None).expect("openpty");
         drop(slave);
         let terminal = Terminal {
-            master: Mutex::new(master),
+            backend: TerminalBackend::Local {
+                master: Mutex::new(master),
+                child_pid: None,
+            },
             scrollback: Mutex::new(Scrollback::default()),
             output: broadcast::channel(4).0,
-            child_pid: None,
         };
         assert!(terminal.resize(0, 24).is_ok());
         assert!(terminal.resize(80, 0).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_remote_terminal_reports_no_pid_and_ignores_a_zero_resize() {
+        // The two places a remote terminal differs from a local one, asserted together because they
+        // are the same fact: there is no process on this machine.
+        let session: std::sync::Arc<dyn hx_remote::PtySession> =
+            std::sync::Arc::new(FakeRemote::default());
+        let terminal = remote(session).expect("a remote terminal is adopted");
+        // No pid: inventing one would point a caller's `kill` at some unrelated process here.
+        assert_eq!(terminal.child_pid(), None);
+        // A hidden viewport is ignored before it reaches the transport, same as locally.
+        assert!(terminal.resize(0, 24).is_ok());
+        assert!(terminal.resize(80, 0).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_remote_terminals_output_reaches_a_client_and_is_retained() {
+        let session = std::sync::Arc::new(FakeRemote::default());
+        let terminal = remote(session.clone()).expect("adopted");
+
+        // Subscribe before the output is produced, the way a client does.
+        let mut output = terminal.subscribe();
+        session.emit(b"hello from the far side");
+
+        // The pump is a task, so give it a turn to run rather than asserting immediately.
+        for _ in 0..100 {
+            if !terminal.scrollback().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Retained, so a client attaching later still sees it.
+        let scrollback = terminal.scrollback();
+        assert_eq!(
+            String::from_utf8_lossy(&scrollback),
+            "hello from the far side",
+            "the remote output must be retained"
+        );
+        // And broadcast, so a client already attached receives it.
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), output.recv())
+            .await
+            .expect("a frame arrives")
+            .expect("the broadcast is live");
+        match frame {
+            TerminalOutput::Output { data } => {
+                assert_eq!(decode(&data).unwrap(), b"hello from the far side");
+            }
+            other => panic!("expected output, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_remote_terminal_says_it_exited_when_the_session_ends() {
+        // "No more output" and "the shell died" render differently, so the end has to be announced
+        // rather than left as a stream that simply stops.
+        let session = std::sync::Arc::new(FakeRemote::default());
+        let terminal = remote(session.clone()).expect("adopted");
+        let mut output = terminal.subscribe();
+        session.emit(b"bye");
+        session.end();
+
+        let mut saw_exit = false;
+        for _ in 0..200 {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), output.recv()).await {
+                Ok(Ok(TerminalOutput::Exited { .. })) => {
+                    saw_exit = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => break,
+                Err(_) => break,
+            }
+        }
+        assert!(saw_exit, "the session ending must broadcast an exit");
+        // No exit code: an interactive shell over SSH does not report one, and claiming 0 would
+        // assert a clean exit nobody observed.
+    }
+
+    /// A stand-in for a remote pty, so the terminal above can be tested without a transport.
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct FakeRemote {
+        pending: Mutex<std::collections::VecDeque<Vec<u8>>>,
+        ended: std::sync::atomic::AtomicBool,
+        written: Mutex<Vec<u8>>,
+    }
+
+    #[cfg(unix)]
+    impl FakeRemote {
+        fn emit(&self, bytes: &[u8]) {
+            self.pending.lock().unwrap().push_back(bytes.to_vec());
+        }
+
+        fn end(&self) {
+            self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl hx_remote::PtySession for FakeRemote {
+        async fn write(&self, data: &[u8]) -> Result<()> {
+            self.written.lock().unwrap().extend_from_slice(data);
+            Ok(())
+        }
+
+        async fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
+            Ok(())
+        }
+
+        async fn read(&self) -> Option<Vec<u8>> {
+            loop {
+                if let Some(chunk) = self.pending.lock().unwrap().pop_front() {
+                    return Some(chunk);
+                }
+                if self.ended.load(std::sync::atomic::Ordering::SeqCst) {
+                    return None;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+
+        async fn close(&self) -> Result<()> {
+            self.end();
+            Ok(())
+        }
     }
 
     #[test]

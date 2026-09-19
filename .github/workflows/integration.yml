@@ -142,7 +142,19 @@ jobs:
           chmod 700 "$HOME/.ssh"
           chmod 600 "$HOME/.ssh/authorized_keys"
           sudo mkdir -p /run/sshd
-          sudo /usr/sbin/sshd -p 2222 -o PasswordAuthentication=no
+          # `PerSourcePenalties=no` where the server knows the option: `ssh-keyscan` never
+          # authenticates, and OpenSSH >=9.8 penalises that and then resets every later connection,
+          # which reads as a transport failure rather than a server policy. Older servers reject the
+          # option outright ("Bad configuration option"), so it is added only when supported — the
+          # runner image's OpenSSH has been on both sides of 9.8.
+          # The probe greps stderr rather than trusting the exit status: `sshd -T` exits 0 here
+          # and reports "no hostkeys available", so a status check says "unsupported" for an
+          # option the server actually accepts.
+          SSH_OPTS="-o PasswordAuthentication=no"
+          if ! sshd -T -o PerSourcePenalties=no 2>&1 >/dev/null | grep -q 'Bad configuration'; then
+            SSH_OPTS="$SSH_OPTS -o PerSourcePenalties=no"
+          fi
+          sudo /usr/sbin/sshd -p 2222 $SSH_OPTS
           # Assert readiness here instead of inside a test: "connection refused" from a test looks
           # like a transport bug, when it is really a server that never came up.
           for attempt in $(seq 1 20); do
@@ -168,3 +180,13 @@ jobs:
 
       - name: The transport, against a real server
         run: cargo test -p hx-remote --test ssh_live --locked -- --ignored --test-threads=1 --nocapture
+
+      - name: An interactive terminal on the far side of that server
+        # A pty is a stream, not a request, so it gets its own suite: the shell has to be *started*
+        # and then spoken to, which is a different claim from "a command ran and returned".
+        run: cargo test -p hx-remote --test pty_live --locked -- --ignored --test-threads=1 --nocapture
+
+      - name: A client driving that terminal through the daemon
+        # The end-to-end one: HTTP create, policy gate, SSH, the pty, the pump, the broadcast and the
+        # WebSocket, with every layer real. It found a deadlock the unit tests could not see.
+        run: cargo test -p hx-server --test terminal_remote_live --locked -- --ignored --test-threads=1 --nocapture
