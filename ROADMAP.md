@@ -206,9 +206,13 @@ attempted capability escalation shows up as a denial event, not a hang.
   to, but as docker CLI command lines handed to a tiny local `RemoteCommandRunner` trait (instead of
   to `bollard` against a local socket), so the safe defaults survive the trip to a far daemon. It
   meets `hx-sandbox`'s no-`hx-remote`-dependency rule: `Host` satisfies the runner later via
-  a thin adapter in `hx-server`. Still to do before the item is ✅: a remote egress allowlist is
-  refused (not half-enforced) until the proxy sidecar can be placed on the far host, and the
-  runtime is not yet wired into `hx-server` or exercised against a live remote daemon.
+  a thin adapter in `hx-server`. Remote egress is **fail-closed**: an allowlist is enforced by a
+  proxy sidecar placed on the *near* host, which a far daemon cannot host, so a remote sandbox
+  whose spec asks for a non-empty egress allowlist is refused at `create` time (before anything
+  reaches the far host) with a reason naming the way out, rather than half-enforced. An isolated
+  remote sandbox — empty allowlist and the network off — needs no proxy and **works**. Still to do
+  before the item is ✅: place the proxy sidecar on the far host so remote egress can be enforced,
+  wire the runtime into `hx-server`, and exercise it against a live remote daemon.
 - ✅ **Remote terminal (a PTY straight to a remote host)** — `POST /v1/terminals` takes an optional
   `host`, and the daemon adopts the session as a terminal like any other, so the terminal pane and
   the WebSocket contract are unchanged: a client attaches to a remote shell the same way it attaches

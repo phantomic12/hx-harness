@@ -51,6 +51,9 @@
 //!    the same rule the local runtime applies to the one shape its proxy cannot match
 //!    ([`SpecError::EgressNotEnforced`](crate::spec::SpecError)) — because a networked remote
 //!    sandbox with an unenforced allowlist is an open sandbox wearing an allowlist as a costume.
+//!    The refusal is scoped to *non-empty* egress: a remote sandbox with an empty allowlist and
+//!    the network off is fully isolated, needs no proxy, and is allowed — refusing that too would
+//!    forbid the one remote case that is safe without any enforcement on the far host.
 //! 2. **Container logs.** The local runtime exposes `crate::docker::logs` as a `bollard`
 //!    helper; the [`SandboxRuntime`] trait has no logs method, so the remote runtime does not
 //!    reach for one either. `docker logs` stays available through [`RemoteCommandRunner`] when a
@@ -193,9 +196,14 @@ pub fn create_command(
 ) -> Result<(String, String)> {
     if !spec.egress_allow.is_empty() {
         return Err(remote_error(format!(
-            "an egress allowlist for a remote daemon is not implemented yet; \
-             refusing to start '{}' with {:?} rather than half-enforcing it",
-            spec.profile, spec.egress_allow
+            "an egress allowlist for a remote daemon is not implemented yet: the local runtime \
+             enforces one by placing a proxy sidecar on the near host, which a far daemon cannot \
+             host, so enforcing {0:?} would be a half-enforced open sandbox. Refusing to start \
+             '{1}' rather than that. A remote sandbox with no network (an empty allowlist and \
+             network off) works today; drop the allowlist and the network, or run on the local \
+             daemon, where the allowlist is enforced. Enabling it remotely needs a proxy sidecar on \
+             the far host.",
+            spec.egress_allow, spec.profile
         )));
     }
 
@@ -652,6 +660,65 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("exit 125"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_non_empty_egress_allowlist_on_a_remote_sandbox_is_refused_without_ever_dialing_the_far_host(
+    ) {
+        // The heart of this milestone's fail-closed rule. A remote daemon cannot host the proxy
+        // sidecar that enforces an allowlist on the near host (it is a local-socket arrangement),
+        // so a networked remote sandbox with an allowlist is refused rather than shipped half-open.
+        // The runner's script is *empty*: because it panics when asked for any command it did not
+        // script, the test fails loudly if `create` ever reaches the far host — a refusal that
+        // still dialled the machine would leak its reachability, the same principle the remote-terminal
+        // route holds. And the reason must say the way out, not just "no".
+        let mut s = spec(IsolationLevel::L1);
+        s.network = true;
+        s.egress_allow = vec!["crates.io".into()];
+        s.workspace_host_path = "/tmp/hx/ws".into();
+        let settings = s.host_settings();
+        let runner = Arc::new(RecordingRunner::new(vec![]));
+        let runtime = RemoteSandboxRuntime::new(runner);
+        let err = runtime
+            .create(&SandboxId::from_raw("sbx_abc123"), &s, &settings)
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("not implemented yet"), "{message}");
+        assert!(message.contains("crates.io"), "{message}");
+        assert!(
+            message.contains("no network") && message.contains("proxy sidecar"),
+            "the refusal has to name the way out — an isolated sandbox works, and a far-host \
+             proxy sidecar would enable it: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_isolated_remote_sandbox_with_no_egress_allowlist_is_allowed_and_its_command_is_sent(
+    ) {
+        // The control for the refusal above: without this, a blanket "refuse every remote sandbox"
+        // would pass the egress tests, forbidding the safe case the human explicitly wanted kept. A
+        // remote sandbox with an empty allowlist and the network off is fully isolated, needs no proxy,
+        // and must actually build and send its docker command to the far host. The runner's script
+        // expects exactly that command, so the test fails if create sends nothing or sends something else.
+        let s = spec(IsolationLevel::L2);
+        let settings = s.host_settings();
+        let (_, expected) = create_command("hx-sbx_abc123", &s, &settings).unwrap();
+        assert!(
+            s.egress_allow.is_empty(),
+            "the control must be empty-egress"
+        );
+        assert!(
+            !settings.is_networked(),
+            "the isolated control must have the network off"
+        );
+        let runner = Arc::new(RecordingRunner::new(vec![(expected.as_str(), ok("id\n"))]));
+        let runtime = RemoteSandboxRuntime::new(runner);
+        let id = runtime
+            .create(&SandboxId::from_raw("sbx_abc123"), &s, &settings)
+            .await
+            .unwrap();
+        assert_eq!(id, "hx-sbx_abc123");
     }
 
     #[tokio::test]
