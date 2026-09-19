@@ -472,8 +472,80 @@ fn libc_winsize(cols: u16, rows: u16) -> Winsize {
     }
 }
 
-const TIOCSWINSZ: u64 = 0x5414;
+// `TIOCSCTTY` and `TIOCSWINSZ` are **not** the same number on every Unix, and the ioctl request
+// encodes the argument's size and direction, so a wrong value is not a near miss: the kernel rejects
+// it with `Inappropriate ioctl for device` and the shell never starts. These were the Linux values
+// for every platform, which is why macOS failed with
+// `could not start '/bin/sh': Inappropriate ioctl for device (os error 25)`.
+//
+// Linux reaches these numbers through `arch/*/mod.rs` in the `libc` crate, and they really do differ
+// by architecture: `0x540E` on x86 and arm, `0x5480` on MIPS, `0x80087467` for a resize on
+// powerpc/mips. BSD and macOS share one encoding (`_IOW`/`_IO` from `<sys/ioccom.h>`), which is what
+// the `0x2000_...`/`0x8008_...` forms below are.
+//
+// Verified against the `libc` crate's own per-target constants rather than from memory. If a target is
+// ever added here, take its values from that crate or the platform header, not by copying a neighbour.
+
+/// The `ioctl` request to make the tty a controlling terminal.
+///
+/// Linux x86 and arm use `0x540E`; MIPS uses `0x5480`.
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(any(target_arch = "mips", target_arch = "mips64"))
+))]
 const TIOCSCTTY: u64 = 0x540E;
+/// The `ioctl` request to set the terminal window size.
+///
+/// Linux: x86/arm is `0x5414`, but MIPS and PowerPC encode the size into the request, so the `libc`
+/// crate's values for those are used rather than assumed.
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64"
+    ))
+))]
+const TIOCSWINSZ: u64 = 0x5414;
+
+// Linux on architectures that encode the size into the request.
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(target_arch = "mips", target_arch = "mips64")
+))]
+const TIOCSCTTY: u64 = 0x5480;
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64"
+    )
+))]
+const TIOCSWINSZ: u64 = 0x80087467;
+
+// BSD and macOS: `_IO('t', 97)` and `_IOW('t', 103, struct winsize)` from `<sys/ioccom.h>`. The
+// values match the `libc` crate's `freebsdlike`/`netbsdlike`/`apple` definitions.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+const TIOCSCTTY: u64 = 0x20007461;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+const TIOCSWINSZ: u64 = 0x80087467;
 
 unsafe fn libc_ioctl_tiocswinsz(fd: i32, ws: &Winsize) -> i32 {
     unsafe extern "C" {

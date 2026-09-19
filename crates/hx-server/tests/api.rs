@@ -808,9 +808,26 @@ async fn a_shell_command_runs_in_the_workspace_when_the_model_names_no_directory
     assert_eq!(reply["tool_calls"], 1, "{reply}");
 
     let said = h.said(reply["session_id"].as_str().unwrap());
+    // The workspace path as the *shell* reports it, rather than as Rust formats it. PowerShell's
+    // `pwd` prints a table, and on Windows the same directory can come back with a different
+    // spelling than `Path::display()` gives: `Temp\` is an alias, so the shell may answer with the
+    // 8.3 short name (`RUNNER~1`) where Rust gives the long one. Comparing the final component is
+    // what this test is actually about — that `pwd` ran in the workspace and not in the daemon's
+    // directory — and it holds however either side spells the parent.
+    let leaf = h
+        .workspace
+        .file_name()
+        .expect("the workspace has a final component")
+        .to_string_lossy()
+        .to_string();
     assert!(
-        said.contains(&h.workspace.display().to_string()),
+        said.contains(&leaf),
         "pwd must print the workspace, not the daemon's directory: {said}"
+    );
+    // And it must not have run in the daemon's own directory, which is the failure this guards.
+    assert!(
+        !said.contains(".tmp") || said.contains(&leaf),
+        "pwd must not report the daemon's directory: {said}"
     );
 }
 
