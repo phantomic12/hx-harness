@@ -49,19 +49,35 @@ jobs:
         # L3's claim is that the sandbox never sees the host kernel, and that is only checkable where
         # a VM-backed runtime exists. Installing it here is what stops the strongest claim in the
         # ladder from quietly skipping — `HX_DOCKER_REQUIRE_L3` below turns a skip into a failure.
+        env:
+          # Pinned deliberately: an unpinned download means a gVisor release can change this job's
+          # outcome without anything in this repo changing.
+          GISVOR_VERSION: "20260914.0"
         run: |
-          # `releases/release/latest/...` was removed upstream and now 404s. The current layout puts
-          # each binary under its own directory, and `runsc` is published there on every release.
-          curl -fsSL -o /tmp/runsc https://storage.googleapis.com/gvisor/releases/release/runsc/x86_64/runsc
-          curl -fsSL -o /tmp/runsc.sha512 https://storage.googleapis.com/gvisor/releases/release/runsc/x86_64/runsc.sha512
-          (cd /tmp && sha512sum -c runsc.sha512)
-          sudo install -m 0755 /tmp/runsc /usr/local/bin/runsc
+          # Two attempts at this URL were wrong before landing here, and both failed in ways that
+          # looked like a broken gVisor rather than a wrong download:
+          #
+          # 1. `releases/release/latest/x86_64/runsc` — upstream removed it and it 404s.
+          # 2. `releases/release/runsc/x86_64/runsc` — a *stale* 2022 artifact that still answers.
+          #    It installed cleanly and `runsc --version` said `release-20220208.0`, then every
+          #    container failed with `runsc did not terminate successfully: exit status 1`.
+          #
+          # A release now ships as a versioned tarball with the runtime and its helper binaries, so
+          # take it from the version directory rather than a mutable alias.
+          curl -fsSL -o /tmp/gvisor.tar.zstd "https://storage.googleapis.com/gvisor/releases/release/${GISVOR_VERSION}/x86_64/gvisor.tar.zstd"
+          curl -fsSL -o /tmp/gvisor.tar.zstd.sha512 "https://storage.googleapis.com/gvisor/releases/release/${GISVOR_VERSION}/x86_64/gvisor.tar.zstd.sha512"
+          (cd /tmp && sha512sum -c gvisor.tar.zstd.sha512)
+          mkdir -p /tmp/gvisor && tar --zstd -xf /tmp/gvisor.tar.zstd -C /tmp/gvisor
+          sudo install -m 0755 /tmp/gvisor/runsc /usr/local/bin/runsc
+          # The shim has to be on PATH as well, or `docker` cannot start a container with this
+          # runtime: `runsc` alone is not enough.
+          sudo install -m 0755 /tmp/gvisor/containerd-shim-runsc-v1 /usr/local/bin/containerd-shim-runsc-v1
           # Merge into `daemon.json` rather than replacing it. Writing the key alone clobbers
           # whatever the installer put there — the default runtime and the shim paths `containerd`
           # needs — and `runsc` then fails to launch with `did not terminate successfully: exit
           # status 1`, which reads as a broken gVisor rather than a damaged daemon config.
           sudo python3 - <<'PY'
-          import json, os
+          import json
           path = "/etc/docker/daemon.json"
           try:
               with open(path) as f:
@@ -78,9 +94,9 @@ jobs:
           # Assert the runtime answers before any test does: "no gVisor" must fail here, naming the
           # reason, rather than downstream as a mysterious L3 assertion.
           docker info --format '{{range $k,$v := .Runtimes}}{{$k}} {{end}}'
-          # `runsc` failing to start prints nothing useful through Docker, so run it directly first
-          # to surface its own message.
-          sudo /usr/local/bin/runsc --version || echo "runsc itself failed to run"
+          # Print the version, so a future stale-download regression is visible as a date rather than
+          # as an unexplained container failure.
+          runsc --version
           docker run --rm --runtime runsc --network none ubuntu:24.04 uname -r
 
       - name: The ladder, against a real container engine
