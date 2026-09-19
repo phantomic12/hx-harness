@@ -328,3 +328,65 @@ async fn executes_writes_reads_and_lists_over_the_connection() {
         .expect("cleanup");
     assert!(cleaned.success(), "cleanup failed: {cleaned:?}");
 }
+
+/// A host that answers the `sftp` subsystem is measured, and its files move over SFTP.
+#[ignore = "requires a real SSH host (HX_SSH_TEST_HOST, HX_SSH_TEST_USER, HX_SSH_TEST_KEY)"]
+#[tokio::test]
+async fn a_host_offering_sftp_is_reported_and_files_move_over_the_subsystem() {
+    let target = skip_without_a_host!();
+    let dir = tempfile::tempdir().unwrap();
+
+    let host = SshHost::connect(
+        HostId::from("hst_live"),
+        &target.host,
+        target.port,
+        &target.user,
+        &auth(&target),
+        &HostKeyPolicy::tofu_at(dir.path().join("known_hosts")),
+    )
+    .await
+    .expect("connect to the test host");
+
+    // A probe that opens the subsystem and completes the handshake measures `Some(true)` — this is
+    // the whole point of the `Option`: it is now a fact a client can act on, not a guess.
+    assert_eq!(
+        host.caps().has_sftp,
+        Some(true),
+        "the probe must measure the subsystem, not guess it: {:?}",
+        host.caps()
+    );
+
+    // rename is one of the operations SFTP does that a shelled-out transfer would fake with `mv`;
+    // moving over the subsystem verifies it goes through the real protocol.
+    let work = format!("/tmp/hx-live-sftp-{}", std::process::id());
+    let made = host
+        .exec(
+            &format!("mkdir -p {work}"),
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("mkdir");
+    assert!(made.success(), "mkdir failed: {made:?}");
+
+    let from = format!("{work}/before.bin");
+    let to = format!("{work}/after.bin");
+    let payload: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+
+    host.write_file(&from, &payload).await.expect("write_file");
+    host.rename(&from, &to).await.expect("rename over SFTP");
+    let read_back = host.read_file(&to).await.expect("read_file");
+
+    assert_eq!(
+        read_back, payload,
+        "the renamed file did not survive the SFTP round trip"
+    );
+
+    let cleaned = host
+        .exec(
+            &format!("rm -f {to} && rmdir {work}"),
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("cleanup");
+    assert!(cleaned.success(), "cleanup failed: {cleaned:?}");
+}

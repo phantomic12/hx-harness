@@ -108,12 +108,17 @@ pub struct HostCaps {
     pub home_dir: Option<String>,
     /// Whether an SFTP subsystem is available for copying files.
     ///
-    /// `None` means **unknown**, and that is the honest answer from the probes this crate runs: a
-    /// `uname` string, or `cmd /C ver`, says nothing about which SSH subsystems the server offers.
-    /// It was a `bool` hard-coded to `true` by both parsers, which the host route then handed to
-    /// clients as though it had been measured — a capability report that no code ever checked, on
-    /// the one question (can I copy files?) a client would act on. `false` would be just as wrong in
-    /// the other direction, so the field says what is true: nobody has looked.
+    /// `None` means **unknown**, and that is still an honest answer from *some* transports: the
+    /// capability parsers for `uname`/`cmd ver` say nothing about which SSH subsystems a server
+    /// offers, so on their own they would leave this unmeasured. `SshHost` therefore measures it on
+    /// connect — it opens the `sftp` subsystem and completes the version handshake (see
+    /// [`crate::sftp`]) — so for an `SshHost` this is `Some(true)` when the server answered,
+    /// `Some(false)` when it declined, and only `None` when the transport itself fell over before the
+    /// server could answer. This field was a `bool` hard-coded to `true` by both parsers, which the
+    /// host route then handed to clients as though it had been measured — a capability report that no
+    /// code ever checked, on the one question (can I copy files?) a client would act on. `false`
+    /// would have been just as wrong in the other direction, so the field said what was true: nobody
+    /// had looked. Now the one transport that can look, does.
     pub has_sftp: Option<bool>,
 }
 

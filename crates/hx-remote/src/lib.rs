@@ -17,6 +17,7 @@
 //! - [`Host`] — the trait every transport implements.
 //! - [`LocalHost`] — the machine the daemon runs on.
 //! - [`known_hosts`] — the trust store that decides whether a host key may be accepted.
+//! - [`sftp`] — a minimal SFTP v3 client carried over a russh channel.
 //!
 //! ## What is landed, and what is not
 //!
@@ -44,6 +45,7 @@ pub mod known_hosts;
 pub mod local;
 pub mod ntlm;
 pub mod runner;
+pub mod sftp;
 pub mod ssh;
 pub mod winrm;
 
@@ -53,5 +55,6 @@ pub use host::{
 };
 pub use known_hosts::{HostKeyVerdict, KnownHosts};
 pub use local::LocalHost;
+pub use sftp::{SftpAvailability, SftpSession};
 pub use ssh::{HostKeyDecision, HostKeyPolicy, SshAuth, SshHost, SshPty};
 pub use winrm::{WinRmAuth, WinRmHost};

@@ -190,15 +190,16 @@ attempted capability escalation shows up as a denial event, not a hang.
   directory browser with a file viewer/editor and a command runner. Reads and writes are gated by
   the same approval policy an agent run uses, and a command is classified by the real classifier, so
   `hostname` runs and `curl … | sh` does not.
-- ❌ **File browser over SFTP specifically** — the file routes go through `Host::read_file`/
-  `write_file`, which for `SshHost` shells out (`base64 < path` over exec, see
-  `crates/hx-remote/src/ssh.rs`). That is binary-safe but it is not SFTP, and it means a large file
-  is buffered through a command's stdout. The flag that used to lie about this is fixed:
-  `HostCaps::has_sftp` was a `bool` hard-coded to `true` by both capability parsers and handed to
-  clients as a measured fact. A `uname` string says nothing about which SSH subsystems a server
-  offers, so it is now `Option<bool>` and reports `None` (unknown) for every probe — `false` would
-  have been just as wrong. `WinRmHost` reports `Some(false)`, which it genuinely knows, since WinRM
-  is not an SSH transport at all.
+- ✅ **File transfer over SFTP** — `SshHost::read_file`/`write_file`/`list_dir`/`rename` open the
+  `sftp` subsystem on a dedicated channel and speak SFTP v3 directly (see `crates/hx-remote/src/sftp.rs`),
+  so a file is a byte stream on that channel rather than a command's stdout. For a server without SFTP
+  (`Some(false)`) the methods fall back to the old shelled-out `base64` path, which is why the capsule
+  probe now *measures* the subsystem instead of guessing: `HostCaps::has_sftp` was a `bool` hard-coded
+  to `true` by both capability parsers and handed to clients as a measured fact, but a `uname` string says
+  nothing about which SSH subsystems a server offers. It is an `Option<bool>`; `SshHost` opens the
+  subsystem and completes the version handshake so `Some(true)` is now a measured fact, `Some(false)` a
+  measured absence, and `None` is reserved for a probe the transport itself cut short. `WinRmHost` reports
+  `Some(false)`, which it genuinely knows, since WinRM is not an SSH transport at all.
 - ❌ **Remote sandboxes** — run the sandbox on a *remote* Docker/Podman host. Nothing in
   `hx-sandbox` reaches a remote daemon today.
 - ✅ **Remote terminal (a PTY straight to a remote host)** — `POST /v1/terminals` takes an optional

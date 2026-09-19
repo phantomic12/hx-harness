@@ -26,6 +26,7 @@ use crate::host::{
     ExecOutput, Host, HostCaps, RemoteEntry, RemoteOs, ShellKind,
 };
 use crate::known_hosts::{HostKeyVerdict, KnownHosts};
+use crate::sftp::{SftpAvailability, SftpSession};
 use async_trait::async_trait;
 use hx_core::error::{HxError, Result};
 use hx_core::ids::HostId;
@@ -564,7 +565,7 @@ impl SshHost {
 
     /// Probe the far end. A raw command, because caps decide how commands get wrapped.
     async fn probe_caps(&self) -> HostCaps {
-        if let Ok(out) = self
+        let mut caps = if let Ok(out) = self
             .exec_direct(
                 "uname -s; uname -m; printf %s \"$HOME\"",
                 Duration::from_secs(15),
@@ -574,27 +575,194 @@ impl SshHost {
             if out.success() {
                 if let Some(mut caps) = caps_from_uname(&out.stdout) {
                     enrich_caps_from_posix_probe(&mut caps, &out.stdout);
-                    return caps;
+                    caps
+                } else {
+                    HostCaps::unknown()
+                }
+            } else {
+                HostCaps::unknown()
+            }
+        } else {
+            HostCaps::unknown()
+        };
+
+        // SFTP is measured, not guessed from the `uname` string: open the subsystem and complete the
+        // version handshake. Only `crate::sftp` knows whether the server offers one, so it decides.
+        caps.has_sftp = self.probe_sftp().await;
+
+        // A POSIX uname probe that failed is retried as a Windows probe; the SFTP probe above is
+        // independent of which shell the far side runs, so it is done once, after the OS is known.
+        if caps.os == RemoteOs::Unknown {
+            if let Ok(out) = self
+                .exec_direct("ver & echo %USERPROFILE%", Duration::from_secs(15))
+                .await
+            {
+                if let Some(mut win) = caps_from_ver(&out.stdout) {
+                    win.home_dir = out
+                        .stdout
+                        .lines()
+                        .last()
+                        .map(|line| line.trim().to_string())
+                        .filter(|line| !line.is_empty());
+                    win.has_sftp = caps.has_sftp;
+                    return win;
                 }
             }
         }
 
-        if let Ok(out) = self
-            .exec_direct("ver & echo %USERPROFILE%", Duration::from_secs(15))
+        caps
+    }
+
+    /// Open a fresh `sftp` subsystem session on this connection.
+    ///
+    /// A session is opened per file operation, the same way [`Self::exec_direct`] opens a channel per
+    /// command. This is what lets the methods below take `&self` — the channel's read half needs `&mut`
+    /// — while each call keeps its own channel.
+    async fn open_sftp(&self) -> Result<SftpSession> {
+        let channel = self
+            .session
+            .channel_open_session()
             .await
-        {
-            if let Some(mut caps) = caps_from_ver(&out.stdout) {
-                caps.home_dir = out
-                    .stdout
-                    .lines()
-                    .last()
-                    .map(|line| line.trim().to_string())
-                    .filter(|line| !line.is_empty());
-                return caps;
-            }
+            .map_err(|e| HxError::Remote(format!("could not open an SSH channel: {e}")))?;
+        let mut available = SftpAvailability::Unknown;
+        SftpSession::open(channel, &mut available).await
+    }
+
+    /// A truthful answer to "does this server offer SFTP?".
+    ///
+    /// Open the `sftp` subsystem and complete the version handshake; only that turns into `Some(true)`. A
+    /// channel that cannot be opened at all — or a handshake that dies without the server having answered — is
+    /// a transport failure, so that stays `None`: the capability is unknown, not absent.
+    async fn probe_sftp(&self) -> Option<bool> {
+        let channel = match self.session.channel_open_session().await {
+            Ok(channel) => channel,
+            Err(_) => return None,
+        };
+        // `SftpSession::open` records the outcome itself, so whatever its result, the availability that was
+        // genuinely measured is what the capability reports.
+        let mut available = SftpAvailability::Unknown;
+        let _ = SftpSession::open(channel, &mut available).await;
+        available.as_bool()
+    }
+
+    /// The shelled-out read: `base64 < path` over an exec channel. Kept for servers without SFTP.
+    async fn read_file_shell(&self, path: &str) -> Result<Vec<u8>> {
+        if !self.caps.is_unix() {
+            return Err(HxError::Remote(format!(
+                "reading files over SSH is only implemented for POSIX hosts; {} is {:?}",
+                self.address, self.caps.os
+            )));
         }
 
-        HostCaps::unknown()
+        let output = self
+            .exec(
+                &format!("base64 < {}", shell_quote(path)),
+                Duration::from_secs(60),
+            )
+            .await?;
+
+        if !output.success() {
+            return Err(HxError::Remote(format!(
+                "could not read {path}: {}",
+                output.stderr.trim()
+            )));
+        }
+
+        // Base64 keeps the transfer binary-safe; a plain `cat` would mangle anything that is not
+        // valid UTF-8 and silently corrupt a binary file.
+        decode_b64_loose(&output.stdout)
+    }
+
+    /// The shelled-out write. Kept for servers without SFTP.
+    async fn write_file_shell(&self, path: &str, contents: &[u8]) -> Result<()> {
+        use base64::Engine;
+
+        if !self.caps.is_unix() {
+            return Err(HxError::Remote(format!(
+                "writing files over SSH is only implemented for POSIX hosts; {} is {:?}",
+                self.address, self.caps.os
+            )));
+        }
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(contents);
+        let parent = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(".");
+
+        let script = format!(
+            "mkdir -p {parent} && printf %s {data} | base64 -d > {target}",
+            parent = shell_quote(parent),
+            data = shell_quote(&encoded),
+            target = shell_quote(path),
+        );
+
+        let output = self.exec(&script, Duration::from_secs(60)).await?;
+        if !output.success() {
+            return Err(HxError::Remote(format!(
+                "could not write {path}: {}",
+                output.stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The shelled-out listing. Kept for servers without SFTP.
+    async fn list_dir_shell(&self, path: &str) -> Result<Vec<RemoteEntry>> {
+        if !self.caps.is_unix() {
+            return Err(HxError::Remote(format!(
+                "directory listing over SSH is only implemented for POSIX hosts; {} is {:?}",
+                self.address, self.caps.os
+            )));
+        }
+
+        let output = self
+            .exec(&list_script(path), Duration::from_secs(60))
+            .await?;
+        if output.exit_code == Some(9) {
+            return Err(HxError::Remote(format!("no such directory: {path}")));
+        }
+        if !output.success() {
+            return Err(HxError::Remote(format!(
+                "could not list {path}: {}",
+                output.stderr.trim()
+            )));
+        }
+
+        Ok(parse_ls_output(&output.stdout, path))
+    }
+
+    /// The shelled-out move. Kept for servers without SFTP.
+    async fn rename_shell(&self, from: &str, to: &str) -> Result<()> {
+        if !self.caps.is_unix() {
+            return Err(HxError::Remote(format!(
+                "moving files over SSH is only implemented for POSIX hosts; {} is {:?}",
+                self.address, self.caps.os
+            )));
+        }
+
+        let parent = to.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(".");
+
+        // `mv -n` is not portable enough to lean on, so the destination test is written out: the
+        // local host refuses an existing destination, and a remote one has to refuse it the same way
+        // or the two transports disagree about what a move means.
+        let script = format!(
+            "if [ -e {to} ]; then exit 3; fi; mkdir -p {parent} && mv -- {from} {to}",
+            to = shell_quote(to),
+            parent = shell_quote(if parent.is_empty() { "/" } else { parent }),
+            from = shell_quote(from),
+        );
+
+        let output = self.exec(&script, Duration::from_secs(60)).await?;
+        if output.exit_code == Some(3) {
+            return Err(HxError::Remote(format!(
+                "{to} already exists; refusing to replace it"
+            )));
+        }
+        if !output.success() {
+            return Err(HxError::Remote(format!(
+                "could not move {from} to {to}: {}",
+                output.stderr.trim()
+            )));
+        }
+        Ok(())
     }
 
     /// Send a command exactly as given, without wrapping it for a shell.
@@ -724,119 +892,34 @@ impl Host for SshHost {
     }
 
     async fn read_file(&self, path: &str) -> Result<Vec<u8>> {
-        if !self.caps.is_unix() {
-            return Err(HxError::Remote(format!(
-                "reading files over SSH is only implemented for POSIX hosts; {} is {:?}",
-                self.address, self.caps.os
-            )));
+        // When the probe measured an SFTP subsystem, use it: the file is a byte stream on a dedicated
+        // channel, not a command's stdout. Fall back to the shell (which needs a POSIX far side) only
+        // when there is no subsystem to use.
+        if self.caps.has_sftp == Some(true) {
+            return self.open_sftp().await?.read_file(path).await;
         }
-
-        let output = self
-            .exec(
-                &format!("base64 < {}", shell_quote(path)),
-                Duration::from_secs(60),
-            )
-            .await?;
-
-        if !output.success() {
-            return Err(HxError::Remote(format!(
-                "could not read {path}: {}",
-                output.stderr.trim()
-            )));
-        }
-
-        // Base64 keeps the transfer binary-safe; a plain `cat` would mangle anything that is not
-        // valid UTF-8 and silently corrupt a binary file.
-        decode_b64_loose(&output.stdout)
+        self.read_file_shell(path).await
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> Result<()> {
-        use base64::Engine;
-
-        if !self.caps.is_unix() {
-            return Err(HxError::Remote(format!(
-                "writing files over SSH is only implemented for POSIX hosts; {} is {:?}",
-                self.address, self.caps.os
-            )));
+        if self.caps.has_sftp == Some(true) {
+            return self.open_sftp().await?.write_file(path, contents).await;
         }
-
-        let encoded = base64::engine::general_purpose::STANDARD.encode(contents);
-        let parent = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(".");
-
-        let script = format!(
-            "mkdir -p {parent} && printf %s {data} | base64 -d > {target}",
-            parent = shell_quote(parent),
-            data = shell_quote(&encoded),
-            target = shell_quote(path),
-        );
-
-        let output = self.exec(&script, Duration::from_secs(60)).await?;
-        if !output.success() {
-            return Err(HxError::Remote(format!(
-                "could not write {path}: {}",
-                output.stderr.trim()
-            )));
-        }
-        Ok(())
+        self.write_file_shell(path, contents).await
     }
 
     async fn list_dir(&self, path: &str) -> Result<Vec<RemoteEntry>> {
-        if !self.caps.is_unix() {
-            return Err(HxError::Remote(format!(
-                "directory listing over SSH is only implemented for POSIX hosts; {} is {:?}",
-                self.address, self.caps.os
-            )));
+        if self.caps.has_sftp == Some(true) {
+            return self.open_sftp().await?.list_dir(path).await;
         }
-
-        let output = self
-            .exec(&list_script(path), Duration::from_secs(60))
-            .await?;
-        if output.exit_code == Some(9) {
-            return Err(HxError::Remote(format!("no such directory: {path}")));
-        }
-        if !output.success() {
-            return Err(HxError::Remote(format!(
-                "could not list {path}: {}",
-                output.stderr.trim()
-            )));
-        }
-
-        Ok(parse_ls_output(&output.stdout, path))
+        self.list_dir_shell(path).await
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
-        if !self.caps.is_unix() {
-            return Err(HxError::Remote(format!(
-                "moving files over SSH is only implemented for POSIX hosts; {} is {:?}",
-                self.address, self.caps.os
-            )));
+        if self.caps.has_sftp == Some(true) {
+            return self.open_sftp().await?.rename(from, to).await;
         }
-
-        let parent = to.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(".");
-
-        // `mv -n` is not portable enough to lean on, so the destination test is written out: the
-        // local host refuses an existing destination, and a remote one has to refuse it the same way
-        // or the two transports disagree about what a move means.
-        let script = format!(
-            "if [ -e {to} ]; then exit 3; fi; mkdir -p {parent} && mv -- {from} {to}",
-            to = shell_quote(to),
-            parent = shell_quote(if parent.is_empty() { "/" } else { parent }),
-            from = shell_quote(from),
-        );
-
-        let output = self.exec(&script, Duration::from_secs(60)).await?;
-        if output.exit_code == Some(3) {
-            return Err(HxError::Remote(format!(
-                "{to} already exists; refusing to replace it"
-            )));
-        }
-        if !output.success() {
-            return Err(HxError::Remote(format!(
-                "could not move {from} to {to}: {}",
-                output.stderr.trim()
-            )));
-        }
-        Ok(())
+        self.rename_shell(from, to).await
     }
 
     async fn open_pty(
