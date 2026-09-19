@@ -163,7 +163,10 @@ async fn terminal_ws_stream(state: Arc<AppState>, id: String, socket: WebSocket)
                     match serde_json::from_str::<TerminalInput>(&text) {
                         Ok(TerminalInput::Input { data }) => match decode(&data) {
                             Ok(bytes) => {
-                                if let Err(e) = terminal.write(&bytes) {
+                                // `write_async`, not `write`: this runs inside a task on the
+                                // runtime, and the synchronous version has to drive the session's
+                                // future to completion, which deadlocks here. See its doc.
+                                if let Err(e) = terminal.write_async(&bytes).await {
                                     // The shell is gone but the reader has not reported it yet.
                                     // Say why, then end: further input cannot be delivered.
                                     let _ = sender
@@ -189,7 +192,7 @@ async fn terminal_ws_stream(state: Arc<AppState>, id: String, socket: WebSocket)
                             }
                         },
                         Ok(TerminalInput::Resize { cols, rows }) => {
-                            let _ = terminal.resize(cols, rows);
+                            let _ = terminal.resize_async(cols, rows).await;
                         }
                         // An unrecognised frame is ignored, not fatal: a newer client sending
                         // something this daemon does not know should keep its terminal.

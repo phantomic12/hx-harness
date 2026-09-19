@@ -467,6 +467,12 @@ struct CreateTerminalBody {
     /// The id to register the terminal under. Required: a client that forgets it would otherwise
     /// get a generated id it cannot attach to again after reconnecting.
     id: String,
+    /// The machine to open the shell on. Absent means the daemon's own host, which is what every
+    /// existing caller means and why this defaults rather than being required.
+    ///
+    /// A host id, never a transport: which of SSH or something else carries it is configuration.
+    #[serde(default)]
+    host: Option<String>,
     /// The shell, if the caller wants something other than the configured default.
     #[serde(default)]
     shell: Option<String>,
@@ -517,6 +523,35 @@ async fn create_terminal(
             "a terminal id cannot be empty",
         ));
     }
+    // An interactive shell is the strongest thing this daemon offers a machine: unlike `exec` there
+    // is no command line to classify, because the caller types whatever they like afterwards. So a
+    // remote shell is gated as an explicit, operator-approved capability rather than being let
+    // through by the weaker read check that command execution uses.
+    //
+    // Gated *before* the connect, so a denied request does not open an SSH connection it will not
+    // use — a denial that still dials the machine leaks reachability, which is information an
+    // operator denying shell access did not intend to give.
+    // `local` is the daemon's own machine and takes the local path below, which is the one that
+    // can use the configured shell and args. Anything else is a machine reached through a transport.
+    if let Some(host_id) = body.host.as_deref().filter(|h| !crate::hosts::is_local(h)) {
+        if let Some(reason) = state.host_denial_for(host_id, hx_core::capability::Action::Execute) {
+            return Err(ApiError::new(StatusCode::FORBIDDEN, reason));
+        }
+        let host = state.resolve_host(host_id).await.map_err(ApiError::from)?;
+        // `None` asks for the machine's own default shell, which is the right answer here: the
+        // configured shell names a path on *this* machine and would be a guess about another one.
+        let session = host
+            .open_pty(body.shell.as_deref(), body.cols, body.rows)
+            .await
+            .map_err(ApiError::from)?;
+        state.terminals.create_remote(&body.id, session)?;
+        return Ok(Json(serde_json::json!({
+            "id": body.id,
+            "host": host_id,
+            "created": true,
+        })));
+    }
+
     // The shell comes from config, never from the request, unless the caller names one explicitly.
     // Defaulting to the configured shell keeps the terminal consistent with what the daemon is set
     // up to run rather than to whatever `/bin/sh` happens to be.
