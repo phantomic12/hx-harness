@@ -4,8 +4,8 @@ Status: 2026-09-16. Companion to `ROADMAP.md` (which tracks features); this file
 
 ```console
 $ cargo test --workspace
-695 tests, 0 failed                       # includes 20 chat API tests and 4 database reopen tests
-24 ignored                               # live: Docker, SSH, search, a real model
+904 tests, 0 failed                       # includes 20 chat API tests and 4 database reopen tests
+47 ignored                               # live: Docker, SSH, search, a real model
 
 # The 24 that need a real server, run by `.github/workflows/integration.yml`
 # and `.github/workflows/canary.yml`:
@@ -154,6 +154,40 @@ The same suite has a hermetic sibling (`openai_http.rs`, 11 tests, runs on every
 the adapter at a stub server and asserts the real request line, headers and body: `arguments` as a
 JSON *string*, `content: null` for a tool-only assistant turn, one `tool` message per call id, and
 `Retry-After` honoured on a `429`.
+
+**A terminal on another machine, end to end** (`crates/hx-remote/tests/pty_live.rs`,
+`crates/hx-server/tests/terminal_remote_live.rs`)
+
+Against a throwaway OpenSSH 10.5 `sshd` on port 2222. The server-side suite is the one that matters:
+a client POSTs a terminal with `"host": "buildbox"`, attaches over the WebSocket, and types — every
+layer in between is real (config, secret store, SSH transport, the pump, the broadcast, the socket).
+
+| What ran | Observed |
+|---|---|
+| **A command typed after the shell starts executes remotely** | `echo PTY_MARKER_$((6*7))` came back `PTY_MARKER_42`. The arithmetic is evaluated by the *remote* shell, so the marker cannot appear unless the bytes reached a shell on the far side |
+| A resize reaches the kernel | `stty size` after a resize reported `40 120` — the winsize the pty actually has, not the request going out |
+| Closing is idempotent and ends the stream | Second `close()` is not an error; `read()` returns `None`. Buffered output already in flight may arrive first, and dropping it would lose the last thing the terminal said |
+| A client attaching late is sent the scrollback | The second client received what the first one had seen after the first detached |
+| **Without an allow rule** | `403 host "buildbox" requires approval (external) but no approver is attached to this route` — and nothing was registered, so a client cannot then attach to a terminal that never existed |
+| An unknown host | Refused, naming the host asked for, with nothing registered |
+
+Three findings are recorded here because each looks like a broken transport and is not:
+
+- **`fish` waits for the terminal to answer.** The default login shell here performs a DA1/DSR
+  handshake on start and blocks until the emulator replies. A test process is not an emulator, so the
+  shell parks at the handshake and the typed command arrives as literal text interleaved with the
+  queries. The tests pass an explicit `sh`; against a real client the queries are answered.
+- **`ssh-keyscan` never authenticates, so OpenSSH ≥9.8 bans it.** After a few scans every later
+  connection is reset (`kex_exchange_identification: read: Connection reset by peer`) while sshd
+  looks healthy and keeps listening. A test sshd needs `PerSourcePenalties no`.
+- **The daemon pins host keys against its own file**, not `~/.ssh/known_hosts`, so reaching a real
+  sshd requires seeding `<data_dir>/known_hosts` — `ssh-keyscan` into it, as an operator would.
+
+One defect was found by running the live suite rather than the unit tests, and it is the reason that
+suite exists: `Terminal::write` is synchronous and ran the remote session's future with
+`block_in_place` + `block_on`, which **deadlocks** from inside the WebSocket task — the SSH write
+needs the connection's own task to progress. It failed 6 of 8 runs. Fixed with async twins
+(`write_async`/`resize_async`) that await instead.
 
 **The SSH transport, against a real sshd** (`crates/hx-remote/tests/ssh_live.rs`)
 

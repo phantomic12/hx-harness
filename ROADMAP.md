@@ -196,17 +196,22 @@ attempted capability escalation shows up as a denial event, not a hang.
   the *server* offers, not what this client uses, and it should either be wired up or renamed.
 - ❌ **Remote sandboxes** — run the sandbox on a *remote* Docker/Podman host. Nothing in
   `hx-sandbox` reaches a remote daemon today.
-- ❌ **Remote terminal (a PTY straight to a remote host)** — the terminal pane is local-only.
-  `SshHost` has PTY support; the route does not yet target a remote host.
+- ✅ **Remote terminal (a PTY straight to a remote host)** — `POST /v1/terminals` takes an optional
+  `host`, and the daemon adopts the session as a terminal like any other, so the terminal pane and
+  the WebSocket contract are unchanged: a client attaches to a remote shell the same way it attaches
+  to a local one. `Host::open_pty` returns a `PtySession` (a stream, not a request); `SshHost`
+  implements it over a real pty channel, `LocalHost` and `WinRmHost` refuse with reasons rather than
+  handing back a session that never speaks. An interactive shell has no command line to classify, so
+  it is gated as `Execute` (`RiskClass::External`) *before* the connect — a denial that still dialled
+  the machine would leak its reachability.
 
 **Exit criteria:** drive a Linux box, a Mac, and a Windows host from the browser; no private
 key ever enters the model context or a sandbox.
 
-*Status: three of the seven items are done and the fourth is the one that makes the rest usable —
-a machine in the config is now visible and drivable from every client. The exit criteria is not met:
-the browser can browse and run on a remote host, but the remote terminal and remote sandboxes are
-still absent, and Unix-only CI means the Windows transport is exercised by unit tests rather than
-against a live host.*
+*Status: four of the seven items are done, and with the remote terminal in place the browser drives a
+remote box for real — browse, run, and an interactive shell — rather than only the first two. The exit
+criteria is still not met: remote sandboxes are absent, and Unix-only CI means the Windows transport
+is exercised by unit tests rather than against a live host.*
 
 ---
 
