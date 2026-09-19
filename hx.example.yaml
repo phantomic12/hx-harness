@@ -4,7 +4,7 @@
 # instead of being silently ignored.
 #
 # Verify with:  hx doctor
-# Inspect with: hx pools ; hx sandbox profiles ; hx sandbox spec dev
+# Inspect with: hx policy ; hx pools ; hx sandbox profiles ; hx sandbox spec dev
 
 # ---------------------------------------------------------------------------
 # Providers: one entry per upstream, each with one or more credentials.
@@ -122,6 +122,50 @@ sandbox_profiles:
     pids_max: 1024
     ttl_secs: 3600
     # Defaults are the safe ones: no network, read-only root, non-root user.
+
+# ---------------------------------------------------------------------------
+# Approval: what runs by itself, and what has to be asked about.
+#
+# Omitted (as here) a deployment gets `ApprovalPolicy::deployment_default()`: `balanced`, plus the
+# catastrophe set *denied* rather than questioned — `rm -rf /`, `rm -rf /etc` and friends, `dd` to a
+# device, `mkfs`, `chmod -R 777 /`, `curl … | sh`, `git push --force`, `DROP DATABASE`. Those are
+# refusals, not prompts, because "yes" is not answerable from a command line. See
+# `hx-core/src/approval.rs::default_denials()` for the exact list, and `docs/approvals.md` for why.
+#
+# The floor is **layered on**, not replaced: a config that writes an `approval:` block still gets the
+# catastrophe set, so the shortest thing you can write to stop being prompted
+# (`approval: {level: yolo}`) no longer removes it. A `deny:` list of your own is checked *first* — your
+# words explain the refusal and the shipped rule is the backstop behind it. To drop the floor entirely
+# you have to say so in so many words, and `hx policy` will then report it as dropped:
+#
+#   agent:
+#     approval:
+#       inherit_denials: false   # the catastrophe set is not applied; this is the review
+#
+# The shape of the block follows:
+#
+# agent:
+#   approval:
+#     level: balanced        # observe | cautious | balanced | trusting | yolo
+#     # ceiling: mutate      # highest risk class that may ever be auto-approved, at any level
+#     # unattended_budget: 20  # check in after this many consecutive unattended actions
+#     # expires_at: 2026-10-01T12:00:00Z
+#     # refuse_unenumerable_deletions: true   # refuses `rm -rf $DIR` / `rm -rf build*` outright
+#     # ask:                 # force a prompt even where the level would auto-allow
+#     #   - { tool: shell, command: "git push*", note: "publishes to the world" }
+#     # allow:
+#     #   - { tool: read_file, command: "*" }
+#     #   # `confined: true` matches only a call that runs inside a sandbox — §4's axis, and the reason
+#     #   # a sandbox is worth having: this lets a build run unattended in the box while the same command
+#     #   # on the host still has to be asked about. Absent means "either", so a rule written before this
+#     #   # existed keeps its meaning.
+#     #   - { tool: shell, command: "npm test*", confined: true }
+#     # deny:
+#     #   - { tool: shell, command: "*rm -rf /var*" }
+#
+# `refuse_unenumerable_deletions` is part of the deployment default alone: a library caller that
+# builds a policy in code inherits no opinions, which is why the flag exists separately from the list.
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Search: SearXNG is the force multiplier — one JSON API in front of ~70 engines.

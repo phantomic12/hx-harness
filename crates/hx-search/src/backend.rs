@@ -134,6 +134,14 @@ impl BackendRegistry {
         self.backends.iter().map(|b| b.id().to_string()).collect()
     }
 
+    /// The backends themselves, for a tool that fans out its own way.
+    ///
+    /// `WebSearchTool` is the caller: it takes the backends at construction and decides its own
+    /// fanout, so it needs handles rather than names.
+    pub fn all(&self) -> Vec<Arc<dyn SearchBackend>> {
+        self.backends.clone()
+    }
+
     pub fn len(&self) -> usize {
         self.backends.len()
     }

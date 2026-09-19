@@ -49,17 +49,63 @@ jobs:
         # L3's claim is that the sandbox never sees the host kernel, and that is only checkable where
         # a VM-backed runtime exists. Installing it here is what stops the strongest claim in the
         # ladder from quietly skipping — `HX_DOCKER_REQUIRE_L3` below turns a skip into a failure.
+        env:
+          # Pinned deliberately: an unpinned download means a gVisor release can change this job's
+          # outcome without anything in this repo changing.
+          GISVOR_VERSION: "20260914.0"
         run: |
-          curl -fsSL -o /tmp/runsc https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/runsc
-          curl -fsSL -o /tmp/runsc.sha512 https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/runsc.sha512
-          (cd /tmp && sha512sum -c runsc.sha512)
-          sudo install -m 0755 /tmp/runsc /usr/local/bin/runsc
-          printf '%s\n' '{ "runtimes": { "runsc": { "path": "/usr/local/bin/runsc" } } }' | sudo tee /etc/docker/daemon.json
+          # Two attempts at this URL were wrong before landing here, and both failed in ways that
+          # looked like a broken gVisor rather than a wrong download:
+          #
+          # 1. `releases/release/latest/x86_64/runsc` — upstream removed it and it 404s.
+          # 2. `releases/release/runsc/x86_64/runsc` — a *stale* 2022 artifact that still answers.
+          #    It installed cleanly and `runsc --version` said `release-20220208.0`, then every
+          #    container failed with `runsc did not terminate successfully: exit status 1`.
+          #
+          # A release now ships as a versioned tarball with the runtime and its helper binaries, so
+          # take it from the version directory rather than a mutable alias.
+          curl -fsSL -o /tmp/gvisor.tar.zstd "https://storage.googleapis.com/gvisor/releases/release/${GISVOR_VERSION}/x86_64/gvisor.tar.zstd"
+          curl -fsSL -o /tmp/gvisor.tar.zstd.sha512 "https://storage.googleapis.com/gvisor/releases/release/${GISVOR_VERSION}/x86_64/gvisor.tar.zstd.sha512"
+          (cd /tmp && sha512sum -c gvisor.tar.zstd.sha512)
+          mkdir -p /tmp/gvisor && tar --zstd -xf /tmp/gvisor.tar.zstd -C /tmp/gvisor
+          sudo install -m 0755 /tmp/gvisor/runsc /usr/local/bin/runsc
+          # The shim and the sidecar binaries have to be installed too. A current `runsc` looks for
+          # `gvisor-bin/` next to itself and fails the container outright without it:
+          #
+          #   sidecar "gvisor_sentry" not usable (stat /usr/local/bin/gvisor-bin/gvisor_sentry:
+          #   no such file or directory) and --sidecar-usage-policy is set to STRICT
+          #
+          # which is a newer requirement than the 2022 build this job used to get, and reads as a
+          # broken runtime rather than an incomplete install.
+          sudo install -m 0755 /tmp/gvisor/containerd-shim-runsc-v1 /usr/local/bin/containerd-shim-runsc-v1
+          sudo mkdir -p /usr/local/bin/gvisor-bin
+          sudo cp -a /tmp/gvisor/gvisor-bin/. /usr/local/bin/gvisor-bin/
+          sudo chmod 0755 /usr/local/bin/gvisor-bin/*
+          # Merge into `daemon.json` rather than replacing it. Writing the key alone clobbers
+          # whatever the installer put there — the default runtime and the shim paths `containerd`
+          # needs — and `runsc` then fails to launch with `did not terminate successfully: exit
+          # status 1`, which reads as a broken gVisor rather than a damaged daemon config.
+          sudo python3 - <<'PY'
+          import json
+          path = "/etc/docker/daemon.json"
+          try:
+              with open(path) as f:
+                  cfg = json.load(f)
+          except (FileNotFoundError, ValueError):
+              cfg = {}
+          cfg.setdefault("runtimes", {})["runsc"] = {"path": "/usr/local/bin/runsc"}
+          with open(path, "w") as f:
+              json.dump(cfg, f, indent=2)
+          print("daemon.json:", json.dumps(cfg))
+          PY
           sudo systemctl restart docker
 
           # Assert the runtime answers before any test does: "no gVisor" must fail here, naming the
           # reason, rather than downstream as a mysterious L3 assertion.
           docker info --format '{{range $k,$v := .Runtimes}}{{$k}} {{end}}'
+          # Print the version, so a future stale-download regression is visible as a date rather than
+          # as an unexplained container failure.
+          runsc --version
           docker run --rm --runtime runsc --network none ubuntu:24.04 uname -r
 
       - name: The ladder, against a real container engine
@@ -67,6 +113,14 @@ jobs:
           # A skip is not a pass: if gVisor vanishes from this environment, fail.
           HX_DOCKER_REQUIRE_L3: "1"
         run: cargo test -p hx-sandbox --test docker_live --locked -- --ignored --test-threads=1 --nocapture
+
+      # The ladder proves the engine accepts a spec. This proves the *chat path* reaches it: a
+      # request that names a profile runs its command inside a real container, writes through the
+      # bind mount as the workspace's owner, and is told the sandbox path rather than the host's.
+      # A recording runtime cannot see any of that — an embedded `cd /host/checkout` in the command
+      # line passed every hermetic test while the command could not have run inside the container.
+      - name: The chat path, against a real container
+        run: cargo test -p hx-server --test chat_live --locked -- --ignored --test-threads=1 --nocapture
 
   # A real sshd, a real key, a real handshake. The port is deliberately not 22: the bracketed
   # `[host]:port` form in `known_hosts` is the part most likely to be wrong, and this is the only

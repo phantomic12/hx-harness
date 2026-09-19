@@ -1,13 +1,13 @@
 # Testing roadmap — what is verified, and what only looks verified
 
-Status: 2026-09-15. Companion to `ROADMAP.md` (which tracks features); this file tracks **evidence**.
+Status: 2026-09-16. Companion to `ROADMAP.md` (which tracks features); this file tracks **evidence**.
 
 ```console
 $ cargo test --workspace
-410 unit + 11 hermetic HTTP tests, 0 failed
-22 ignored                               # live: Docker, SSH, search, a real model
+695 tests, 0 failed                       # includes 20 chat API tests and 4 database reopen tests
+24 ignored                               # live: Docker, SSH, search, a real model
 
-# The 18 that need a real server, run by `.github/workflows/integration.yml`
+# The 24 that need a real server, run by `.github/workflows/integration.yml`
 # and `.github/workflows/canary.yml`:
 $ cargo test -p hx-sandbox --test docker_live -- --ignored --test-threads=1
 9 passed; 0 failed                       # a real Docker daemon, with gVisor installed
@@ -16,15 +16,49 @@ $ HX_OPENAI_TEST_BASE_URL=… HX_OPENAI_TEST_MODEL=… HX_OPENAI_TEST_KEY=… \
 4 passed; 0 failed                       # a real model, through a real gateway
 $ cargo test -p hx-remote --test ssh_live -- --ignored --test-threads=1
 5 passed; 0 failed                       # a real sshd, real key auth
+$ cargo test -p hx-server --test chat_live -- --ignored --test-threads=1
+2 passed; 0 failed                       # a real container, through POST /v1/chat
 $ HX_SEARXNG_URL=http://127.0.0.1:8888 HX_SEARCH_EXPECT_RESULTS=searxng \
   cargo test -p hx-search --test search_live -- --ignored --test-threads=1
 4 passed; 0 failed                       # a real SearXNG, real internet
 ```
 
 The counts matter in both directions. A green `cargo test` alone still means **the logic is right**;
-those 18 ignored tests are the ones that have reached another process, and the only ones here that
+those 24 ignored tests are the ones that have reached another process, and the only ones here that
 could catch a protocol mistake. They now run in CI, which is the difference between "verified once"
 and "stays verified".
+
+## The audit chain (hermetic + verified on a real database)
+
+`crates/hx-store/src/audit.rs` gives every event row a digest over (its sequence, timestamp, kind,
+payload, session id) and the previous row's digest. **The first version of the verifier only compared
+each stored digest to the previous stored digest — a property true of any list of strings, so it
+detected nothing.** Three tests failed and caught it: a verifier that cannot fail certifies an edited
+log as intact. `verify_events` now recomputes each row's digest from the row's own content, and takes
+content + digest rather than digests alone.
+
+Verified on a real database (a copy of a V1 store with 348 events): opening it with this build
+migrated the schema to V2, added the `digest` column, kept all 348 rows (all reported as *unchained*
+rather than as tampered with), and a subsequent run chained its 4 new events. That is the upgrade path
+an existing deployment takes.
+
+What it does not prove: it is hash chaining, not a signature. An attacker who rewrites the whole chain
+from a chosen point forward produces one that verifies, because the only secret involved is the
+construction. Detecting *that* needs a key held outside the database — `hx-secrets`' business and an
+open step.
+
+## Chat sandbox wiring verification
+
+`cargo fmt --all --check`, strict workspace clippy, and `cargo test --workspace --locked` pass.
+Four added HTTP tests cover unknown profile (400), absent engine (503), failed startup (502), and
+successful shell dispatch through the real manager with a recording runtime. They assert no model
+call or session on startup rejection, exact command source without a host-side `cd`, translated
+`/workspace`, and no host marker. A shell test covers an explicit relative workdir separately from
+command source. CLI help exposes `--sandbox-profile`.
+
+This is hermetic evidence, not a live container run. Docker is not installed on this development host;
+the new chat path has not yet been exercised against a real engine. The historical live results below
+remain evidence for their named suites, not for this new wiring.
 
 ## The four tiers
 
@@ -86,6 +120,24 @@ keep. The first failing run also happened to demonstrate the rollback invariant 
 engine: seven spawns failed at *start* after a successful create, and every one reported
 `it has been removed`.
 
+**The chat path, against a real container engine** (`crates/hx-server/tests/chat_live.rs`)
+
+Two tests that drive `POST /v1/chat` with a scripted model and a real Docker daemon. `tests/api.rs`
+proves the wiring with a *recording* runtime — the manager is real, the command is asserted exactly —
+but a recording runtime cannot see whether that command can actually run where it is sent. That gap is
+not hypothetical: the first version of this wiring built the command line with `cd '/host/checkout' &&
+…` embedded in the shell source, so the container received a path that does not exist inside it while
+the adapter was dutifully translating the separate workdir argument into `/workspace`. Every hermetic
+test passed.
+
+| What ran | Observed |
+|---|---|
+| A request that names a profile, with a shell call | The command ran inside a real container: `printf … > proof.txt && pwd && id -u` produced a file that appears on the **host** through the bind mount, with the container's own contents |
+| What the model was told | `/workspace` — not the host checkout path — plus `ran in sandbox …`, so the model is not handed a path that only exists outside the box |
+| Which user it ran as | Non-root: the adopted workspace owner, which is what makes the bind writable on a host whose uid is not 1000 |
+| A second request in the same checkout | Reused the same container id rather than starting a second one — the cache is keyed on profile + host workspace path, so a boundary is paid for once per checkout |
+| A request naming an unknown profile | `400`, naming the profile, with **no** container started and **no** session created — a misspelt boundary is never a quiet unconfined run |
+
 **A real model, through a real gateway** (`crates/hx-provider/tests/openai_live.rs`)
 
 Four tests against a hosted gateway (OpenAI-compatible `/v1`), model `gemini/gemini-3.1-flash-lite`,
@@ -144,14 +196,17 @@ returning an empty list.
 
 | Crate | Tests | LOC | What the tests actually prove |
 |---|---|---|---|
-| `hx-core` | 83 | 4092 | ID monotonicity, error taxonomy, **capability path grants** (incl. the empty-grant-means-root regression), approval policy incl. unattended budgets, message/event round-trips, config parsing and rejection of unknown keys |
-| `hx-provider` | 81 | 3679 | Token-bucket timing, **budget fail-closed on a zero estimate**, credential pool round-robin, shared-limiter identity across pools, routing and fallthrough |
-| `hx-remote` | 90 | 3108 | Platform caps parsing (`uname`/`ver`), path translation, shell quoting incl. injection attempts, risky-command classification, mid-truncation, approval round-trip against the local host, and **`known_hosts`**: hashed host fields (HMAC-SHA1), globs, negation, `@revoked` beating trust regardless of line order, a different key type reading as first use rather than substitution, plus the policy's fail-closed behaviour and the wording of every refusal |
-| `hx-sandbox` | 62 | 2057 | Isolation ladder ordering and monotonicity, spec↔YAML round-trip, `SandboxSpec`→`HostConfig` mapping field by field, **no engine-rejected security option** (`userns=`, `seccomp=default`), an egress allowlist that cannot be enforced, registry/TTL bookkeeping, the concurrency cap, and rollback on a failed start |
-| `hx-search` | 45 | 1732 | RRF rank fusion, HTML extraction, entity decoding, per-backend failure isolation (with **fake** backends) |
-| `hx-secrets` | 27 | 901 | Argon2id+XChaCha20 round-trip, tamper detection, redaction patterns |
-| `hx-server` | 11 | 739 | Route dispatch via `oneshot`, `HxError`→HTTP status mapping |
-| `hx` | 11 | — | Renderers for pools/hosts/sandbox-spec, CLI parsing |
+| `hx-core` | 108 | 5385 | ID monotonicity, error taxonomy (**a rejected credential is an auth failure, and a 500 is not**, so a pool retries one and benches the other), **capability path grants** (incl. the empty-grant-means-root regression), approval policy incl. unattended budgets and **the shipped catastrophe set in both directions** (the unrecoverable paths refused, `/tmp` and `/home` left answerable) and the refusal of a delete whose target is a pattern, message/event round-trips, target descriptions a person can price, and config parsing incl. rejection of unknown keys and **`hx.example.yaml` itself parsing** |
+| `hx-provider` | 111 | 4091 | Token-bucket timing, **budget fail-closed on a zero estimate**, credential pool round-robin, shared-limiter identity across pools, routing and fallthrough, a granted ticket carrying the credential's `secret_ref`, a role's reservation estimated from the **dearest** route, the provider factory refusing a kind it has no adapter for, and **streaming**: SSE events reassembled across split chunks before being parsed, text deltas emitted in order, and the batch of unmerged tool-call fragments a proxy hands over merged by `index` into one call. The **Anthropic** stream as well: named events reassembled across split reads and CRLF terminators, text deltas in order, `input_json_delta` fragments accumulated and parsed only at `content_block_stop` (a per-fragment parse fails on nearly every real call), an empty-argument call treated as `{}` while genuinely truncated JSON is an error naming the call, two tool calls in one turn kept apart by index, usage taken from the last cumulative `message_delta` rather than summed, `ping` and unknown event types ignored rather than fatal, and a mid-stream `error` event raised rather than returned as a short answer — plus two tests over real HTTP asserting `stream: true` is the only difference from the non-streaming body |
+| `hx-remote` | 90 | 3176 | Platform caps parsing (`uname`/`ver`), path translation, shell quoting incl. injection attempts, risky-command classification, mid-truncation, approval round-trip against the local host, and **`known_hosts`**: hashed host fields (HMAC-SHA1), globs, negation, `@revoked` beating trust regardless of line order, a different key type reading as first use rather than substitution, plus the policy's fail-closed behaviour and the wording of every refusal |
+| `hx-sandbox` | 62 | 2066 | Isolation ladder ordering and monotonicity, spec↔YAML round-trip, `SandboxSpec`→`HostConfig` mapping field by field, **no engine-rejected security option** (`userns=`, `seccomp=default`), an egress allowlist that cannot be enforced, registry/TTL bookkeeping, the concurrency cap, and rollback on a failed start |
+| `hx-search` | 45 | 1740 | RRF rank fusion, HTML extraction, entity decoding, per-backend failure isolation (with **fake** backends) |
+| `hx-secrets` | 36 | 1302 | Argon2id+XChaCha20 round-trip, tamper detection, redaction patterns, and **credential resolution**: a `store:name` reference resolved through `vault:`/`env:`/a fixed map, an empty environment variable refused like an absent one, an unknown store listing the stores that *are* configured, and every error message asserted **not** to contain a value |
+| `hx-agent` | 45 | 1407 | The loop's gate, in one file of integration tests: the target of a destructive call is **measured after the capability check and before the prompt** (and the event that reaches the store carries it, so the trail proves what the approver was shown), a **capability denial is a result the model reads and cannot be approved away** (an approver willing to say yes is never asked), an approval denial is reported and the command never reaches the host, `allow for chat` stops the second prompt while a remembered denial is not re-asked, a tool declaring no external effect is never prompted about, a refused call does not stop its sibling, unknown tools and unusable arguments return as results, a non-zero exit is still a call that *ran*, `max_turns` and the deadline stop the run, and the exact event sequence a client renders. Plus the **routed model call** over a real `ModelRouter` and a real `ProviderRegistry`, with only the adapter faked: the route decides the model, the key follows the credential the pool granted, a refused credential is benched and its *sibling* is tried before another provider, a missing key and a 502 both give the reservation back (asserted with `concurrent: 1`, since a leaked lease looks exactly like a rate limit), and a day's budget that covers one pessimistic reservation still allows three calls |
+| `hx-store` | 42 | 2059 | Migrations applied once and never re-run, **a database from a newer build refused with both versions named** (and left untouched), `STRICT` rejecting a type mistake at insert, the transcript written by `seq` the caller does not track, a batch written whole or not at all, a cascade that only happens because `Store` sets `foreign_keys`, every part type round-tripping while an unknown one is reported rather than dropped, events and usage surviving a reopen — plus 4 in `tests/resume.rs` that drop the store and open a **new connection** to the same file, which is the closest a test gets to killing the daemon |
+| `hx-tools` | 94 | 3826 | Requirements per tool, bounded output, the two-phase registry, **confinement** (a run with a boundary runs the command there and touches no host; a boundary that cannot be entered is reported as a failure instead of falling back to the machine — the failure mode that would silently unconfine every run whose engine hiccuped), and **a misnamed argument refused rather than ignored** — `cwd` instead of `workdir` used to drop silently and run the command in the daemon's own directory. `delete` is the largest entry: the XDG trash round-trip on a real in-memory host, a directory walked rather than counted at the top level, the filesystem root refused, an unreadable path refused **before** anything is touched, an existing trash name never overwritten, a *pattern* read as one literal filename and told so, a transport failure that says nothing was deleted, and a `delete` that still requires the `Delete` capability on the resolved path |
+| `hx-server` | 46 | 2545 | Route dispatch via `oneshot`, `HxError`→HTTP status mapping, and twelve tests that run the **real loop over the real HTTP surface** with only the model scripted: an answer comes back with its session, its cost and its events; a tool call runs and its result reaches the model; a write outside the workspace is denied and never happens; a shell command that needs a human is refused **with the reason**, and the same command runs under `yolo`; a second request on a session continues the transcript; unknown autonomy and unknown roles are 400s that name what is accepted; and a request that cannot run leaves no session behind. Two of them are the floor a `yolo` run cannot lift: `rm -rf /etc` is **refused** (with the shipped rule's reason, so the model can read why) while `rm -rf /tmp/…` still runs, which is the pair that shows the refusal is a list of named paths and not a blanket stop. Plus the sandbox adapter: a command runs in the boundary with its workdir translated host→mount, a path outside the mount is refused **without running anything**, a sandbox path is left alone (the model may have copied one), one container per checkout and none shared across checkouts, a reaped sandbox is replaced rather than returned, a command that outlives its deadline is reported as still-running rather than as success, and dropping the boundary destroys it. Plus **SSE**: three tests that POST `/v1/chat/stream` through the real router and parse the response the way a spec-compliant client would — a run streams its events and ends with a named `done` carrying the reply, a run that cannot start arrives as a named `error` event rather than a status (the response is already `text/event-stream` by then, so there is no status left to change), and two runs on one shared bus do not see each other's events |
+| `hx` | 39 | 1884 | Renderers for pools/hosts/sandbox-spec/**policy**/sessions/runs/approvals, CLI parsing, and the daemon client's URL rules (an explicit `--daemon` wins, a bare `host:port` from the config gets a scheme, a URL that already has one is left alone). The policy renderer is asserted on the *order* of the rules rather than their presence — printing them in the struct's order would describe a policy the session does not have — and the approvals renderer is asserted to show a target list, the way back, and the command that answers the question, because a terminal that showed less than the daemon asked would be a weaker interface to one decision. Plus the **SSE reader** for `hx chat --stream`: a frame needs a blank line to complete, a CRLF stream still terminates frames (a proxy that sent those would otherwise buffer every event forever with no error), a run event carries its session, `done` and `error` frames are told apart, a keepalive comment is not a frame, a multi-line payload needs several `data:` lines and joins with newlines, a long argument is truncated to one line, and the `done` frame is asserted to unwrap to the same shape `/v1/chat` returns — the mistake that printed `session ?` and `0 turn(s)` for a run that had done real work |
 
 Two families in that table are worth naming, because in both the obvious implementation is wrong and
 the failure is silent:
@@ -176,9 +231,9 @@ the failure is silent:
 
 ### Tier D — absent
 
-Six crates are one line each — placeholder `lib.rs` with a doc comment and nothing else:
+Three crates are one line each — placeholder `lib.rs` with a doc comment and nothing else:
 
-`hx-agent` · `hx-browser` · `hx-gateway` · `hx-mcp` · `hx-store` · `hx-tools`
+`hx-browser` · `hx-gateway` · `hx-mcp`
 
 They are declared as workspace members, so `cargo test` reports nothing for them and the build is
 green. **A green suite says nothing about them.** Also absent: the web UI, the Tauri desktop/mobile
@@ -245,8 +300,11 @@ failure is accounted for, results that do come back are usable and not redirect 
 found DuckDuckGo serving an `anomaly` challenge on every request — reported correctly, and now
 recorded in README as the reason a browser-fingerprint client is M6 work rather than a parsing bug.
 
-**6 — End-to-end agent test.** Blocked on M1. The moment the loop exists it should drive one real
-task against a real sandbox — that becomes the first true end-to-end test in the repo.
+**6 — End-to-end agent test.** ◐ Unblocked, not done. The loop exists now (`crates/hx-agent`), and
+its 21 tests exercise the gate end to end — but against a *scripted* model and an in-memory host,
+which is still only our own assumptions. The test that counts drives a real model through the loop
+with a real tool against a real host or sandbox, and it cannot be written before the loop is wired
+into something that owns a credential and a host (`hx-store` and `hxd`, next in M1).
 
 **7 — L3, and a non-Linux remote.**
 
@@ -260,10 +318,180 @@ quietly stop being tested.
 guards have never met a real server. It needs a Windows box with an SSH server and a key, which is
 environment work rather than code work.
 
+✅ **WinRM against a real Windows host.** `hx-remote` carries a hand-rolled NTLMv2 implementation
+(`src/ntlm.rs`) and a WinRM transport (`src/winrm.rs`), and `tests/winrm_live.rs` exercises both
+against a Windows 10 guest: **9 of 9 pass.** The suite is `#[ignore]`d, so the default gate does not
+run it — it needs a host.
+
+    HX_WINRM_HOST  HX_WINRM_USER  HX_WINRM_PASSWORD   the host to talk to
+    HX_WINRM_PORT                                     5985 HTTP, 5986 HTTPS
+    HX_WINRM_AUTH=basic                               use Basic auth instead of NTLM
+    HX_WINRM_HTTPS=1                                  https, required with Basic
+    HX_WINRM_INSECURE=1                               accept a self-signed certificate
+
+**NTLM is not the transport to use over plain HTTP WinRM.** WinRM over NTLM seals every request after
+the handshake with the session key (`multipart/encrypted`, MS-NLMP SEAL), which this client does not
+implement, so an NTLM request carrying the envelope in the clear is rejected. **Use HTTPS with Basic
+auth** — TLS supplies the confidentiality that makes Basic acceptable, and the client refuses Basic
+over HTTP for exactly that reason. The `HX_WINRM_*` matrix above is what the live suite is verified
+with. One consequence worth knowing before deploying: the live tests pass through a TLS-terminating
+proxy in front of a plain listener, because configuring an HTTPS listener on the guest was more
+moving parts than the code under test.
+
+## Tier C — a real model through the daemon (manual, recorded)
+
+The suites above fake the model. This is the row that proves the harness drives one, and it is run by
+hand because it needs a key and someone else's rate limits:
+
+```console
+$ export HX_LITELLM_KEY=...                      # a LiteLLM proxy key, never in the config
+$ ./target/release/hxd --config ~/.hx/litellm.yaml --bind 127.0.0.1:8899
+$ curl -s :8899/v1/chat -d '{"prompt":"...","role":"swe2high","workspace":"/tmp/ws"}'
+```
+
+Measured against `litellm.phantomic.live` (2026-09-16, hx-harness at `9de1227`):
+
+| Model | Task | Result |
+|---|---|---|
+| `glm-prox/swe-2-high` | read 6 files, one call each | 6 tool calls, 0 refusals, correct; 22 s |
+| `glm-prox/swe-2-high` | read 13 `Cargo.toml`s, name the `hx-provider` dependants | 3 calls, correct (batched) |
+| `glm-prox/swe-2-high` | create a file and read it back | 2 calls, file on disk byte-for-byte |
+| `minimax/MiniMax-M3` | read `Cargo.toml`, count members | 1 call, correct ("15") |
+| `opencode-go/deepseek-v4.1-flash` | same | 1 call, correct |
+| `glm-prox/glm-5-2` | same | 1 call, correct |
+| `openrouter/nvidia/nemotron-3-super-120b-a12b:free` | same | 1 call, correct |
+| `openrouter/cohere/north-mini-code:free` | same | 1 call, correct |
+
+### Streaming, end to end (2026-09-17)
+
+`hx chat --stream` against `litellm.phantomic.live`, real model, real tools:
+
+```
+$ hx --config ~/.hx/litellm.yaml --daemon 127.0.0.1:8899 chat --stream --autonomy yolo \
+    --workspace ~/.hx/ws/sse-e2e2 --max-turns 8 \
+    "Read a.txt and b.txt, then create combined.txt with both lines in order, then run 'wc -l combined.txt'. Report the count."
+
+turn 1
+turn 2
+turn 3
+turn 4
+`combined.txt` contains:
+...
+session ses_17e49a344b0841a0bba1cf9f692e9bc9  (new)
+stop completed after 4 turn(s): 4 tool call(s), 0 refusal(s)
+tokens 5694 in / 300 out   cost no rate card configured
+```
+
+Progress went to stderr and the reply to stdout, so the piped stdout stayed parseable. The run's work
+was checked independently rather than taken on its word: `combined.txt` held both lines in order and a
+separate `wc -l` said 2.
+
+The first attempt at this printed `session ?` / `stop ?` / `0 turn(s)` for a run that had done four
+turns and four tool calls — the `done` frame wraps its reply where `/v1/chat` returns it flat, and the
+client was reading the envelope. Fixed in the client (the envelope is the server's contract), with a
+test asserting both paths hand `render_chat` the same shape.
+
+Three did **not** work, and none of it was the harness: `openrouter/google/gemma-4-31b-it:free` and
+`openrouter/z-ai/glm-5.2:free` are upstream-limited or do not route tool use at all (verified with a
+direct `curl` to the proxy), and `opencode-zen/nemotron-3.5-lightning-free` is restricted by the
+provider to OpenCode's own client. A model that cannot call tools cannot drive this harness, and the
+error says which of those it was.
+
+**A kill, and what it leaves behind.** `kill -9` on the daemon 6 s into a run, once the first tool
+result was on disk (`~/.hx/kill-test.sh` polls the database and kills at that moment rather than
+guessing):
+
+```console
+$ ./kill-test.sh
+session ses_7c8f29c6… has 3 messages on disk — killing -9 now
+1 | user      | "Read every Cargo.toml under crates/ …"
+2 | assistant | "I'll first find all the Cargo.toml files …"      (with a tool call)
+3 | tool      | tool_result for shell_0#f8cdea97…
+messages=3 events=6 usage=1
+```
+
+Then restart and resume the same session: `created=false repaired=0`, 13 tool calls, 0 refusals, 20
+messages, and the answer correct. That is M1's second exit criterion — a killed run resumes because
+its transcript was never only in memory, and a kill that lands *between* a call and its result is
+repaired on the next request rather than sent to a provider that rejects it.
+
+The first run of this tier found two bugs no scripted test could: an OpenAI-compatible proxy that hands
+over *unmerged streaming fragments* as a `tool_calls` array (seven entries, six nameless, one call),
+and relative paths from the model being checked against an absolute workspace grant — 35 refusals and
+no progress. Both are fixed, and both now have tests that reproduce the real wire bodies.
+
+**A deletion, and what the question said.** `docs/approvals.md` §3 asks a destructive prompt to name
+what will be gone. That is a claim about the filesystem rather than about the arguments, so the test
+that settles it is one where a model chooses the path and a person reads the measurement
+(`~/.hx/delete-demo.sh`, which builds a tree with a nested file, runs the daemon, and answers the
+question through the CLI rather than with a raw `curl`):
+
+```console
+$ ./delete-demo.sh
+--- the target, before ---
+610000  /home/yoav/.hx/ws/delete-demo/build        # one.o, two.o, and sub/three.o
+--- the question a person sees (after 3s) ---
+delete /home/yoav/.hx/ws/delete-demo/build
+risk: destructive
+why:  deletes /home/yoav/.hx/ws/delete-demo/build
+target:
+  /home/yoav/.hx/ws/delete-demo/build — directory, 4 entries, 595.7 KB
+after: moves to the trash at /home/yoav/.local/share/Trash/files, where it can be moved back — nothing is destroyed until the trash is emptied
+answer: allow once | allow for this chat | deny
+id: apr_400a59742a374405b475551db9369089   ->  hx approve apr_400a59… --option once
+```
+
+`glm-prox/swe-2-high` called `delete {"path":"build","recursive":true}` — a **relative** path, measured
+against the workspace — and the count is the tree, not the top level: 4 entries for two object files,
+the `sub` directory, and the object file inside it. The run waited, the CLI answered, and afterwards
+the workspace held only `keep.txt` while the trash held the tree byte-for-byte (610 000 bytes) with an
+XDG `build.trashinfo` naming the original absolute path. Read back from SQLite once the run finished:
+
+```json
+{"event":"approval_requested","approval":"apr_400a59…",
+ "reason":"deletes /home/yoav/.hx/ws/delete-demo/build",
+ "targets":[{"path":"/home/yoav/.hx/ws/delete-demo/build","kind":"directory",
+             "entries":4,"bytes":610000,"partial":false}]}
+{"event":"approval_resolved","approval":"apr_400a59…","approved":true,"by":"terminal"}
+```
+
+The second line is the reason for the first: the trail records *who* answered **and** what they were
+shown, so an approval can never be audited as a bare yes.
+
+**`hx policy`, against the real config.** The renderer is unit-tested, but the thing it is for is
+reading a *deployment's* ladder, and that is a fact about a file nobody tests:
+
+```console
+$ hx policy --config ~/.hx/litellm.yaml
+approval policy from /home/yoav/.hx/litellm.yaml
+  level    balanced — asks before anything leaving the machine, or worse
+  read         runs free
+  mutate       runs free
+  external     asks
+  destructive  asks
+  privileged   asks
+  ceiling  none — a `yolo` chat can auto-approve anything, including a deleted database
+  deletes  a pattern or a variable in a delete is refused outright (`rm -rf build*`, `rm -rf $DIR`), …
+rules, in the order they are checked:
+  deny — refused before anything else is considered, and no approval can buy it back
+     1. tool shell, matching rm -rf /  # recursive delete of the root directory
+     …
+    32. tool shell, matching *DROP DATABASE*  # dropping a database
+      (all 32 shipped catastrophe rules, from `default_denials()`)
+```
+
+That output is what makes the two defects in §7 of `docs/approvals.md` *visible*: rule 4 used to be a
+single `*rm -rf /*` that also matched `/tmp`, and a config with no `agent:` section printed no rules at
+all until `AgentConfig::default()` was fixed.
+
 ## Running the suite
 
 ```bash
-cargo test --workspace          # 410 unit tests + 11 hermetic HTTP + 22 ignored live tests
+cargo test --workspace          # 695 tests, 0 failed, 24 ignored live tests
+cargo test -p hx-store          # 42 — migrations, the transcript, and 4 that reopen the file
+cargo test -p hx-agent          # 42 — the loop's gate, the routed model call, the transcript sink
+cargo test -p hx-tools          # 91 — requirements, bounded output, the two-phase registry, workspace resolution, the trash
+cargo test -p hx-server         # 30 — routes, and the loop end to end over HTTP
 cargo test -p hx-sandbox        # 62 — includes the ladder and the rollback invariants
 cargo test -p hx-remote         # 90 — includes known_hosts parsing and the host key policy
 cargo build --workspace         # clean: 0 warnings, 0 deprecations
@@ -277,8 +505,18 @@ HX_SSH_TEST_HOST=<host> HX_SSH_TEST_USER=<user> HX_SSH_TEST_KEY=~/.ssh/id_ed2551
 
 ## Summary
 
-- **8 crates with logic**: unit-tested at the level of pure functions and in-process lifecycles.
-- **6 crates**: empty. The green suite does not cover them.
+- **11 crates with logic**: unit-tested at the level of pure functions and in-process lifecycles.
+- **3 crates**: empty. The green suite does not cover them.
+- **The store's resume path is tested across a real process boundary, in the only way a test can**:
+  four tests in `crates/hx-store/tests/resume.rs` drop the `Store` and open a *new connection* to
+  the same file, then continue the conversation. One of them is the case M1's exit criterion turns
+  on — a run that died between a tool call and its result — where the transcript is repaired with a
+  result that says the call did not run, rather than being sent to a provider that would reject it
+  with an error that does not mention the cause.
+- **The agent loop's gate is tested where it can be**: 21 integration tests with no network and no
+  model — a capability denial that an approval cannot widen, an approval denial that never reaches the
+  host, a refusal that does not stop the next call, and the event sequence a client will render. What
+  none of them reaches is a real model: a scripted one is a model we wrote.
 - **22 live tests**, all `#[ignore]`d by default: a real Docker daemon with gVisor installed, a real
   `sshd` and a real SearXNG are run in CI; the four against a real model are run deliberately, since
   they need a key and CI has none.

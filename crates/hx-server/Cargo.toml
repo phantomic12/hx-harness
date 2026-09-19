@@ -12,15 +12,35 @@ hx-search.workspace = true
 hx-sandbox.workspace = true
 hx-remote.workspace = true
 hx-secrets.workspace = true
+hx-agent.workspace = true
+hx-tools.workspace = true
+hx-store.workspace = true
 axum.workspace = true
+async-trait.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 indexmap.workspace = true
+base64.workspace = true
 reqwest.workspace = true
+futures.workspace = true
+# A PTY is a handful of libc calls (`posix_openpt`, `grantpt`, `unlockpt`, `ptsname`) plus termios.
+# `nix` already sits in the workspace lock, so the terminal needs no new crate — and `portable-pty`,
+# which the roadmap named, is not vendored and crates.io is unreachable from the offline gate.
+nix = { version = "0.31", features = ["term", "process", "fs", "signal"] }
 
 [dev-dependencies]
+tempfile.workspace = true
+# The audit tests tamper with a stored row through raw SQL on purpose: a tamper test that recomputed
+# the digest with the same helper that made it would be agreeing with itself.
+rusqlite.workspace = true
+async-trait.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# The WebSocket integration tests drive a real axum server over a real socket, because the upgrade
+# handshake cannot be exercised through `tower::oneshot`. That ply is already in the workspace's lock
+# (pulled in by the MCP/rmcp stack), so adding it as a dev-dependency for the tests costs nothing
+# that is not already compiled.
+tokio-tungstenite = "0.29"

@@ -16,7 +16,7 @@ Four ways to get it running, in the order most people should consider them.
 Two binaries:
 
 - **`hxd`** — the daemon. Owns the model router, search backends, sandbox manager and HTTP API. Every front end (CLI, web UI, desktop app, chat connectors) is a client of this process.
-- **`hx`** — the CLI. Inspects and validates a running configuration (`hx doctor`, `hx pools`, `hx sandbox profiles`).
+- **`hx`** — the CLI. Inspects and validates a running configuration (`hx doctor`, `hx pools`, `hx sandbox profiles`), and drives the daemon (`hx chat "…"`, `hx sessions`, `hx session <id> --export md`).
 
 > **Read this before you deploy.** The harness is a work in progress. `hxd` starts, validates
 > your configuration, exposes the HTTP API and reports status — but there is no agent loop yet,

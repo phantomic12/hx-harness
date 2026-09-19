@@ -56,17 +56,34 @@ $ curl -s localhost:7717/v1/status | jq .pools
 |---|---|
 | Capability tokens, approval policy, command classification | **Done**, tested |
 | Encrypted secret vault (Argon2id + XChaCha20), outbound redaction | **Done**, tested |
-| Model pools, per-credential rate/token/budget limits, role routing | **Done**, tested |
+| Model pools, per-credential rate/token/budget limits, role routing | **Done**, tested — and now *reachable*: a call reserves at both levels, resolves the key the reservation was granted, sends, and settles against real usage (`crates/hx-agent/tests/router_model.rs`) |
 | Provider adapters: OpenAI-compatible `/v1/chat/completions` | **Built** — wire mapping unit-tested, real HTTP against a stub, and a real model: text, usage, tool calls and a tool-result round trip (`crates/hx-provider/tests/openai_live.rs`) |
+| Provider adapter: Anthropic Messages API (`/v1/messages`) | **Built** — top-level `system`, `x-api-key` + `anthropic-version` auth, `tool_use`/`tool_result` blocks, `stop_reason`; hermetic HTTP over a stub + a `#[ignore]`d live suite (`crates/hx-provider/tests/anthropic_live.rs`) |
 | Web search: self-hosted SearXNG + keyless DuckDuckGo, RRF fusion, per-backend failure reporting | **Built** — SearXNG verified end to end against a live instance; DuckDuckGo is bot-walled for a non-browser client and *says so* rather than returning nothing |
 | Remote hosts: local + SSH (real `russh`), host key verification, Windows/macOS/Linux capability detection | **Built** — connect, auth, exec and file transfer run against a real host (`crates/hx-remote/tests/ssh_live.rs`) |
 | Sandboxes: L1/L2/L3 isolation ladder, Docker lifecycle, TTL reaper | **Built** — created, confined and reaped against a real daemon (`crates/hx-sandbox/tests/docker_live.rs`), running as the workspace's owner so the bind mount is writable; L3 verified inside gVisor, where the sandbox sees `4.19.0-gvisor` and not the host kernel |
 | Daemon (`hxd`) + HTTP API + CLI (`hx`) | **Done**, runnable |
-| Web UI, Tauri desktop/mobile, chat connectors | **Not started** |
+| Tools (`hx-tools`) + the agent loop (`hx-agent`) | **Built** — seven tools, and a loop that classifies every call against the capability token and then the approval policy; 26 tests pin the gate down against a scripted model (`crates/hx-agent/tests/loop.rs`). `delete` moves a named path to the XDG trash rather than unlinking it, and a destructive prompt carries what will be gone — the resolved path, its entry count, its bytes — because the tool measures the target before anyone is asked |
+| Sessions (`hx-store`) | **Built** — SQLite: create, resume, list, rename, delete, export (JSON/Markdown), events, usage totals. A transcript that ended mid-call is *repaired*, not sent to a provider that would reject it |
+| Web UI, Tauri desktop/mobile, chat connectors | **Partly built** — the daemon serves a browser client at `/` (terminal + session stream, no build step), the per-session WebSocket event stream is built and tested, and the server-side terminal is built and tested. The file tree, the diff pane, the approval queue, Tauri, and the connectors are not built |
 | MCP client, browser-automation pool | **Not started** |
-| The agent loop itself | **Not started** — see below |
+| The loop wired into `hxd` and `hx`: `POST /v1/chat`, `hx chat`, session routes over `hx-store` | **Built** — one request runs the loop against a session: the prompt is stored before the model is called, the role decides the model, credentials come from a `store:name` reference, events are written as they happen, and a transcript that ended mid-call is repaired before it is sent. Twenty tests drive the **real loop over the real HTTP surface**; model replies are scripted and sandbox engine calls use a recording runtime. `hx chat --sandbox-profile dev` selects a configured shell boundary; missing or failed boundaries never fall back to host execution |
 
 ---
+
+## The terminal is the daemon's, not the client's
+
+`POST /v1/terminals` starts a shell in `hxd`; `GET /v1/terminals/{id}/ws` attaches to it. An attach
+is a *join*, not an open: the PTY outlives every client, so a browser and a TUI can be on one shell
+at the same time and see the same bytes, and closing either one leaves it running. That is the
+concrete form of the split this project is built around, and it is why the terminal is not a frame on
+the session event stream — that stream is an ordered, stored, resumable, one-way log, and a terminal
+is none of those things.
+
+Output is base64 in both directions because a terminal is byte-oriented: escape sequences and partial
+UTF-8 sequences split across reads have to survive exactly, and a JSON string cannot carry them. The
+scrollback is capped on write, so a runaway producer cannot exhaust memory, and the shell exiting is
+sent as its own frame — a stream that simply stops is indistinguishable from a hung shell.
 
 ## The one thing to understand first
 
@@ -105,19 +122,22 @@ connect and reports capabilities; commands are built for the shell that is actua
 ```
 crates/
   hx-core        ids, errors, messages, events, capability tokens, approval, config
-  hx-secrets     Argon2id + XChaCha20-Poly1305 vault, secret redaction engine
+  hx-secrets     Argon2id + XChaCha20-Poly1305 vault, credential resolution, redaction engine
   hx-provider    token buckets, credential pools, role router, provider trait
   hx-search      SearXNG + DuckDuckGo backends, RRF fusion, graceful degradation
   hx-remote      Host trait, capability detection, local + SSH transports, command runner
   hx-sandbox     isolation ladder, sandbox specs, container lifecycle + reaper
+  hx-tools       the tools an agent calls, each declaring the resource it needs
+  hx-agent       the loop, and the two gates — capability, then approval — every call passes
+  hx-store       SQLite: sessions, transcripts, events, usage
   hx-server      the HTTP API and shared daemon state
 apps/
   hxd            the daemon
   hx             the CLI
 ```
 
-Empty placeholder crates (`hx-agent`, `hx-tools`, `hx-store`, `hx-gateway`, `hx-mcp`,
-`hx-browser`) are reserved for the milestones that need them.
+Empty placeholder crates (`hx-browser`, `hx-gateway`, `hx-mcp`) are reserved for the milestones that
+need them.
 
 ## Installing
 
@@ -140,7 +160,44 @@ has no authentication of its own.
 ```console
 $ cp hx.example.yaml hx.yaml     # then edit
 $ hx doctor                      # validate the config
+$ hx policy                      # what runs free, what is asked about, what is refused
 $ hxd --config hx.yaml --bind 127.0.0.1:7717
+```
+
+`hx policy` prints the ladder the daemon will actually apply, in the order it is checked: the level
+spelled out per risk class, the ceiling, the rules as a numbered list with `deny` first, and which of
+them are the shipped catastrophe set. It is the answer to "what did I allow?" without reading
+`hx-core/src/approval.rs`:
+
+```console
+$ hx policy
+approval policy from hx.yaml
+  level    balanced — asks before anything leaving the machine, or worse
+  read         runs free
+  mutate       runs free
+  external     asks
+  destructive  asks
+  privileged   asks
+  ceiling  none — a `yolo` chat can auto-approve anything, including a deleted database
+  deletes  a pattern or a variable in a delete is refused outright (`rm -rf build*`, `rm -rf $DIR`), …
+```
+
+A call that needs a human does not fail, it waits — and any client can answer it. From a second
+terminal, while the run is blocked:
+
+```console
+$ hx chat "delete the ./build directory" --role glm52 --workspace ~/projects/thing &
+$ hx approvals
+delete /home/yoav/projects/thing/build
+risk: destructive
+why:  deletes /home/yoav/projects/thing/build
+target:
+  /home/yoav/projects/thing/build — directory, 1342 entries, 480.0 MB
+after: moves to the trash at /home/yoav/.local/share/Trash/files, where it can be moved back — nothing is destroyed until the trash is emptied
+answer: allow once | allow for this chat | deny
+id: apr_7f3a…   ->  hx approve apr_7f3a… --option once
+
+$ hx approve apr_7f3a… --option once --by terminal
 ```
 
 From a clone:
@@ -152,7 +209,7 @@ $ ./target/release/hxd --bind 127.0.0.1:7717
 ```
 
 ```console
-$ cargo test --workspace         # 410 unit tests + 11 hermetic HTTP tests + 22 ignored live tests
+$ cargo test --workspace         # 695 tests, 0 failed, 24 ignored live tests
 $ cargo test -p hx-sandbox --test docker_live -- --ignored   # needs a container engine
 $ cargo test -p hx-remote --test ssh_live -- --ignored       # needs an SSH server
 $ HX_SEARXNG_URL=... HX_SEARCH_EXPECT_RESULTS=searxng \
@@ -169,9 +226,33 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
 
 ## What is deliberately not done yet
 
-- **The agent loop.** The provider router, tool plumbing, search, sandboxes, approvals and hosts
-  all build and are unit-tested, but nothing yet ties them into a model-calling loop. `/v1/chat`
-  returns `501` and says so rather than pretending.
+- **Approval is a queue a client polls.** A run that needs a human waits, and any client can read the
+  question and answer it over HTTP (`GET /v1/approvals`, `POST /v1/approvals/{id}`; `hx approvals` and
+  `hx approve` are the terminal one). Silence is a denial on a timer, the answer is recorded as an
+  event with its `by`, and the question itself — including what a deletion measures — is in the
+  stored trail. What is *not* there yet: nothing pushes a question to a client, so a web UI polls.
+  `hx policy` prints the ladder in force, so "why did it ask?" and "what did I allow?" are answered by
+  the same output rather than by reading the source.
+- **Project-scoped allowlists are not persisted.** "Always allow this" is remembered in memory for the
+  rest of the run, and `docs/approvals.md` §5's reviewable `.hx/allow.toml` — the file in the
+  repository a team can diff — is not written yet. Until it is, a remembered approval outlives
+  nothing. The `confined` axis (§4), chat profile selection, and `hx policy` (§6) are built.
+  Shell confinement does not confine file tools or make the writable workspace mount disposable.
+- **Streaming.** **Built** for the OpenAI-compatible provider: a turn is sent with `stream: true`
+  and deltas are emitted as they arrive, with tool-call fragments merged by the same rule the
+  non-streaming parser uses. The daemon publishes every `AgentEvent` at `POST /v1/chat/stream` as
+  SSE, tagged with its session, ending in a named `done` (or `error`) event carrying the reply; and
+  `hx chat --stream` renders a run as it happens — turns, tool calls and text deltas live on stderr,
+  the reply on stdout. **A per-session WebSocket event stream** (`GET /v1/sessions/{id}/ws`) is
+  built too: any number of clients attach to one session and receive its events live after its stored
+  history, and a reconnecting client sends `{"since_seq": N}` to resume exactly from there — the
+  two-clients-on-one-session multiplex M2 requires. **Anthropic streams for real too**: `stream: true`,
+  named SSE events reassembled across reads, `input_json_delta` fragments accumulated and parsed only
+  when the block stops, cumulative usage taken from the last `message_delta`, and a mid-stream `error`
+  event raised rather than returned as a short answer. Context
+  compaction is **built** too: a long session is elided at the `compact_at_tokens` threshold (head +
+  an explicit marker + tail, never splitting a tool call from its result) for the model while the
+  stored audit trail is untouched.
 - **Nothing in `ci.yml` reaches another machine.** That file is in-process unit tests; the tests
   that open a socket — a real Docker daemon, a real `sshd` — live in
   `.github/workflows/integration.yml` and are `#[ignore]`d by default, so a local `cargo test` stays
@@ -179,9 +260,15 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
   L3 is verified where gVisor is installed — the CI job installs it, and `HX_DOCKER_REQUIRE_L3`
   turns a skip into a failure so the strongest claim in the ladder cannot quietly stop being
   tested.
-- **Egress filtering.** A sandbox has a network or it does not. There is no proxy and no firewall
-  rule behind `egress`, so an allowlist is *refused* (`SpecError::EgressNotEnforced`) rather than
-  silently ignored — a profile that says four hostnames must not mean the whole internet.
+- **Egress filtering.** **Enforced** for hostname allowlists: the sandbox is created on an internal
+  Docker network with no gateway, and the only route out is a proxy sidecar that admits a `CONNECT`
+  target only if the allowlist matches. A profile that names four hostnames reaches those four and
+  nothing else. A sandbox with no allowlist still has no network at all. CIDRs and raw IPs are still
+  *refused* (`SpecError::EgressNotEnforced`) — the proxy decides a `CONNECT` target by name, so
+  accepting an address would be a half-enforced allowlist that looks permitted and never connects.
+  The live tests run against a real Docker daemon: an allowed host is relayed and a denied one is
+  refused, a wildcard admits the subdomain but not the apex, and a sandbox with no allowlist has no
+  network at all.
 - **Keyless scraping that survives a bot wall.** DuckDuckGo, Mojeek and public SearXNG instances
   now serve a challenge to a plain HTTP client — a TLS-fingerprint problem, not a markup one, and
   one no amount of parsing fixes. The harness reports it per backend rather than returning an empty

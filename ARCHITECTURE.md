@@ -53,7 +53,7 @@ Deliberately layered so the core has **zero IO** and is testable without a netwo
 
 ```
 hx-core          ids, message/event types, errors, config model, capability tokens   [no IO]
-  ├─ hx-secrets    vault (argon2id→xchacha20poly1305), OS keyring, redaction engine
+  ├─ hx-secrets    vault (argon2id→xchacha20poly1305), credential resolution, redaction engine
   ├─ hx-store      sqlite: sessions, events, usage counters, audit log
   ├─ hx-provider   Provider trait, pools, rate limits, reservation accounting
   ├─ hx-search     SearchBackend trait + free backends + RRF aggregation
@@ -165,7 +165,11 @@ the agent is asked to respect.
 
 ### 3.3 Feature-packed web UI
 
-`hx-server` (axum) exposes three things over one WebSocket multiplex, plus REST for CRUD:
+`hx-server` (axum) exposes three things over one WebSocket multiplex, plus REST for CRUD. **Built as
+REST so far**: `/v1/chat` (one request, one session, one run), `/v1/sessions*` (list, read, rename,
+export, events, delete), and the routing, search, sandbox and host routes. The WebSocket multiplex is
+**not built** — a client polls a session's events rather than subscribing, which is why the routes
+below are still the design and not the description:
 
 - **`/ws/term/:id`** — full PTY, server-side (`portable-pty`), attach/detach like tmux. This is
   what makes the browser a real terminal: it's not an emulation of a terminal, it *is* one.

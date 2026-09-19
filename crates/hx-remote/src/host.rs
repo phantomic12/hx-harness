@@ -57,6 +57,30 @@ impl ShellKind {
             ShellKind::Cmd => vec!["cmd".into(), "/C".into(), command_line.into()],
         }
     }
+
+    /// Join two commands so the second runs only when the first succeeded.
+    ///
+    /// This is per-shell because `&&` is not universal. Windows PowerShell 5.1 — what `powershell`
+    /// resolves to on every Windows host without PowerShell 7 installed — rejects it outright with
+    /// `The token '&&' is not a valid statement separator in this version`, so a `cd <dir> && <cmd>`
+    /// built for a POSIX shell fails before the command is ever reached. That is what broke every
+    /// `workdir`-qualified command on Windows, in tests and in production alike.
+    ///
+    /// - POSIX `sh` uses `&&`.
+    /// - `cmd.exe` uses `&&`.
+    /// - PowerShell separates statements with `;`, and gates the second on the first with `if`.
+    pub fn chain(self, first: &str, second: &str) -> String {
+        match self {
+            ShellKind::Posix | ShellKind::Cmd => format!("{first} && {second}"),
+            // `;` alone runs the second statement whatever happened to the first, which is not the
+            // same thing: a `cd` into a directory that does not exist must not then run the command
+            // in the daemon's own working directory. `$?` is checked instead, so the second
+            // statement is skipped on failure exactly as `&&` would skip it.
+            ShellKind::PowerShell => {
+                format!("{first}; if ($? -eq $true) {{ {second} }}")
+            }
+        }
+    }
 }
 
 /// Wrap an argument in single quotes for a POSIX shell.
@@ -237,6 +261,15 @@ pub trait Host: Send + Sync {
     async fn write_file(&self, path: &str, contents: &[u8]) -> Result<()>;
 
     async fn list_dir(&self, path: &str) -> Result<Vec<RemoteEntry>>;
+
+    /// Move a file or directory within the host, creating the destination's parent directory.
+    ///
+    /// A transport operation rather than a command the caller composes: the trash a `delete` leaves
+    /// behind has to be created and moved into, and a tool that built `mv …` itself would be a tool
+    /// that needs a POSIX shell on a machine it is not allowed to assume one on. An existing
+    /// destination is an **error, never an overwrite** — a delete picks a free name, and the one
+    /// thing a trash must not do is destroy the file already sitting in it.
+    async fn rename(&self, from: &str, to: &str) -> Result<()>;
 
     /// A one-line description for status output.
     fn describe(&self) -> String;

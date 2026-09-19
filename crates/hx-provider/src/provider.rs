@@ -6,10 +6,12 @@
 //! `OpenAI`-compatible chat-completions is the single highest-leverage adapter to write first:
 //! it covers OpenAI itself, Azure OpenAI, OpenRouter, Together, Groq, Fireworks, vLLM, llama.cpp
 //! server, Ollama, LiteLLM, and most gateways. Anthropic and Google have bespoke wire formats
-//! and get their own modules.
+//! and get their own modules; [`crate::AnthropicMessages`] covers the Anthropic Messages API.
 
+use crate::anthropic::AnthropicMessages;
+use crate::openai::OpenAiCompatible;
 use async_trait::async_trait;
-use hx_core::config::{Price, ProviderKind};
+use hx_core::config::{Config, Price, ProviderKind};
 use hx_core::error::{HxError, Result};
 use hx_core::ids::ProviderId;
 use hx_core::message::{approximate_tokens, Message};
@@ -164,6 +166,25 @@ pub fn cost_usd(price: &Price, usage: &Usage) -> f64 {
     input + cached_cost + output
 }
 
+/// One provider delta: the smallest piece of a turn a client can render.
+///
+/// A text delta is a token-or-so of answer, appended by a live surface; a tool-call delta is
+/// a whole call whose argument fragments have already been merged ([`crate::openai`] normalises
+/// unmerged fragments with the same rule the single-shot path uses). Reasoning is kept separate so a
+/// client can hide it. There is deliberately no "done" delta: the terminal event is the
+/// returned [`ChatResponse`] itself, which carries usage and the finish reason.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StreamDelta {
+    Text(String),
+    Reasoning(String),
+    /// A finished tool call, id and name resolved and arguments merged from their fragments.
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: serde_json::Value,
+    },
+}
+
 /// Every vendor adapter implements this.
 #[async_trait]
 pub trait Provider: Send + Sync {
@@ -174,9 +195,45 @@ pub trait Provider: Send + Sync {
     /// Model ids this provider advertises, used to expand globs in pool membership.
     fn models(&self) -> &[String];
 
-    /// Single-shot completion. Streaming arrives as a separate method in a later milestone so
-    /// that the non-streaming path can be correct and well-tested first.
+    /// Single-shot completion: one request, one whole reply.
     async fn complete(&self, req: ChatRequest, key: &Secret) -> Result<ChatResponse>;
+
+    /// Stream a turn, invoking `on_delta` as each piece arrives, and return the reply whole.
+    ///
+    /// The default is a *real* implementation, not a stub: it completes the turn and replays it as
+    /// one text delta plus one delta per merged tool call. That is what lets a caller depend on
+    /// streaming without every adapter having written an SSE parser, and it is exactly as live as the
+    /// turn it wraps — an adapter that streams really calls `on_delta` as fragments arrive. The
+    /// only difference from `complete` a caller must not rely on is that deltas may come out in
+    /// pieces.
+    async fn stream(
+        &self,
+        req: ChatRequest,
+        key: &Secret,
+        on_delta: &mut (dyn FnMut(StreamDelta) -> Result<()> + Send),
+    ) -> Result<ChatResponse> {
+        let response = self.complete(req, key).await?;
+        let text = response.message.text();
+        if !text.is_empty() {
+            on_delta(StreamDelta::Text(text))?;
+        }
+        for call in response.message.tool_calls() {
+            if let hx_core::message::Part::ToolCall {
+                id,
+                name,
+                arguments,
+                ..
+            } = call
+            {
+                on_delta(StreamDelta::ToolCall {
+                    id: id.as_str().to_string(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                })?;
+            }
+        }
+        Ok(response)
+    }
 }
 
 /// Providers available to the daemon, keyed by id.
@@ -196,6 +253,66 @@ impl ProviderRegistry {
 
     pub fn get(&self, id: &ProviderId) -> Option<Arc<dyn Provider>> {
         self.providers.get(id).cloned()
+    }
+
+    /// Build one adapter per configured provider.
+    ///
+    /// The client is passed in rather than built here so that a deployment's timeouts, proxy and
+    /// user agent are decided in one place — a provider that quietly made its own HTTP client would
+    /// be the one that ignores the proxy.
+    ///
+    /// A kind this build has no adapter for is **refused by name**. Speaking the wrong protocol to
+    /// a provider is the failure that looks like a hundred different bugs: the request goes out,
+    /// the answer is unparseable, and the error blames the model. Better to fail at startup.
+    pub fn from_config(cfg: &Config, client: reqwest::Client) -> Result<Self> {
+        let mut registry = Self::new();
+
+        for (name, pc) in &cfg.providers {
+            let id = ProviderId::from_raw(name);
+            let base_url = pc.base_url.as_deref().ok_or_else(|| {
+                HxError::Config(format!(
+                    "provider '{name}' has no base_url; the adapter needs an API root \
+                     (e.g. https://api.openai.com/v1)"
+                ))
+            })?;
+
+            let provider: Arc<dyn Provider> = match pc.kind {
+                ProviderKind::Openai | ProviderKind::Custom => Arc::new(OpenAiCompatible::new(
+                    id.clone(),
+                    base_url,
+                    pc.models.clone(),
+                    client.clone(),
+                )),
+                // Ollama's OpenAI-compatible surface lives under `/v1`, and the config names the
+                // server rather than the API root. Normalising here is what stops every ollama user
+                // from having to know that.
+                ProviderKind::Ollama => Arc::new(
+                    OpenAiCompatible::new(
+                        id.clone(),
+                        api_root_for_ollama(base_url),
+                        pc.models.clone(),
+                        client.clone(),
+                    )
+                    .without_auth(),
+                ),
+                ProviderKind::Anthropic => Arc::new(AnthropicMessages::new(
+                    id.clone(),
+                    base_url,
+                    pc.models.clone(),
+                    client.clone(),
+                )),
+                ProviderKind::Google => {
+                    return Err(HxError::Config(format!(
+                    "provider '{name}' is configured as `google`, which has its own wire format \
+                         and no adapter yet. Use an OpenAI-compatible gateway in the meantime."
+                )))
+                }
+            };
+
+            registry.insert(provider);
+        }
+
+        Ok(registry)
     }
 
     pub fn ids(&self) -> Vec<ProviderId> {
@@ -227,6 +344,31 @@ impl ProviderRegistry {
             )));
         }
         Ok(provider)
+    }
+}
+
+impl std::fmt::Debug for ProviderRegistry {
+    /// Hand-written because `dyn Provider` is not `Debug`: what a log line needs is which providers
+    /// are configured, not the internals of each adapter.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderRegistry")
+            .field("providers", &self.providers.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// The API root to speak to an Ollama server's OpenAI-compatible surface.
+///
+/// Ollama serves `/v1/chat/completions` on the same port as its native API, and the config names
+/// the *server* (`http://127.0.0.1:11434`) because that is what every other Ollama tool wants.
+/// The adapter needs the API root, so the difference is absorbed here rather than in a comment
+/// nobody reads.
+fn api_root_for_ollama(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/v1") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/v1")
     }
 }
 
@@ -328,5 +470,106 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(u.total_tokens(), 15);
+    }
+
+    // -- the provider factory ------------------------------------------------------------------
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::new()
+    }
+
+    fn config_with(providers: Vec<(&str, ProviderKind, &str)>) -> Config {
+        let mut config = Config::default();
+        for (name, kind, base_url) in providers {
+            config.providers.insert(
+                name.to_string(),
+                hx_core::config::ProviderConfig {
+                    kind,
+                    base_url: Some(base_url.to_string()),
+                    credentials: Vec::new(),
+                    routing: hx_core::config::Strategy::Priority,
+                    models: vec![format!("{name}-model")],
+                    price: None,
+                    priority: 0,
+                },
+            );
+        }
+        config
+    }
+
+    #[test]
+    fn the_factory_builds_one_adapter_per_openai_compatible_provider() {
+        let config = config_with(vec![
+            (
+                "openrouter",
+                ProviderKind::Openai,
+                "https://openrouter.ai/api/v1",
+            ),
+            ("local", ProviderKind::Ollama, "http://127.0.0.1:11434"),
+            (
+                "anthropic-main",
+                ProviderKind::Anthropic,
+                "https://api.anthropic.com",
+            ),
+        ]);
+        let registry = ProviderRegistry::from_config(&config, client()).unwrap();
+
+        assert_eq!(registry.len(), 3);
+        assert!(registry.get(&ProviderId::from("openrouter")).is_some());
+        assert!(registry.get(&ProviderId::from("local")).is_some());
+        assert!(registry.get(&ProviderId::from("anthropic-main")).is_some());
+        // The adapter advertises the models the config listed, so `resolve` can check them.
+        assert_eq!(
+            registry
+                .get(&ProviderId::from("openrouter"))
+                .unwrap()
+                .models(),
+            ["openrouter-model"]
+        );
+    }
+
+    #[test]
+    fn an_anthropic_provider_builds_the_messages_adapter() {
+        // Anthropic has its own wire format; the factory must route `kind: anthropic` to its own
+        // adapter and report its identity, not to the OpenAI-compatible one.
+        let config = config_with(vec![(
+            "anthropic",
+            ProviderKind::Anthropic,
+            "https://api.anthropic.com",
+        )]);
+        let registry = ProviderRegistry::from_config(&config, client()).unwrap();
+        let provider = registry.get(&ProviderId::from("anthropic")).unwrap();
+        assert_eq!(provider.kind(), ProviderKind::Anthropic);
+    }
+
+    #[test]
+    fn ollama_gets_the_v1_api_root_however_the_config_spells_it() {
+        // The config names the server; the OpenAI-compatible surface is under /v1. Getting this
+        // wrong sends the request to `/chat/completions` on the host root, which 404s.
+        assert_eq!(
+            api_root_for_ollama("http://127.0.0.1:11434"),
+            "http://127.0.0.1:11434/v1"
+        );
+        assert_eq!(
+            api_root_for_ollama("http://127.0.0.1:11434/"),
+            "http://127.0.0.1:11434/v1"
+        );
+        assert_eq!(
+            api_root_for_ollama("http://127.0.0.1:11434/v1"),
+            "http://127.0.0.1:11434/v1",
+            "already an API root: appending again would 404"
+        );
+    }
+
+    #[test]
+    fn a_provider_with_no_base_url_is_refused_with_the_example_in_the_message() {
+        let mut config = config_with(vec![("bare", ProviderKind::Openai, "https://x/v1")]);
+        config.providers.get_mut("bare").unwrap().base_url = None;
+
+        let err = ProviderRegistry::from_config(&config, client()).unwrap_err();
+        assert!(
+            err.to_string().contains("https://api.openai.com/v1"),
+            "{err}"
+        );
     }
 }

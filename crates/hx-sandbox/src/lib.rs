@@ -15,10 +15,12 @@
 //! act.** Network off, capabilities dropped, non-root, bounded memory/CPU/PIDs, finite TTL.
 
 pub mod docker;
+pub mod egress;
 pub mod runtime;
 pub mod spec;
 
 pub use docker::{logs, to_container_config, to_host_config, wait_for_engine, DockerRuntime};
+pub use egress::EgressProxy;
 pub use runtime::{SandboxExecOutput, SandboxHandle, SandboxManager, SandboxRuntime, SandboxState};
 pub use spec::{
     HostSettings, IsolationLevel, SandboxProfile, SandboxSpec, SpecError, DEFAULT_WORKSPACE_PATH,

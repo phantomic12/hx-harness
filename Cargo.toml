@@ -113,6 +113,9 @@ russh-keys = "0.45"
 # versions `russh` already pulls in, so this adds no new crate to the graph.
 hmac = "0.13"
 sha1 = "0.11"
+# NTLM's password hash. Already in the lock (via `russh`'s dependencies), so this promotes it
+# rather than adding a crate to the graph.
+md5 = "0.8"
 bollard = "0.21"
 
 # mcp

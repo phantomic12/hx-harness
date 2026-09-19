@@ -61,6 +61,14 @@ impl RouteTicket {
         &self.credential.credential
     }
 
+    /// The reference the key for the granted credential lives under.
+    ///
+    /// The router's caller needs exactly this and nothing more: which key to fetch, decided by the
+    /// same call that reserved the capacity.
+    pub fn secret_ref(&self) -> &str {
+        self.credential.secret_ref()
+    }
+
     pub fn reserved_tokens(&self) -> u64 {
         self.credential.reserved_tokens()
     }
@@ -334,8 +342,17 @@ impl ModelRouter {
 
     /// Estimated cost of a response on a route, from the provider's rate card.
     pub fn estimate_cost(&self, route: &Route, usage: &Usage) -> f64 {
+        self.cost_for(&route.provider, usage)
+    }
+
+    /// The same, for a provider known by id rather than a route.
+    ///
+    /// The loop reports usage per turn without a route — a price table is not its business — so the
+    /// daemon prices those turns with this. `0.0` when no rate card is configured, which is the
+    /// absence of a price rather than a claim that the call was free.
+    pub fn cost_for(&self, provider: &ProviderId, usage: &Usage) -> f64 {
         self.prices
-            .get(&route.provider)
+            .get(provider)
             .map(|price| cost_usd(price, usage))
             .unwrap_or(0.0)
     }
@@ -349,6 +366,29 @@ impl ModelRouter {
             .get(&route.provider)
             .map(|p| tokens as f64 * p.input_per_mtok / 1_000_000.0)
             .unwrap_or(0.0)
+    }
+
+    /// The same estimate for a *role*, before a route has been chosen.
+    ///
+    /// The dearest route in the pool sets the number. That is the only pessimistic choice
+    /// available: the reservation is taken before the route is picked, so anything cheaper would
+    /// under-reserve whenever routing happens to land on the expensive member — which is exactly
+    /// how a day's spend ceiling gets quietly exceeded. A pool whose routes have no rate card
+    /// estimates `0.0`, which the limiter still refuses to let past an already-spent budget.
+    pub fn estimate_role_reservation_usd(&self, role: &str, tokens: u64) -> Result<f64> {
+        let name = self.pool_for_role(role)?;
+        // `pool_for_role` has just checked that this pool exists.
+        let Some(pool) = self.pools.get(name) else {
+            return Err(HxError::NoRoute(format!(
+                "pool '{name}' is bound to role '{role}' but missing from the routing table"
+            )));
+        };
+
+        Ok(pool
+            .routes
+            .iter()
+            .map(|route| self.estimate_reservation_usd(route, tokens))
+            .fold(0.0_f64, f64::max))
     }
 
     pub fn status(&self) -> RouterStatus {

@@ -19,6 +19,14 @@ base64.workspace = true
 russh.workspace = true
 hmac.workspace = true
 sha1.workspace = true
+# NTLM, which a WinRM connection to a workgroup Windows host authenticates with. `md5` and `hmac`
+# are already in the workspace lock; `md4` is not, so it is implemented in `ntlm.rs` rather than
+# added — it is ~40 lines, used for exactly one thing (the NT hash), and the offline gate will not
+# fetch a crate for it.
+md5.workspace = true
+getrandom.workspace = true
+# WinRM is SOAP over HTTP, so its transport is an HTTP client rather than a socket.
+reqwest.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

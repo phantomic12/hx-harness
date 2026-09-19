@@ -38,11 +38,46 @@ pub struct Config {
     pub search: SearchConfig,
     #[serde(default)]
     pub agent: AgentConfig,
+    #[serde(default)]
+    pub terminal: TerminalConfig,
+}
+
+/// The server-side terminal: what a client's `POST /v1/terminals` runs when it does not say.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TerminalConfig {
+    /// The shell a new terminal starts.
+    ///
+    /// Configurable rather than hardcoded because the right answer depends on the machine: a
+    /// daemon on a minimal image has no `bash`, and one on a developer host usually wants it.
+    #[serde(default = "default_terminal_shell")]
+    pub shell: String,
+}
+
+fn default_terminal_shell() -> String {
+    // `$SHELL` if the daemon inherited one, else `/bin/sh`, which POSIX guarantees exists. Reading
+    // the environment here rather than at spawn keeps the default visible in a dumped config.
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self {
+            shell: default_terminal_shell(),
+        }
+    }
 }
 
 impl Config {
+    /// Parse a configuration, folding the shipped approval floor into whatever it says.
+    ///
+    /// The fold happens *here*, at the boundary between a file and a policy, rather than in the policy's
+    /// `Deserialize`: a config is the only thing that inherits the floor, and doing it in `Deserialize`
+    /// would hand it to every in-code policy that happens to round-trip through YAML. See
+    /// [`ApprovalPolicy::inherit_denials`] for why the floor is layered rather than defaulted.
     pub fn from_yaml(yaml: &str) -> Result<Self> {
-        Ok(serde_yaml::from_str(yaml)?)
+        let mut config: Self = serde_yaml::from_str(yaml)?;
+        config.agent.approval = config.agent.approval.with_floor();
+        Ok(config)
     }
 
     /// Resolve the pool a role should use, following `inherits` chains.
@@ -94,6 +129,18 @@ pub struct DaemonConfig {
     pub data_dir: String,
     #[serde(default)]
     pub log_json: bool,
+    /// Environment variable holding the key the audit chain is written with.
+    ///
+    /// A variable name rather than the secret itself, so the key does not sit in a config file that
+    /// is committed, copied between machines, or read by anything that can read the repo. Empty or
+    /// unset leaves the chain unkeyed, which is reported rather than assumed: an unkeyed chain still
+    /// catches an inconsistent edit and cannot catch a rewrite.
+    #[serde(default = "default_audit_key_env")]
+    pub audit_key_env: String,
+}
+
+fn default_audit_key_env() -> String {
+    "HX_AUDIT_KEY".to_string()
 }
 
 impl Default for DaemonConfig {
@@ -103,6 +150,7 @@ impl Default for DaemonConfig {
             http_addr: default_http_addr(),
             data_dir: default_data_dir(),
             log_json: false,
+            audit_key_env: default_audit_key_env(),
         }
     }
 }
@@ -545,7 +593,7 @@ pub struct AgentConfig {
     ///
     /// Per-chat sessions override this at runtime ([`crate::approval::ApprovalSession::set_level`]);
     /// this value is the starting point for a new chat.
-    #[serde(default)]
+    #[serde(default = "deployment_approval")]
     pub approval: ApprovalPolicy,
     #[serde(default = "default_concurrent")]
     pub max_concurrent_subagents: u32,
@@ -558,7 +606,11 @@ impl Default for AgentConfig {
         Self {
             max_turns: default_max_turns(),
             compact_at_tokens: default_compact_at(),
-            approval: ApprovalPolicy::default(),
+            // `deployment_approval()`, not `ApprovalPolicy::default()`: `Config`'s `agent` field is
+            // `#[serde(default)]`, so this is what a config that mentions no policy at all gets — and
+            // "the config was silent" must not be the one shape that loses the catastrophe set. The
+            // blank policy stays what a *library caller* builds in code.
+            approval: deployment_approval(),
             max_concurrent_subagents: default_concurrent(),
             default_pool: default_pool_name(),
         }
@@ -576,6 +628,15 @@ fn default_concurrent() -> u32 {
 }
 fn default_pool_name() -> String {
     "interactive".into()
+}
+
+/// The approval policy a *configuration* starts from.
+///
+/// Not `ApprovalPolicy::default()`: that one is blank so library callers and tests are not handed an
+/// opinion. A deployment gets the floor — `balanced`, with the catastrophe set denied — and can still
+/// delete a rule it disagrees with, in writing, which is the review.
+fn deployment_approval() -> ApprovalPolicy {
+    ApprovalPolicy::deployment_default().with_floor()
 }
 
 #[cfg(test)]
@@ -778,5 +839,130 @@ roles:
             ..Default::default()
         }
         .is_unbounded());
+    }
+
+    /// The trap this field exists to close: the *shortest* config an operator writes to stop being
+    /// prompted used to remove the entire catastrophe set with it, because a config deserialises into a
+    /// policy and a list that is written replaces a list that was there.
+    ///
+    /// The looser the setting, the more the floor mattered — which is the worst shape a safety default can
+    /// have, so the floor is layered on unless the file says otherwise. These are the three shapes.
+    #[test]
+    fn a_config_that_writes_a_policy_still_gets_the_shipped_floor() {
+        for yaml in [
+            // The one that used to be dangerous: loosens the level and mentions nothing else.
+            "agent:\n  approval:\n    level: yolo\n",
+            // Writing its own deny list. It replaces *its own* rules, not the floor.
+            "agent:\n  approval:\n    deny:\n      - { tool: shell, command: \"*my-own-rule*\" }\n",
+            // And writing every other field, which is what a careful operator does.
+            "agent:\n  approval:\n    level: trusting\n    ceiling: mutate\n    unattended_budget: 10\n             \n    allow:\n      - { tool: shell, command: \"cargo test*\" }\n",
+        ] {
+            let config = Config::from_yaml(yaml).expect("must parse");
+            let policy = &config.agent.approval;
+            assert!(
+                policy.has_floor(),
+                "the floor must survive this config: {yaml}\n{policy:?}"
+            );
+            assert!(
+                policy.refuse_unenumerable_deletions,
+                "and so must the refusal of a delete nobody can enumerate: {yaml}"
+            );
+
+            // The behaviour, not the bookkeeping: a yolo chat still refuses the catastrophe.
+            let mut session = crate::approval::ApprovalSession::new(policy.clone());
+            let verdict = session.decide(
+                &crate::approval::ActionRequest::shell("rm -rf /etc"),
+                chrono::Utc::now(),
+            );
+            assert!(verdict.is_denied(), "in {yaml}: {verdict:?}");
+        }
+    }
+
+    #[test]
+    fn the_floor_is_dropped_only_when_the_file_says_so_in_so_many_words() {
+        let yaml = "agent:\n  approval:\n    level: yolo\n    inherit_denials: false\n";
+        let config = Config::from_yaml(yaml).unwrap();
+        let policy = &config.agent.approval;
+
+        assert!(!policy.has_floor());
+        assert!(!policy.refuse_unenumerable_deletions);
+
+        // Which is a real choice with a real consequence, and it is the operator's to make — stated in the
+        // file, reviewable in a diff, and visible in `hx policy` (which prints "none of the shipped
+        // catastrophe set: this config's `deny` list replaced it").
+        let mut session = crate::approval::ApprovalSession::new(policy.clone());
+        let verdict = session.decide(
+            &crate::approval::ActionRequest::shell("rm -rf /etc"),
+            chrono::Utc::now(),
+        );
+        assert!(!verdict.is_denied(), "{verdict:?}");
+    }
+
+    #[test]
+    fn a_config_own_rule_for_the_same_command_wins_over_the_shipped_one() {
+        // Prepend, not append: `deny` is a first-match list, so the operator's rule has to come first for
+        // the note they wrote to be the one that explains the refusal. Both stay in force.
+        let yaml = "agent:\n  approval:\n    deny:\n      - { tool: shell, command: \"rm -rf /\", note: \"no — ask the team first\" }\n";
+        let config = Config::from_yaml(yaml).unwrap();
+        let policy = &config.agent.approval;
+
+        let mut session = crate::approval::ApprovalSession::new(policy.clone());
+        let verdict = session.decide(
+            &crate::approval::ActionRequest::shell("rm -rf /"),
+            chrono::Utc::now(),
+        );
+        assert!(verdict.is_denied());
+        assert!(
+            verdict.why().contains("ask the team first"),
+            "the operator's own words, not the shipped note: {verdict:?}"
+        );
+        assert!(
+            policy.has_floor(),
+            "and the rest of the floor is still there"
+        );
+    }
+
+    #[test]
+    fn a_library_policy_built_in_code_never_acquires_the_floor() {
+        // `ApprovalPolicy::default()` is what a test or an embedder builds. Folding a deployment's
+        // opinions into it would replace one trap with another — a library caller's blank policy would
+        // suddenly refuse fourteen commands it never heard of.
+        let policy = crate::approval::ApprovalPolicy::default();
+        assert!(policy.deny.is_empty());
+        assert_eq!(policy.inherit_denials, None);
+        assert!(!policy.has_floor());
+        assert!(!policy.clone().with_floor().has_floor(), "None is not true");
+    }
+
+    /// The file we tell people to copy has to parse against the schema we actually have.
+    ///
+    /// `hx.example.yaml` promises in its own header that a typo'd key fails loudly, and the file is
+    /// what a first run is built from — so a stale example is the worst kind of documentation: it is
+    /// the thing people type, and nothing notices until their first launch fails. This also pins the
+    /// *behaviour* the example claims by omission: with no `agent:` section, a deployment carries the
+    /// floor (`balanced`, catastrophe set denied, unenumerable deletions refused).
+    #[test]
+    fn the_shipped_example_config_parses_and_carries_the_floor() {
+        let yaml = include_str!("../../../hx.example.yaml");
+        let config = Config::from_yaml(yaml).expect("hx.example.yaml must parse");
+
+        assert!(
+            !config.providers.is_empty(),
+            "it should show, not just tell"
+        );
+        assert!(!config.pools.is_empty());
+        assert!(!config.roles.is_empty());
+
+        let approval = &config.agent.approval;
+        assert_eq!(approval.level, crate::approval::AutonomyLevel::Balanced);
+        assert!(
+            approval.refuse_unenumerable_deletions,
+            "the example documents the refusal, so omitting `agent:` must produce it"
+        );
+        assert!(
+            approval.deny.len() >= 10,
+            "and the catastrophe set with it: {:?}",
+            approval.deny
+        );
     }
 }

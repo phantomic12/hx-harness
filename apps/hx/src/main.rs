@@ -1,10 +1,16 @@
 //! `hx` — the hx harness CLI.
 //!
-//! Runs against the configuration directly rather than over HTTP, so the inspection commands
-//! work when the daemon is down — which is exactly when you most want to know why it will not
-//! start. `hx doctor` is the first thing to reach for.
+//! The inspection commands read the configuration directly, so they work when the daemon is down —
+//! which is exactly when you most want to know why it will not start. `hx doctor` is the first thing
+//! to reach for.
+//!
+//! A *run* is different, and the difference is deliberate: `hx chat` is a client of the daemon, like
+//! the TUI and the browser will be. The process that owns the routing table, the limits and the
+//! session store is the one that runs the loop, so the terminal asks it rather than racing it.
 
 mod commands;
+mod daemon;
+mod stream;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -27,14 +33,127 @@ struct Cli {
     #[arg(short, long, env = "HX_CONFIG", default_value = "hx.yaml")]
     config: PathBuf,
 
+    /// Where the daemon is. Defaults to `daemon.http_addr` from the config.
+    #[arg(long)]
+    daemon: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Send a prompt to the running daemon and print what the run did.
+    Chat {
+        /// What to ask for.
+        prompt: String,
+
+        /// Continue an existing session instead of starting one.
+        #[arg(long)]
+        session: Option<String>,
+
+        /// Which role (and therefore which pool) to run as.
+        #[arg(long)]
+        role: Option<String>,
+
+        /// The directory the run may read and write. Defaults to the daemon's own.
+        #[arg(long)]
+        workspace: Option<String>,
+
+        /// Confine shell calls to this daemon sandbox profile; other tools still use the host.
+        #[arg(long)]
+        sandbox_profile: Option<String>,
+
+        /// `paranoid`, `cautious`, `balanced`, `trusting` or `yolo`.
+        ///
+        /// Calls above the threshold wait for an answer through `hx approvals` / `hx approve`.
+        /// The shipped deny floor still applies at every level.
+        #[arg(long)]
+        autonomy: Option<String>,
+
+        /// Stop after this many turns.
+        #[arg(long, default_value_t = 12)]
+        max_turns: u32,
+
+        /// Print the daemon's reply as JSON instead of a summary.
+        #[arg(long)]
+        json: bool,
+
+        /// Show the run as it happens: each turn and tool call as it starts, and text as it arrives.
+        ///
+        /// Off by default so scripted use keeps its current one-shot output.
+        #[arg(long)]
+        stream: bool,
+    },
+
+    /// List the daemon's sessions.
+    Sessions {
+        #[arg(short, long, default_value_t = 20)]
+        limit: usize,
+    },
+
+    /// Show one session, or export it.
+    Session {
+        id: String,
+
+        /// `json`, `md`, or `none` for just the record and totals.
+        #[arg(long, default_value = "none")]
+        export: String,
+    },
+
+    /// Check that a session's stored trail has not been altered.
+    ///
+    /// Verifies each event against the digest recorded beside it. Exits non-zero when a row's
+    /// content no longer matches, so a script can gate on it.
+    Audit {
+        /// The session to check.
+        id: String,
+
+        /// Print the daemon's answer as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show the approval questions a run is waiting on.
+    Approvals {
+        /// Only the questions belonging to this session.
+        #[arg(long)]
+        session: Option<String>,
+
+        /// Print the daemon's reply as JSON instead of a rendering.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Answer a waiting approval question.
+    Approve {
+        /// The id printed by `hx approvals`.
+        id: String,
+
+        /// `once`, `chat`, `always` or `deny`.
+        #[arg(long, default_value = "once")]
+        option: String,
+
+        /// Who is answering. Recorded in the audit trail, so a terminal and a phone do not look
+        /// alike afterwards.
+        #[arg(long, default_value = "terminal")]
+        by: String,
+    },
+
     /// Show the model pools, their routes, and the role bindings.
     Pools,
+
+    /// Show the effective approval ladder: what runs free, what is asked about, and what is refused.
+    ///
+    /// Reads the configuration, so it shows what a *new* run will do. A live session's level can
+    /// differ (`--autonomy`, `allow for this chat`), which the output says rather than hides. Also
+    /// shows the project's own grants from the checkout's `.hx/allow.toml`, so the provenance of
+    /// every rule (shipped floor, config, or project file) is visible.
+    Policy {
+        /// The checkout whose `.hx/allow.toml` to report. Defaults to the current directory.
+        #[arg(long)]
+        workspace: Option<String>,
+    },
 
     /// Check the configuration and the environment.
     Doctor,
@@ -93,9 +212,157 @@ async fn main() -> Result<()> {
         .with_context(|| format!("{} is not a valid hx config", cli.config.display()))?;
 
     match cli.command {
+        Command::Chat {
+            prompt,
+            session,
+            role,
+            workspace,
+            sandbox_profile,
+            autonomy,
+            max_turns,
+            json,
+            stream,
+        } => {
+            let base = daemon::base_url(&config, cli.daemon.as_deref());
+            let mut body = serde_json::json!({ "prompt": prompt, "max_turns": max_turns });
+            // Only the fields the caller actually set: the daemon's defaults are its own to decide,
+            // and sending `null`s would make this command's defaults look like the daemon's.
+            if let Some(session) = session {
+                body["session"] = serde_json::json!(session);
+            }
+            if let Some(role) = role {
+                body["role"] = serde_json::json!(role);
+            }
+            if let Some(workspace) = workspace {
+                body["workspace"] = serde_json::json!(workspace);
+            }
+            if let Some(profile) = sandbox_profile {
+                body["sandbox_profile"] = serde_json::json!(profile);
+            }
+            if let Some(autonomy) = autonomy {
+                body["autonomy"] = serde_json::json!(autonomy);
+            }
+
+            let client = reqwest::Client::new();
+            let reply = if stream {
+                // Progress goes to stderr, the reply to stdout: piping `hx chat` through something
+                // else must not drag "turn 3" lines into the parsed output.
+                let mut last_delta = false;
+                daemon::chat_stream(&client, &base, &body, |frame| match frame {
+                    stream::Streamed::Event { event, .. } => {
+                        if let Some(line) = stream::progress_line(event) {
+                            if last_delta {
+                                eprintln!();
+                                last_delta = false;
+                            }
+                            eprintln!("{line}");
+                        } else if let Some(text) = event["text"].as_str() {
+                            // Text is printed as it arrives, without a trailing newline per chunk —
+                            // a delta is a fragment, and a newline after each would shatter a word
+                            // into pieces down the screen.
+                            eprint!("{text}");
+                            last_delta = true;
+                        }
+                    }
+                    stream::Streamed::Done(_) | stream::Streamed::Failed(_) => {}
+                })
+                .await?
+            } else {
+                daemon::chat(&client, &base, &body).await?
+            };
+            if stream {
+                eprintln!();
+            }
+            print!("{}", commands::render_chat(&reply, json));
+
+            // A run that did not complete is not a success: `stop` says whether the text above is an
+            // answer or the beginning of one, and a script needs to be able to tell.
+            if reply["stop"].as_str() != Some("completed") {
+                std::process::exit(2);
+            }
+        }
+
+        Command::Audit { id, json } => {
+            let base = daemon::base_url(&config, cli.daemon.as_deref());
+            let report = daemon::audit(&reqwest::Client::new(), &base, &id).await?;
+            print!("{}", commands::render_audit(&report, json));
+
+            // A broken chain is not a success. Exit 2 the way an incomplete run does, so `hx audit`
+            // can be used in a script or a cron without parsing its output.
+            if report["status"].as_str() == Some("broken") {
+                std::process::exit(2);
+            }
+        }
+
+        Command::Sessions { limit } => {
+            let base = daemon::base_url(&config, cli.daemon.as_deref());
+            let list = daemon::sessions(&reqwest::Client::new(), &base, limit).await?;
+            print!("{}", commands::render_sessions(&list));
+        }
+
+        Command::Session { id, export } => {
+            let base = daemon::base_url(&config, cli.daemon.as_deref());
+            let client = reqwest::Client::new();
+
+            match export.as_str() {
+                "none" => {
+                    let value = daemon::session(&client, &base, &id, false).await?;
+                    print!("{}", commands::render_session(&value));
+                }
+                "json" | "md" | "markdown" => {
+                    let format = if export == "json" { "json" } else { "markdown" };
+                    print!("{}", daemon::export(&client, &base, &id, format).await?);
+                }
+                other => anyhow::bail!("unknown export format '{other}'; known: json, md, none"),
+            }
+        }
+
         Command::Pools => {
             let router = ModelRouter::from_config(&config, Utc::now())?;
             print!("{}", commands::render_pools(&router));
+        }
+
+        Command::Policy { workspace } => {
+            let root = workspace
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let allow_path = root.join(hx_core::allowlist::ALLOW_FILE);
+            // A broken `.hx/allow.toml` is the first thing a reader of `hx policy` needs to know
+            // about: a run will refuse to start on it (fail closed), so a report that hid it would be
+            // describing a policy the daemon will never run.
+            let (grants, shown_path) = match hx_core::allowlist::AllowFile::load(&allow_path) {
+                Ok(list) => (list.into_rules(), Some(allow_path.display().to_string())),
+                Err(hx_core::allowlist::AllowlistError::NotFound(_)) => (Vec::new(), None),
+                Err(err) => {
+                    eprintln!("! {err}");
+                    (Vec::new(), Some(allow_path.display().to_string()))
+                }
+            };
+            print!(
+                "{}",
+                commands::render_policy(
+                    &config,
+                    &cli.config.display().to_string(),
+                    &grants,
+                    shown_path.as_deref()
+                )
+            );
+        }
+
+        Command::Approvals { session, json } => {
+            let base = daemon::base_url(&config, cli.daemon.as_deref());
+            let list =
+                daemon::approvals(&reqwest::Client::new(), &base, session.as_deref()).await?;
+            print!("{}", commands::render_approvals(&list, json));
+        }
+
+        Command::Approve { id, option, by } => {
+            let base = daemon::base_url(&config, cli.daemon.as_deref());
+            let reply = daemon::approve(&reqwest::Client::new(), &base, &id, &option, &by).await?;
+            // Echoed, not assumed: the daemon is the one that knows whether a question was still
+            // waiting, and an answer that arrived after the run gave up is not an answer.
+            println!("{}", serde_json::to_string(&reply).unwrap_or_default());
         }
 
         Command::Doctor => {

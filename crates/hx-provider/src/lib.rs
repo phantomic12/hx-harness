@@ -30,24 +30,36 @@
 //! essentially every gateway, reseller and local server. Its mapping is two pure functions
 //! ([`openai::build_body`], [`openai::parse_response`]) with the HTTP call as the only impure part,
 //! so the vendor quirks are asserted against literals rather than discovered in production.
+//! [`anthropic::AnthropicMessages`] speaks the Anthropic Messages API (`POST /v1/messages`) with the
+//! same two-pure-functions shape: top-level `system`, `tool_result` blocks, `tool_use` blocks, and
+//! `stop_reason` for the finish.
 //!
-//! Not here yet: `AnthropicMessages`, `GoogleGenAi`, streaming (SSE), and a retry/backoff layer.
+//! A turn can be completed whole ([`Provider::complete`]) or streamed as
+//! [`StreamDelta`] ([`Provider::stream`], which defaults to replaying a completed turn and which
+//! the OpenAI adapter overrides with real SSE). Streaming is opt-in so the well-tested single-shot
+//! path is untouched.
+//!
+//! Not here yet: `GoogleGenAi`, and a retry/backoff layer.
 //!
 //! Note that the limits/pools/routing layers are deliberately **not** async — they are pure
 //! bookkeeping, and making them `async` would buy nothing and make every test a runtime. Only the
 //! adapters are async.
 
+pub mod anthropic;
+pub mod anthropic_stream;
 pub mod limits;
 pub mod openai;
 pub mod pool;
 pub mod provider;
 pub mod router;
 
+pub use anthropic::AnthropicMessages;
 pub use limits::{Lease, LimitError, Limiter, TokenBucket};
 pub use openai::OpenAiCompatible;
 pub use pool::{CostPerMtok, CredentialPool, PoolError, Slot, SlotStatus, Ticket};
 pub use provider::{
-    cost_usd, ChatRequest, ChatResponse, FinishReason, Provider, ProviderRegistry, ToolSpec, Usage,
+    cost_usd, ChatRequest, ChatResponse, FinishReason, Provider, ProviderRegistry, StreamDelta,
+    ToolSpec, Usage,
 };
 pub use router::{ModelRouter, PoolStatus, Route, RouteTicket, RouterStatus};
 

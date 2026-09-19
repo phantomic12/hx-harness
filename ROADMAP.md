@@ -22,8 +22,9 @@ exist before anything can hide behind an integration test.
   TTL reaping, rollback on a failed start
 - `hx-server` + `hxd` — axum route surface and the daemon binary
 
-**Status: 324 tests green, clippy clean (0 warnings).** Per crate: core 83, provider 61, sandbox
-53, search 45, remote 33, secrets 27, server 11, cli 11.
+**Status: 690 tests green, clippy clean (0 warnings).** M0 closed at 324 of them: core 83, provider
+61, sandbox 53, search 45, remote 33, secrets 27, server 11, cli 11 — `hx-tools`, `hx-agent` and
+`hx-store` came after M0 and are covered in the M1/M2 sections.
 
 What the tests actually pin down: the vault round-trips and rejects both a wrong passphrase and a
 tampered ciphertext; redaction masks known secrets and provider-shaped tokens; the risk classifier
@@ -32,8 +33,7 @@ ceiling, unattended budget and expiry; buckets refuse when exhausted and recover
 fail over and bench unhealthy credentials; RRF dedupes `?utm_source=` variants of one URL; a
 failed sandbox create rolls back rather than leaking a container.
 
-**Not landed yet** (typed stubs only): `hx-store`, `hx-tools`, `hx-agent`, `hx-browser`,
-`hx-mcp`, `hx-gateway`.
+**Not landed yet** (typed stubs only): `hx-browser`, `hx-mcp`, `hx-gateway`.
 
 **Deliberately unverified at M0:** the concrete HTTP adapters (`OpenAiCompatible`,
 `AnthropicMessages`) and the fetch/parse halves of the search backends. Their *pure* halves —
@@ -49,18 +49,57 @@ Those get real tests in M1 against a live endpoint.
 
 - ✅ `Provider` impl for OpenAI-compatible endpoints (covers ~80% of providers) — landed with a
   hermetic HTTP suite and a live suite (text, usage, tool calls, transcript)
-- Provider adapter for Anthropic Messages API
-- Streaming over SSE, token deltas into the TUI
-- Tool dispatch: `shell`, `read_file`, `write_file`, `patch`, `search`, `todo`
-- **Approval wired into dispatch** — every tool call classified before it runs, `/approval
-  <level>` and `/yolo [duration]` per chat, prompts rendered in the TUI (§3.11). The engine
-  already exists; this milestone is the wiring and the prompt UI.
-- Context builder + compaction at a token threshold
-- `hxd` runs, `hx` connects to it over the local socket
-- Session persistence (`hx-store`): resume, list, export
+- ✅ Provider adapter for Anthropic Messages API — landed with a hermetic HTTP suite (top-level `system`,
+  `x-api-key` + `anthropic-version`, `tool_use`/`tool_result` blocks) and a live suite
+- ✅ Streaming over SSE, token deltas into the TUI — provider-level deltas (OpenAI-compatible;
+  Anthropic too: named events, `input_json_delta` fragments parsed only at the block stop),
+  `POST /v1/chat/stream`, and `hx chat --stream` rendering
+  turns, tool calls and text live
+- ✅ Tool dispatch: `shell`, `read_file`, `write_file`, `patch`, `delete`, `search`, `todo` — each
+  declares the resource and action it needs; none decides whether it is allowed
+- ✅ **Approval wired into dispatch** — every tool call is classified against the capability token and
+  then the approval policy, in that order, and every refusal comes back to the model as a tool result
+  (`crates/hx-agent/tests/loop.rs`). `docs/approvals.md` §7's steps 1–4 have landed with it: `ask`
+  rules and the `deny → ask → allow` precedence, the shipped catastrophe deny set, remember-scoping by
+  tier, and the `delete` tool — a destructive request now names its targets, measured after the
+  capability check and before the prompt, and the question reaches a client over HTTP
+  (`hx approvals` / `hx approve`), and `hx policy` prints the ladder in force, in the order it is
+  checked (§6), and **`confined` as a second axis (§4)**: a rule can require that a call run inside a
+  boundary, `shell` runs it there when its context has one, and a boundary that cannot be entered is a
+  failed call rather than a quiet fallback to the machine. Requests select a profile with
+  `sandbox_profile` (`hx chat --sandbox-profile`); invalid or unavailable boundaries fail before the
+  model runs. `docs/approvals.md` §5's project-scoped allowlist has landed: `.hx/allow.toml` is a
+  reviewable file in the checkout, loaded per run and scoped to that workspace alone
+- ◐ **Compaction at a token threshold** — `compact_at_tokens` is honoured: when a transcript's
+  estimated tokens pass the threshold, the middle is elided for the model (head + an explicit marker +
+  tail, never splitting a tool call from its result) while the stored audit trail is untouched. The
+  The general context builder has landed too: `hx_agent::context::ContextBuilder` owns what a turn
+  sends — which transcript (the audit trail, or a compacted view of it), whether tools are offered,
+  whether a system prompt exists — so the loop is control flow and the request's *shape* has one
+  home. Both halves of this item are done.
+- ✅ `hxd` runs, `hx` connects to it: `hx chat` sends the prompt to the daemon over the configured
+  HTTP address and prints the run's report (over HTTP rather than the unix socket, which the config
+  also names and nothing uses yet); `hx sessions` / `hx session <id> [--export md]` read back what the
+  daemon stored. A run that did not complete exits non-zero, so a script can tell
+- ✅ Session persistence (`hx-store`): resume, list, export — and the case that actually matters, a
+  transcript that ended mid-call being repaired rather than sent to a provider, which rejects it
+- ◐ **The loop reachable over HTTP** — `POST /v1/chat` runs the loop against a session, `hx-server`
+  resolves the role's model through the routing table (reserving capacity and resolving the key), the
+  prompt is stored before the model is called, events are written as they happen, and `/v1/sessions*`
+  reads sessions, transcripts, events and exports back. Messages and events are written as the run
+  produces them, so a killed daemon leaves a session that says what happened — the difference between
+  "restartable" and "resumable". The approval channel is built; a WebSocket event stream remains open.
 
 **Exit criteria:** a multi-step task (5+ tool calls) completes end-to-end; killing the TUI and
-reconnecting resumes the session mid-flight.
+reconnecting resumes the session mid-flight. **Both met against a real model** (2026-09-17): a task
+(“read the sources, add `divide()`, add its test, run pytest”) completed in 12 turns and 14 tool calls
+— 9 shell, 3 read_file, 2 patch — with 0 refusals, and the `pytest` output it reported was re-run
+independently (`2 passed`). For the second half, the daemon was `kill -9`d the moment a tool result
+reached disk: 3 messages and 5 events survived, the client saw `RemoteDisconnected`, and restarting
+the daemon resumed that same session id — 3 → 19 messages, unchanged `created_at` — to a correct
+answer. The evidence is `~/.hx/kill-test.sh`, whose session-picker was fixed to consider only
+sessions created *after* the run starts (it previously latched onto the previous run's session and
+killed an idle daemon while looking like a pass).
 
 ---
 
@@ -68,14 +107,41 @@ reconnecting resumes the session mid-flight.
 
 **Goal:** everything the TUI does, in a browser, at the same time, on the same session.
 
-- `hx-server`: axum, REST + `/ws/agent/:session` + `/ws/term/:id` + `/ws/events`
-- Server-side PTY via `portable-pty`, attach/detach, scrollback retained in `hxd`
-- Frontend: xterm.js terminal, chat/stream pane, workspace file tree, diff/review pane
+- ✅ **Per-session WebSocket event stream** — `GET /v1/sessions/{id}/ws` upgrades to a stream that
+  sends the session's stored events first, then its live ones, as `{"seq","session","event"}` JSON
+  frames sharing one filtered broadcast bus (a client gets only its own session's events). A reconnecting
+  client sends `{"since_seq": N}` as its first message and the server replays exactly `seq > N` from the
+  store — no duplicates, no gaps — because every live event carries the store sequence `chat::write_events`
+  assigned it. Tested end to end in `crates/hx-server/tests/ws_api.rs` against a real socket: two
+  clients on one session both receive the same events, and a reconnecting client proves no-dup/no-gap.
+- ✅ **A server-side terminal** — `POST /v1/terminals`, `GET /v1/terminals/{id}/ws`, `DELETE
+  /v1/terminals/{id}`. The PTY lives in `hxd` and outlives every client, so an attach is a *join*: a
+  browser and a TUI reach one shell and see the same bytes, and closing either leaves it running.
+  Output arrives as scrollback-then-live as separate frames, base64 because a terminal is
+  byte-oriented; scrollback is capped on write so a runaway producer cannot exhaust memory; the
+  shell exiting is its own frame, because a stream that simply stops is indistinguishable from a
+  hung shell. Per the roadmap's own preference for a self-contained service this uses `nix` (already
+  in the lock, and a PTY is four libc calls) rather than `portable-pty`, which is not vendored.
+- `hx-server`: axum, REST + `/v1/sessions/{id}/ws` + `/v1/terminals/{id}/ws`
+- ✅ **A web client** — one self-contained page served by the daemon at `/` (`include_str!`, so the
+  binary is the whole daemon and a deploy cannot half-succeed), xterm.js on a CDN, no build step.
+  It is a client in the strict sense: the terminal is created once under a fixed id and reattached,
+  so a refresh rejoins the running shell; the session socket resumes with `since_seq` so a reconnect
+  renders the gap rather than the whole history.
+- Frontend, still to come: a workspace file tree, a diff/review pane, and the approval queue
 - **Two clients on one session simultaneously** (TUI + browser) — this is the real test that
   the daemon/client split is honest and not cosmetic
 
 **Exit criteria:** open a browser terminal to a shell, run a command, watch the same bytes in
-the TUI; then send an agent prompt from the browser and see it stream in both.
+the TUI; then send an agent prompt from the browser and see it stream in both. **Both halves are
+proven at the protocol level.** The events half: two WebSocket clients on one session, and a browser
+SSE run plus a WebSocket client, seeing the same stream (`tests/ws_api.rs`). The terminal half: two
+clients on one shell receiving the same bytes, a late client sent the scrollback, and a detached
+client leaving the shell running (`tests/terminal_api.rs` for the socket, `tests/terminal.rs` for the
+PTY, and `scripts/check_web_client.py` against a live daemon, which drives the exact frames the page
+sends). What is *not* yet exercised is a real TUI and a real browser against one session at the same
+moment: the browser stack was unavailable, so the page's protocol was driven directly rather than
+through a rendered page.
 
 ---
 
@@ -87,8 +153,15 @@ the TUI; then send an agent prompt from the browser and see it stream in both.
 - Capability tokens wired into the policy engine. Approval and capability are two independent
   checks on one path: the level decides whether to *ask*, the token decides whether "yes" is
   even legal. A denied capability is an auditable event, not a prompt the user can approve away.
-- Hash-chained audit log — every ask, answer, auto-allow and denial, with the risk class and
-  reason string that produced it
+- ✅ Hash-chained audit log — every event row carries a digest over its content and its
+  predecessor, so an edited or deleted row is detectable (`hx-store/src/audit.rs`). Verified against a
+  real V1 database: 348 pre-chain events kept and reported as unchained, new events chained. It is not
+  a signature — see that module's doc block for exactly what it does not prove.
+- ✅ The check is reachable: `hx audit <session>` and `GET /v1/sessions/{id}/audit`, exiting 2 on a
+  break. Three answers kept distinct — `intact`, `broken` (naming the row and both digests), and the
+  count of rows written before the chain existed, which is never folded into `intact`. Verified live
+  against a daemon: 8 chained events report intact, one row rewritten with raw SQL reports TRAIL
+  ALTERED at that row.
 - Web UI: container pane, and an approval queue showing the risk class, the reason, and the
   remaining unattended budget
 
@@ -119,6 +192,18 @@ key ever enters the model context or a sandbox.
 - **Discord** (twilight gateway, slash commands, threads, Message Content Intent)
 - Delivery targets, home-channel pinning, so cron output doesn't interleave with chat
 - Then: Slack (Socket Mode) → Matrix → Email → WhatsApp Cloud → Signal → SMS
+
+- **Approvals out of band, as a configurable option** — a request can be answered from anywhere the
+  user already is, not only from the surface that started the run: `approval.ask_via` naming one or
+  more channels (Telegram, Discord, Slack, email, a webhook), each with the policy for what it may
+  answer. The prompt is the same `ApprovalRequest` that renders in the TUI (§3.11), so the buttons on
+  a phone and the dialog in the terminal are the same decision — but the *answer authority* is
+  configured per channel, because a phone tap is a weaker signal than a terminal. Rules worth
+  pinning: only a channel that can display the full request (targets, sizes, what is irreversible)
+  may answer; per-channel ceilings, so a chat bridge can approve a `Mutate` but never a
+  `Destructive`; a channel that is down must fail closed rather than leave the run waiting; and the
+  answer is attributed in the audit log to the channel it came from. `/yolo` and `/approval` over a
+  DM follow the same rule: scoped to one chat, expiring, and never above the deployment's ceiling
 
 **Exit criteria:** DM the bot from your phone, get a streaming answer, approve a dangerous
 command with a button, receive a cron digest in a separate pinned thread.

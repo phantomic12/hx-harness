@@ -7,3 +7,14 @@ publish.workspace = true
 
 [dependencies]
 hx-core.workspace = true
+hx-provider.workspace = true
+hx-secrets.workspace = true
+hx-tools.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+hx-remote.workspace = true
+tempfile.workspace = true

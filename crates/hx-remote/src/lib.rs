@@ -42,8 +42,10 @@
 pub mod host;
 pub mod known_hosts;
 pub mod local;
+pub mod ntlm;
 pub mod runner;
 pub mod ssh;
+pub mod winrm;
 
 pub use host::{
     powershell_quote, shell_quote, ExecOutput, Host, HostCaps, RemoteEntry, RemoteOs, ShellKind,

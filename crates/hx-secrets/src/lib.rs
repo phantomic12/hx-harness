@@ -12,7 +12,9 @@
 //! The second one matters more than people expect, and most harnesses skip it.
 
 pub mod redact;
+pub mod source;
 pub mod vault;
 
 pub use redact::{Redaction, Redactor};
+pub use source::{EnvSecrets, FixedSecrets, SecretSource, SecretStores, VaultSecrets};
 pub use vault::{KdfParams, Secret, Vault, VaultError};

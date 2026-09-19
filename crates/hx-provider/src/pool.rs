@@ -111,6 +111,13 @@ impl Slot {
 pub struct Ticket {
     pub provider: ProviderId,
     pub credential: CredentialId,
+    /// The reference the credential's key lives under, carried through from the slot.
+    ///
+    /// A *reference*, never a value: the ticket says which key to fetch, and the thing that fetches
+    /// it is the only code that ever holds it. Carrying it here rather than looking the slot up
+    /// again matters — the reservation and the key must come from the same decision, or a retry
+    /// could spend on one credential and authenticate with another.
+    pub secret_ref: String,
     lease: Lease,
     pool_lease: Option<Lease>,
 }
@@ -122,6 +129,10 @@ impl Ticket {
 
     pub fn reserved_usd(&self) -> f64 {
         self.lease.reserved_usd
+    }
+
+    pub fn secret_ref(&self) -> &str {
+        &self.secret_ref
     }
 }
 
@@ -235,10 +246,12 @@ impl CredentialPool {
             match self.slots[idx].limiter.acquire(est_tokens, est_usd, now) {
                 Ok(lease) => {
                     let credential = self.slots[idx].id.clone();
+                    let secret_ref = self.slots[idx].secret_ref.clone();
                     self.cursor = self.cursor.wrapping_add(1);
                     return Ok(Ticket {
                         provider: self.provider.clone(),
                         credential,
+                        secret_ref,
                         lease,
                         pool_lease,
                     });
