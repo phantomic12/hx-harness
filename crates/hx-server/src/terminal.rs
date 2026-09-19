@@ -547,6 +547,10 @@ const TIOCSCTTY: u64 = 0x20007461;
 ))]
 const TIOCSWINSZ: u64 = 0x80087467;
 
+// The ioctl helpers are Unix-only: they reference the per-platform request constants above, and on a
+// platform with no PTY neither the constants nor the calls exist. Guarding them here is what keeps
+// Windows compiling — without it the constants are absent and these two functions fail to resolve.
+#[cfg(unix)]
 unsafe fn libc_ioctl_tiocswinsz(fd: i32, ws: &Winsize) -> i32 {
     unsafe extern "C" {
         fn ioctl(fd: i32, request: u64, ...) -> i32;
@@ -554,6 +558,7 @@ unsafe fn libc_ioctl_tiocswinsz(fd: i32, ws: &Winsize) -> i32 {
     unsafe { ioctl(fd, TIOCSWINSZ, ws as *const Winsize) }
 }
 
+#[cfg(unix)]
 unsafe fn libc_ioctl_tiocsctty(fd: i32) -> i32 {
     unsafe extern "C" {
         fn ioctl(fd: i32, request: u64, ...) -> i32;
@@ -561,6 +566,7 @@ unsafe fn libc_ioctl_tiocsctty(fd: i32) -> i32 {
     unsafe { ioctl(fd, TIOCSCTTY, 0i32) }
 }
 
+#[cfg(unix)]
 unsafe fn libc_setsid() -> i32 {
     unsafe extern "C" {
         fn setsid() -> i32;
