@@ -88,10 +88,13 @@ async fn a_real_windows_host_connects_and_reports_itself() {
     // guess from the transport's own construction.
     let caps = host.caps();
     assert_eq!(caps.os, RemoteOs::Windows, "a WinRM host is Windows");
+    // `Cmd`, because this transport sends `cmd /c` — a caller branches on this to decide how to
+    // quote, so it has to name the shell that actually runs. The earlier expectation here was
+    // `PowerShell`, which asserted the defect rather than the behaviour.
     assert_eq!(
         caps.shell,
-        ShellKind::PowerShell,
-        "Windows means PowerShell for anything non-trivial"
+        ShellKind::Cmd,
+        "this transport runs cmd.exe, so it must say so"
     );
     assert!(
         host.describe().contains("winrm"),
@@ -170,7 +173,7 @@ async fn a_file_round_trips_byte_for_byte() {
     };
 
     // Bytes that are not valid UTF-8 and contain a NUL: the case a text-shaped transport mangles.
-    // Base64 through PowerShell is how the transport carries them.
+    // Base64 through `certutil` is how the transport carries them.
     let contents: Vec<u8> = vec![0x00, 0x01, 0xff, 0xfe, 0x80, b'h', b'i', 0x0d, 0x0a, 0x7f];
     let path = r"C:\Windows\Temp\hx-winrm-roundtrip.bin";
 
@@ -181,8 +184,39 @@ async fn a_file_round_trips_byte_for_byte() {
     let read_back = host.read_file(path).await.expect("reading must succeed");
     assert_eq!(
         read_back, contents,
-        "a binary file must round-trip exactly, including a NUL and invalid UTF-8"
+        "the bytes must survive the round trip exactly"
     );
+
+    // The sizes that the single-`echo` write got wrong, and that the original version of this test
+    // did not reach because it only wrote ten bytes. A `cmd /c` command line is capped near 8191
+    // characters, so a payload past ~6 KB exercised a limit the small case never touched — and an
+    // empty payload made `echo` write the literal `ECHO is on.` instead of nothing.
+    for (label, payload) in [
+        ("empty", Vec::new()),
+        ("one byte", vec![0x41]),
+        // Strikingly past the command-line limit: this must be written in several chunks.
+        ("100 KB", vec![0x5Au8; 100 * 1024]),
+        // A size that lands mid-chunk-boundary rather than on a round number.
+        ("6003 bytes", vec![0xC3u8; 6003]),
+    ] {
+        let path = format!(r"C:\Windows\Temp\hx-size-{}.bin", label.replace(' ', "-"));
+        host.write_file(&path, &payload)
+            .await
+            .unwrap_or_else(|e| panic!("writing a {label} payload must succeed: {e}"));
+        let back = host
+            .read_file(&path)
+            .await
+            .unwrap_or_else(|e| panic!("reading the {label} payload back must succeed: {e}"));
+        assert_eq!(
+            back.len(),
+            payload.len(),
+            "a {label} payload must round-trip at the same length"
+        );
+        assert_eq!(back, payload, "a {label} payload must round-trip exactly");
+        let _ = host
+            .exec(&format!("del /f /q \"{path}\""), Duration::from_secs(30))
+            .await;
+    }
 
     // The directory is created when it does not exist, because a caller asked to write a file
     // rather than to also arrange its parent.

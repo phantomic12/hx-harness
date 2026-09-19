@@ -121,7 +121,12 @@ impl WinRmHost {
         }
 
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
+            // Not the per-request deadline — `exec` bounds the run itself. This is the transport
+            // ceiling, and it has to exceed the longest timeout a caller can pass, or a `Receive`
+            // the server holds open is cut off by the client first and the caller sees a transport
+            // error instead of their own deadline. The envelope advertises `PT300S`, so the ceiling
+            // sits above that.
+            .timeout(Duration::from_secs(600))
             // Verification stays ON by default: a WinRM endpoint carries credentials and remote
             // command execution, so silently accepting any certificate would turn a misconfigured
             // or hostile DNS answer into a credential leak. `HX_WINRM_INSECURE=1` opts out for a
@@ -141,7 +146,11 @@ impl WinRmHost {
             client,
             caps: HostCaps {
                 os: RemoteOs::Windows,
-                shell: ShellKind::PowerShell,
+                // `cmd /c`, because that is what `run_in_shell` sends and what the file helpers
+                // use. Reporting `PowerShell` here was wrong in a way that matters: a caller reads
+                // this to decide how to quote, so a `cd '<dir>' && ...` built for PowerShell reached
+                // a `cmd.exe` that does not treat single quotes as quoting at all.
+                shell: ShellKind::Cmd,
                 arch: None,
                 home_dir: None,
                 has_sftp: false,
@@ -460,7 +469,12 @@ impl WinRmHost {
     }
 
     /// Run a command in the shell and collect its output.
-    async fn run_in_shell(&self, shell_id: &str, command: &str) -> Result<ExecOutput> {
+    async fn run_in_shell(
+        &self,
+        shell_id: &str,
+        command: &str,
+        timeout: Duration,
+    ) -> Result<ExecOutput> {
         // `CommandLine` spells the program and then the whole argument string in ONE `Arguments`
         // element: `cmd /c "echo hi"` is `<Command>cmd</Command><Arguments>/c echo hi</Arguments>`.
         // Splitting `/c` and the rest across two elements is rejected as invalid XML, which is what
@@ -531,10 +545,14 @@ impl WinRmHost {
             }
             // A server that never reports Done would otherwise loop forever. The bound is the
             // client's own sanity check, not the protocol's.
-            if start.elapsed() > Duration::from_secs(300) {
-                return Err(HxError::Remote(
-                    "the command did not report completion within five minutes".to_string(),
-                ));
+            if start.elapsed() > timeout {
+                // The caller's deadline, not a fixed one. This used to be a hard-coded 300 s while
+                // the envelope advertised the same, which meant a caller asking for 10 s waited 300
+                // and a caller asking for an hour was cut off at five minutes.
+                return Err(HxError::Remote(format!(
+                    "the command did not finish within {}s",
+                    timeout.as_secs()
+                )));
             }
         }
 
@@ -559,7 +577,7 @@ impl Host for WinRmHost {
         &self.caps
     }
 
-    async fn exec(&self, command: &str, _timeout: Duration) -> Result<ExecOutput> {
+    async fn exec(&self, command: &str, timeout: Duration) -> Result<ExecOutput> {
         let shell_id = {
             let guard = self.shell.lock().await;
             guard.clone()
@@ -575,16 +593,41 @@ impl Host for WinRmHost {
                 id
             }
         };
-        self.run_in_shell(&shell_id, command).await
+        self.run_in_shell(&shell_id, command, timeout).await
     }
 
     async fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+        check_path(path, "read")?;
         // Base64 rather than a binary stream: WSMan's output is text, and anything that is not text
         // would be mangled by the encoding round trip in between.
         //
         // `certutil` decodes and encodes base64 and is present on every Windows install, which makes
         // it the cmd-shell equivalent of the PowerShell one-liner this replaced — `[Convert]` and
         // `[IO.File]` are not available to `cmd.exe`.
+        //
+        // A zero-byte file is handled before `certutil` runs: `certutil -encode` refuses an empty
+        // input with `ERROR_INVALID_DATA`, so an empty file read back as a failure rather than as
+        // empty contents.
+        //
+        // The size test is its own `for` statement with no parenthesised block around it. Measured:
+        // `%~zI` does not expand reliably inside `else (...)`, where it makes the whole line fail
+        // with a bare exit code 1 and an empty stderr — which reads as a transport fault rather than
+        // a bug in the command. Two flat statements avoid that.
+        let out = self
+            .exec(
+                &format!("for %I in (\"{path}\") do @echo %~zI"),
+                Duration::from_secs(60),
+            )
+            .await?;
+        if !out.success() {
+            return Err(HxError::Remote(format!(
+                "could not measure '{path}': {}",
+                out.stderr.trim()
+            )));
+        }
+        if out.stdout.trim() == "0" {
+            return Ok(Vec::new());
+        }
         let out = self
             .exec(
                 &format!(
@@ -613,25 +656,32 @@ impl Host for WinRmHost {
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> Result<()> {
+        check_path(path, "write")?;
         let encoded = base64::engine::general_purpose::STANDARD.encode(contents);
-        // The directory is created first: writing a file into a path whose parent does not exist
-        // fails, and the caller asked to write a file, not to also arrange its directory.
-        //
-        // The base64 goes through a temp file because `certutil -decode` takes a path, not a string,
-        // and the temp file is removed whether or not the decode succeeds.
+
+        // Each chunk is its own `exec`, and the reason is measured: joining the chunks into one
+        // command line exceeded the limit too. A 100 KB payload came back as
+        // `winrm: 500 ... The filename or extension is too long`, because `cmd /c` caps the *whole*
+        // line near 8191 characters — appending `&& echo ...` for every chunk made the line grow with
+        // the payload even when no individual `echo` was long. Separate calls keep every line small
+        // and make the payload size unbounded.
+        for step in write_steps(path, &encoded) {
+            let out = self.exec(&step, Duration::from_secs(180)).await?;
+            if !out.success() {
+                return Err(HxError::Remote(format!(
+                    "could not stage a chunk of '{path}': {}",
+                    out.stderr.trim()
+                )));
+            }
+        }
+
+        // The decode is a separate call for the same reason: `certutil` decodes the whole staged temp
+        // file, and its own command line does not grow with the payload.
         let out = self
             .exec(
                 &format!(
-                    // `&&` throughout rather than `&`. A chain of `&` runs every step regardless, and
-                    // `%ERRORLEVEL%` in such a line is expanded when the line is *parsed*, before the
-                    // decode has run — so a check written that way reports the previous command's
-                    // status. `&&` stops at the first failure and tests each command's own result.
-                    "if not exist \"{parent}\" mkdir \"{parent}\" && \
-                     >\"%TEMP%\\hx-b64.tmp\" echo {encoded} && \
-                     certutil -decode -f \"%TEMP%\\hx-b64.tmp\" \"{path}\" >nul && \
-                     del /q \"%TEMP%\\hx-b64.tmp\" && echo OK",
-                    parent = parent_dir(path),
-                    path = path,
+                    "certutil -decode -f \"%TEMP%\\hx-b64.tmp\" \"{path}\" >nul && \
+                     del /q \"%TEMP%\\hx-b64.tmp\" && echo OK"
                 ),
                 Duration::from_secs(180),
             )
@@ -646,7 +696,7 @@ impl Host for WinRmHost {
     }
 
     async fn list_dir(&self, path: &str) -> Result<Vec<RemoteEntry>> {
-        let escaped = path.replace('\'', "''");
+        check_path(path, "list")?;
         // Commands run through `cmd.exe`, not PowerShell, so this uses `dir` rather than
         // `Get-ChildItem` — a PowerShell cmdlet is not on PATH for a cmd shell and the failure reads
         // as "not recognized as an internal or external command", which names the cmdlet rather than
@@ -657,10 +707,7 @@ impl Host for WinRmHost {
         // switch for size-and-name in one machine-readable line, so the path is listed as names and
         // each entry's attributes are asked for separately below.
         let out = self
-            .exec(
-                &format!("dir /a /b \"{escaped}\""),
-                Duration::from_secs(120),
-            )
+            .exec(&format!("dir /a /b \"{path}\""), Duration::from_secs(120))
             .await?;
         if !out.success() {
             return Err(HxError::Remote(format!(
@@ -707,6 +754,8 @@ impl Host for WinRmHost {
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
+        check_path(from, "rename")?;
+        check_path(to, "rename")?;
         // `move` rather than `Move-Item`, because the shell is `cmd.exe`.
         //
         // The gate is `if not exist <destination> move ...`. Measured against the alternatives on a
@@ -911,6 +960,75 @@ fn extract_selector(xml: &str, name: &str) -> Option<String> {
     }
 
     None
+}
+
+/// The `mkdir` and `echo` steps that stage a base64 payload into the temp file, before `certutil`
+/// decodes it. Each element is a complete command for its own `exec` call.
+///
+/// Split out from `write_file` so the commands that get built can be asserted on directly — the
+/// chunking and the empty-payload case are properties of the *strings*, and a test that has to run a
+/// command to check them would be testing the host as much as this function.
+///
+/// Three measured constraints shape it. A `cmd /c` command line is capped near 8191 characters, and
+/// the cap applies to the *whole* line, so the chunks are separate commands rather than one joined
+/// line — joining them failed with `The filename or extension is too long` on a 100 KB payload even
+/// though no individual `echo` was long. Each chunk stays well inside the cap on its own. And `echo`
+/// with nothing after it writes the literal `ECHO is on.`, so an empty payload needs `(echo. )>`
+/// instead, which is the form measured to give `certutil` a decodable zero-length input.
+fn write_steps(path: &str, encoded: &str) -> Vec<String> {
+    let parent = parent_dir(path);
+    // The directory is created first: writing a file into a path whose parent does not exist fails,
+    // and the caller asked to write a file, not to also arrange its directory.
+    let mut steps = vec![
+        format!("if not exist \"{parent}\" mkdir \"{parent}\""),
+        // `del` reports a missing file as an error, which is the normal case on the first write.
+        "del /q \"%TEMP%\\hx-b64.tmp\" 2>nul & exit /b 0".to_string(),
+    ];
+
+    const CHUNK: usize = 8000;
+    if encoded.is_empty() {
+        // `type nul > f` and `copy nul f` were both tried and leave a file `certutil` refuses. The
+        // parenthesised echo writes a newline, which decodes to `Output Length = 0`.
+        steps.push("(echo. )> \"%TEMP%\\hx-b64.tmp\"".to_string());
+    } else {
+        for (i, chunk) in encoded.as_bytes().chunks(CHUNK).enumerate() {
+            // base64 output is ASCII, so a byte-wise chunk is also a character-wise one.
+            let chunk = std::str::from_utf8(chunk).unwrap_or_default();
+            // The first write truncates; the rest append, or the file would hold only the last chunk.
+            let op = if i == 0 { ">" } else { ">>" };
+            steps.push(format!("echo {chunk} {op} \"%TEMP%\\hx-b64.tmp\""));
+        }
+    }
+    steps
+}
+
+/// Reject a path this client cannot safely put inside a `cmd.exe` command line.
+///
+/// The winrm transport has no argument channel: every path becomes part of a command *string* that
+/// `cmd.exe` parses, so a path is code as far as the shell is concerned. A name like
+/// `notes" & whoami & "x.txt` closes the quote it was meant to sit inside and runs the rest, and the
+/// capability that allowed the call was a *filesystem* one (`Read`/`Write`/`Delete`) — it never
+/// claimed the right to run a process. So this is the boundary that keeps a file access from being a
+/// command execution, and it has to hold for every path before interpolation, including the parent
+/// directory derived from one.
+///
+/// Quoting alone is not enough. `cmd.exe` has no escaping convention that makes all of these literals
+/// — `%VAR%` expands even inside double quotes, and a `"` cannot be escaped by doubling it the way an
+/// apostrophe can in POSIX shells. Rejecting is the honest option: a path containing these characters
+/// cannot be addressed safely by this transport, and saying so is better than a call whose meaning
+/// depends on the shell.
+fn check_path(path: &str, what: &str) -> Result<()> {
+    // `"` breaks the quoting; `&|<>^` chain or redirect; `%` expands; CR/LF end the command line.
+    // `!` is included for delayed expansion, which some shells have enabled.
+    const FORBIDDEN: &[char] = &['"', '&', '|', '<', '>', '^', '%', '!', '\r', '\n'];
+    if let Some(bad) = path.chars().find(|c| FORBIDDEN.contains(c)) {
+        return Err(HxError::Remote(format!(
+            "refusing {what} '{path}': it contains {bad:?}, which cmd.exe would interpret rather than \
+             treat as part of the path. This transport passes a path inside a command line, so a \
+             filesystem call would become a command execution."
+        )));
+    }
+    Ok(())
 }
 
 /// The parent of a Windows path, for the `mkdir` that precedes a write or a move.
@@ -1337,5 +1455,134 @@ mod tests {
             "a BOM is decisive"
         );
         assert!(!looks_utf16le(b"plain ascii text here"), "UTF-8 ASCII");
+    }
+
+    #[test]
+    fn a_path_that_would_be_parsed_as_a_command_is_refused() {
+        // The transport has no argument channel: a path is interpolated into a `cmd.exe` command
+        // line, so a path is code. This is the boundary that keeps a filesystem capability from
+        // becoming a command execution — the call was approved as `Read`/`Write`/`Delete`, and none
+        // of those grant the right to run a process.
+        let hostile = [
+            r#"C:\tmp\x" & whoami & "y.txt"#,
+            r"C:\tmp\a&calc.txt",
+            r"C:\tmp\a|b.txt",
+            r"C:\tmp\a>b.txt",
+            r"C:\tmp\a<b.txt",
+            r"C:\tmp\a^b.txt",
+            r"C:\tmp\%USERNAME%.txt",
+            r"C:\tmp\a!b.txt",
+            "C:\\tmp\\a\rb.txt",
+            "C:\\tmp\\a\nb.txt",
+        ];
+        for path in hostile {
+            let refused = check_path(path, "write");
+            assert!(
+                refused.is_err(),
+                "a path cmd.exe would interpret must be refused, not quoted: {path}"
+            );
+        }
+
+        // And the control: an ordinary Windows path, including the characters that are merely
+        // awkward, must still be accepted or this boundary is a wall rather than a guard.
+        for path in [
+            r"C:\Windows\Temp\report.txt",
+            r"C:\Users\First Last\My Documents\a (1).txt",
+            r"C:\tmp\dotted.name.txt",
+            r"C:\\share\file#1.txt",
+            r"C:\tmp\brackets[0].txt",
+            r"C:\tmp\tilde~1.txt",
+            r"C:\tmp\star*is-not-allowed-either", // only glob chars cmd does not treat as operators
+        ] {
+            // The last entry is a deliberate exception check: `*` is not a shell operator in cmd and
+            // must pass, so this asserts the guard is about interpreters, not about unusual names.
+            assert!(
+                check_path(path, "write").is_ok(),
+                "an ordinary path must still be usable: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_write_is_chunked_so_a_large_payload_never_exceeds_the_command_line() {
+        // A `cmd /c` command line is capped near 8191 characters, and the cap applies to the *whole*
+        // line — so the chunks have to be separate commands, not one line joined with `&&`. Joining
+        // them failed with `The filename or extension is too long` on a 100 KB payload even though no
+        // individual `echo` was long, which is why this asserts per-step length rather than the total.
+        let payload = vec![0xABu8; 60_000];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&payload);
+        let steps = write_steps(r"C:\tmp\big.bin", &encoded);
+
+        let echoes: Vec<&String> = steps.iter().filter(|s| s.starts_with("echo ")).collect();
+        assert!(
+            echoes.len() > 1,
+            "a 60 KB payload must be written in more than one chunk"
+        );
+        for step in &echoes {
+            assert!(
+                step.len() < 8191,
+                "every step must stay inside the command line limit on its own, got {}",
+                step.len()
+            );
+        }
+
+        // The first chunk truncates and the rest append, or the payload would be the last chunk only.
+        assert!(echoes[0].contains("> \"%TEMP%") && !echoes[0].contains(">>"));
+        for later in &echoes[1..] {
+            assert!(
+                later.contains(">> \"%TEMP%"),
+                "every chunk after the first must append: {later}"
+            );
+        }
+
+        // Reassembling the echoed chunks must give the original base64 back, in order.
+        let rebuilt: String = echoes
+            .iter()
+            .map(|s| {
+                let body = s.trim_start_matches("echo ");
+                let (chunk, _) = body
+                    .split_once(" >")
+                    .or_else(|| body.split_once(" >>"))
+                    .expect("a chunk carries a redirection");
+                chunk.to_string()
+            })
+            .collect();
+        assert_eq!(
+            rebuilt, encoded,
+            "the chunks must reassemble into the same base64, in order"
+        );
+    }
+
+    #[test]
+    fn an_empty_write_produces_an_empty_file_not_the_echo_banner() {
+        // `echo` with no argument writes the literal `ECHO is on.`, so an empty payload used to
+        // produce a file whose contents were that banner rather than nothing. The fix is the form
+        // measured to work on a real host: `(echo. )>` writes a newline, which `certutil` decodes to
+        // `Output Length = 0`. Both `type nul > f` and `copy nul f` were tried and leave a file
+        // certutil refuses, so this asserts the specific working form rather than "not the banner".
+        let steps = write_steps(r"C:\tmp\empty.bin", "");
+        let joined = steps.join("\n");
+        assert!(
+            !joined.contains("echo  >"),
+            "an empty payload must not produce a bare echo: {joined}"
+        );
+        assert!(
+            steps.iter().any(|s| s.contains("(echo. )>")),
+            "an empty payload must write a decodable zero-length base64 file: {joined}"
+        );
+    }
+
+    #[test]
+    fn a_write_rejects_a_hostile_path_before_building_any_command() {
+        // The check must run before the command is assembled, not after: a refusal that has already
+        // interpolated the path has already built the thing it was refusing.
+        let hostile = r#"C:\tmp\x" & whoami & "y.txt"#;
+        let refused = check_path(hostile, "write");
+        assert!(refused.is_err());
+        let message = format!("{:?}", refused.unwrap_err());
+        assert!(
+            message.contains("cmd.exe"),
+            "the refusal must say why, and name the interpreter: {message}"
+        );
     }
 }
