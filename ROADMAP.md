@@ -191,9 +191,12 @@ attempted capability escalation shows up as a denial event, not a hang.
 - ❌ **File browser over SFTP specifically** — the file routes go through `Host::read_file`/
   `write_file`, which for `SshHost` shells out (`base64 < path` over exec, see
   `crates/hx-remote/src/ssh.rs`). That is binary-safe but it is not SFTP, and it means a large file
-  is buffered through a command's stdout. Note the inconsistency: `HostCaps::has_sftp` reports
-  `true` for SSH hosts while no SFTP subsystem code exists in the crate — the flag describes what
-  the *server* offers, not what this client uses, and it should either be wired up or renamed.
+  is buffered through a command's stdout. The flag that used to lie about this is fixed:
+  `HostCaps::has_sftp` was a `bool` hard-coded to `true` by both capability parsers and handed to
+  clients as a measured fact. A `uname` string says nothing about which SSH subsystems a server
+  offers, so it is now `Option<bool>` and reports `None` (unknown) for every probe — `false` would
+  have been just as wrong. `WinRmHost` reports `Some(false)`, which it genuinely knows, since WinRM
+  is not an SSH transport at all.
 - ❌ **Remote sandboxes** — run the sandbox on a *remote* Docker/Podman host. Nothing in
   `hx-sandbox` reaches a remote daemon today.
 - ✅ **Remote terminal (a PTY straight to a remote host)** — `POST /v1/terminals` takes an optional

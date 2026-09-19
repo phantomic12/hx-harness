@@ -775,6 +775,13 @@ pub struct HostDetail {
     pub arch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub home_dir: Option<String>,
+    /// Whether an SFTP subsystem is available for copying files.
+    ///
+    /// Omitted when unknown, which is the case for every host today: the capability probes read a
+    /// `uname` string or `cmd /C ver`, neither of which says anything about SSH subsystems. It was
+    /// `Some(true)` for SSH hosts, from a field hard-coded to `true` by the parser — a capability
+    /// report no code had checked, on the one question a client would act on. It now reports what is
+    /// known, and nothing is known yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub has_sftp: Option<bool>,
     /// Why the machine could not be reached, when it could not. Present instead of a 5xx so a client
@@ -836,7 +843,10 @@ async fn host_detail(
                 shell: Some(format!("{:?}", caps.shell).to_lowercase()),
                 arch: caps.arch.clone(),
                 home_dir: caps.home_dir.clone(),
-                has_sftp: Some(caps.has_sftp),
+                // Flattened: the route's `None` and the caps' `None` mean the same thing to a
+                // client ("nobody has checked"), so there is no reason to make it distinguish
+                // between two flavours of unknown.
+                has_sftp: caps.has_sftp,
                 unreachable: None,
                 denied: None,
             }))

@@ -130,7 +130,7 @@ impl FakeHost {
                 shell: ShellKind::Posix,
                 arch: Some("x86_64".to_string()),
                 home_dir: Some("/home/agent".to_string()),
-                has_sftp: false,
+                has_sftp: None,
             },
             files: Mutex::new(BTreeMap::new()),
             dirs: Mutex::new(BTreeSet::new()),

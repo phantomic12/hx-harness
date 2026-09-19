@@ -106,8 +106,15 @@ pub struct HostCaps {
     /// `uname -m`-style architecture, when known.
     pub arch: Option<String>,
     pub home_dir: Option<String>,
-    /// Whether a second SSH connection can be used to copy files.
-    pub has_sftp: bool,
+    /// Whether an SFTP subsystem is available for copying files.
+    ///
+    /// `None` means **unknown**, and that is the honest answer from the probes this crate runs: a
+    /// `uname` string, or `cmd /C ver`, says nothing about which SSH subsystems the server offers.
+    /// It was a `bool` hard-coded to `true` by both parsers, which the host route then handed to
+    /// clients as though it had been measured — a capability report that no code ever checked, on
+    /// the one question (can I copy files?) a client would act on. `false` would be just as wrong in
+    /// the other direction, so the field says what is true: nobody has looked.
+    pub has_sftp: Option<bool>,
 }
 
 impl HostCaps {
@@ -119,7 +126,7 @@ impl HostCaps {
             shell: ShellKind::Posix,
             arch: None,
             home_dir: None,
-            has_sftp: false,
+            has_sftp: None,
         }
     }
 
@@ -148,7 +155,8 @@ pub fn caps_from_uname(stdout: &str) -> Option<HostCaps> {
         shell: ShellKind::Posix,
         arch: None,
         home_dir: None,
-        has_sftp: true,
+        // Nothing here has asked the server what subsystems it offers.
+        has_sftp: None,
     })
 }
 
@@ -166,7 +174,8 @@ pub fn caps_from_ver(stdout: &str) -> Option<HostCaps> {
         shell: ShellKind::PowerShell,
         arch: None,
         home_dir: None,
-        has_sftp: true,
+        // Not checked; see the field's note.
+        has_sftp: None,
     })
 }
 
@@ -391,6 +400,28 @@ mod tests {
         let caps = caps_from_uname("Linux host 6.8.0-generic #1 SMP x86_64 GNU/Linux").unwrap();
         assert_eq!(caps.os, RemoteOs::Linux);
         assert_eq!(caps.shell, ShellKind::Posix);
+    }
+
+    #[test]
+    fn a_capability_probe_does_not_claim_sftp_it_never_checked() {
+        // The bug this pins: both parsers hard-coded `has_sftp: true`, and the host route handed
+        // that to clients as though it had been measured. A `uname` string says nothing about which
+        // SSH subsystems the server offers, so the honest answer is "unknown" — `false` would be
+        // just as wrong in the other direction.
+        assert_eq!(
+            caps_from_uname("Linux host 6.8.0-generic #1 SMP x86_64 GNU/Linux")
+                .unwrap()
+                .has_sftp,
+            None
+        );
+        assert_eq!(
+            caps_from_ver("Microsoft Windows [Version 10.0.19045.3803]")
+                .unwrap()
+                .has_sftp,
+            None
+        );
+        // And the default caps are as unmeasured as the parsed ones.
+        assert_eq!(HostCaps::unknown().has_sftp, None);
     }
 
     #[test]

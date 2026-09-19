@@ -154,7 +154,9 @@ impl WinRmHost {
                 shell: ShellKind::Cmd,
                 arch: None,
                 home_dir: None,
-                has_sftp: false,
+                // Known, not guessed: WinRM is not an SSH transport, so there is no SFTP subsystem
+                // to offer whatever the server supports.
+                has_sftp: Some(false),
             },
             shell: tokio::sync::Mutex::new(None),
         };

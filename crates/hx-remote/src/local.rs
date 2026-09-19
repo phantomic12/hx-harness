@@ -303,7 +303,7 @@ mod tests {
                 shell: ShellKind::Posix,
                 arch: None,
                 home_dir: None,
-                has_sftp: false,
+                has_sftp: None,
             },
         )
     }
