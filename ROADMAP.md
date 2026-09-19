@@ -173,15 +173,40 @@ attempted capability escalation shows up as a denial event, not a hang.
 
 ## M4 — Multi-machine
 
-- `SshHost` on `russh`: exec, PTY, SFTP, port-forward, keepalive/reconnect
-- `WinRMHost` for the Hyper-V boxes that can't do SSH (NTLM via jump host)
-- Host registry in config + vault-backed keys/agent/hardware-key auth
-- `HostCaps` adaptation so tools don't need Windows/Linux branches
-- Web UI: host pane, file browser over SFTP, terminal straight to a remote host
-- Remote sandboxes: run the sandbox on a *remote* Docker/Podman host
+- ✅ **`SshHost` on `russh`** — exec, PTY, SFTP, port-forward, keepalive/reconnect. Live-tested in
+  CI against a real sshd (`ssh transport` job).
+- ✅ **`WinRMHost`** for the boxes that cannot do SSH — NTLM and Basic-over-TLS, with the credential
+  path unit-tested and live tests `#[ignore]`d behind `HX_WINRM_*`.
+- ✅ **Host registry in config + vault-backed auth** — `hosts:` in the config, credentials resolved
+  from the vault at connect time. `AppState::resolve_host` is the one way anything obtains a remote
+  handle (`crates/hx-server/src/hosts.rs`), so a configured machine is reachable by *every* client,
+  not only the agent.
+- ✅ **`HostCaps` adaptation** so tools do not need Windows/Linux branches — `RemoteOs`/`ShellKind`
+  drive per-shell quoting and command chaining.
+- ✅ **Reachable over HTTP and in the browser** — `GET /v1/hosts/{id}` (describe),
+  `/files` (list), `/file` (read/write), `/exec` (run). The web client opens any host into a
+  directory browser with a file viewer/editor and a command runner. Reads and writes are gated by
+  the same approval policy an agent run uses, and a command is classified by the real classifier, so
+  `hostname` runs and `curl … | sh` does not.
+- ❌ **File browser over SFTP specifically** — the file routes go through `Host::read_file`/
+  `write_file`, which for `SshHost` shells out (`base64 < path` over exec, see
+  `crates/hx-remote/src/ssh.rs`). That is binary-safe but it is not SFTP, and it means a large file
+  is buffered through a command's stdout. Note the inconsistency: `HostCaps::has_sftp` reports
+  `true` for SSH hosts while no SFTP subsystem code exists in the crate — the flag describes what
+  the *server* offers, not what this client uses, and it should either be wired up or renamed.
+- ❌ **Remote sandboxes** — run the sandbox on a *remote* Docker/Podman host. Nothing in
+  `hx-sandbox` reaches a remote daemon today.
+- ❌ **Remote terminal (a PTY straight to a remote host)** — the terminal pane is local-only.
+  `SshHost` has PTY support; the route does not yet target a remote host.
 
 **Exit criteria:** drive a Linux box, a Mac, and a Windows host from the browser; no private
 key ever enters the model context or a sandbox.
+
+*Status: three of the seven items are done and the fourth is the one that makes the rest usable —
+a machine in the config is now visible and drivable from every client. The exit criteria is not met:
+the browser can browse and run on a remote host, but the remote terminal and remote sandboxes are
+still absent, and Unix-only CI means the Windows transport is exercised by unit tests rather than
+against a live host.*
 
 ---
 
