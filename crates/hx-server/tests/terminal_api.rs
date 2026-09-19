@@ -9,6 +9,13 @@
 //! Why a real server and a real socket rather than calling the handler: the WebSocket upgrade
 //! handshake and the framing cannot be exercised through `tower::oneshot`. A test that called the
 //! handler directly would agree with itself about a protocol neither side had to speak.
+//!
+//! Unix-only. Every test here starts a real shell on a PTY, and a platform without one cannot run
+//! any of them — the daemon refuses to create a terminal there by design, so there is nothing to
+//! attach to. The route and its refusal are still worth checking on those platforms, but that is a
+//! different test; this file is the protocol proof and it needs a shell.
+
+#![cfg(unix)]
 
 use std::sync::{Arc, Mutex};
 
