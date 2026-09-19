@@ -199,8 +199,15 @@ attempted capability escalation shows up as a denial event, not a hang.
   offers, so it is now `Option<bool>` and reports `None` (unknown) for every probe — `false` would
   have been just as wrong. `WinRmHost` reports `Some(false)`, which it genuinely knows, since WinRM
   is not an SSH transport at all.
-- ❌ **Remote sandboxes** — run the sandbox on a *remote* Docker/Podman host. Nothing in
-  `hx-sandbox` reaches a remote daemon today.
+- 🔶 **Remote sandboxes** — run the sandbox on a *remote* Docker/Podman host. The runtime now
+  exists: `RemoteSandboxRuntime` in `crates/hx-sandbox/src/remote.rs` is a second
+  `SandboxRuntime` that renders the same reviewed `HostConfig` as the local runtime's settings map
+  to, but as docker CLI command lines handed to a tiny local `RemoteCommandRunner` trait (instead of
+  to `bollard` against a local socket), so the safe defaults survive the trip to a far daemon. It
+  meets `hx-sandbox`'s no-`hx-remote`-dependency rule: `Host` satisfies the runner later via
+  a thin adapter in `hx-server`. Still to do before the item is ✅: a remote egress allowlist is
+  refused (not half-enforced) until the proxy sidecar can be placed on the far host, and the
+  runtime is not yet wired into `hx-server` or exercised against a live remote daemon.
 - ✅ **Remote terminal (a PTY straight to a remote host)** — `POST /v1/terminals` takes an optional
   `host`, and the daemon adopts the session as a terminal like any other, so the terminal pane and
   the WebSocket contract are unchanged: a client attaches to a remote shell the same way it attaches
@@ -213,9 +220,10 @@ attempted capability escalation shows up as a denial event, not a hang.
 **Exit criteria:** drive a Linux box, a Mac, and a Windows host from the browser; no private
 key ever enters the model context or a sandbox.
 
-*Status: four of the seven items are done, and with the remote terminal in place the browser drives a
+*Status: five of the seven items are done, and with the remote terminal in place the browser drives a
 remote box for real — browse, run, and an interactive shell — rather than only the first two. The exit
-criteria is still not met: remote sandboxes are absent, and Unix-only CI means the Windows transport
+criteria is still not met: remote sandboxes exist only as a unit-tested runtime (not yet wired into a
+route or verified against a live remote daemon), and Unix-only CI means the Windows transport
 is exercised by unit tests rather than against a live host.*
 
 ---
