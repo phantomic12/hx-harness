@@ -70,7 +70,7 @@ Those get real tests in M1 against a live endpoint.
   `sandbox_profile` (`hx chat --sandbox-profile`); invalid or unavailable boundaries fail before the
   model runs. `docs/approvals.md` §5's project-scoped allowlist has landed: `.hx/allow.toml` is a
   reviewable file in the checkout, loaded per run and scoped to that workspace alone
-- ◐ **Compaction at a token threshold** — `compact_at_tokens` is honoured: when a transcript's
+- ✅ **Compaction at a token threshold** — `compact_at_tokens` is honoured: when a transcript's
   estimated tokens pass the threshold, the middle is elided for the model (head + an explicit marker +
   tail, never splitting a tool call from its result) while the stored audit trail is untouched. The
   The general context builder has landed too: `hx_agent::context::ContextBuilder` owns what a turn
@@ -83,12 +83,14 @@ Those get real tests in M1 against a live endpoint.
   daemon stored. A run that did not complete exits non-zero, so a script can tell
 - ✅ Session persistence (`hx-store`): resume, list, export — and the case that actually matters, a
   transcript that ended mid-call being repaired rather than sent to a provider, which rejects it
-- ◐ **The loop reachable over HTTP** — `POST /v1/chat` runs the loop against a session, `hx-server`
+- ✅ **The loop reachable over HTTP** — `POST /v1/chat` runs the loop against a session, `hx-server`
   resolves the role's model through the routing table (reserving capacity and resolving the key), the
   prompt is stored before the model is called, events are written as they happen, and `/v1/sessions*`
   reads sessions, transcripts, events and exports back. Messages and events are written as the run
   produces them, so a killed daemon leaves a session that says what happened — the difference between
-  "restartable" and "resumable". The approval channel is built; a WebSocket event stream remains open.
+  "restartable" and "resumable". The approval channel is built, and so is the WebSocket event stream
+  that used to be named here as open: `GET /v1/sessions/{id}/ws` frames `{"seq", "session", "event"}`
+  and a reconnecting client sends `since_seq` to be sent only what it missed.
 
 **Exit criteria:** a multi-step task (5+ tool calls) completes end-to-end; killing the TUI and
 reconnecting resumes the session mid-flight. **Both met against a real model** (2026-09-17): a task
