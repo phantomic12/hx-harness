@@ -263,10 +263,17 @@ fn resource_matches(granted: &Resource, requested: &Resource) -> bool {
 ///
 /// Fail-closed rules, each of which is a privilege-escalation bug if relaxed:
 /// - an empty or whitespace grant never means root (it means "no grant");
-/// - both paths must be absolute. A relative path is ambiguous, and resolving it here would
-///   make the decision depend on a working directory the policy engine cannot see. Callers
-///   must resolve to absolute *before* asking;
+/// - both paths must be absolute, on either platform. A relative path is ambiguous, and resolving
+///   it here would make the decision depend on a working directory the policy engine cannot see.
+///   Callers must resolve to absolute *before* asking;
 /// - only an explicit `"/"` grant covers everything.
+///
+/// "Absolute" includes Windows drive-letter (`C:\work`) and UNC (`\\server\share`) paths, which
+/// this used to reject for want of a leading `/`. That made every grant deny on Windows — the
+/// capability token could not name any file on the machine — so a test that reads a file inside its
+/// own workspace was refused with `refusals: 1`. Accepting those forms does not widen what a grant
+/// covers: the comparison stays component-wise on the normalized path, so the subtree rules below
+/// are unchanged, and a relative path is still refused.
 pub fn path_grant_covers(granted: &str, requested: &str) -> bool {
     let g_raw = granted.trim();
     let r_raw = requested.trim();
@@ -274,7 +281,7 @@ pub fn path_grant_covers(granted: &str, requested: &str) -> bool {
     if g_raw.is_empty() || r_raw.is_empty() {
         return false;
     }
-    if !g_raw.starts_with('/') || !r_raw.starts_with('/') {
+    if !is_absolute_path(g_raw) || !is_absolute_path(r_raw) {
         return false;
     }
 
@@ -284,7 +291,34 @@ pub fn path_grant_covers(granted: &str, requested: &str) -> bool {
     if g == "/" {
         return true;
     }
+    // A drive root (`C:/`, normalized from `C:\`) covers that drive: the subtree test below would
+    // otherwise compare `C:/secret` against the prefix `C://`, which never matches.
+    if g.len() == 3 && g.ends_with(":/") {
+        return r.len() >= 3 && r[..2].eq_ignore_ascii_case(&g[..2]);
+    }
     r == g || r.starts_with(&format!("{g}/"))
+}
+
+/// Is this path absolute in a form the policy engine can compare?
+///
+/// Unix: a leading `/`. Windows: a drive-letter path (`C:\work`, `C:/work`) or a UNC path
+/// (`\\server\share`). A relative path is not absolute, and that is the point of asking — the engine
+/// compares *text*, and resolving a relative path would need a working directory it cannot see.
+fn is_absolute_path(p: &str) -> bool {
+    if p.starts_with('/') {
+        return true;
+    }
+    let bytes = p.as_bytes();
+    // `C:\` or `C:/` — a drive letter, a colon, then a separator. `C:` alone is drive-relative.
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return true;
+    }
+    // A UNC path: two leading separators, then a host.
+    p.starts_with("\\\\") || p.starts_with("//")
 }
 
 fn normalize_path(p: &str) -> String {
@@ -292,7 +326,20 @@ fn normalize_path(p: &str) -> String {
     if trimmed.is_empty() {
         return "/".to_string();
     }
+    // Separators are unified, but a drive-letter path keeps its shape: turning `C:\work` into
+    // `/C:/work` would stop it matching the equally-normalized requested path only by luck, and
+    // would misrepresent it as living under a Unix root.
     let mut s = trimmed.replace('\\', "/");
+    if is_windows_drive_path(&s) {
+        // Uppercase the drive so `c:\work` and `C:\work` are one path, as Windows treats them.
+        let mut chars = s.chars();
+        let drive = chars.next().unwrap_or_default().to_ascii_uppercase();
+        s = format!("{drive}{}", chars.as_str());
+        while s.len() > 3 && s.ends_with('/') {
+            s.pop();
+        }
+        return s;
+    }
     while s.len() > 1 && s.ends_with('/') {
         s.pop();
     }
@@ -300,6 +347,12 @@ fn normalize_path(p: &str) -> String {
         s.insert(0, '/');
     }
     s
+}
+
+/// Is this already-separator-unified path a Windows drive path (`C:/work`)?
+fn is_windows_drive_path(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/'
 }
 
 fn has_parent_component(p: &str) -> bool {
@@ -372,6 +425,44 @@ mod tests {
         // Contained decisions must not depend on an unseen working directory.
         assert!(!path_grant_covers("workspace", "/workspace/x"));
         assert!(!path_grant_covers("/workspace", "workspace/x"));
+        // The Windows equivalents, which the absolute-path check must also refuse.
+        assert!(!path_grant_covers("work", r"C:\work\x"));
+        assert!(!path_grant_covers(r"C:\work", r"work\x"));
+        // `C:` alone is drive-*relative* in Windows, so it is not absolute.
+        assert!(!path_grant_covers(r"C:", r"C:\work\x"));
+    }
+
+    #[test]
+    fn windows_absolute_paths_are_covered_inside_their_subtree() {
+        // Regression test. This used to require a leading `/`, so on Windows *every* grant was
+        // denied — the token could not name any file on the machine, and a test reading a file in
+        // its own workspace came back with `refusals: 1`.
+        assert!(path_grant_covers(r"C:\work", r"C:\work\src\main.rs"));
+        assert!(path_grant_covers(r"C:\work", r"C:\work"));
+        // Separators and drive case are the same path to Windows, so they must compare equal.
+        assert!(path_grant_covers(r"C:\work", "C:/work/src/main.rs"));
+        assert!(path_grant_covers("c:/work", r"C:\work\src"));
+        assert!(path_grant_covers(r"C:\work\", r"C:\work\src"));
+        // A UNC path is absolute too.
+        assert!(path_grant_covers(
+            r"\\server\share",
+            r"\\server\share\dir\file.txt"
+        ));
+    }
+
+    #[test]
+    fn windows_paths_keep_the_same_subtree_containment_rules() {
+        // Accepting a drive-letter path must not widen what a grant covers. These are the same
+        // leaks the Unix cases above guard, in Windows spelling.
+        assert!(!path_grant_covers(r"C:\work\a", r"C:\work\ab"));
+        assert!(!path_grant_covers(r"C:\work\a", r"C:\work\abc\secret"));
+        assert!(!path_grant_covers(r"C:\work", r"D:\work\x"));
+        assert!(!path_grant_covers(r"C:\work", r"C:\work2\x"));
+        // A grant does not reach above itself.
+        assert!(!path_grant_covers(r"C:\work\sub", r"C:\work"));
+        // And a drive root is not a universal grant, unlike `/` on Unix.
+        assert!(!path_grant_covers(r"C:\", r"D:\secret"));
+        assert!(path_grant_covers(r"C:\", r"C:\secret"));
     }
 
     #[test]
