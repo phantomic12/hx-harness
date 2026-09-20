@@ -16,6 +16,7 @@ members = [
     "crates/hx-server",
     "apps/hxd",
     "apps/hx",
+    "apps/hx-desktop",
 ]
 
 [workspace.package]
