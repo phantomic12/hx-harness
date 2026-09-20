@@ -23,3 +23,10 @@ futures.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The live remote suite (`tests/remote_live.rs`) drives `SshHost` against a real host and
+# `SandboxSpec`/`RemoteSandboxRuntime` in one process, so the test crate needs both crates.
+# This is a `[dev-dependencies]` only — it never reaches the published library, which is exactly
+# why it does not violate the module's no-`hx-remote`-in-the-library rule: the library edge
+# is the inversion; a test that links the two together is what proves they fit.
+hx-remote.workspace = true
+hx-secrets.workspace = true

@@ -227,6 +227,39 @@ connection negotiated and recorded `ssh-ed25519`.
 Still not covered by any run: a Windows SSH server, a jump host, and `ssh-agent` auth (which returns
 an explicit "not implemented" error rather than a wrong answer).
 
+**The remote sandbox runtime, against a real remote Docker daemon** (`crates/hx-sandbox/tests/remote_live.rs`)
+
+`RemoteSandboxRuntime` renders the same settings the local runtime maps to as docker CLI command
+lines and hands them to a transport; the unit tests assert those lines token-for-token against a
+recording fake. That proves the words we send are the words we reviewed, not that a far `docker`
+accepts them or that the far daemon enforces the flags. This suite connects a **real `SshHost`** to
+a host with Docker and drives the runtime for real, inspecting the container on the far host to verify
+the security properties independently of the command string.
+
+Run it exactly like `ssh_live.rs`, naming a machine that has Docker reachable without sudo:
+
+```console
+$ HX_SSH_TEST_HOST=100.99.145.19 \
+  HX_SSH_TEST_USER=yoav \
+  HX_SSH_TEST_KEY=~/.ssh/yoav \
+  cargo test -p hx-sandbox --test remote_live -- --ignored --nocapture --test-threads=1
+```
+
+The host's user must be able to `docker` without sudo (be in the `docker` group), and the test
+image (`ubuntu:24.04`, override with `HX_DOCKER_TEST_IMAGE`) must be pullable by that daemon.
+
+| What ran (rainbowone, `100.99.145.19`, Docker 29.3.1) | Observed |
+|---|---|
+| **Full lifecycle over SSH: create → start → exec → stop → remove** | The container existed on the far host after create and after stop; `exec` ran `REMOTE_ALIVE; id -u` → `1000`; gone after remove; a second remove left it removed (idempotent, no leak) |
+| **Security flags as the far daemon stored them** (`docker inspect` parsed from the far host, not re-read from the command) | `ReadonlyRootfs==true`, `Privileged==false`, `CapDrop` contains `ALL`, `NetworkMode=="none"`, `PidsLimit==128`, workspace bind-mounted; a real `touch /definitely-not-allowed` was denied while `/workspace` stayed writable and the write reached the remote host's directory |
+| **Remote egress is fail-closed before anything runs** | A spec with a non-empty egress allowlist was refused at `create` (`not implemented yet`) and nothing was created on the far host |
+| **A real finding: `--userns=private`** | L2/L3 sends `--userns=private`, which a daemon **without** `userns-remap` in `daemon.json` refuses at create with `--userns: invalid USER mode`. The module claimed the CLI flag was a no-op on such a daemon — it is not (see the ROADMAP entry). The finding is pinned by `the_far_daemon_rejects_l2_userns_remapping_when_it_is_not_configured` and leaves nothing behind |
+
+**This suite cannot run in CI.** It needs a machine on the private tailnet (`100.99.x.x`) that CI
+runners cannot reach, so there is deliberately **no** integration.yml job for it — a job that only
+skips would add noise without evidence. An operator runs it by hand against a reachable host, as above.
+No container or workspace is left on the host when it finishes.
+
 **Search, against a real SearXNG and the real internet** (`crates/hx-search/tests/search_live.rs`)
 
 A SearXNG in Docker, JSON output enabled, the canary pointed at it: **10 fused results for one

@@ -300,9 +300,22 @@ impl SandboxSpec {
                 // `--userns=keep-id` and putting that in `security_opt` is what a Docker daemon
                 // rejects outright:
                 //   invalid --security-opt 2: "userns=keep-id"
-                // Docker's API takes the intent as `HostConfig.UsernsMode = "private"`: accepted on
-                // a daemon with no remap configured (where it is a no-op), and honoured on one that
-                // has it. So the request is always expressible and never fatal.
+                // Docker's API takes the intent as `HostConfig.UsernsMode = "private"`. **That is
+                // not the same thing as the CLI flag, and the difference is fatal:** a live run
+                // against a daemon with no `userns-remap` in `daemon.json` (rainbowone, Docker
+                // 29.3.1) refuses `docker create --userns=private` with
+                //   docker: --userns: invalid USER mode          (exit 125)
+                // so the CLI spelling is *not* a harmless no-op on an unconfigured daemon, which is
+                // what this comment used to claim. The API value and the CLI flag are interpreted
+                // differently, and only the API path is tolerant.
+                //
+                // Consequence for `RemoteSandboxRuntime`, which speaks the CLI: an L2/L3 profile
+                // against a daemon without remap configured fails at `create` with an engine error
+                // rather than silently downgrading. That is the honest failure — it must not
+                // degrade to L1 on its own, because the level is the promise the operator made.
+                // Pinned by `the_far_daemon_rejects_l2_userns_remapping_when_it_is_not_configured`
+                // in `crates/hx-sandbox/tests/remote_live.rs`. Whether the runtime should instead
+                // *refuse* such a profile up front (naming the daemon's missing remap) is open.
                 settings.userns_mode = Some(USERNS_REMAPPED.to_string());
             }
             IsolationLevel::L3 => {
