@@ -143,6 +143,7 @@ mod tests {
             targets: vec![],
             reversible: false,
             undo: None,
+            unattended: None,
             confined: Default::default(),
             default_on_timeout: hx_core::approval::ApprovalOption::Deny,
             timeout_secs: None,

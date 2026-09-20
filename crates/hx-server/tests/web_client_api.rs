@@ -8,6 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use hx_agent::{ApprovalQueue, ModelCall};
+use hx_core::approval::{
+    ActionRequest, ApprovalPolicy, ApprovalRequest, ApprovalSession, AutonomyLevel, Verdict,
+};
 use hx_core::error::{HxError, Result};
 use hx_core::ids::{CredentialId, ProviderId};
 use hx_provider::{ChatRequest, ChatResponse, ModelRouter, ProviderRegistry};
@@ -63,6 +66,10 @@ search:
 
 struct Server {
     addr: String,
+    /// The daemon behind the address, so a test can put something into a shared structure (the
+    /// approval queue) and then read it back over HTTP — which is the only way to tell "the route
+    /// serves it" from "the page's script believes it".
+    state: Arc<AppState>,
     _dir: tempfile::TempDir,
 }
 
@@ -122,6 +129,7 @@ async fn harness_with_token(token: Option<&str>) -> Server {
 
     Server {
         addr: addr.to_string(),
+        state,
         _dir: dir,
     }
 }
@@ -233,5 +241,127 @@ async fn the_page_carries_the_bearer_token_on_every_call_it_makes() {
     assert!(
         !body.contains("await fetch(`${API}"),
         "a call site bypasses apiFetch, and would be sent without the token"
+    );
+}
+
+/// The remaining unattended budget travels with the question, and it is the run's own number.
+///
+/// The tempting wrong test is a grep of the served page for the word `unattended`, which passes for
+/// a number typed into the HTML just as readily as for a real one. So this drives the value the way
+/// the daemon produces it — `hx-core`'s [`ApprovalSession`] decides, its own counter is what the
+/// question carries — puts the questions where a run puts them (the shared queue, scoped to a
+/// session), and reads them back off `/v1/approvals`.
+///
+/// The control is the cadence. The two sessions differ in exactly one field, the unattended budget,
+/// and the served remainders have to differ by the same amount. A number baked into the page, or a
+/// route that dropped the field, cannot satisfy both of the first two assertions.
+///
+/// The page half is deliberately weaker, and stated as such: the browser stack is not available
+/// here, so the page's script is not *driven*. What is asserted is that the served page reads the
+/// exact field name the payload carries — which proves the page is not reading a field nobody
+/// sends, and does **not** prove the card renders. Rendering is the browser's, and this is the
+/// limit of what a test without one can claim.
+#[tokio::test]
+async fn the_remaining_unattended_budget_travels_with_the_question_and_tracks_the_policy() {
+    let server = harness().await;
+    let now = chrono::Utc::now();
+
+    // A question asked by a session with `budget`, one unreviewed action into it. Built through
+    // `decide` rather than as a literal, so what the route serves is the shape a run produces and
+    // not a fixture that can drift away from it.
+    let asked = |budget: u64| -> ApprovalRequest {
+        let policy = ApprovalPolicy::at(AutonomyLevel::Balanced).with_unattended_budget(budget);
+        let mut session = ApprovalSession::new(policy);
+        // `ls` is below `balanced`'s threshold, so nobody is asked and the budget is spent by one.
+        assert!(
+            session
+                .decide(&ActionRequest::shell("ls"), now)
+                .is_allowed(),
+            "the fixture needs one auto-approved action to have spent part of the budget"
+        );
+        match session.decide(&ActionRequest::shell("rm -rf ./build"), now) {
+            Verdict::Ask(request) => *request,
+            other => panic!("a destructive command must be asked about, got {other:?}"),
+        }
+    };
+    let tight = asked(3);
+    let loose = asked(10);
+
+    // Where a run's question goes. `decide_in` waits for an answer, so it is driven from a task and
+    // the shared queue is what the test then reads — the same object `/v1/approvals` serves from.
+    let action = ActionRequest::shell("rm -rf ./build");
+    for (request, session) in [(&tight, "ses_tight"), (&loose, "ses_loose")] {
+        let queue = Arc::clone(&server.state.approvals);
+        let request = request.clone();
+        let action = action.clone();
+        tokio::spawn(async move { queue.decide_in(&request, &action, Some(session)).await });
+    }
+    // The queue records the question synchronously, before it starts waiting, so yielding is enough
+    // to let the spawned tasks reach that point. Yields and not sleeps: nothing here asserts on how
+    // long anything took, so a loaded machine cannot make this flake.
+    for _ in 0..1_000 {
+        if server.state.approvals.len() == 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        server.state.approvals.len(),
+        2,
+        "both questions must be waiting before the route is asked for them"
+    );
+
+    let payload: serde_json::Value = reqwest::Client::new()
+        .get(format!("http://{}/v1/approvals", server.addr))
+        .send()
+        .await
+        .expect("a response")
+        .json()
+        .await
+        .expect("the approvals route answers with JSON");
+    let items = payload
+        .as_array()
+        .expect("the approvals route answers with the list of questions");
+    let served = |id: &str| -> (u64, u64) {
+        let item = items
+            .iter()
+            .find(|item| item["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("no served question with id {id}: {payload}"));
+        let unattended = &item["unattended"];
+        (
+            unattended["budget"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("no budget on the served question: {item}")),
+            unattended["remaining"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("no remaining budget on the served question: {item}")),
+        )
+    };
+
+    assert_eq!(
+        served(tight.id.as_str()),
+        (3, 2),
+        "the cadence is the policy's and the remainder is the session's: one of three spent"
+    );
+    assert_eq!(served(loose.id.as_str()), (10, 9));
+    assert_ne!(
+        served(tight.id.as_str()).1,
+        served(loose.id.as_str()).1,
+        "two cadences that differ must produce two remainders that differ, or the number is a \
+         constant rather than the run's"
+    );
+
+    // And the page reads that field. Not a claim that the card renders — see the note above.
+    let page = reqwest::Client::new()
+        .get(format!("http://{}/", server.addr))
+        .send()
+        .await
+        .expect("a response")
+        .text()
+        .await
+        .expect("a body");
+    assert!(
+        page.contains("req.unattended"),
+        "the page's approval card must read the field the daemon sends"
     );
 }
