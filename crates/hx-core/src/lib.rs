@@ -27,7 +27,7 @@ pub use capability::{
     path_grant_covers, Action, Capability, CapabilityToken, Constraints, Decision, DenyReason,
     Resource,
 };
-pub use config::{Config, ModelRef, SandboxProfile, SecretRef};
+pub use config::{Config, McpServerConfig, McpTransport, ModelRef, SandboxProfile, SecretRef};
 pub use error::{HxError, Result};
 pub use event::{AgentEvent, StopReason};
 pub use ids::{

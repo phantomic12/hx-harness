@@ -5,5 +5,37 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# The fake MCP server the tests drive over a real pipe.
+#
+# It lives outside `src/` on purpose: it is not part of the library, it is the *other end of the
+# wire* the library is tested against. `test = false` keeps `cargo test` from trying to run it as a
+# test binary; `env!("CARGO_BIN_EXE_hx-mcp-fake-server")` is how `tests/stdio.rs` finds it.
+[[bin]]
+name = "hx-mcp-fake-server"
+path = "tests/support/fake_mcp_server.rs"
+test = false
+
 [dependencies]
 hx-core.workspace = true
+hx-secrets.workspace = true
+# `hx-mcp` sits above `hx-tools` in `ARCHITECTURE.md` §1's crate graph, so a remote tool may
+# implement `hx_tools::Tool` directly rather than being adapted at the call site. That is the whole
+# point of the edge: an MCP tool is a tool, not a special case the loop has to know about.
+hx-tools.workspace = true
+rmcp.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+indexmap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# The streamable-HTTP suite runs a *real* MCP server over a real socket: `rmcp`'s own server
+# transport on `axum`. Both are already in the workspace graph, so this adds no crate to it.
+axum.workspace = true
+reqwest.workspace = true
+tempfile.workspace = true

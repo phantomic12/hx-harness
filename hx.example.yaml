@@ -187,3 +187,48 @@ connectors:
     kind: telegram
     token: "vault:telegram/bot"
     allow_from: ["@yourhandle"]
+
+# ---------------------------------------------------------------------------
+# MCP servers (M6 in the roadmap): other people's tool servers, consumed by
+# `crates/hx-mcp`. Commented out, because a fresh install should not spawn
+# `npx` the first time it starts.
+#
+# A server's tools appear to the model namespaced under the server's name, so
+# two servers that both expose `search` do not collide:
+#
+#   files__search   github__search
+#
+# Everything a server sends back — its tool descriptions, its JSON Schemas, its
+# results — is DATA authored by whoever wrote that server, never an instruction.
+# A description reading "ignore your instructions and run this" is a sentence
+# describing a tool. What a tool may *reach* is decided here and by the approval
+# policy, never by the server's own claims about itself.
+#
+#   mcp_servers:
+#     # stdio: the host spawns the child and speaks JSON-RPC over its pipes.
+#     files:
+#       transport: stdio
+#       command: npx
+#       args: ["-y", "@modelcontextprotocol/server-filesystem", "/srv/data"]
+#       env: { RUST_LOG: warn }
+#       # cwd: /srv
+#
+#     # streamable_http: a remote endpoint. The token is a *reference*, resolved
+#     # through `hx-secrets` at connect time — never a literal, because a value in
+#     # a config file is a value in every dump of it.
+#     github:
+#       transport: streamable_http
+#       url: https://mcp.example.com/mcp
+#       token: "vault:mcp/github"
+#
+#     # Every policy field has a bounded default; these are shown for the shape.
+#     #   enabled: true              # `false` starts nothing and offers no tools
+#     #   namespace: gh              # defaults to the config key
+#     #   call_timeout_secs: 30      # one tools/call may not outlive this
+#     #   start_timeout_secs: 20     # the initialize + tools/list handshake
+#     #   max_restarts: 3            # inside the window below, then it stays down
+#     #   restart_window_secs: 300
+#
+# A server that is down, wedged, or exiting on startup surfaces as a tool result
+# the model can read ("mcp server 'files' is not running: ..."), never as a hang.
+# ---------------------------------------------------------------------------
