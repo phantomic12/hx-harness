@@ -31,6 +31,7 @@
 pub mod aggregate;
 pub mod backend;
 pub mod backends;
+pub mod extract;
 pub mod types;
 
 pub use aggregate::{fanout, BackendFailure, SearchReport, DEFAULT_BACKEND_TIMEOUT};
@@ -40,6 +41,10 @@ pub use backend::{
 pub use backends::{
     BraveBackend, DuckDuckGoBackend, GoogleCseBackend, HnAlgoliaBackend, MarginaliaBackend,
     MojeekBackend, SearxngBackend, WikipediaBackend,
+};
+pub use extract::{
+    looks_like_markup, Extracted, ExtractionRung, FetchedPage, Ladder, PlainRung, ReadabilityRung,
+    Rung, MAIN_SHARE, MIN_MAIN_CHARS,
 };
 pub use types::{
     canonicalize_url, fuse, host_matches, FusedResult, Recency, SearchQuery, SearchResult, RRF_K,
