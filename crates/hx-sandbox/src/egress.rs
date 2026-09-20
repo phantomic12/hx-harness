@@ -6,26 +6,58 @@
 //! operator names explicitly with `egress:` in a profile, and until now it was refused because
 //! nothing could keep it.
 //!
-//! The mechanism, and why it is a *guarantee* rather than a promise:
+//! The mechanism, and what it actually guarantees:
 //!
-//! 1. [`setup`] creates a user-defined Docker network with `Internal: true`. An internal network
-//!    has **no gateway**, so a container attached to it cannot route a packet to anything off the
-//!    network — there is literally no route. This is the same mechanism [`docker_live`] proves for
+//! 1. [`setup`] creates a user-defined Docker network with `Internal: true`. A container attached
+//!    to it gets **no default route**, so it cannot route a packet to anything off the network —
+//!    there is no route for it to take. This is the same mechanism [`docker_live`] proves for
 //!    `network: none`, applied to a network the sandbox *can* talk to.
 //! 2. The sandbox container is created **on** that internal network (via `network_mode`), so it
-//!    can reach the other endpoint and nothing else.
+//!    can reach the other endpoint and nothing else *off-network*.
 //! 3. A *proxy sidecar* container is started on both the internal network and the default bridge.
 //!    It is the only node on the internal network with a path off it. Its job is
 //!    [`hx-egress-proxy`](crate::bin), the [`egress_proxy`](crate::bin::egress_proxy)
 //!    binary, which answers `CONNECT` requests only for hosts on the allowlist and answers `403`
 //!    for everything else.
-//! 4. The sandbox is pointed at the proxy with `HTTPS_PROXY`/`HTTP_PROXY` env vars, and
-//!    (critically) **cannot bypass it**: with no gateway the only route out is through the sidecar,
-//!    which is the thing enforcing the list.
+//! 4. The sandbox is pointed at the proxy with `HTTPS_PROXY`/`HTTP_PROXY` env vars, and it
+//!    **cannot reach the internet any other way**: with no default route there is no route out, so
+//!    the sidecar is the only exit and it is the thing enforcing the list.
 //!
-//! The net effect is true default-deny egress with an explicit grant. A process inside the sandbox
-//! has no way to reach the internet except by asking the proxy, and the proxy admits only what the
-//! allowlist names.
+//! The net effect is default-deny **internet** egress with an explicit grant. A process inside the
+//! sandbox has no way to reach the internet except by asking the proxy, and the proxy admits only
+//! what the allowlist names.
+//!
+//! ## The claim that used to stand here, and why it was wrong
+//!
+//! This module used to say the sandbox "**cannot bypass it**: with no gateway the only route out is
+//! through the sidecar", and that "a container attached to it cannot route a packet to anything off
+//! the network — there is literally no route". **That was false, and it was measured false.** No
+//! default route is not the same thing as no reachable address: an internal network's IPAM config
+//! still assigns a gateway, and that gateway is the **far host's own bridge interface on the same
+//! on-link subnet as the sandbox**. On-link delivery needs no route at all — the container ARPs for
+//! the address and the packet is delivered — so the host's own listening services are reachable from
+//! inside the sandbox.
+//!
+//! Measured on rainbowone, from inside a sandbox on its own `-egress` internal network
+//! (`10.200.7.0/24`, gateway `10.200.7.1`): `gateway:22` was **OPEN**, with a banner matching the
+//! host's own `127.0.0.1:22`, along with `4330`, `9191`, `20140` and `44321-44323`.
+//! Container-*published* ports are dropped by Docker's network isolation; **host-native services are
+//! not.** The internet half of the old claim is true and stays true: `1.1.1.1:443` answers
+//! `Network is unreachable`, and `/proc/net/route` inside the sandbox holds exactly one route — the
+//! on-link subnet — with no `00000000` default.
+//!
+//! So the honest statement is: **no *internet* route except the sidecar; the far host's own bridge
+//! address remains reachable from inside the sandbox.** That is a known hole. It is pinned by
+//! `a_sandbox_reaches_the_far_hosts_own_bridge_address_and_that_is_a_known_hole` in
+//! `crates/hx-sandbox/tests/remote_live.rs`, so it stays *known* rather than assumed, and it is
+//! filed as an open security item in `ROADMAP.md`. **Do not "fix" this text back to the stronger
+//! claim** — the stronger claim was the defect.
+//!
+//! The two ways to close it, and why neither is taken here: a `DOCKER-USER` rule on the far host
+//! needs far-host root and has to be installed per host (so the module would depend on a
+//! configuration it cannot verify); running the sandbox with a network namespace it controls itself
+//! is the privileged route, and it would weaken the isolation this module exists to provide. Both are
+//! recorded in `ROADMAP.md` rather than half-done here.
 //!
 //! ## What is deliberately NOT enforced here
 //!
@@ -99,7 +131,10 @@ pub async fn setup(
     let network = format!("{name_base}-egress");
     let container = format!("{name_base}-egress-proxy");
 
-    // 1. The internal network: no gateway, so no route off it. Creating it fresh per sandbox
+    // 1. The internal network: no *default* route, so nothing off it is routable. (It is not
+    //    unreachable in every direction — the gateway address is the host's own bridge interface on
+    //    the same on-link subnet, and that stays reachable; see this module's doc, which records the
+    //    measurement and the ROADMAP's open security item.) Creating it fresh per sandbox
     //    (rather than sharing one) keeps one sandbox's proxy and allowlist from ever becoming another
     //    sandbox's route — each sandbox owns its enforcement, which is the only way the allowlist
     //    stays the sandbox's own reviewed guarantee.

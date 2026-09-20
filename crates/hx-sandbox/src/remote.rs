@@ -40,7 +40,7 @@
 //! ## Remote egress enforcement
 //!
 //! A remote sandbox reaches helpful sites through the *same* mechanism as a local one — an internal
-//! Docker network with no gateway, plus a proxy sidecar — but placed **on the far host** instead of
+//! Docker network with no default route, plus a proxy sidecar — but placed **on the far host** instead of
 //! the near one. The premise of this module was that a proxy sidecar is "fundamentally a local-
 //! socket mechanism"; it is not. The sidecar is created by a few docker CLI commands, which is
 //! exactly what a far daemon already accepts. The only genuinely remote-host-specific requirement is that
@@ -334,9 +334,13 @@ pub fn create_command(
     for opt in &settings.security_opt {
         tokens.push(format!("--security-opt={}", shell_quote(opt)));
     }
-    // With an active allowlist the sandbox rides the internal egress network — no gateway, so the
-    // only way out is the proxy sidecar that enforces the list. Otherwise the spec's network mode
-    // (bridge, or none for an isolated sandbox) applies unchanged.
+    // With an active allowlist the sandbox rides the internal egress network: **no default route**,
+    // so the only way out *to the internet* is the proxy sidecar that enforces the list. It is not a
+    // claim of total unreachability — the far host's own bridge address sits on the same on-link
+    // subnet and stays reachable from inside the sandbox. That is a known hole, measured and pinned
+    // (see `crate::egress`'s module doc and the open security item in `ROADMAP.md`), and the old
+    // wording here said the opposite. Otherwise the spec's network mode (bridge, or none for an
+    // isolated sandbox) applies unchanged.
     let network = if egress {
         egress_network_name(name)
     } else {
@@ -502,7 +506,7 @@ pub fn egress_setup_commands(name: &str, allowlist: &[String], proxy_bin: &str) 
     let sidecar = egress_sidecar_name(name);
     let allow_env = allowlist.join(",");
     vec![
-        // 1. The internal network: no gateway, so no route off it. Fresh per sandbox, so one
+        // 1. The internal network: no *default* route, so nothing off it is routable. Fresh per sandbox, so one
         //    sandbox's proxy and allowlist never become another sandbox's route.
         format!(
             "{DOCKER} network create --internal --attachable=false {}",
@@ -916,7 +920,8 @@ mod tests {
     #[test]
     fn an_enforceable_egress_allowlist_is_accepted_and_rides_the_internal_network_with_proxy_env() {
         // The heart of this milestone: a non-empty allowlist that the proxy *can* match (a hostname)
-        // is no longer refused. The sandbox is placed on its internal egress network (no gateway,
+        // is no longer refused. The sandbox is placed on its internal egress network (no *default*
+        // route — the host's own bridge address stays reachable on-link, see `crate::egress`),
         // so no route out except the sidecar) and handed the proxy env vars so tools inside actually talk
         // to it. Assert the rendered command, so a dropped proxy var or a reused plain `bridge` cannot
         // return silently — either would be a half-enforced open sandbox.

@@ -262,7 +262,7 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
   turns a skip into a failure so the strongest claim in the ladder cannot quietly stop being
   tested.
 - **Egress filtering.** **Enforced** for hostname allowlists: the sandbox is created on an internal
-  Docker network with no gateway, and the only route out is a proxy sidecar that admits a `CONNECT`
+  Docker network with no default route, and the only route out *to the internet* is a proxy sidecar that admits a `CONNECT`
   target only if the allowlist matches. A profile that names four hostnames reaches those four and
   nothing else. A sandbox with no allowlist still has no network at all. CIDRs and raw IPs are still
   *refused* (`SpecError::EgressNotEnforced`) — the proxy decides a `CONNECT` target by name, so

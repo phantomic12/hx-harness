@@ -1,9 +1,10 @@
 //! The egress proxy that enforces a sandbox's allowlist.
 //!
-//! A sandbox on an [`crate::egress`] internal network cannot reach the internet directly —
-//! the network has no gateway. The *only* path out is this proxy, which sits on both that
-//! internal network and the normal bridge, and which admits connections only to destinations on the
-//! allowlist it was started with.
+//! A sandbox on an [`crate::egress`] internal network cannot reach the internet directly — the
+//! network has no default route. The *only* path out to the internet is this proxy, which sits on
+//! both that internal network and the normal bridge, and which admits connections only to
+//! destinations on the allowlist it was started with. (The far host's own bridge address remains
+//! reachable on-link; see `crate::egress`'s module doc for the measurement and the ROADMAP item.)
 //!
 //! Why a separate binary rather than a thread in the daemon: the proxy must live *inside a
 //! container* to hold a foot on both networks (internal for the sandbox, bridge for the

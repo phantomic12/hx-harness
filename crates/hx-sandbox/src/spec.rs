@@ -170,7 +170,7 @@ pub struct SandboxSpec {
     /// Egress allowlist — hostnames or `*.domain` globs the sandbox may reach. Empty means no
     /// egress.
     ///
-    /// Enforced by placing the sandbox on an internal Docker network (no gateway) and routing its
+    /// Enforced by placing the sandbox on an internal Docker network (no *default* route) and routing its
     /// outbound traffic through a proxy sidecar that admits only these destinations — see
     /// [`crate::egress`]. An entry that is not a hostname or a `*.domain` globe (a CIDR, an
     /// IP) cannot be enforced through that proxy, so such an allowlist is refused by
