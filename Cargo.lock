@@ -1289,7 +1289,13 @@ dependencies = [
 name = "hx-browser"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "hx-core",
+ "reqwest",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "url",
 ]
 
 [[package]]

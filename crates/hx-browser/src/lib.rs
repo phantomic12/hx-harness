@@ -60,6 +60,7 @@
 pub mod error;
 pub mod interactive;
 pub mod ladder;
+pub mod pool;
 pub mod profile;
 pub mod rung;
 pub mod target;
@@ -70,6 +71,7 @@ pub use interactive::{
     DEFAULT_HUMAN_BUDGET,
 };
 pub use ladder::{Attempt, FetchReport, Ladder, DEFAULT_RUNG_TIMEOUT};
+pub use pool::BrowserPool;
 pub use profile::{PoolRoot, ProfileError, SessionProfile, COOKIE_FILE};
 pub use rung::{FetchRequest, Fetcher, RungKind, UntrustedPage};
 pub use target::{Admission, BlockReason, TargetRefusal, TargetUrl};

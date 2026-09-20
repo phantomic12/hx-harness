@@ -319,6 +319,12 @@ command with a button, receive a cron digest in a separate pinned thread.
     target admission refused never escalates at all. Admission itself is structural — `TargetUrl`
     is the only thing a rung can be pointed at, and it refuses `file://`, loopback, link-local and
     the metadata service by construction.
+  - ◐ **The pool.** `BrowserPool` composes the two: a session's profile outlives a fetch, so a login
+    or a cleared challenge earned during one fetch is still there for the session's next one, and
+    admission runs *before* anything is created or launched, so a refused target leaves no profile
+    directory behind and reaches no rung. The session map is a `Mutex` held across one
+    `create_dir_all`, because minting the directory outside the lock would let two concurrent
+    callers for one session get two handles to the same path.
   - ◐ **Human-in-the-loop.** The escalation surface a browser pane plugs into, with the contract
     written down: what it receives (a redacted URL, the *session's own* profile directory, the
     rung's reason, a budget), what it returns, and what happens on timeout. The rung enforces the

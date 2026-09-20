@@ -125,6 +125,18 @@ per challenge. A person who clears the wall ends the rung with a reason saying w
 re-run the ladder in that session — because reading the page needs a CDP driver this crate does not
 have yet, and saying so is better than returning an empty page.
 
+**The pool** (`src/pool.rs`, 11 tests). The two things the pool adds over the ladder, both asserted
+rather than described. *Identity*: the same session id returns the same handle (`Arc::ptr_eq`, not a
+path comparison — the handle is what the rungs are handed) and eight concurrent callers get that one
+handle, while distinct ids get distinct directories. *Admission before anything exists*: for
+`file://`, the metadata address, loopback and `localhost` the report carries **no attempts** and the
+pool holds **no session**, asserted under a rung that panics if it is called at all. The first
+version of that test built its pool with `Admission::AllowLocal` and therefore asserted nothing —
+`AllowLocal` admits the metadata address by design, the rung ran, and the rung's own panic is what
+failed the gate. The refusal test now uses the default policy, and a helper exists for each. A
+session id that escapes the root is reported as a stopped fetch rather than a panic, and a token in
+the query never renders in a report's summary or its `Debug`.
+
 ## The four tiers
 
 Every claim in the repo falls into one of these. The gap that bites is B→C.

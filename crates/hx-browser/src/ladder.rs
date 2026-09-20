@@ -77,10 +77,19 @@ impl FetchReport {
     /// The refusal is kept as the stop reason rather than turned into a failed *attempt*: an empty
     /// `attempts` is the honest record that nothing was launched, and the tests assert it.
     pub fn refused(target: &str, refusal: &TargetRefusal) -> Self {
+        Self::stopped(target, refusal.to_string())
+    }
+
+    /// A report for a fetch that stopped before any rung ran, for a reason of the caller's.
+    ///
+    /// Used for a session whose profile could not be created: the target was admitted, but there is
+    /// nowhere isolated to fetch it in, and fetching it in a shared profile would be worse than not
+    /// fetching it at all.
+    pub fn stopped(target: &str, reason: impl Into<String>) -> Self {
         Self {
             target: target.to_string(),
             page: None,
-            stop_reason: Some(refusal.to_string()),
+            stop_reason: Some(reason.into()),
             attempts: Vec::new(),
             elapsed_ms: 0,
         }
