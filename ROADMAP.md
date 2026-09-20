@@ -33,7 +33,7 @@ ceiling, unattended budget and expiry; buckets refuse when exhausted and recover
 fail over and bench unhealthy credentials; RRF dedupes `?utm_source=` variants of one URL; a
 failed sandbox create rolls back rather than leaking a container.
 
-**Not landed yet** (typed stubs only): `hx-browser`, `hx-mcp`, `hx-gateway`.
+**Not landed yet** (typed stubs only): `hx-browser`, `hx-gateway`.
 
 **Deliberately unverified at M0:** the concrete HTTP adapters (`OpenAiCompatible`,
 `AnthropicMessages`) and the fetch/parse halves of the search backends. Their *pure* halves —
@@ -304,8 +304,26 @@ command with a button, receive a cron digest in a separate pinned thread.
 
 ## M6 — MCP + browser pool + full search
 
-- `rmcp` host: consume stdio and streamable-HTTP MCP servers, per-server tool namespacing,
-  health checks and restarts
+- ✅ `rmcp` host: consume stdio and streamable-HTTP MCP servers, per-server tool namespacing,
+  health checks and restarts. Landed with a hand-rolled MCP server as the double — real
+  newline-delimited JSON-RPC 2.0 over a real pipe, with scripted misbehaviour modes (silent,
+  garbage, exit-after-init, die-on-tool, hang-on-tool, noisy-stderr) that fail loudly on unscripted
+  input — plus a real `rmcp` server on `axum` for the HTTP happy path. See TESTING.md's `hx-mcp` row.
+- ⬜ **Open, from this item:** a stdio MCP call is `Resource::Process` → `risk_of` → `Mutate`, which
+  the default `balanced` level auto-allows, so an operator who expects a prompt for a stdio server's
+  tools does not get one. This is `hx-agent`'s risk table's answer, not a choice made in `hx-mcp`
+  (reporting anything but `Process` for a child process would name a resource that means something
+  else). **Workaround:** an `ask` rule on the tool name, which the approval engine already supports.
+  **The real fix** is a dedicated `RiskClass` for "runs a third-party binary the operator did not
+  write", which belongs in `hx-agent` alongside the table.
+- ⬜ **Open, from this item:** MCP children inherit the daemon's environment (needed for `npx`/`PATH`
+  and `HOME`), so a secret exported into the daemon's shell reaches every child it spawns. Documented
+  in `hx-mcp/src/stdio.rs` and TESTING.md Tier C. The fix is an allowlist of inherited variables,
+  which needs a decision about which ones `npx`, `uvx` and `node` actually require.
+- ⬜ **Open, from this item:** the live MCP canary (`hx-mcp/tests/mcp_live.rs`) has never been run
+  against a real third-party server. Every wire-level property is currently verified against a double
+  this crate also wrote. Run it against `npx -y @modelcontextprotocol/server-filesystem /tmp` and an
+  HTTP endpoint before calling the host proven.
 - `rmcp` server: expose `hx`'s tools to other agents/IDEs
 - Browser pool: crw (Rust, Firecrawl-compat) → camoufox (stealth) → Chromium (interactive CDP),
   per-container profile isolation, challenge escalation to a human-in-the-loop browser pane
