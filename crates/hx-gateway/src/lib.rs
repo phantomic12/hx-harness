@@ -14,6 +14,9 @@
 //! - [`connector`] — the [`Connector`] trait: what every adapter must do (receive, deliver, ask).
 //! - [`answer`] — the security half: per-channel answer ceilings (a chat bridge can never authorise a
 //!   `Destructive` action) and the delivery policy that keeps cron output from interleaving with chat.
+//! - [`bridge`] — the loop-back: a tap on a phone is matched to the question it names, judged against
+//!   the channel's ceiling, applied to the queue the run is waiting on, and attributed to its channel
+//!   in the audit trail.
 //! - [`telegram`] — the first real connector, proving the trait against the actual Telegram Bot API.
 //!
 //! [`Conversation`]: crate::types::Conversation
@@ -22,11 +25,13 @@
 //! [`SessionKey`]: crate::router::SessionKey
 
 pub mod answer;
+pub mod bridge;
 pub mod connector;
 pub mod router;
 pub mod telegram;
 pub mod types;
 
+pub use bridge::{AnswerOutcome, AnswerSource, AnsweringChannel, ApprovalBridge, ChannelApprover};
 pub use connector::Connector;
 pub use router::{home_key, session_key, SessionKey};
 pub use types::{ChatId, Conversation, Inbound, Platform, Target, ThreadId};

@@ -8,6 +8,10 @@ publish.workspace = true
 [dependencies]
 hx-core.workspace = true
 hx-secrets.workspace = true
+# The bridge applies a channel's answer to the queue a run is waiting on, so this crate depends on
+# the loop crate — never the reverse (`ARCHITECTURE.md` §1: arrows only point down). See
+# `src/bridge.rs` for why the join lives here rather than in the daemon.
+hx-agent.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -15,4 +19,12 @@ reqwest.workspace = true
 sha2.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# The loop-back tests drive a real `AgentLoop` over the real queue, so they need the tool registry and
+# the provider shapes the loop is built from. Both are already in this crate's dependency graph
+# through `hx-agent`, so the tests add no build the crate does not already pay for.
+hx-provider.workspace = true
+hx-tools.workspace = true
+chrono.workspace = true
 

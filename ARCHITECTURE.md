@@ -63,7 +63,7 @@ hx-core          ids, message/event types, errors, config model, capability toke
   ├─ hx-tools      built-in tool implementations
   ├─ hx-agent      the loop: context, compaction, tool dispatch, approvals, subagents
   ├─ hx-mcp        rmcp host (consume MCP servers) + rmcp server (be one)
-  ├─ hx-gateway    Connector trait + platform adapters
+  ├─ hx-gateway    Connector trait + platform adapters + the approval loop-back
   └─ hx-server     axum: REST + WebSocket protocol + static web UI
        ├─ hxd      the daemon binary
        └─ hx       the TUI/CLI binary (a protocol client, not a special case)
@@ -71,6 +71,14 @@ hx-core          ids, message/event types, errors, config model, capability toke
 
 Rule: **arrows only point down.** `hx-agent` never imports `hx-server`. If it did, the
 daemon-and-clients split would rot immediately.
+
+One arrow points sideways, and it is deliberate: `hx-gateway` depends on `hx-agent`, because a channel's
+answer has to be applied to the queue a run is parked on, and the queue is the loop's. The dependency
+never runs the other way — a `Connector` that knew about approval queues would be a connector that is not
+a connector — and the alternatives (a newtype in `hxd`, a crate for one `impl`) would each move the
+channel-policy check further from `AnswerAuthority`, where it is tested. The cost is stated where it is
+paid: building `hx-gateway` alone now builds the tool and remote stack with it. See
+`crates/hx-gateway/src/bridge.rs`.
 
 ---
 

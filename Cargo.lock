@@ -1311,8 +1311,12 @@ name = "hx-gateway"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "chrono",
+ "hx-agent",
  "hx-core",
+ "hx-provider",
  "hx-secrets",
+ "hx-tools",
  "reqwest",
  "serde",
  "serde_json",
