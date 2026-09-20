@@ -437,6 +437,24 @@ command with a button, receive a cron digest in a separate pinned thread.
     argv**, which every other process on the machine can read.
 - Search: SearXNG, DDG, Mojeek, Marginalia, Brave, Google PSE, Wikipedia, plus the
   extraction ladder and URL/ETag caching
+  - ◐ **The URL/ETag cache.** `crates/hx-search/src/cache.rs`: one JSON document per entry under a
+    caller-supplied root, keyed by the URL with its **query stripped** — so a signed URL's token
+    reaches neither a filename nor a log line, at the cost of two URLs differing only in their query
+    sharing one entry, which is accepted deliberately and pinned by a test. A repeat fetch sends
+    `If-None-Match` / `If-Modified-Since`, and a `304` reuses the stored body rather than
+    re-downloading it. A `304` with **nothing stored** is its own outcome
+    (`CacheOutcome::Miss304`, whose `body()` is `None` and never `Some("")`) rather than an empty
+    body a caller could mistake for a page the origin returned. Freshness comes only from the
+    entry's own `Cache-Control: max-age` / `Expires`; with neither, the entry is **revalidated
+    rather than assumed fresh**. Bounded by entry count and body size, evicting oldest-first by
+    `stored_at` on an **injected clock** — not by mtime, which a restore or an `rsync` would
+    reorder — and a body over the cap is **not stored at all** while still being returned, never
+    stored truncated. Hand-rolled throughout: no new dependency, and FNV-1a 64-bit for the filename
+    suffix rather than `sha2` (in the workspace but not in this crate's manifest, and a filename
+    component does not need collision resistance — the `key` field is re-checked on read, so the
+    residual collision is a miss rather than a wrong body). The module doc says plainly that this is
+    **not** an HTTP cache implementation: `Vary`, `no-store`, `Age` and `stale-while-revalidate` are
+    not implemented and not claimed.
 
 **Exit criteria:** a research task runs 6 free backends in parallel, dedupes, RRF-ranks,
 extracts the top 8, and cites them — with zero paid API calls.
