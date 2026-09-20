@@ -225,11 +225,13 @@ attempted capability escalation shows up as a denial event, not a hang.
 **Exit criteria:** drive a Linux box, a Mac, and a Windows host from the browser; no private
 key ever enters the model context or a sandbox.
 
-*Status: five of the seven items are done, and with the remote terminal in place the browser drives a
-remote box for real — browse, run, and an interactive shell — rather than only the first two. The exit
-criteria is still not met: remote sandboxes exist only as a unit-tested runtime (not yet wired into a
-route or verified against a live remote daemon), and Unix-only CI means the Windows transport
-is exercised by unit tests rather than against a live host.*
+*Status: six of the seven items are done, and this is the proof for a non-Linux Unix box: the same
+SSH transport now runs against a real Apple-signed macOS VM in CI (the `macos-ssh` integration job —
+a `macos-latest` runner boots in about a minute, whereas the `dockur/macos` I kept needed a 10-30
+minute interactive GUI install before sshd even existed). The exit criteria is still not met: remote sandboxes
+exist only as a unit-tested runtime (not yet wired into a route or verified against a live remote daemon),
+and the browser has not yet driven a live Windows host (WinRM is verified by unit tests and by a live suite
+that needs a box).*
 
 ---
 
