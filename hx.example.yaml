@@ -109,9 +109,11 @@ sandbox_profiles:
     workspace_mb: 32768
     ttl_secs: 14400
     network: true
-    # No egress allowlist: a sandbox cannot enforce one yet, and an unenforceable constraint is
-    # refused rather than silently ignored. An L1 build container needs the network, so this one
-    # accepts an unrestricted one — knowingly, in writing.
+    # No egress allowlist here: an L1 build container needs the network, so this one accepts an
+    # unrestricted one — knowingly, in writing. An allowlist *is* enforceable now (the sandbox rides
+    # an internal network whose only exit is an `hx-egress-proxy` sidecar that matches the CONNECT
+    # target by name), so uncomment the line below to restrict this profile. A CIDR or raw IP in it
+    # is refused rather than half-enforced — a name-matching proxy cannot decide one.
     # egress: ["crates.io", "static.crates.io", "registry.npmjs.org", "github.com"]
 
   untrusted:

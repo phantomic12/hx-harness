@@ -235,7 +235,7 @@ quietly stop being tested. The sandbox runs as the workspace's owner (not uid 10
 
 ### SSH transport — `crates/hx-remote/tests/ssh_live.rs`
 
-Against a real `sshd` (in CI, a throwaway one on a non-default port). **5 ignored tests.**
+Against a real `sshd` (in CI, a throwaway one on a non-default port). **7 ignored tests.**
 Uses each test's own trust store in a temp dir, so nothing touches `~/.ssh/known_hosts`:
 
 ```console
@@ -257,6 +257,20 @@ instance; the canary starts its own:
 $ HX_SEARXNG_URL=http://127.0.0.1:8888 HX_SEARCH_EXPECT_RESULTS=searxng \
   cargo test -p hx-search --test search_live --offline -- --ignored --test-threads=1
 ```
+
+### Remote PTY, remote terminal, remote sandbox
+
+Three more suites that reach another machine, all `#[ignore]`d:
+
+- `crates/hx-remote/tests/pty_live.rs` — **4 ignored tests** against a throwaway `sshd` (run by
+  `integration.yml`).
+- `crates/hx-server/tests/terminal_remote_live.rs` — **3 ignored tests**: a client POSTs a terminal
+  with a `host`, attaches over the WebSocket and types, with every layer real (run by
+  `integration.yml`).
+- `crates/hx-sandbox/tests/remote_live.rs` — **3 ignored tests**: a real `SshHost` drives
+  create → start → exec → stop → remove against a remote Docker daemon. Needs
+  `HX_SSH_TEST_HOST`/`HX_SSH_TEST_USER`/`HX_SSH_TEST_KEY` and a host on the private tailnet, so
+  **CI cannot run it** — an operator runs it by hand.
 
 ### Provider live — `crates/hx-provider/tests/openai_live.rs` and `anthropic_live.rs`
 
@@ -319,9 +333,11 @@ These are failures documented in the code, `TESTING.md`, or CI config — not sp
   runs as uid 1001). `SandboxSpec::user` is overridable and `adopt_workspace_owner()` is the
   supported way to set it, so the sandbox runs as whoever owns the mount.
 - **An egress allowlist that is (silently) not enforced.** A `network: true` profile plus
-  hostnames used to produce a full bridge network. It is now *refused*
-  (`SpecError::EgressNotEnforced`) rather than accepted-and-ignored, and only actual hostnames /
-  `*.domain` entries are allowed by `SandboxSpec::validate`. CIDRs / raw IPs are refused.
+  hostnames used to produce a full bridge network. It is now *enforced*: the sandbox rides an
+  internal Docker network with no gateway, and the only route out is an `hx-egress-proxy` sidecar
+  that matches the `CONNECT` target by name (`crates/hx-sandbox/src/egress.rs`). Only actual
+  hostnames / `*.domain` entries can be matched that way, so a CIDR or raw IP is *refused*
+  (`SpecError::EgressNotEnforced`) rather than half-enforced.
 - **WinRM over plain HTTP with NTLM fails.** See the WinRM note above: NTLM seals are not
   implemented; use HTTPS + Basic.
 - **`hx doctor` reports the container engine as `FAIL`.** This is expected behaviour (the daemon
