@@ -33,6 +33,7 @@ pub mod backend;
 pub mod backends;
 pub mod cache;
 pub mod extract;
+pub mod research;
 pub mod types;
 
 pub use aggregate::{fanout, BackendFailure, SearchReport, DEFAULT_BACKEND_TIMEOUT};
@@ -47,6 +48,11 @@ pub use cache::{cache_key, CacheOutcome, Clock, SystemClock, UrlCache};
 pub use extract::{
     looks_like_markup, Extracted, ExtractionRung, FetchedPage, Ladder, PlainRung, ReadabilityRung,
     Rung, MAIN_SHARE, MIN_MAIN_CHARS,
+};
+pub use research::{
+    research, BackendOutcome, Citation, Fetcher, HttpFetcher, ResearchReport, ResearchRequest,
+    ResearchTask, DEFAULT_FETCH_CONCURRENCY, DEFAULT_FETCH_TIMEOUT, DEFAULT_MAX_BODY_BYTES,
+    DEFAULT_MAX_SOURCES, DEFAULT_SNIPPET_MAX_CHARS,
 };
 pub use types::{
     canonicalize_url, fuse, host_matches, FusedResult, Recency, SearchQuery, SearchResult, RRF_K,
