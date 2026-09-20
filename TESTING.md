@@ -75,6 +75,21 @@ The `Host`→`RemoteCommandRunner` adapter and the per-host manager routing are 
 
 Not yet exercised against a live remote daemon; that is the remaining M4 step.
 
+## The browser pool (M6)
+
+The escalation ladder and the pool are built; the rungs above the cheap one are not exercised
+against a real browser in this environment, and nothing below claims otherwise.
+
+**Per-session profile isolation** (`crates/hx-browser/src/profile.rs`, 10 tests). The property is
+that two sessions never share a directory, a cookie jar or a storage area, and it is asserted on a
+real filesystem rather than derived: a cookie written for one session is read back by that session
+and is *absent* for another (its file is never even created), a session id of `../other`, `a/b`,
+`/absolute`, `..` or `` is refused by a whitelist rather than a `..` blacklist, an **uppercase** id
+is refused because `Session_A` and `session_a` are one directory on macOS and Windows, and a
+Windows device name (`con`, `nul`, `com1`) is refused by name. Eight sessions are created from
+eight threads at once and every path is distinct, and every directory canonicalises inside the pool
+root.
+
 ## The four tiers
 
 Every claim in the repo falls into one of these. The gap that bites is B→C.
@@ -400,12 +415,13 @@ the failure is silent:
 
 ### Tier D — absent
 
-Three crates are one line each — placeholder `lib.rs` with a doc comment and nothing else:
+Two crates are one line each — placeholder `lib.rs` with a doc comment and nothing else:
 
-`hx-browser` · `hx-gateway` · `hx-mcp`
+`hx-gateway` · `hx-mcp`
 
 They are declared as workspace members, so `cargo test` reports nothing for them and the build is
-green. **A green suite says nothing about them.** Also absent: the web UI, the Tauri desktop/mobile
+green. **A green suite says nothing about them.** `hx-browser` has left this list — see
+[the browser pool](#the-browser-pool-m6). Also absent: the web UI, the Tauri desktop/mobile
 apps, host certificates, `ssh-agent` auth, `WinRMHost`, SSH file transfer to a Windows host (the
 POSIX-only paths refuse via a capability check), and the egress proxy.
 

@@ -7,3 +7,13 @@ publish.workspace = true
 
 [dependencies]
 hx-core.workspace = true
+async-trait.workspace = true
+# `reqwest` is used by the cheap rung only, and that rung builds its own client rather than taking
+# one — see `rungs::http` for why a shared client would silently defeat the per-hop admission guard.
+reqwest.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

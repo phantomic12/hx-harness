@@ -309,6 +309,10 @@ command with a button, receive a cron digest in a separate pinned thread.
 - `rmcp` server: expose `hx`'s tools to other agents/IDEs
 - Browser pool: crw (Rust, Firecrawl-compat) → camoufox (stealth) → Chromium (interactive CDP),
   per-container profile isolation, challenge escalation to a human-in-the-loop browser pane
+  - ◐ **Profiles.** Per-session isolation in `crates/hx-browser/src/profile.rs`: a session's
+    directory, cookie hand-off file and browser storage are derived from its id under one pool
+    root, and the derivation is *asserted* injective (path escape, case-insensitive collision and
+    Windows device names refused by name) rather than assumed from a `format!` call.
 - Search: SearXNG, DDG, Mojeek, Marginalia, Brave, Google PSE, Wikipedia, plus the
   extraction ladder and URL/ETag caching
 
