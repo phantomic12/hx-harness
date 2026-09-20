@@ -34,7 +34,7 @@ use hx_core::event::{AgentEvent, StopReason};
 use hx_core::ids::{AgentId, ToolCallId};
 use hx_core::message::{Message, Part};
 use hx_provider::{ToolSpec, Usage};
-use hx_tools::{ToolContext, ToolError, ToolRegistry};
+use hx_tools::{Requirement, ToolContext, ToolError, ToolRegistry};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -510,7 +510,7 @@ impl AgentLoop {
         match requirement.command() {
             Some(command) if prepared.name() == "shell" => ActionRequest::shell(command),
             _ => {
-                let (risk, reason) = risk_of(&requirement.resource, requirement.action);
+                let (risk, reason) = risk_of(requirement);
                 ActionRequest::tool(prepared.name(), requirement.describes.clone(), risk, reason)
             }
         }
@@ -560,8 +560,27 @@ impl CallOutcome {
 ///
 /// Deliberately coarse: the classifier does the fine-grained work for commands, and a capability
 /// check has already decided whether the agent may touch this at all.
-fn risk_of(resource: &Resource, action: Action) -> (RiskClass, String) {
-    match (resource, action) {
+///
+/// ## The one arm that is not a `(resource, action)` pair
+///
+/// A [`Resource::Process`] with [`Requirement::third_party`] set is [`RiskClass::ThirdParty`]
+/// rather than [`RiskClass::Mutate`], and the guard is first so it wins. The resource is unchanged
+/// — the capability token is still asked about `Process` + `Execute`, because that is what a child
+/// process *is* — and the flag is a separate fact the tool reported: *this runs a program the
+/// operator did not write*. Without it, a stdio MCP server's tools were classified `Mutate`, which
+/// the default `balanced` level auto-allows, so an operator who expected a prompt never got one
+/// (`ROADMAP.md` M6). With it they are `ThirdParty`, which sits above `External` and therefore
+/// above `balanced`'s threshold.
+///
+/// The table is the **only** place the flag becomes a class. `hx-mcp` reports the fact and nothing
+/// else, so a future tool that spawns a third-party binary gets the same answer without a second
+/// policy being written for it.
+fn risk_of(requirement: &Requirement) -> (RiskClass, String) {
+    match (&requirement.resource, requirement.action) {
+        (Resource::Process, _) if requirement.third_party => (
+            RiskClass::ThirdParty,
+            "runs a program the operator did not write".to_string(),
+        ),
         (Resource::FsPath { path }, Action::Read) => (RiskClass::Read, format!("reads {path}")),
         (Resource::FsPath { path }, Action::Delete) => {
             (RiskClass::Destructive, format!("deletes {path}"))
@@ -590,4 +609,152 @@ fn last_assistant_text(transcript: &[Message]) -> String {
         .find(|message| message.role == hx_core::message::Role::Assistant)
         .map(|message| message.text())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hx_core::approval::{ApprovalPolicy, AutonomyLevel};
+
+    fn requirement(resource: Resource, action: Action) -> Requirement {
+        Requirement::new(resource, action, "a call")
+    }
+
+    #[test]
+    fn the_table_puts_a_third_party_process_above_the_default_level() {
+        // The classification `hx-mcp`'s `requirement_for` feeds in — `Process` + `Execute` with the
+        // third-party flag set — and the class it must produce.
+        let third_party = requirement(Resource::Process, Action::Execute).third_party();
+        let (risk, reason) = risk_of(&third_party);
+        assert_eq!(risk, RiskClass::ThirdParty, "{reason}");
+        assert!(
+            reason.contains("did not write"),
+            "the prompt has to say what is wrong with this call: {reason}"
+        );
+
+        // The control, and the one that matters: the *same* resource and action without the flag is
+        // still `Mutate`. A table that returned `ThirdParty` for every process would be as wrong as
+        // one that returned `Mutate` for this one — it would prompt on `ls`.
+        let own_code = requirement(Resource::Process, Action::Execute);
+        assert_eq!(risk_of(&own_code).0, RiskClass::Mutate);
+
+        // And the guard is not a blanket override: the flag on a resource that is not a process
+        // changes nothing, because nothing about it runs a program.
+        let flagged_file = requirement(
+            Resource::FsPath {
+                path: "/tmp/x".to_string(),
+            },
+            Action::Write,
+        )
+        .third_party();
+        assert_eq!(risk_of(&flagged_file).0, RiskClass::Mutate);
+    }
+
+    #[test]
+    fn a_third_party_process_is_asked_about_at_the_default_level() {
+        // The property item 1 of M6 exists for, end to end through this crate: the requirement an
+        // MCP stdio call produces is classified here and decided by `hx-core`'s session — and at
+        // the default level the answer is a prompt, not a wave-through.
+        let (risk, reason) =
+            risk_of(&requirement(Resource::Process, Action::Execute).third_party());
+        let request = ActionRequest::tool("files__read_file", "call `read_file`", risk, reason);
+
+        let mut balanced = ApprovalSession::new(ApprovalPolicy::at(AutonomyLevel::Balanced));
+        let verdict = balanced.decide(&request, chrono::Utc::now());
+        assert!(
+            verdict.is_asking(),
+            "`balanced` must ask before a third-party binary runs: {verdict:?}"
+        );
+
+        // A level that already tolerates an egress runs it without asking: the class is a prompt,
+        // not a refusal, so MCP stays usable for an operator who has decided to trust it.
+        let mut trusting = ApprovalSession::new(ApprovalPolicy::at(AutonomyLevel::Trusting));
+        assert!(trusting.decide(&request, chrono::Utc::now()).is_allowed());
+    }
+
+    #[test]
+    fn every_other_resource_keeps_the_class_it_had() {
+        // The new arm is a guard in front of a match that predates it, so the regression this
+        // catches is a reordering: `(Process, _)` moved above the guard, or the guard widened to a
+        // wildcard, would change the answer for calls that have nothing to do with third-party code.
+        let cases = [
+            (
+                requirement(
+                    Resource::FsPath {
+                        path: "/tmp/x".to_string(),
+                    },
+                    Action::Read,
+                ),
+                RiskClass::Read,
+            ),
+            (
+                requirement(
+                    Resource::FsPath {
+                        path: "/tmp/x".to_string(),
+                    },
+                    Action::Delete,
+                ),
+                RiskClass::Destructive,
+            ),
+            (
+                requirement(
+                    Resource::NetworkHost {
+                        host: "example.com".to_string(),
+                    },
+                    Action::Connect,
+                ),
+                RiskClass::External,
+            ),
+            (
+                requirement(
+                    Resource::Provider {
+                        id: hx_core::ids::ProviderId::from("prv_x"),
+                    },
+                    Action::Connect,
+                ),
+                RiskClass::External,
+            ),
+            (
+                requirement(
+                    Resource::Secret {
+                        name: "s".to_string(),
+                    },
+                    Action::Read,
+                ),
+                RiskClass::Privileged,
+            ),
+            (
+                requirement(Resource::Process, Action::Execute),
+                RiskClass::Mutate,
+            ),
+            (
+                requirement(
+                    Resource::Host {
+                        id: hx_core::ids::HostId::from("hst_x"),
+                    },
+                    Action::Read,
+                ),
+                RiskClass::Read,
+            ),
+            (
+                requirement(
+                    Resource::Host {
+                        id: hx_core::ids::HostId::from("hst_x"),
+                    },
+                    Action::Write,
+                ),
+                RiskClass::Mutate,
+            ),
+        ];
+
+        for (requirement, expected) in cases {
+            assert_eq!(
+                risk_of(&requirement).0,
+                expected,
+                "{:?} / {:?}",
+                requirement.resource,
+                requirement.action
+            );
+        }
+    }
 }

@@ -133,13 +133,16 @@ fn bounded_schema(schema: &serde_json::Map<String, Value>) -> Value {
 /// describe genuinely different reaches:
 ///
 /// - A **stdio** server is a local child process, so the resource is [`Resource::Process`] — the
-///   bluntest capability `hx-core` has ("spawning processes at all") — with [`Action::Execute`].
-///   Note where that lands: `hx-agent`'s `risk_of` maps `Process` to `RiskClass::Mutate`, which the
-///   default `balanced` level auto-allows. That is the risk table's answer, not a choice made here,
-///   and it is called out in this crate's module doc as a gap worth closing rather than papered
-///   over with a resource that means something else. An operator who wants a prompt for a stdio
-///   server's tools writes an `ask` rule on the tool name, which the approval engine already
-///   supports.
+///   bluntest capability `hx-core` has ("spawning processes at all") — with [`Action::Execute`],
+///   and [`Requirement::third_party`] set. The resource is what the *capability token* is asked
+///   about, and a child process is exactly what `Process` means; the flag is the separate fact that
+///   the child is a program **the operator did not write**. `hx-agent`'s risk table maps
+///   `Process` + `third_party` to `RiskClass::ThirdParty`, which the default `balanced` level
+///   **asks** about, so a stdio server's tools prompt without an `ask` rule being written for each
+///   one. (Before the flag existed this path reported `Mutate`, which `balanced` auto-allows — the
+///   gap `ROADMAP.md` M6 recorded, and the reason the flag exists rather than a new resource:
+///   a new resource would be a new *grant* to hold, turning an approval preference into an
+///   authority change.)
 /// - A **streamable-HTTP** server is a remote service, so the resource is
 ///   [`Resource::NetworkHost`] naming the endpoint's host, with [`Action::Connect`] — which
 ///   `risk_of` maps to `RiskClass::External`, and which the default level therefore *asks* about.
@@ -150,7 +153,8 @@ pub fn requirement_for(cfg: &McpServerConfig, namespace: &str, tool: &str) -> Re
             Resource::Process,
             Action::Execute,
             format!("call `{tool}` on the MCP server `{namespace}` (a local child process)"),
-        ),
+        )
+        .third_party(),
         McpTransport::StreamableHttp => {
             let host = host_of(cfg.url.as_deref().unwrap_or_default());
             Requirement::new(
@@ -344,8 +348,8 @@ mod tests {
     #[test]
     fn the_two_transports_require_different_things_because_they_reach_different_places() {
         // A stdio server is a local process; an HTTP server is off the machine. `hx-agent`'s risk
-        // table maps these to `Mutate` and `External` respectively, so the difference is what makes
-        // the default level *ask* about one of them.
+        // table maps these to `ThirdParty` and `External` respectively, so the difference is what
+        // makes the default level *ask* about one of them.
         let stdio = requirement_for(
             &McpServerConfig::stdio("npx", Vec::<String>::new()),
             "files",
@@ -368,6 +372,46 @@ mod tests {
             http.describes
         );
         assert_ne!(stdio.resource, http.resource);
+    }
+
+    #[test]
+    fn a_stdio_server_is_reported_as_running_a_program_the_operator_did_not_write() {
+        // The fact this crate contributes to `hx-agent`'s risk table, and the reason a stdio MCP
+        // call prompts at the default level instead of being auto-allowed as `Mutate`.
+        //
+        // The property is held across two crates and neither can see the other: this test pins what
+        // `requirement_for` *reports*, and `hx-agent`'s `risk_of` pins what a `third_party` process
+        // is *classified as* (`the_table_puts_a_third_party_process_above_the_default_level`), plus
+        // `hx-core`'s `the_default_level_asks_about_a_third_party_binary_and_a_higher_one_does_not`
+        // for what `balanced` then does with the class. Composed, those three are "a stdio MCP call
+        // prompts under `balanced`".
+        let stdio = requirement_for(
+            &McpServerConfig::stdio("npx", Vec::<String>::new()),
+            "files",
+            "search",
+        );
+        assert!(
+            stdio.third_party,
+            "a child process spawned from an operator's config is a program the operator did not \
+             write — the common case is an `npx` package fetched from a registry"
+        );
+        assert_eq!(
+            stdio.resource,
+            Resource::Process,
+            "and it is still a process for the capability check: a new resource would be a new \
+             grant to hold"
+        );
+        assert_eq!(stdio.action, Action::Execute);
+
+        // The HTTP arm is *not* marked: it runs no local binary, and its reach is already `External`
+        // — which the default level asks about. Marking it too would add nothing and would blur
+        // what the flag means.
+        let http = requirement_for(
+            &McpServerConfig::streamable_http("https://mcp.example.com/mcp"),
+            "gh",
+            "search",
+        );
+        assert!(!http.third_party, "an HTTP endpoint runs nothing locally");
     }
 
     #[test]

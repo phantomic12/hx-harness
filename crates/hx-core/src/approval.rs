@@ -39,8 +39,18 @@ use std::collections::BTreeMap;
 
 /// How bad an action is if it goes wrong.
 ///
-/// Ordering is meaningful — the derive gives us `Read < Mutate < External < Destructive <
-/// Privileged`, and every policy comparison is a `>=` on that ordering.
+/// Ordering is meaningful — the derive gives us `Read < Mutate < External < ThirdParty <
+/// Destructive < Privileged`, and every policy comparison is a `>=` on that ordering.
+///
+/// ## Where [`RiskClass::ThirdParty`] sits, and why not one rung lower
+///
+/// The class is for *"runs a program the operator did not write"* — a `npx`/`uvx` MCP server, a
+/// binary fetched from a registry. It is deliberately **above** [`RiskClass::External`], not merely
+/// above [`RiskClass::Mutate`]: the default level's threshold *is* `External`
+/// ([`AutonomyLevel::Balanced`]), so a class placed between `Mutate` and `External` would be
+/// auto-allowed by the default level — which is precisely the gap this variant exists to close.
+/// "Ordered after `Mutate` and before `Destructive`" is satisfied either way; only this placement
+/// makes the class prompt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskClass {
@@ -51,6 +61,16 @@ pub enum RiskClass {
     /// Crosses the trust boundary: network egress, a push, a message sent to a human, money
     /// spent. Reversible locally, but the effect has already left the building.
     External,
+    /// Runs a program the operator did not write and has not read — a `npx`/`uvx` package, a
+    /// third-party binary, a downloaded installer.
+    ///
+    /// Distinct from [`Self::Mutate`] because "install a package" and "run an unreviewed program
+    /// that a registry published" are not the same act: the second executes code nobody in the
+    /// conversation has seen, and its blast radius is whatever that code decided it was. Distinct
+    /// from [`Self::Destructive`] because it is not *irreversible* — nothing is deleted by being
+    /// run — so a deployment that refuses this class outright would be refusing the feature MCP
+    /// exists for. It is a *prompt* class, not a refusal class.
+    ThirdParty,
     /// Irreversible, or destroys data. `rm -rf`, `git reset --hard`, `terraform destroy`,
     /// `DROP TABLE`. No undo exists.
     Destructive,
@@ -65,6 +85,7 @@ impl RiskClass {
             Self::Read => "read",
             Self::Mutate => "mutate",
             Self::External => "external",
+            Self::ThirdParty => "third_party",
             Self::Destructive => "destructive",
             Self::Privileged => "privileged",
         }
@@ -76,6 +97,7 @@ impl RiskClass {
             Self::Read => "reads only — nothing is changed",
             Self::Mutate => "changes files in the workspace",
             Self::External => "sends data outside this machine",
+            Self::ThirdParty => "runs a program the operator did not write",
             Self::Destructive => "cannot be undone",
             Self::Privileged => "elevates privileges or touches credentials",
         }
@@ -83,9 +105,9 @@ impl RiskClass {
 
     /// Does a surface whose ceiling is `self` authorise an action of `risk`?
     ///
-    /// The ordering *is* the policy: `Read < Mutate < External < Destructive < Privileged`, and a
-    /// ceiling authorises everything at or below it, so a chat bridge with ceiling `Mutate` may
-    /// approve a file write and may never approve `rm -rf`.
+    /// The ordering *is* the policy: `Read < Mutate < External < ThirdParty < Destructive <
+    /// Privileged`, and a ceiling authorises everything at or below it, so a chat bridge with
+    /// ceiling `Mutate` may approve a file write and may never approve `rm -rf`.
     ///
     /// This is deliberately the **only** implementation of that comparison. `hx-gateway`'s
     /// `AnswerAuthority::may_answer` (which decides a connector's answer) and `hx-agent`'s
@@ -1080,6 +1102,26 @@ impl AutonomyLevel {
             Self::Balanced => Some(RiskClass::External),
             Self::Trusting => Some(RiskClass::Destructive),
             Self::Yolo => None,
+        }
+    }
+
+    /// Does this level let an action of `risk` run without asking a human?
+    ///
+    /// The complement of [`Self::threshold`], and the same comparison [`ApprovalSession::decide`]
+    /// makes at its last step — written as a method because *"which calls does `balanced` wave
+    /// through?"* is the question every reader of the risk table asks, and answering it by hand is
+    /// how a new [`RiskClass`] gets a level nobody decided it should have. [`RiskClass::ThirdParty`]
+    /// is the live example: `balanced` must **not** cover it, and the only way that is checkable
+    /// without a session is here.
+    ///
+    /// It says nothing about the other things `decide` consults — a deployment `ceiling`, an
+    /// unattended budget, an `ask` rule and a remembered decision all sit above the threshold and
+    /// can turn an auto-allowed call into a prompt. A `true` here is "the *level* would not ask",
+    /// never "nothing will ask".
+    pub fn auto_allows(&self, risk: RiskClass) -> bool {
+        match self.threshold() {
+            Some(threshold) => risk < threshold,
+            None => true,
         }
     }
 
@@ -2328,6 +2370,13 @@ mod tests {
             (RiskClass::Mutate, RiskClass::Destructive, false),
             (RiskClass::External, RiskClass::External, true),
             (RiskClass::External, RiskClass::Destructive, false),
+            // `ThirdParty` sits between `External` and `Destructive`: a ceiling at `External` (a
+            // chat bridge that may approve an egress) does not reach it, and one at `Destructive`
+            // does. The other half of the pair is below, in the ladder assertions.
+            (RiskClass::External, RiskClass::ThirdParty, false),
+            (RiskClass::ThirdParty, RiskClass::ThirdParty, true),
+            (RiskClass::ThirdParty, RiskClass::Destructive, false),
+            (RiskClass::Destructive, RiskClass::ThirdParty, true),
             (RiskClass::Destructive, RiskClass::Destructive, true),
             (RiskClass::Destructive, RiskClass::Privileged, false),
             (RiskClass::Privileged, RiskClass::Privileged, true),
@@ -2342,6 +2391,128 @@ mod tests {
         assert!(RiskClass::Mutate < RiskClass::External);
         assert!(RiskClass::External < RiskClass::Destructive);
         assert!(RiskClass::Destructive < RiskClass::Privileged);
+
+        // `ThirdParty`'s two neighbours, pinned by name. "After `Mutate`, before `Destructive`" is
+        // satisfied by two different slots and only one of them is correct: placed directly after
+        // `Mutate` it would fall *below* `External`, and `External` is exactly where the default
+        // level starts asking — so the class would be auto-allowed by the level it exists to make
+        // prompt. The assertion against `External` is the one that has teeth.
+        assert!(RiskClass::Mutate < RiskClass::ThirdParty);
+        assert!(
+            RiskClass::External < RiskClass::ThirdParty,
+            "ThirdParty must be above External, or `balanced` auto-allows it"
+        );
+        assert!(RiskClass::ThirdParty < RiskClass::Destructive);
+    }
+
+    #[test]
+    fn the_default_level_asks_about_a_third_party_binary_and_a_higher_one_does_not() {
+        // The whole point of the class, stated as the two questions an operator asks.
+        assert!(
+            !AutonomyLevel::Balanced.auto_allows(RiskClass::ThirdParty),
+            "`balanced` is the default, and a stdio MCP call must not be waved through by it"
+        );
+        assert!(
+            AutonomyLevel::Trusting.auto_allows(RiskClass::ThirdParty),
+            "a level that already tolerates `External` tolerates a program the operator installed"
+        );
+        // The neighbours, so this cannot pass by the class having been moved somewhere harmless.
+        assert!(AutonomyLevel::Balanced.auto_allows(RiskClass::Mutate));
+        assert!(!AutonomyLevel::Balanced.auto_allows(RiskClass::External));
+        assert!(!AutonomyLevel::Trusting.auto_allows(RiskClass::Destructive));
+        assert!(AutonomyLevel::Yolo.auto_allows(RiskClass::ThirdParty));
+
+        // And through the session, which is the code that actually decides: the level's own
+        // threshold is the only thing consulted here (no ceiling, no budget, no rules).
+        let req = ActionRequest::tool(
+            "files__read_file",
+            "call `read_file` on the MCP server `files`",
+            RiskClass::ThirdParty,
+            "runs a program the operator did not write",
+        );
+        let mut s = ApprovalSession::new(ApprovalPolicy::at(AutonomyLevel::Balanced));
+        let v = s.decide(&req, t0());
+        assert!(v.is_asking(), "a stdio MCP call must prompt: {v:?}");
+        assert!(
+            v.why().contains("did not write"),
+            "and the prompt says why: {v:?}"
+        );
+
+        let mut s = ApprovalSession::new(ApprovalPolicy::at(AutonomyLevel::Trusting));
+        assert!(
+            s.decide(&req, t0()).is_allowed(),
+            "the class is a prompt, not a refusal: a level above it runs it"
+        );
+    }
+
+    #[test]
+    fn the_level_threshold_and_the_session_agree_on_every_level_and_class() {
+        // `AutonomyLevel::auto_allows` is the complement of `threshold()`, and `decide` is the code
+        // that actually gates a call. Two implementations of one rule is how a table ends up
+        // describing a policy the session does not have, so they are compared over the whole
+        // cross-product rather than spot-checked — with a policy that has no ceiling, no budget and
+        // no rules, so the level is the only thing deciding.
+        let levels = [
+            AutonomyLevel::Paranoid,
+            AutonomyLevel::Cautious,
+            AutonomyLevel::Balanced,
+            AutonomyLevel::Trusting,
+            AutonomyLevel::Yolo,
+        ];
+        let classes = [
+            RiskClass::Read,
+            RiskClass::Mutate,
+            RiskClass::External,
+            RiskClass::ThirdParty,
+            RiskClass::Destructive,
+            RiskClass::Privileged,
+        ];
+
+        for level in levels {
+            for risk in classes {
+                let mut s = ApprovalSession::new(ApprovalPolicy::at(level));
+                let asked = s
+                    .decide(&ActionRequest::tool("t", "t", risk, "test"), t0())
+                    .is_asking();
+                assert_eq!(
+                    asked,
+                    !level.auto_allows(risk),
+                    "{level:?} / {risk:?}: the session and the table disagree"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_shipped_floor_neither_swallows_a_third_party_call_nor_waves_it_through() {
+        // A new class is a new thing for the floor to have an opinion about, and the floor has no
+        // opinion — its rules match tool names and command lines, not risk classes. What must be
+        // true is that adding the class changed neither half: the catastrophe set still refuses the
+        // commands it refused, and a `ThirdParty` call under the *deployment* policy (floor in
+        // force, `balanced`) is asked about rather than denied or auto-allowed.
+        let mut s = ApprovalSession::new(ApprovalPolicy::deployment_default());
+        assert!(s.policy().has_floor(), "the fixture is the shipped floor");
+
+        let third_party = ActionRequest::tool(
+            "files__read_file",
+            "call `read_file` on the MCP server `files`",
+            RiskClass::ThirdParty,
+            "runs a program the operator did not write",
+        );
+        let v = s.decide(&third_party, t0());
+        assert!(v.is_asking(), "asked about, not refused: {v:?}");
+
+        // The floor itself, unchanged: the two commands that must never be answerable, and the
+        // ordinary cleanup that must stay answerable.
+        assert!(s
+            .decide(&ActionRequest::shell("rm -rf /"), t0())
+            .is_denied());
+        assert!(s
+            .decide(&ActionRequest::shell("rm -rf $BUILD_DIR"), t0())
+            .is_denied());
+        assert!(!s
+            .decide(&ActionRequest::shell("rm -rf /tmp/hx-build"), t0())
+            .is_denied());
     }
 
     // -- classification ------------------------------------------------------

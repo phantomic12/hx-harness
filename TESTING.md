@@ -197,7 +197,7 @@ converted into a yes.
 | `an_answer_at_the_ceiling_is_accepted` (`hx-agent`, unit) | The other half, so the check cannot pass by refusing everything: a `Mutate` question from a `Mutate` ceiling is answered |
 | `a_destructive_answer_from_a_chat_channel_is_refused_over_http` (`hx-server/tests/api.rs`) | A **real run**, parked on a real question, answered over the real route with a chat channel's ceiling: **403**, the question is still listed, and the run records a refusal rather than running the `rm -rf` |
 | `an_answer_that_declares_no_ceiling_is_refused_rather_than_granted_everything` (`hx-server/tests/api.rs`) | A body with no `ceiling` is a client error and answers nothing — omission is a rejection, not an unbounded grant |
-| `a_ceiling_covers_everything_at_or_below_it_and_nothing_above` (`hx-core`, unit) | The ladder itself (`Read < Mutate < External < Destructive < Privileged`), so a reordering of the enum is a failing test rather than a silent widening of what a phone may authorise |
+| `a_ceiling_covers_everything_at_or_below_it_and_nothing_above` (`hx-core`, unit) | The ladder itself (`Read < Mutate < External < ThirdParty < Destructive < Privileged`), so a reordering of the enum is a failing test rather than a silent widening of what a phone may authorise — with `ThirdParty`'s two neighbours asserted by name, because "after `Mutate`, before `Destructive`" is satisfied by two slots and only one of them makes `balanced` ask |
 
 **Every check below was run against the broken code first.** With the ceiling check disabled in
 `ApprovalQueue::answer`, the queue test fails `Answered` vs `AboveCeiling { Destructive, Mutate }` and the
@@ -217,6 +217,82 @@ the prompt has always had. A **channel** does not answer through this route at a
 `ApprovalBridge`, whose ceiling comes from the deployment rather than from the channel. The residual hole
 is honest and named: with `--bind 0.0.0.0` and no auth on the API, a declared ceiling is not a defence
 against a remote caller, because the API's own authentication is the missing control, not the ceiling.
+
+## The third-party class (M6)
+
+A stdio MCP call used to be `Resource::Process` → `risk_of` → `Mutate`, which the default `balanced`
+level **auto-allows** — so an operator who expected a prompt for a stdio server's tools never got one.
+The fix is a new `RiskClass::ThirdParty` ("runs a program the operator did not write") plus a fact the
+requirement carries: `hx-mcp`'s `requirement_for` still reports `Resource::Process` + `Action::Execute`
+(a child process is exactly what that capability means, and a new resource variant would have been a new
+*grant* to hold — an approval preference smuggled in as an authority change) and additionally sets
+`Requirement::third_party`, which `hx-agent`'s table is the single place to turn into a class.
+
+The class is ordered **above `External`**, not merely above `Mutate`: `balanced`'s threshold *is*
+`External`, so a rung between `Mutate` and `External` would have been auto-allowed by the very level the
+class exists to make prompt. "After `Mutate`, before `Destructive`" is satisfied by both slots, and only
+one of them works — which is why the ordering is asserted against `External` by name.
+
+The property is held across three crates and no single one can see the others, so it is pinned where
+each fact lives and the composition is stated in each test:
+
+| Test | The property |
+|---|---|
+| `a_stdio_server_is_reported_as_running_a_program_the_operator_did_not_write` (`hx-mcp`, unit) | `requirement_for` sets `third_party` for a stdio server and **not** for a streamable-HTTP endpoint, while the resource stays `Process` — the capability check is unchanged |
+| `the_table_puts_a_third_party_process_above_the_default_level` (`hx-agent`, unit) | `risk_of` maps `Process` + the flag to `ThirdParty`, and the *same* requirement without the flag stays `Mutate` — the control, because a table that called every process third-party would prompt on `ls` |
+| `a_third_party_process_is_asked_about_at_the_default_level` (`hx-agent`, unit) | Through the real `ApprovalSession`: `balanced` asks, `trusting` allows — the class is a prompt, not a refusal |
+| `every_other_resource_keeps_the_class_it_had` (`hx-agent`, unit) | The guard sits in front of a match that predates it, so the regression it catches is a reordering or a widened guard changing the answer for eight unrelated resources |
+| `the_default_level_asks_about_a_third_party_binary_and_a_higher_one_does_not` (`hx-core`, unit) | The level question itself, via `AutonomyLevel::auto_allows` and the session |
+| `the_level_threshold_and_the_session_agree_on_every_level_and_class` (`hx-core`, unit) | `auto_allows` is compared against `decide` over the **whole** cross-product (5 levels × 6 classes) rather than spot-checked — two implementations of one rule is how a table ends up describing a policy the session does not have |
+| `the_shipped_floor_neither_swallows_a_third_party_call_nor_waves_it_through` (`hx-core`, unit) | Adding a class changed neither half of the floor: `rm -rf /` and `rm -rf $BUILD_DIR` are still refused, `rm -rf /tmp/hx-build` is still answerable, and a `ThirdParty` call under the deployment policy is **asked** about |
+| `the_policy_report_says_what_this_level_does_with_each_risk_class` (`hx`, unit) | The `hx policy` renderer lists all six classes, so `third_party  asks` is visible at `balanced` — a report that answered for five of six would be decoration |
+
+**The honest limit.** The flag is set for *every* stdio MCP server, including one whose `command:`
+names a script the operator wrote themselves. `hx` reads a config and sees a command; it cannot tell
+`npx -y @scope/pkg` from `./my-server`, and the fail-closed answer is to ask once rather than to guess.
+The narrower fix — a per-server opt-out meaning "I wrote this" — is named in `ROADMAP.md` and
+deliberately **not** added: it would be a config flag whose only effect is to silence a prompt, which
+is the shape a safety switch should not have. An operator who wants one server silent writes
+`allow`/`ask` rules against its tool namespace, which is per-tool and visible.
+
+## The environment an MCP child inherits (M6)
+
+MCP children inherited the daemon's environment. `env:` in a server's config *adds* variables, and
+`Command::env` adds to what the parent already has — so `OPENAI_API_KEY` exported into the shell that
+started the daemon reached every MCP child, including servers written by somebody else.
+
+The fix is `Command::env_clear()` followed by an explicit **allowlist**: `PATH`, `HOME`, `USER`,
+`LOGNAME`, `SHELL`, `TMPDIR`, `LANG`, `LC_ALL`, `TERM`, plus a Windows-only set (`SYSTEMROOT`, `TEMP`,
+`TMP`, `PATHEXT`, `COMSPEC`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `PROGRAMFILES`,
+`NUMBER_OF_PROCESSORS`). A per-server `env_passthrough: [VAR, …]` opts anything else in, and `env:`
+is still applied on top as the operator's own literal for that server. It is an allowlist rather than
+a scrubber on purpose: a scrubber has to *recognise* a secret, and `OPENAI_API_KEY`,
+`AWS_SECRET_ACCESS_KEY`, `GH_TOKEN` and `MY_COMPANY_DEPLOY_KEY` share no shape. A list has to
+recognise nothing.
+
+**The test asks a real child, not a filter function.** `hx-mcp/tests/env.rs` spawns the same
+hand-rolled MCP server `tests/stdio.rs` drives, through the real `McpHost::from_config`, with
+`--env-file` making the child dump *its own* environment before the handshake. It is its own test
+binary because it mutates the process environment and has one test in it, so `set_var` cannot race
+another thread's `vars()`.
+
+| Test | The property |
+|---|---|
+| `an_mcp_child_gets_the_allowlist_the_opt_in_and_its_own_config_and_nothing_else` (`hx-mcp/tests/env.rs`) | A sentinel secret exported into the parent does **not** reach either child; an ordinary non-credential-shaped variable does not either; the allowlisted positive controls (`LOGNAME`, whose *value* the test sets, and a non-empty `PATH`) **do** arrive, so a child that inherited nothing cannot pass; the opted-in variable arrives for the server that named it and is absent for its sibling in the same run; the config's own `env:` arrives; and **every** name the child holds is on the allowlist, opted in, or in its own `env:` — a name nobody thought to check fails the test |
+| `the_allowlist_lets_a_toolchain_start_and_nothing_else_through` (`hx-mcp`, unit) | The predicate itself: `PATH`/`HOME`/`TMPDIR`/`LANG` in, `OPENAI_API_KEY`/`ANTHROPIC_API_KEY`/`AWS_SECRET_ACCESS_KEY`/`GH_TOKEN`/`MY_COMPANY_DEPLOY_KEY`/`HTTPS_PROXY` out, plus near-misses (`path`, `PATHEXTRA`) that a prefix or case-insensitive match on Unix would let through |
+| `an_opted_in_name_is_inherited_and_only_for_the_server_that_named_it` (`hx-mcp`, unit) | The opt-in is exact: naming `HTTPS_PROXY` does not bring `HTTP_PROXY`, does not widen the list, and does not remove what was already there |
+| `the_config_env_is_applied_and_overrides_what_was_inherited` (`hx-mcp`, unit) | `env:` is not filtered, and a name it repeats takes the config's value rather than appearing twice |
+| `an_env_passthrough_entry_that_is_not_a_variable_name_is_refused_by_name` (`hx-core`, unit) | A typo in the opt-in is a startup error naming the entry, because it fails *closed* — the variable silently does not arrive and the server breaks in a way that reads as the server's fault |
+| `an_mcp_block_parses_with_every_field_it_has` (`hx-core`, unit) | The key round-trips from YAML, and a server that says nothing opts into nothing |
+
+**The sensitivity of the negatives, stated rather than assumed.** A `!contains(secret)` assertion
+passes trivially if the child inherits nothing at all — which is why the test asserts the positive
+controls first and, before the completeness check, asserts that the *parent* holds names the allowlist
+does not cover. Those two facts together ("the parent has unlisted names", "the child has none") are
+the filter doing something; neither half alone is. The `--env-file` mechanism was checked
+independently by running the fake server straight from a shell, where it dumped 142 variables
+including the sentinel — so the dump reports what the child really holds, and the absence in the test
+is `hx-mcp`'s doing.
 
 ## The browser pool (M6)
 
@@ -679,9 +755,7 @@ the failure is silent:
 | **Egress filtering by CIDR or raw IP** | A hostname / `*.domain` allowlist **is** enforced, on both the near and the far host (internal network with no *default* route + `hx-egress-proxy` sidecar). What has no implementation is *matching* a CIDR or a raw IP against an unresolved `CONNECT` target, so such an entry — and anything address-shaped in the `inet_aton` grammar — is *refused* rather than pretended (`SpecError::EgressNotEnforced`) | Medium — a `network: true` profile with no allowlist at all is still unrestricted |
 | DuckDuckGo keyless scraping — the *success* path | Every attempt from a plain HTTP client is answered with an `anomaly` challenge: a TLS-fingerprint wall, not a markup change. The failure path is verified live; the success path needs a browser-fingerprint client (M6) | Medium — search silently loses a source, but `SearchReport` names it |
 | `hxd` reaper loop, `axum::serve` under load | Manual only | Low |
-| **`hx-mcp` against a real third-party MCP server** | No real server can be assumed on a build machine, so the live canary (`tests/mcp_live.rs`) is `#[ignore]`d and reads its target from `HX_MCP_LIVE_COMMAND`/`HX_MCP_LIVE_URL`. It has **never been run**. Everything the suite verifies about the wire is verified against a double this crate also wrote — real JSON-RPC over a real pipe, but our reading of the protocol at both ends. The one test in that file that needs no environment (`a_live_target_that_is_not_there_is_a_readable_failure_and_not_a_hang`) *does* run, and covers the commonest real state: a misconfigured server | Medium — a `rmcp` behaviour we have misread would pass every test here and fail on first contact. `rmcp` is the mitigation, and it is not under test |
-| **`hx-mcp` children inherit the daemon's environment** | Deliberate, and therefore never exercised as a failure. `env:` in a server's config *adds* variables; it does not replace the inherited set, because `npx` resolves Node through `PATH` and servers read `HOME` for caches. A secret exported into the daemon's shell therefore reaches every child it spawns. See `src/stdio.rs`'s module doc | Medium — the exposure is real but bounded: `hx`'s own credentials come from the vault, resolved per call, and are never placed in an environment |
-| **A stdio MCP call is auto-allowed at the default autonomy level** | Not a bug in `hx-mcp`: `requirement_for` reports `Resource::Process` + `Action::Execute` for a stdio server, which is what a child process *is*, and `hx-agent`'s risk table maps `Process` to `RiskClass::Mutate`, which the default `balanced` level allows without asking. Changing it in `hx-mcp` would mean reporting a resource that means something else | Medium — an operator who expects a prompt for a stdio server's tools does not get one. The workaround is an `ask` rule on the tool name, which the approval engine already supports (see ROADMAP) |
+| **`hx-mcp` against a real third-party MCP server over streamable-HTTP** | The **stdio** half of the canary has now been run against a real server (see *The live MCP canary* below). The streamable-HTTP half (`HX_MCP_LIVE_URL`) has **never been run**: there is no third-party endpoint configured for this environment, and the HTTP suite's happy path uses `rmcp`'s own server, which this project also built. So the HTTP session header, SSE framing and `Last-Event-ID` resume are verified against an implementation we did not write but *did* choose, and not against a third party | Medium — a `rmcp` behaviour we have misread would pass every test here and fail on first contact. `rmcp` is the mitigation, and it is not under test |
 
 *The vault written to disk and reopened in a new process* was the fourth row here. It is now in
 tier A above: `crates/hx-secrets/tests/vault_process.rs`, six tests, hermetic, in CI on all three
@@ -823,6 +897,72 @@ over HTTP for exactly that reason. The `HX_WINRM_*` matrix above is what the liv
 with. One consequence worth knowing before deploying: the live tests pass through a TLS-terminating
 proxy in front of a plain listener, because configuring an HTTPS listener on the guest was more
 moving parts than the code under test.
+
+## The live MCP canary, against a real third-party server (2026-09-20, recorded)
+
+`crates/hx-mcp/tests/mcp_live.rs` is `#[ignore]`d because it needs a package and a network, and it had
+never been run. It has now been run, on the machine this build was made on, against the real
+`@modelcontextprotocol/server-filesystem`:
+
+```console
+$ HX_MCP_LIVE_COMMAND=npx \
+  HX_MCP_LIVE_ARGS="-y @modelcontextprotocol/server-filesystem /tmp" \
+  cargo test -p hx-mcp --test mcp_live -- --ignored --nocapture \
+      a_real_stdio_server_is_spawned_handshaken_and_called
+
+test a_real_stdio_server_is_spawned_handshaken_and_called ... ok
+test result: ok. 1 passed; 0 failed; 2 filtered out; finished in 0.85s
+```
+
+`node` 26.7.0 and `npx` 11.19.0 were present and the registry was reachable, so the canary ran
+unmodified — no test was relaxed and nothing was asserted that the run did not produce. 0.85 s is a
+**warm `npx` cache**, not a fast server: the same command from a shell starts in the same fraction of a
+second, and the test's own bound (120 s) is what a cold install would have to fit inside.
+
+**What that establishes.** A real third-party server, spawned by `hx-mcp`'s own `stdio::connect`,
+completed a real `initialize` + `tools/list` handshake; its tools were published namespaced under
+`live__`; and a real `tools/call` round-tripped as a `ToolOutcome` rather than hanging. The wire-level
+properties this crate had only ever verified against a double it also wrote — the JSON-RPC framing, the
+handshake shape, the namespacing of names a third party chose — hold against a server nobody here
+wrote. **No defect was found.** The canary was left exactly as it was, and it stays `#[ignore]`d: it
+needs a package and a network, so it is not a CI default.
+
+**Independent confirmation, so the pass is not just the canary agreeing with itself.** The same
+package, spoken to directly over a shell pipe with three newline-delimited JSON-RPC messages:
+
+```console
+$ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize",…}' … | npx -y @modelcontextprotocol/server-filesystem /tmp
+{"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":true}},
+ "serverInfo":{"name":"secure-filesystem-server","version":"0.2.0"}},"jsonrpc":"2.0","id":1}
+{"result":{"tools":[{"name":"read_file",…,"annotations":{"readOnlyHint":true,…},
+ "execution":{"taskSupport":"forbidden"},"outputSchema":{…}},…]},"jsonrpc":"2.0","id":2}
+```
+
+So the server is `secure-filesystem-server` 0.2.0, it answers both methods, and its `tools/list` is
+richer than the double's — `outputSchema`, `annotations` and `execution` are all present, and `rmcp`
+parsed the lot. The canary also passes with `HX_MCP_LIVE_TOOL=live__list_allowed_directories` named
+explicitly (0.42 s), which is the path a caller takes when it wants one particular tool rather than the
+first one the server lists.
+
+**The check that the canary can fail, run before trusting the pass.** Pointed at a package that does
+not exist:
+
+```console
+$ HX_MCP_LIVE_ARGS="-y @modelcontextprotocol/server-that-does-not-exist-hx-canary" cargo test … --ignored
+thread 'a_real_stdio_server_is_spawned_handshaken_and_called' panicked at mcp_live.rs:186:
+a real server must come up: Down { reason: "the handshake failed: connection closed: initialize
+response", retrying: true }
+```
+
+It fails, on the assertion it is supposed to fail on, with a sentence a model could read. A canary
+that cannot fail is not evidence, and this one can.
+
+**What is still not covered by this run.** The canary calls one tool with `{}` — the call that needs no
+knowledge of the schema — so the round-trip is proven and the *arguments* are not; a tool that takes a
+path is exercised by `tests/stdio.rs` against the double, not here. And the streamable-HTTP canary
+(`HX_MCP_LIVE_URL`) is still unrun: there is no third-party endpoint available in this environment, and
+the HTTP suite's happy path drives `rmcp`'s own server, which this project also built. That is the
+remaining Tier C row.
 
 ## Tier C — a real model through the daemon (manual, recorded)
 

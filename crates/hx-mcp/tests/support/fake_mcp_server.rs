@@ -39,6 +39,15 @@
 //! | `die-on-tool` | full handshake, then exit(1) on the first `tools/call` |
 //! | `hang-on-tool` | full handshake, then never answer a `tools/call` |
 //! | `noisy-stderr` | write the sentinel to stderr many times, then behave as `ok` |
+//!
+//! ## `--env-file`: the one question stdout cannot answer
+//!
+//! A child's environment is not observable from the wire, and `tests/env.rs` needs to ask what
+//! `hx-mcp` actually handed the child — not what a filter function says it should have. So
+//! `--env-file <path>` dumps this process's own environment, one `KEY=VALUE` per line, before the
+//! handshake begins. It is written first thing, so a test that has seen the host come *up* knows the
+//! file is complete without sleeping; and it is this process's environment rather than a copy of a
+//! variable list, so a value that reached the child is in it and a value that did not is not.
 
 use std::io::{BufRead, Write};
 
@@ -57,6 +66,7 @@ const NOISY_STDERR_LINES: usize = 40;
 struct Args {
     mode: String,
     pid_file: Option<String>,
+    env_file: Option<String>,
 }
 
 fn main() {
@@ -72,6 +82,12 @@ fn main() {
     // was started. One line per process: the line count is the spawn count.
     if let Some(path) = &args.pid_file {
         record(path, &format!("{}\n", std::process::id()));
+    }
+
+    // And the environment, before the handshake, so a test that has seen the host come up can read
+    // it without racing the child. See the module doc.
+    if let Some(path) = &args.env_file {
+        dump_environment(path);
     }
 
     match args.mode.as_str() {
@@ -106,15 +122,41 @@ fn main() {
 fn parse_args(argv: Vec<String>) -> Result<Args, String> {
     let mut mode = "ok".to_string();
     let mut pid_file = None;
+    let mut env_file = None;
     let mut iter = argv.into_iter();
     while let Some(flag) = iter.next() {
         match flag.as_str() {
             "--mode" => mode = iter.next().ok_or("--mode needs a value")?,
             "--pid-file" => pid_file = Some(iter.next().ok_or("--pid-file needs a value")?),
+            "--env-file" => env_file = Some(iter.next().ok_or("--env-file needs a value")?),
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
-    Ok(Args { mode, pid_file })
+    Ok(Args {
+        mode,
+        pid_file,
+        env_file,
+    })
+}
+
+/// Write this process's own environment, one `KEY=VALUE` per line.
+///
+/// Not a copy of the allowlist and not a filter: whatever this process actually holds is what goes
+/// in, which is the only way a test can distinguish "the filter is right" from "the filter ran".
+/// `VALUE` may contain `=`, so the reader splits on the *first* one. A value containing a newline is
+/// not representable in an environment on any platform `hx` targets, so line-per-variable is safe.
+fn dump_environment(path: &str) {
+    let mut lines: Vec<String> = std::env::vars()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    // Sorted so a diff of two runs is readable; the order means nothing to the caller.
+    lines.sort();
+
+    if let Ok(mut file) = std::fs::File::create(path) {
+        for line in lines {
+            let _ = writeln!(file, "{line}");
+        }
+    }
 }
 
 /// Append to the pid file. Not atomic, and it does not need to be: the tests that count lines are

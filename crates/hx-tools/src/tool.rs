@@ -60,6 +60,28 @@ pub struct Requirement {
     pub action: Action,
     /// A short phrase for the approval prompt — "run a command", "write /etc/hosts".
     pub describes: String,
+    /// Whether acting on this runs a program **the operator did not write** — an `npx`/`uvx`
+    /// package, a binary fetched from a registry, a downloaded installer.
+    ///
+    /// ## Why this is a flag on the requirement and not a `Resource`
+    ///
+    /// A third-party binary is still a process, and `Resource` is what the *capability token* is
+    /// asked about. A new resource variant would be a new grant to hold: every existing
+    /// `Process` + `Execute` token would stop covering an MCP server, so the operator's fix would
+    /// be to widen their capability token — an authority change, made to express an *approval*
+    /// preference. So the resource stays `Process` (the honest name for "a child process", and
+    /// what `hx-mcp` reports) and the extra fact travels beside it.
+    ///
+    /// It is a **fact the tool reports**, not a classification: it says what will run, and
+    /// `hx-agent`'s risk table is the single place that turns it into a [`RiskClass`]. A tool that
+    /// set this to silence a prompt would be lying about its own reach, which is why the only
+    /// caller is a transport that spawns a command it did not write.
+    ///
+    /// Defaults to `false` from [`Requirement::new`]: a built-in tool's own code is not third-party,
+    /// and a tool has to say so deliberately.
+    ///
+    /// [`RiskClass`]: hx_core::approval::RiskClass
+    pub third_party: bool,
 }
 
 impl Requirement {
@@ -68,7 +90,15 @@ impl Requirement {
             resource,
             action,
             describes: describes.into(),
+            third_party: false,
         }
+    }
+
+    /// Mark this requirement as running a program the operator did not write. See
+    /// [`Self::third_party`].
+    pub fn third_party(mut self) -> Self {
+        self.third_party = true;
+        self
     }
 
     /// The command line a shell approval decision turns on, when there is one.
