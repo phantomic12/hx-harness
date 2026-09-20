@@ -15,6 +15,15 @@ name = "hx-mcp-fake-server"
 path = "tests/support/fake_mcp_server.rs"
 test = false
 
+# The server half: this crate serving `hx`'s own tools to somebody else's MCP client over stdio.
+#
+# Declared the way `hx-sandbox`'s `hx-egress-proxy` is: the binary is the transport's entry point
+# (a process whose stdin/stdout *are* the wire) and holds no logic. Everything it serves is
+# `crate::server`, so a test can drive the same gate without a pipe and a reviewer reads one file.
+[[bin]]
+name = "hx-mcp-server"
+path = "src/bin/mcp_server.rs"
+
 [dependencies]
 hx-core.workspace = true
 hx-secrets.workspace = true
@@ -22,8 +31,17 @@ hx-secrets.workspace = true
 # implement `hx_tools::Tool` directly rather than being adapted at the call site. That is the whole
 # point of the edge: an MCP tool is a tool, not a special case the loop has to know about.
 hx-tools.workspace = true
+# The server half's gate reuses `hx-agent`'s pieces rather than re-implementing them: `risk_of` is
+# the risk table an MCP call is classified by, and `ApprovalQueue` is the daemon's approval surface
+# the tests hold a refusal against. A second copy of either is a copy that can drift from the policy
+# the local path applies — which is the one thing a remote surface must not do.
+hx-agent.workspace = true
+# Only for `LocalHost`: the binary has to give its tools a machine to act on, and inventing a second
+# host for the server half would be a second answer to "where does a tool run".
+hx-remote.workspace = true
 rmcp.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
 futures.workspace = true
 indexmap.workspace = true
 serde.workspace = true

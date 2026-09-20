@@ -561,6 +561,14 @@ impl CallOutcome {
 /// Deliberately coarse: the classifier does the fine-grained work for commands, and a capability
 /// check has already decided whether the agent may touch this at all.
 ///
+/// **Public, and shared with `hx-mcp`'s server half**, because the alternative is a second table
+/// that can drift: a tool call made by a third-party MCP client is classified by exactly this
+/// function, so "the same requirement/risk path as a local call" is one implementation rather
+/// than two that agree today. It reads a [`Requirement`] — an `hx-tools` type carrying the
+/// resource, the action and the third-party fact — and returns the class the approval policy
+/// judges, which is why it belongs beside the loop that consults it rather than in the surface
+/// that calls it.
+///
 /// ## The one arm that is not a `(resource, action)` pair
 ///
 /// A [`Resource::Process`] with [`Requirement::third_party`] set is [`RiskClass::ThirdParty`]
@@ -575,7 +583,7 @@ impl CallOutcome {
 /// The table is the **only** place the flag becomes a class. `hx-mcp` reports the fact and nothing
 /// else, so a future tool that spawns a third-party binary gets the same answer without a second
 /// policy being written for it.
-fn risk_of(requirement: &Requirement) -> (RiskClass, String) {
+pub fn risk_of(requirement: &Requirement) -> (RiskClass, String) {
     match (&requirement.resource, requirement.action) {
         (Resource::Process, _) if requirement.third_party => (
             RiskClass::ThirdParty,

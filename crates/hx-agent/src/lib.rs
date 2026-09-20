@@ -30,7 +30,7 @@ pub mod context;
 pub mod model;
 pub mod queue;
 
-pub use agent::{AgentLoop, Limits, RunOutcome, TranscriptSink};
+pub use agent::{risk_of, AgentLoop, Limits, RunOutcome, TranscriptSink};
 pub use approver::{
     AlwaysAllow, AlwaysDeny, ApprovalDecision, Approver, DenyWithReason, ScriptedApprover,
 };
