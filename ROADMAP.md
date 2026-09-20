@@ -279,9 +279,12 @@ browser, file viewer/editor and command runner. Linux is live-tested in CI, a Ma
 against a real Apple-signed arm64 VM, and no private key reaches the model, the trail or a sandbox
 — that last clause is now pinned by tripwire tests rather than asserted. See `TESTING.md`.
 
-*What is still open is the remaining 🔶 below, not the criteria: **remote sandbox egress is
-fail-closed** — an allowlist is refused rather than enforced, because the proxy sidecar lives on the
-near host. Closing that is what the last item needs.*
+*M4's exit criteria are met, with no `🔶` left in this milestone: **remote sandbox egress is enforced,
+not merely fail-closed** — an allowlist is held by the same internal-network + `hx-egress-proxy` sidecar
+the local runtime uses, placed on the far host, and live-verified by observation rather than by reading
+back the command: an allowed host is relayed, a denied host is refused by the allowlist itself rather
+than by a blanket block, and the sandbox has no direct route out. Only what the proxy cannot match — a
+CIDR or raw IP — is still refused, with a reason naming the way out.*
 
 ---
 
