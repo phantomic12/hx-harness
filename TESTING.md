@@ -430,6 +430,32 @@ littered**. Cleanup lived at the end of each test body, so the run that found th
 defect left a container running, and it was still up 36 minutes later. A `Drop` guard now destroys
 the sandbox however the test ends — including a panic. A test that fails should not also leak.
 
+## An environmental flake in two `hx-server` exec route tests (Windows)
+
+`exec_runs_a_command_on_the_local_host` and
+`exec_reports_a_failing_command_rather_than_making_it_a_transport_error` (in
+`crates/hx-server/src/routes.rs`) intermittently fail on `windows-latest` with:
+
+```
+remote host error: command timed out after 30.0s
+```
+
+as a **502** instead of the expected **200**. This is environmental, confirmed two ways: the failure
+appeared on a commit that did not touch `routes.rs` at all, and `gh run rerun --failed` on that
+same commit went green. On a loaded CI runner the local `exec` can exceed the request's 30s default
+even when the route is healthy.
+
+**The two-step diagnosis.** (1) Diff the commit that went red. If it did not touch the failing crate
+(`hx-server`/`routes.rs`), the failure is not caused by that commit. (2) `gh run rerun --failed`
+on the same commit. If it goes green, the run was a loaded-runner flake, not a regression.
+
+**Do NOT bump the production exec timeout to make CI green.** The 30s default is a real product
+property — a route pointable at any machine should not hold a request open indefinitely. Instead the two
+tests pass `timeout_secs: 120` on their own request (a field the route already supports, clamped
+1..600), giving the *test* headroom without touching the product default and without weakening the
+assertion: they still assert `status == OK`, exact stdout, and exit code, so exec failing genuinely
+still fails the test. If the flake ever returns, re-check runner health before suspecting the route.
+
 ## Roadmap: closing the gaps, in priority order
 
 Ordered by (security impact × likelihood of silent breakage), not by effort.

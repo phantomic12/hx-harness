@@ -577,7 +577,8 @@ async fn the_far_daemon_rejects_l2_userns_remapping_when_it_is_not_configured() 
         "the engine's own message must surface: {message}"
     );
     assert!(
-        message.contains("no user-namespace remapping") && message.contains("Configure userns-remap"),
+        message.contains("no user-namespace remapping")
+            && message.contains("Configure userns-remap"),
         "the rejection must name the cause and the way out: {message}"
     );
     assert!(

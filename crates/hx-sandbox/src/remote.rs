@@ -799,7 +799,9 @@ mod tests {
         // The pure guard, pinned directly: it fires only when the command carried `--userns` AND the
         // engine said the specific `invalid USER mode` rejection. Either half alone is not enough.
         let remap_command = "docker create --name='x' --userns='private' ubuntu:24.04";
-        let remap_err = remote_error("`docker create …` failed with exit 125: docker: --userns: invalid USER mode");
+        let remap_err = remote_error(
+            "`docker create …` failed with exit 125: docker: --userns: invalid USER mode",
+        );
         assert!(
             userns_remap_advice(remap_command, &remap_err).is_some(),
             "the remap rejection must be rewritten"
