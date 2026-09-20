@@ -66,11 +66,23 @@ async fn state(token: Option<&str>) -> Arc<AppState> {
 }
 
 /// The same, for the cases where building is *supposed* to fail.
+///
+/// The ambient `HX_API_TOKEN` is cleared first, and that is load-bearing rather than tidiness: this
+/// suite asserts things like "a config with no token and no `HX_API_TOKEN` has no token", and
+/// `AppState::build` resolves the config and then falls back to that variable — the form a container
+/// and a CI job use. A *test process* must not inherit a real credential from the developer's shell,
+/// or `a_non_loopback_bind_with_no_token_is_refused...` fails for a reason that has nothing to do
+/// with what it asserts. Clearing here rather than handing each test a token is the point: a test
+/// that needed one would mean the loopback rule, not the test, was wrong.
+///
+/// The fallback itself is *not* left untested — it has its own file, `tests/api_token_env.rs`,
+/// because `set_var` races any other test running in the same binary.
 async fn try_state(token: Option<&str>) -> hx_core::error::Result<Arc<AppState>> {
     let mut config =
         hx_core::config::Config::from_yaml(&config_yaml(token)).expect("config parses");
     let dir = tempfile::tempdir().expect("temp dir");
     config.daemon.data_dir = dir.keep().display().to_string();
+    std::env::remove_var(hx_core::api_auth::API_TOKEN_ENV);
     let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
     AppState::build(config, now).await
 }

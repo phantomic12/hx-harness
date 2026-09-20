@@ -1252,6 +1252,25 @@ search:
   backends: []
 "#;
 
+    /// Build state from a config with the ambient API token cleared first.
+    ///
+    /// `AppState::build` resolves `api.token` and then falls back to `HX_API_TOKEN` in the
+    /// environment, which is the form a container and a CI job use. A *test process* must not
+    /// inherit a real credential from the developer's shell: with `HX_API_TOKEN` exported — which
+    /// `DEPLOY.md` tells operators to do — every request in this module comes back `401` and
+    /// twenty-four tests fail for a reason that has nothing to do with what they assert. Clearing
+    /// it here rather than handing a token to each test is the point: a test that needed a token
+    /// would mean the loopback rule, not the test, was wrong.
+    ///
+    /// Not a lock, and it does not need to be: every harness in this module wants the same answer,
+    /// so a concurrent clear is idempotent. `set_var`/`remove_var` inside a test is the convention
+    /// already used by `hx-secrets`, `hx-search`, `hx-store` and `hx-mcp`.
+    async fn build_state(config: hx_core::config::Config) -> Arc<AppState> {
+        std::env::remove_var(hx_core::api_auth::API_TOKEN_ENV);
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        AppState::build(config, now).await.expect("state builds")
+    }
+
     async fn test_state() -> Arc<AppState> {
         let mut config = hx_core::config::Config::from_yaml(CONFIG).expect("config parses");
         // A test must not write a session database into the developer's home directory, and the
@@ -1260,8 +1279,7 @@ search:
         let dir = tempfile::tempdir().expect("temp dir");
         config.daemon.data_dir = dir.keep().display().to_string();
 
-        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        AppState::build(config, now).await.expect("state builds")
+        build_state(config).await
     }
 
     async fn get(state: Arc<AppState>, uri: &str) -> (StatusCode, serde_json::Value) {
@@ -1940,8 +1958,7 @@ search:
             ..Default::default()
         };
 
-        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        let state = AppState::build(config, now).await.expect("state builds");
+        let state = build_state(config).await;
 
         let (status, body) = post(
             state.clone(),
@@ -1968,8 +1985,7 @@ search:
             ..Default::default()
         };
 
-        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        let state = AppState::build(config, now).await.expect("state builds");
+        let state = build_state(config).await;
 
         let (status, body) = get(state.clone(), "/v1/status").await;
         assert_eq!(status, StatusCode::OK);
