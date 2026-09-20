@@ -407,10 +407,26 @@ command with a button, receive a cron digest in a separate pinned thread.
   this" — is named here and deliberately **not** added: it would be a config flag whose only effect is
   to silence a prompt, which is the shape a safety switch should not have. An operator who wants one
   server silent writes `allow`/`ask` rules against its tool namespace, which is per-tool and visible.
-- ⬜ **Open, from this item:** MCP children inherit the daemon's environment (needed for `npx`/`PATH`
-  and `HOME`), so a secret exported into the daemon's shell reaches every child it spawns. Documented
-  in `hx-mcp/src/stdio.rs` and TESTING.md Tier C. The fix is an allowlist of inherited variables,
-  which needs a decision about which ones `npx`, `uvx` and `node` actually require.
+- ✅ **Closed, from this item:** MCP children inherited the daemon's environment, so a secret exported
+  into the daemon's shell reached every child it spawned. `hx-mcp`'s `stdio::connect` now calls
+  `Command::env_clear()` and then `envs(child_environment(cfg))` — a **fail-closed allowlist** of
+  `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `LANG`, `LC_ALL`, `TERM`, plus the
+  Windows-only set (`SYSTEMROOT`, `TEMP`, `TMP`, `PATHEXT`, `COMSPEC`, `USERPROFILE`, `APPDATA`,
+  `LOCALAPPDATA`, `PROGRAMFILES`, `NUMBER_OF_PROCESSORS`) — with a per-server
+  `env_passthrough: [VAR, …]` opt-in for anything else an `npx`/`uvx`/`node` tool needs, and `env:`
+  still applied on top as the operator's own literal for that server. `env_clear()` is the load-bearing
+  part: `env()` alone *adds* to the inherited set, so an allowlist written as a filter over `env()`
+  calls is one a later `env()` can undo. The allowlist is a list rather than a scrubber on purpose —
+  a scrubber has to *recognise* a secret, and `OPENAI_API_KEY`, `AWS_SECRET_ACCESS_KEY` and
+  `MY_COMPANY_DEPLOY_KEY` share no shape; a list has to recognise nothing.
+  Proven by `hx-mcp/tests/env.rs`, which spawns a **real child** through the real `McpHost` and reads
+  the environment the child itself dumped: the sentinel secret does not arrive, an ordinary
+  non-credential-shaped variable does not either, `LOGNAME`/`PATH` **do** (the positive controls, so
+  a child that inherited nothing cannot pass), the opted-in variable arrives for the server that named
+  it and not for its sibling in the same run, and **every** name the child holds is on the allowlist,
+  opted in, or in its own `env:` — a name nobody thought to check fails the test. `hx.example.yaml`
+  documents the key, and `McpServerConfig::validate` refuses an `env_passthrough` entry that is not a
+  variable name, because a typo there fails closed and looks like the server's fault.
 - ⬜ **Open, from this item:** the live MCP canary (`hx-mcp/tests/mcp_live.rs`) has never been run
   against a real third-party server. Every wire-level property is currently verified against a double
   this crate also wrote. Run it against `npx -y @modelcontextprotocol/server-filesystem /tmp` and an

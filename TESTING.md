@@ -255,6 +255,45 @@ deliberately **not** added: it would be a config flag whose only effect is to si
 is the shape a safety switch should not have. An operator who wants one server silent writes
 `allow`/`ask` rules against its tool namespace, which is per-tool and visible.
 
+## The environment an MCP child inherits (M6)
+
+MCP children inherited the daemon's environment. `env:` in a server's config *adds* variables, and
+`Command::env` adds to what the parent already has — so `OPENAI_API_KEY` exported into the shell that
+started the daemon reached every MCP child, including servers written by somebody else.
+
+The fix is `Command::env_clear()` followed by an explicit **allowlist**: `PATH`, `HOME`, `USER`,
+`LOGNAME`, `SHELL`, `TMPDIR`, `LANG`, `LC_ALL`, `TERM`, plus a Windows-only set (`SYSTEMROOT`, `TEMP`,
+`TMP`, `PATHEXT`, `COMSPEC`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `PROGRAMFILES`,
+`NUMBER_OF_PROCESSORS`). A per-server `env_passthrough: [VAR, …]` opts anything else in, and `env:`
+is still applied on top as the operator's own literal for that server. It is an allowlist rather than
+a scrubber on purpose: a scrubber has to *recognise* a secret, and `OPENAI_API_KEY`,
+`AWS_SECRET_ACCESS_KEY`, `GH_TOKEN` and `MY_COMPANY_DEPLOY_KEY` share no shape. A list has to
+recognise nothing.
+
+**The test asks a real child, not a filter function.** `hx-mcp/tests/env.rs` spawns the same
+hand-rolled MCP server `tests/stdio.rs` drives, through the real `McpHost::from_config`, with
+`--env-file` making the child dump *its own* environment before the handshake. It is its own test
+binary because it mutates the process environment and has one test in it, so `set_var` cannot race
+another thread's `vars()`.
+
+| Test | The property |
+|---|---|
+| `an_mcp_child_gets_the_allowlist_the_opt_in_and_its_own_config_and_nothing_else` (`hx-mcp/tests/env.rs`) | A sentinel secret exported into the parent does **not** reach either child; an ordinary non-credential-shaped variable does not either; the allowlisted positive controls (`LOGNAME`, whose *value* the test sets, and a non-empty `PATH`) **do** arrive, so a child that inherited nothing cannot pass; the opted-in variable arrives for the server that named it and is absent for its sibling in the same run; the config's own `env:` arrives; and **every** name the child holds is on the allowlist, opted in, or in its own `env:` — a name nobody thought to check fails the test |
+| `the_allowlist_lets_a_toolchain_start_and_nothing_else_through` (`hx-mcp`, unit) | The predicate itself: `PATH`/`HOME`/`TMPDIR`/`LANG` in, `OPENAI_API_KEY`/`ANTHROPIC_API_KEY`/`AWS_SECRET_ACCESS_KEY`/`GH_TOKEN`/`MY_COMPANY_DEPLOY_KEY`/`HTTPS_PROXY` out, plus near-misses (`path`, `PATHEXTRA`) that a prefix or case-insensitive match on Unix would let through |
+| `an_opted_in_name_is_inherited_and_only_for_the_server_that_named_it` (`hx-mcp`, unit) | The opt-in is exact: naming `HTTPS_PROXY` does not bring `HTTP_PROXY`, does not widen the list, and does not remove what was already there |
+| `the_config_env_is_applied_and_overrides_what_was_inherited` (`hx-mcp`, unit) | `env:` is not filtered, and a name it repeats takes the config's value rather than appearing twice |
+| `an_env_passthrough_entry_that_is_not_a_variable_name_is_refused_by_name` (`hx-core`, unit) | A typo in the opt-in is a startup error naming the entry, because it fails *closed* — the variable silently does not arrive and the server breaks in a way that reads as the server's fault |
+| `an_mcp_block_parses_with_every_field_it_has` (`hx-core`, unit) | The key round-trips from YAML, and a server that says nothing opts into nothing |
+
+**The sensitivity of the negatives, stated rather than assumed.** A `!contains(secret)` assertion
+passes trivially if the child inherits nothing at all — which is why the test asserts the positive
+controls first and, before the completeness check, asserts that the *parent* holds names the allowlist
+does not cover. Those two facts together ("the parent has unlisted names", "the child has none") are
+the filter doing something; neither half alone is. The `--env-file` mechanism was checked
+independently by running the fake server straight from a shell, where it dumped 142 variables
+including the sentinel — so the dump reports what the child really holds, and the absence in the test
+is `hx-mcp`'s doing.
+
 ## The browser pool (M6)
 
 The escalation ladder, the pool and the two cheap rungs are built. **No browser is driven anywhere
@@ -689,7 +728,6 @@ the failure is silent:
 | Vault written to disk and reopened in a **new process** | Untested | Medium — in-process round-trip only |
 | `hxd` reaper loop, `axum::serve` under load | Manual only | Low |
 | **`hx-mcp` against a real third-party MCP server** | No real server can be assumed on a build machine, so the live canary (`tests/mcp_live.rs`) is `#[ignore]`d and reads its target from `HX_MCP_LIVE_COMMAND`/`HX_MCP_LIVE_URL`. It has **never been run**. Everything the suite verifies about the wire is verified against a double this crate also wrote — real JSON-RPC over a real pipe, but our reading of the protocol at both ends. The one test in that file that needs no environment (`a_live_target_that_is_not_there_is_a_readable_failure_and_not_a_hang`) *does* run, and covers the commonest real state: a misconfigured server | Medium — a `rmcp` behaviour we have misread would pass every test here and fail on first contact. `rmcp` is the mitigation, and it is not under test |
-| **`hx-mcp` children inherit the daemon's environment** | Deliberate, and therefore never exercised as a failure. `env:` in a server's config *adds* variables; it does not replace the inherited set, because `npx` resolves Node through `PATH` and servers read `HOME` for caches. A secret exported into the daemon's shell therefore reaches every child it spawns. See `src/stdio.rs`'s module doc | Medium — the exposure is real but bounded: `hx`'s own credentials come from the vault, resolved per call, and are never placed in an environment |
 
 ### Tier D — absent
 

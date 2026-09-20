@@ -226,6 +226,12 @@ connectors:
 #       command: npx
 #       args: ["-y", "@modelcontextprotocol/server-filesystem", "/srv/data"]
 #       env: { RUST_LOG: warn }
+#       # The child inherits an *allowlist* of the daemon's own variables
+#       # (PATH, HOME, USER, LOGNAME, SHELL, TMPDIR, LANG, LC_ALL, TERM), so a
+#       # credential exported into the daemon's shell does not reach it. Name
+#       # anything else the server needs here — this is the opt-in, and it is
+#       # per server rather than global.
+#       env_passthrough: ["HTTP_PROXY", "VIRTUAL_ENV"]
 #       # cwd: /srv
 #
 #     # streamable_http: a remote endpoint. The token is a *reference*, resolved

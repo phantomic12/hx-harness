@@ -697,8 +697,33 @@ pub struct McpServerConfig {
     /// Environment variables for the child. Values are literals here on purpose: this is how an MCP
     /// server is told which directory to serve, and a *secret* in this map would be a secret in the
     /// config file, so anything credential-shaped belongs in `token` or in the server's own vault.
+    ///
+    /// These are **added to** whatever the child inherits, and unlike the inherited set they are not
+    /// filtered: a value written here was written *for this server*, by the operator, on purpose.
     #[serde(default)]
     pub env: IndexMap<String, String>,
+    /// Names of variables to inherit from the daemon's own environment, beyond the built-in
+    /// allowlist.
+    ///
+    /// The child's environment is an **allowlist, fail-closed**: `PATH`, `HOME`, `USER`, `LOGNAME`,
+    /// `SHELL`, `TMPDIR`, `LANG`, `LC_ALL` and `TERM` (plus the Windows-only set — `SYSTEMROOT`,
+    /// `TEMP`, `TMP`, `PATHEXT`, `COMSPEC`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`,
+    /// `PROGRAMFILES`, `NUMBER_OF_PROCESSORS`) are inherited, and **anything else is not**. That is
+    /// the fix for a real exposure: a credential exported into the daemon's shell used to reach
+    /// every MCP child it spawned, because `env:` *adds* to the inherited set rather than replacing
+    /// it.
+    ///
+    /// The allowlist is deliberately short, so a tool that genuinely needs something else — an
+    /// `npx` package reading a proxy variable, a `uvx` tool wanting `VIRTUAL_ENV` — names it here.
+    /// This is an **opt-in per server**, never a global one: the operator writing the name is the
+    /// review, and a variable nobody names cannot leak. Naming a variable that is already on the
+    /// allowlist is harmless.
+    ///
+    /// Note what this cannot do: it bounds *inheritance*, not the child's own access. A process the
+    /// operator runs can read any file its user can, and a server that wants a credential should be
+    /// given one through `env:` or read it from the vault — not find it lying in its environment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_passthrough: Vec<String>,
     /// Working directory for the child process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
@@ -763,6 +788,7 @@ impl McpServerConfig {
             command: Some(command.into()),
             args: args.into_iter().collect(),
             env: IndexMap::new(),
+            env_passthrough: Vec::new(),
             cwd: None,
             url: None,
             token: None,
@@ -782,6 +808,7 @@ impl McpServerConfig {
             command: None,
             args: Vec::new(),
             env: IndexMap::new(),
+            env_passthrough: Vec::new(),
             cwd: None,
             url: Some(url.into()),
             token: None,
@@ -880,6 +907,18 @@ impl McpServerConfig {
                 "mcp server {key:?}: `call_timeout_secs` must be at least 1 — a zero timeout would \
                  fail every call, and an unbounded one would hang a run on a wedged server"
             )));
+        }
+
+        // An `env_passthrough` entry that is not a variable name can only be a typo, and a typo here
+        // fails *closed* — the variable silently does not arrive and the server breaks in a way that
+        // looks like the server's fault. So it is a startup error naming the entry.
+        for name in &self.env_passthrough {
+            if name.is_empty() || name.contains(['=', '\0']) {
+                return Err(HxError::Config(format!(
+                    "mcp server {key:?}: `env_passthrough` entry {name:?} is not a variable name — \
+                     it must be non-empty and must not contain `=`"
+                )));
+            }
         }
 
         Ok(())
@@ -1482,6 +1521,7 @@ mcp_servers:
     args: ["-y", "@modelcontextprotocol/server-filesystem", "/srv"]
     env:
       RUST_LOG: warn
+    env_passthrough: ["HTTP_PROXY", "VIRTUAL_ENV"]
     cwd: /srv
 "#;
         let config = Config::from_yaml(yaml).expect("must parse");
@@ -1496,12 +1536,20 @@ mcp_servers:
         assert_eq!(github.start_timeout_secs, 7);
         assert_eq!(github.max_restarts, 1);
         assert_eq!(github.restart_window_secs, 60);
+        assert!(
+            github.env_passthrough.is_empty(),
+            "the field is per server: a block that says nothing opts into nothing"
+        );
 
         let files = &config.mcp_servers["files"];
         assert_eq!(files.transport, McpTransport::Stdio);
         assert_eq!(files.command.as_deref(), Some("npx"));
         assert_eq!(files.args.len(), 3);
         assert_eq!(files.env["RUST_LOG"], "warn");
+        assert_eq!(
+            files.env_passthrough,
+            vec!["HTTP_PROXY".to_string(), "VIRTUAL_ENV".to_string()]
+        );
         assert_eq!(files.cwd.as_deref(), Some("/srv"));
 
         for (key, server) in &config.mcp_servers {
@@ -1509,6 +1557,30 @@ mcp_servers:
                 .validate(key)
                 .expect("the documented block must be valid");
         }
+    }
+
+    /// The opt-in is an allowlist entry, so a *typo* in it fails closed — the variable does not
+    /// arrive and the server breaks in a way that reads as the server's fault. Naming it at startup
+    /// is the difference between a five-second fix and an afternoon.
+    #[test]
+    fn an_env_passthrough_entry_that_is_not_a_variable_name_is_refused_by_name() {
+        let mut server = McpServerConfig::stdio("npx", Vec::<String>::new());
+        server.env_passthrough = vec!["HTTP_PROXY".to_string(), "NOT_A_NAME=x".to_string()];
+
+        let message = server.validate("fs").unwrap_err().to_string();
+        assert!(message.contains("NOT_A_NAME=x"), "{message}");
+        assert!(message.contains("env_passthrough"), "{message}");
+
+        server.env_passthrough = vec!["".to_string()];
+        assert!(
+            server.validate("fs").is_err(),
+            "an empty name is a typo too"
+        );
+
+        // And the well-formed list is accepted, which is what stops the check above from passing by
+        // refusing everything.
+        server.env_passthrough = vec!["HTTP_PROXY".to_string(), "VIRTUAL_ENV".to_string()];
+        server.validate("fs").expect("real variable names");
     }
 
     /// The shortest block an operator can write. Every policy field has a default, and the defaults

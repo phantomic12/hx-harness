@@ -15,16 +15,31 @@
 //! stdout. `rmcp`'s `AsyncRwTransport` implements exactly that, which is why this module's own code
 //! is about process hygiene rather than about parsing.
 //!
-//! ## The child inherits the daemon's environment, knowingly
+//! ## The child inherits an allowlist, not the daemon's environment
 //!
-//! `env:` in the config *adds* variables; it does not replace the inherited set. That is deliberate
-//! — `npx` resolves Node through `PATH`, and servers read `HOME` for caches — and it is also a real
-//! exposure: a credential exported into the daemon's environment reaches every MCP child it spawns.
-//! `hx`'s own answer to this is the vault (`vault:` references, resolved per call, never placed in
-//! an environment) and the rule that a server needing a token is configured with one, but a daemon
-//! started from a shell with `OPENAI_API_KEY` exported does hand that to its children. It is called
-//! out here, in `ROADMAP.md`, and in `TESTING.md` rather than papered over with a half-scrubbed
-//! environment that would break the servers this feature exists to run.
+//! `env:` in the config *adds* variables for the child, and the set the child *inherits* is an
+//! **allowlist**: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `LANG`, `LC_ALL` and `TERM`,
+//! plus the Windows-only set (`SYSTEMROOT`, `TEMP`, `TMP`, `PATHEXT`, `COMSPEC`, `USERPROFILE`,
+//! `APPDATA`, `LOCALAPPDATA`, `PROGRAMFILES`, `NUMBER_OF_PROCESSORS`). Everything else the daemon
+//! holds is **not** passed, so a credential exported into the daemon's shell does not reach the
+//! children it spawns.
+//!
+//! This replaced plain inheritance. Inheritance was the honest reading of what `npx` needs — `PATH`
+//! resolves Node, `HOME` is where it caches — and it was also a real exposure: `OPENAI_API_KEY`
+//! exported into the shell that started the daemon reached every MCP child, including servers
+//! written by somebody else. The list is short on purpose, and a tool that genuinely needs something
+//! else names it in the server's `env_passthrough:`. That opt-in is **per server**, never global:
+//! the operator writing the name is the review, and a variable nobody names cannot leak.
+//!
+//! `Command::env_clear()` is what makes this fail closed. `env()` alone *adds* to whatever the parent
+//! already has, so an allowlist written as a filter over `env()` calls is an allowlist a later
+//! `env()` can undo — and one that silently stops applying the day a caller sets a variable before
+//! spawning.
+//!
+//! What this does not do: it bounds *inheritance*, not access. The child runs as the daemon's user
+//! and can read what that user can read. `hx`'s answer to a credential a server genuinely needs is
+//! still the vault (`vault:` references, resolved per call, never placed in an environment) or an
+//! explicit `env:` literal for that one server.
 //!
 //! ## stderr is captured, never forwarded
 //!
@@ -99,6 +114,102 @@ impl StderrTail {
     }
 }
 
+/// The variables an MCP child inherits from the daemon's environment, on every platform.
+///
+/// Short on purpose, and the shortness is the security property. Every entry is here because a
+/// program this crate spawns cannot start without it:
+///
+/// - `PATH` — how `npx`/`uvx`/`node` are resolved at all. Without it nothing spawns.
+/// - `HOME`, `USER`, `LOGNAME` — where `npx` and `uvx` keep their caches, and what a server reports
+///   about who is running it. `SHELL` for the same reason `HOME` is here: a `npx` shim may run one.
+/// - `TMPDIR` — where a package manager stages an install; the default is wrong often enough on a
+///   container that omitting it breaks real servers.
+/// - `LANG`, `LC_ALL`, `TERM` — locale and terminal, which a server that prints anything reads.
+///
+/// What is deliberately **absent** is anything credential-shaped, and the reason this is a list
+/// rather than a scrubber: a scrubber has to *recognise* a secret, and `OPENAI_API_KEY`,
+/// `AWS_SECRET_ACCESS_KEY`, `GH_TOKEN` and `MY_COMPANY_DEPLOY_KEY` do not share a shape. An
+/// allowlist does not have to recognise anything.
+const INHERITED_ALWAYS: &[&str] = &[
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "TERM",
+];
+
+/// The extra variables a Windows child needs to start at all.
+///
+/// `SYSTEMROOT` is not optional there — a process cannot load its own DLLs without it — and `TEMP`
+/// is `TMPDIR`'s counterpart. The rest are what `cmd`, `npm`'s `.cmd` shims and `PATHEXT`-driven
+/// resolution read: a Windows child without `PATHEXT` cannot run `npx.cmd`.
+#[cfg(windows)]
+const INHERITED_WINDOWS: &[&str] = &[
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "PATHEXT",
+    "COMSPEC",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMFILES",
+    "NUMBER_OF_PROCESSORS",
+];
+
+/// The counterpart on every other platform, so the filter is one expression rather than a `cfg` at
+/// each use site. Empty filters nothing, and [`INHERITED_ALWAYS`] is then the whole allowlist.
+#[cfg(not(windows))]
+const INHERITED_WINDOWS: &[&str] = &[];
+
+/// Is this variable inherited — on the built-in allowlist, or named by the server's
+/// `env_passthrough`?
+///
+/// The comparison is case-insensitive on Windows and exact everywhere else, because that is what the
+/// platform does: `Path` and `PATH` are one variable there, and two variables here. Getting this
+/// wrong on Windows fails *open* in the one direction that matters — the allowlist entry `PATH`
+/// would not match the `Path` the OS actually exports, and the child would not start — so it is a
+/// `cfg` rather than a normalisation applied everywhere.
+fn is_inherited(name: &str, passthrough: &[String]) -> bool {
+    let listed = |allowed: &str| -> bool {
+        #[cfg(windows)]
+        {
+            allowed.eq_ignore_ascii_case(name)
+        }
+        #[cfg(not(windows))]
+        {
+            allowed == name
+        }
+    };
+
+    INHERITED_ALWAYS
+        .iter()
+        .chain(INHERITED_WINDOWS)
+        .any(|allowed| listed(allowed))
+        || passthrough.iter().any(|opted_in| listed(opted_in))
+}
+
+/// The environment an MCP child is given: the daemon's own, filtered down to the allowlist, plus
+/// whatever the server's config says.
+///
+/// Fail-closed by construction — the caller pairs this with [`Command::env_clear`], so a variable
+/// that reaches the child is one that was *put* there. See the module doc for the exposure this
+/// closes and [`INHERITED_ALWAYS`] for the list.
+///
+/// `env:` is applied last and is not filtered: a value written in a server's config was written for
+/// that server, by the operator, on purpose — which is the same review `env_passthrough` gets. A
+/// name in both places takes the config's value, because the config is the more specific statement.
+fn child_environment(cfg: &McpServerConfig) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = std::env::vars()
+        .filter(|(name, _)| is_inherited(name, &cfg.env_passthrough))
+        .collect();
+
+    for (key, value) in &cfg.env {
+        match env.iter_mut().find(|(name, _)| name == key) {
+            Some(slot) => slot.1 = value.clone(),
+            None => env.push((key.clone(), value.clone())),
+        }
+    }
+
+    env
+}
+
 /// Spawn the configured command and complete the MCP handshake over its pipes.
 ///
 /// `tail` is the server's stderr sink, owned by the supervisor rather than by the connection: the
@@ -118,9 +229,12 @@ pub(crate) async fn connect(
 
     let mut cmd = tokio::process::Command::new(command);
     cmd.args(&cfg.args);
-    for (key, value) in &cfg.env {
-        cmd.env(key, value);
-    }
+    // Fail closed. `env()` alone *adds* to the inherited environment, so an allowlist written as a
+    // filter over `env()` calls is one a later `env()` — or a variable the daemon happens to have —
+    // can undo. `env_clear()` first, then exactly what the allowlist and the config say. See
+    // `child_environment`.
+    cmd.env_clear();
+    cmd.envs(child_environment(cfg));
     if let Some(cwd) = &cfg.cwd {
         cmd.current_dir(cwd);
     }
@@ -170,4 +284,94 @@ fn drain_stderr(stderr: tokio::process::ChildStderr, tail: StderrTail) {
             tail.record(line);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The predicate, unit-tested where the child-process test can only show it end to end. The
+    /// integration test proves the filter is *used*; this proves it is the right filter.
+    #[test]
+    fn the_allowlist_lets_a_toolchain_start_and_nothing_else_through() {
+        let nothing = Vec::new();
+
+        // The positive controls: without these the child does not start at all.
+        for name in ["PATH", "HOME", "TMPDIR", "LANG"] {
+            assert!(is_inherited(name, &nothing), "{name} must be inherited");
+        }
+
+        // The negatives, chosen to be the shapes a real daemon holds: two API keys, a cloud secret,
+        // a token, and a company-specific deploy key. None shares a pattern with another, which is
+        // exactly why this is a list and not a scrubber.
+        for name in [
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "GH_TOKEN",
+            "MY_COMPANY_DEPLOY_KEY",
+            "HTTPS_PROXY",
+        ] {
+            assert!(
+                !is_inherited(name, &nothing),
+                "{name} must not be inherited by default"
+            );
+        }
+
+        // A near-miss, so a prefix or case-insensitive match on Unix cannot pass this by accident.
+        assert!(
+            !is_inherited("path", &nothing),
+            "Unix names are case-sensitive"
+        );
+        assert!(!is_inherited("PATHEXTRA", &nothing));
+    }
+
+    #[test]
+    fn an_opted_in_name_is_inherited_and_only_for_the_server_that_named_it() {
+        let opted_in = vec!["HTTPS_PROXY".to_string()];
+
+        assert!(is_inherited("HTTPS_PROXY", &opted_in));
+        assert!(
+            !is_inherited("HTTP_PROXY", &opted_in),
+            "one name does not bring its family: the opt-in is exact"
+        );
+        assert!(
+            !is_inherited("OPENAI_API_KEY", &opted_in),
+            "and it does not widen the list it was added to"
+        );
+        assert!(
+            is_inherited("PATH", &opted_in),
+            "opting in does not remove what was already there"
+        );
+    }
+
+    #[test]
+    fn the_config_env_is_applied_and_overrides_what_was_inherited() {
+        // `env:` is the operator's own literal for one server, so it is not filtered — and a name it
+        // repeats takes the config's value, because the config is the more specific statement.
+        let mut cfg = McpServerConfig::stdio("npx", Vec::<String>::new());
+        cfg.env
+            .insert("HTTPS_PROXY".into(), "http://127.0.0.1:9".into());
+        cfg.env
+            .insert("SENTINEL_FOR_THIS_SERVER".into(), "on".into());
+        cfg.env_passthrough = vec!["HTTPS_PROXY".to_string()];
+
+        // Only assert on what the *config* contributed: the inherited half depends on the machine
+        // this runs on, and a test that hard-coded `PATH` would be asserting the CI environment.
+        let env = child_environment(&cfg);
+        let value = |name: &str| {
+            env.iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(value("SENTINEL_FOR_THIS_SERVER"), Some("on"));
+        assert_eq!(value("HTTPS_PROXY"), Some("http://127.0.0.1:9"));
+        assert_eq!(
+            env.iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case("HTTPS_PROXY"))
+                .count(),
+            1,
+            "the config's value replaces the inherited one rather than appearing twice"
+        );
+    }
 }

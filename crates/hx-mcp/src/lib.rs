@@ -55,10 +55,9 @@
 //!
 //! ## The risk class, and the environment
 //!
-//! Two things this crate reports as *facts* rather than deciding for itself. The first is now
-//! answered and the second is still open; both are recorded in `ROADMAP.md` rather than papered over:
+//! Two things this crate reports or enforces as *facts* rather than deciding for itself:
 //!
-//! 1. **A stdio call is no longer auto-allowed at the default level.** `tool::requirement_for`
+//! 1. **A stdio call is not auto-allowed at the default level.** `tool::requirement_for`
 //!    reports [`Resource::Process`] + [`Action::Execute`] for a stdio server, because a child process
 //!    is exactly what that capability means — a new resource variant would have been a new *grant*
 //!    to hold, turning an approval preference into an authority change. It also sets
@@ -69,13 +68,14 @@
 //!    for each one. The honest limit is in `ROADMAP.md` and in `tool::requirement_for`'s doc — the
 //!    flag is set for *every* stdio server, including one whose `command:` is a script the operator
 //!    wrote, because a config names a command and `hx` cannot tell `npx` from `./my-server`.
-//! 2. **MCP children inherit the daemon's environment.** `env:` in a server's config *adds*
-//!    variables; it does not replace the inherited set, because `npx` resolves Node through `PATH`
-//!    and servers read `HOME` for caches. The exposure is real: a secret exported into the daemon's
-//!    environment reaches every child it spawns. `hx`'s answer is the vault (resolved per call,
-//!    never placed in an environment), and the rule that a server needing a token is configured with
-//!    one — but a daemon started from a shell with `OPENAI_API_KEY` exported does hand that to its
-//!    children. See `crate::stdio`'s module doc.
+//! 2. **A child inherits an allowlist, not the daemon's environment.** `env:` in a server's config
+//!    *adds* variables for that server; the set a child *inherits* is `PATH`, `HOME`, `USER`,
+//!    `LOGNAME`, `SHELL`, `TMPDIR`, `LANG`, `LC_ALL`, `TERM` (plus the Windows-only set), and
+//!    anything else a particular tool needs is named in that server's `env_passthrough:`. So a
+//!    credential exported into the shell that started the daemon does **not** reach the MCP servers
+//!    it spawns, and the opt-in is per server rather than global. `Command::env_clear()` is what
+//!    makes it fail closed — see `crate::stdio`'s module doc, and `tests/env.rs`, which asks a real
+//!    child what it actually holds.
 //!
 //! [`Resource::Process`]: hx_core::capability::Resource::Process
 //! [`Action::Execute`]: hx_core::capability::Action::Execute
