@@ -293,6 +293,16 @@ deliberately **not** added: it would be a config flag whose only effect is to si
 is the shape a safety switch should not have. An operator who wants one server silent writes
 `allow`/`ask` rules against its tool namespace, which is per-tool and visible.
 
+**The unstated consequence for chat bridges.** Placing `ThirdParty` above `External` means that on a
+deployment with a chat bridge (e.g. Telegram), the prompt raised by a stdio MCP call **cannot be answered
+from that channel**. The bridge ceiling is `Mutate` (`crates/hx-gateway/src/answer.rs:40`, `telegram.rs:604`),
+`covers(ThirdParty)` is false, and `docs/approvals.md` §9 says an answer exceeding the ceiling leaves the
+question open until its timeout denies it (`default_on_timeout: Deny`). Nothing is newly denied by the policy
+itself (an over-ceiling prompt is `Ask`, not `Deny`), but on a bridge-only deployment it denies itself by timeout.
+The named remedy of writing `allow` rules against the tool namespace does not work here, because `docs/approvals.md` §2
+enforces that rules are subject to the ceiling: a rule cannot allow what the ceiling forbids. The operator's actual
+options are either to raise the bridge ceiling or to answer the prompt from a local surface (terminal or web UI).
+
 ## The environment an MCP child inherits (M6)
 
 MCP children inherited the daemon's environment. `env:` in a server's config *adds* variables, and

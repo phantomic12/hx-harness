@@ -436,6 +436,15 @@ command with a button, receive a cron digest in a separate pinned thread.
   this" — is named here and deliberately **not** added: it would be a config flag whose only effect is
   to silence a prompt, which is the shape a safety switch should not have. An operator who wants one
   server silent writes `allow`/`ask` rules against its tool namespace, which is per-tool and visible.
+  **The unstated consequence for chat bridges:** placing `ThirdParty` above `External` means that on a
+  deployment with a chat bridge (e.g. Telegram), the prompt raised by a stdio MCP call **cannot be answered
+  from that channel**. The bridge ceiling is `Mutate` (`crates/hx-gateway/src/answer.rs:40`, `telegram.rs:604`),
+  `covers(ThirdParty)` is false, and `docs/approvals.md` §9 says an answer exceeding the ceiling leaves the
+  question open until its timeout denies it (`default_on_timeout: Deny`). Nothing is newly denied by the policy
+  itself (an over-ceiling prompt is `Ask`, not `Deny`), but on a bridge-only deployment it denies itself by timeout.
+  The named remedy of writing `allow` rules against the tool namespace does not work here, because `docs/approvals.md` §2
+  enforces that rules are subject to the ceiling: a rule cannot allow what the ceiling forbids. The operator's actual
+  options are either to raise the bridge ceiling or to answer the prompt from a local surface (terminal or web UI).
 - ✅ **Closed, from this item:** MCP children inherited the daemon's environment, so a secret exported
   into the daemon's shell reached every child it spawned. `hx-mcp`'s `stdio::connect` now calls
   `Command::env_clear()` and then `envs(child_environment(cfg))` — a **fail-closed allowlist** of
