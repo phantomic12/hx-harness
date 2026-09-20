@@ -380,7 +380,7 @@ CIDR or raw IP — is still refused, with a reason naming the way out.*
   browser cannot authenticate by header, and the same query string on a plain GET is worth nothing. Both
   clients are wired: `hx` puts the token on its client's default headers and its 401 message names the
   settings, and the page sends it on every `fetch` and on its socket URLs. Proven by
-  `crates/hx-server/tests/api_auth.rs` (11 tests: a no-token `PUT` that must not reach the handler *with*
+  `crates/hx-server/tests/api_auth.rs` (12 tests: a no-token `PUT` that must not reach the handler *with*
   its write control, every prefix of the token refused, a bare token and another scheme refused, the two
   refusals compared byte for byte, an unresolvable `api.token` failing the build, and a capture of the
   tracing output on both refusal paths asserting the sentinel is in no log line and no `Debug` dump),
@@ -620,18 +620,36 @@ promise about how it is used.
 
 ## M7 — Native apps
 
-- Tauri 2 shell reusing the exact web UI bundle; local or remote `hxd`
-- Desktop: system tray, global hotkey, OS notifications, native file pickers
-- Mobile (iOS + Android): chat, session browse, log view, approval queue, push notifications
-  via APNs/FCM; device token in Keychain/Keystore
-- Auto-update, code signing, CI matrix for all five targets
+- ✅ **Tauri 2 desktop shell** reusing the exact web UI bundle (`apps/hx-desktop`): it references
+  `crates/hx-server/static/index.html` directly via Tauri's `frontendDist` rather than forking it, and
+  reuses `hx-secrets::resolve_api_token` so `api.token` literals, `store:name` references and
+  `HX_API_TOKEN` all work. Tested (11 tests) for the endpoint/token resolution pure function (local vs
+  remote, config-vs-env precedence, eager remote-missing-token failure) and for bundle-path identity. It can
+  target a local or remote `hxd`.
+- ⬜ **Desktop: system tray, global hotkey, OS notifications, native file pickers** — not started.
+- ⬜ **Mobile (iOS + Android)** — explicitly deferred (needs the Android NDK/SDK and a macOS host for
+  iOS signing; neither is available).
+- ⬜ **Auto-update, code signing, CI matrix for all five targets** — not landed.
 
 **Exit criteria:** an approval requested by a running agent pings your phone; you approve it
-from the lock screen and the agent continues.
+from the lock screen and the agent continues. **Unmet.** The desktop shell is a window that points at the
+daemon; it does not push an approval to a phone, and the phone/lock-screen approval path is not built. The
+`approval.ask_via` receive loop and a mobile client are the missing halves (see M5).
 
 ---
 
 ## M8 — Subagent pooling (more than one model)
+
+*Status note (docs-truth-sweep): the roadmap item below was written on the assumption that a
+subagent system already exists in this repo — a **process-global** `delegation.model` key read when a
+child is spawned. That premise is **false on this tree**: there is no `delegation.model` key, no
+`ChildSpec`, no orchestrator, and no path that spawns a child model at all. The concurrency-and-pool
+settings that exist (`AgentConfig::max_concurrent_subagents`, `default_pool`) bound a **credential
+pool**, not a model-pool of subagents. So this milestone's framing describes a system that does not exist
+yet: there is no fan-out to draw lanes from, no `delegation.model` to be per-lane, and no spawn to
+record a model for. A pool lane is landing the pool with no spawner drawing from it. The items below
+remain the target; they are goals for the harness yet to be built, not done work. Where the code lags a
+claim, that is reported here rather than papered over.*
 
 Today a subagent's model is a **process-global**: a single `delegation.model` key, read when the child
 is spawned. That is a real ceiling, and it was measured rather than assumed:
