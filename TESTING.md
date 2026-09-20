@@ -90,6 +90,29 @@ Windows device name (`con`, `nul`, `com1`) is refused by name. Eight sessions ar
 eight threads at once and every path is distinct, and every directory canonicalises inside the pool
 root.
 
+**The escalation ladder** (`src/ladder.rs`, `src/rung.rs`, `src/error.rs`, 18 tests). The decision
+is the design, and it is asserted against scripted rungs that **panic when called with no script
+left** — so "a success does not escalate" fails the test rather than passing because a double
+answered anyway. A refusal escalates and the page comes from the dearer rung; a success ends the
+climb with the stealth and interactive rungs *never called*; a transport error and a rung timeout
+both stop it, with no browser launched and no person asked; a 404 stops it; a `Blocked` error from a
+rung stops it; an unavailable rung (no camoufox installed) is reported and the climb continues; every
+attempt is recorded in order with its own reason; and the attempt ceiling stops the climb even when
+the site keeps refusing. Reports are asserted never to carry a token from the query string, and a
+fetched body is asserted never to render in `Debug`.
+
+**Target admission** (`src/target.rs`, 13 tests). `file://`, `data:`, `gopher://` and `chrome://` are
+refused by scheme; loopback, RFC 1918, link-local (`169.254.169.254`, the metadata service), CGNAT,
+multicast, IPv6 unique-local and link-local, and IPv4-mapped spellings of the same are refused by
+address; `localhost`, `localhost.` (the trailing dot is a one-character bypass), `.local`,
+`.internal`, `.home.arpa`, the metadata hostnames and any single-label name are refused by name; and
+public addresses and hostnames are the control that proves the rule is a list of ranges and not
+"refuse IP literals". `Admission::AllowLocal` — the named escape hatch the hermetic suite uses — is
+asserted **not** to lift the scheme rule. A three-failure run of this suite is what caught IPv6
+literals being judged as *hostnames*: `Url::host_str` keeps the brackets, so `"[::1]"` never parsed
+as an address and fell through to the name rules, where it was refused for the wrong reason. The
+check now uses `url.host()`, which cannot be fooled by spelling.
+
 ## The four tiers
 
 Every claim in the repo falls into one of these. The gap that bites is B→C.

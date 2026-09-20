@@ -57,6 +57,14 @@
 //! but whether the browser it launches defeats any given detector is not something this crate can
 //! assert, and nothing here claims a real browser was driven.
 
+pub mod error;
+pub mod ladder;
 pub mod profile;
+pub mod rung;
+pub mod target;
 
+pub use error::{Disposition, FetchError, RefusalReason};
+pub use ladder::{Attempt, FetchReport, Ladder, DEFAULT_RUNG_TIMEOUT};
 pub use profile::{PoolRoot, ProfileError, SessionProfile, COOKIE_FILE};
+pub use rung::{FetchRequest, Fetcher, RungKind, UntrustedPage};
+pub use target::{Admission, BlockReason, TargetRefusal, TargetUrl};

@@ -313,6 +313,12 @@ command with a button, receive a cron digest in a separate pinned thread.
     directory, cookie hand-off file and browser storage are derived from its id under one pool
     root, and the derivation is *asserted* injective (path escape, case-insensitive collision and
     Windows device names refused by name) rather than assumed from a `format!` call.
+  - ◐ **The ladder.** A `Fetcher` trait the rungs are interchangeable behind, plus the escalation
+    decision: a refusal escalates, a success ends the climb without launching a dearer rung, a
+    transport error or a timeout stops it rather than spending a browser on a dead host, and a
+    target admission refused never escalates at all. Admission itself is structural — `TargetUrl`
+    is the only thing a rung can be pointed at, and it refuses `file://`, loopback, link-local and
+    the metadata service by construction.
 - Search: SearXNG, DDG, Mojeek, Marginalia, Brave, Google PSE, Wikipedia, plus the
   extraction ladder and URL/ETag caching
 
