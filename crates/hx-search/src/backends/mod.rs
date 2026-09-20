@@ -30,12 +30,14 @@
 //! job instead of an afternoon.
 
 mod duckduckgo;
+mod hn;
 mod marginalia;
 mod mojeek;
 mod searxng;
 mod wikipedia;
 
 pub use duckduckgo::{parse_ddg_lite, unwrap_ddg_redirect, DuckDuckGoBackend};
+pub use hn::{hn_search_url, parse_hn_hits, HnAlgoliaBackend};
 pub use marginalia::{marginalia_search_url, parse_marginalia_html, MarginaliaBackend};
 pub use mojeek::{mojeek_result_count, mojeek_search_url, parse_mojeek_html, MojeekBackend};
 pub use searxng::{searxng_search_url, SearxngBackend};

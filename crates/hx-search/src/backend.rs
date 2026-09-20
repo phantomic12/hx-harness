@@ -2,7 +2,8 @@
 
 use crate::aggregate::{fanout, SearchReport, DEFAULT_BACKEND_TIMEOUT};
 use crate::backends::{
-    DuckDuckGoBackend, MarginaliaBackend, MojeekBackend, SearxngBackend, WikipediaBackend,
+    DuckDuckGoBackend, HnAlgoliaBackend, MarginaliaBackend, MojeekBackend, SearxngBackend,
+    WikipediaBackend,
 };
 use crate::types::{SearchQuery, SearchResult};
 use async_trait::async_trait;
@@ -14,7 +15,25 @@ use std::time::Duration;
 
 /// Every backend name `search.backends` accepts, in one place so the "unknown backend" error
 /// cannot drift out of step with what the registry actually builds.
-pub const KNOWN_BACKENDS: &str = "searxng, duckduckgo (alias: ddg), mojeek, marginalia, wikipedia";
+///
+/// The keyless names are the free set the milestone counts; `brave` and `google_cse` are keyed and
+/// are therefore never defaults.
+pub const KNOWN_BACKENDS: &str = "searxng, duckduckgo (alias: ddg), mojeek, marginalia, \
+     wikipedia, hackernews (alias: hn), brave, google_cse";
+
+/// The names that need neither a URL nor a credential — the "free backends" of M6's exit criteria.
+///
+/// Listed here so the milestone's count is a number the code knows rather than a number the docs
+/// assert: `every_keyless_backend_is_counted` in `backend.rs` compares this list against what the
+/// registry actually builds.
+pub const KEYLESS_BACKENDS: &[&str] = &[
+    "searxng",
+    "duckduckgo",
+    "mojeek",
+    "marginalia",
+    "wikipedia",
+    "hackernews",
+];
 
 /// Which family a backend belongs to. Useful for status output and for grouping sources.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +142,7 @@ impl BackendRegistry {
                 "mojeek" => Arc::new(MojeekBackend::new()),
                 "marginalia" => Arc::new(MarginaliaBackend::new()),
                 "wikipedia" => Arc::new(WikipediaBackend::new()),
+                "hackernews" | "hn" => Arc::new(HnAlgoliaBackend::new()),
                 other => {
                     return Err(HxError::Config(format!(
                         "unknown search backend '{other}'; known backends: {KNOWN_BACKENDS}"
@@ -206,7 +226,14 @@ mod tests {
         // config that names them and nothing else must build.
         let r = BackendRegistry::from_config(
             &cfg(
-                &["searxng", "ddg", "mojeek", "marginalia", "wikipedia"],
+                &[
+                    "searxng",
+                    "ddg",
+                    "mojeek",
+                    "marginalia",
+                    "wikipedia",
+                    "hackernews",
+                ],
                 Some("http://localhost:8888"),
             ),
             reqwest::Client::new(),
@@ -215,12 +242,54 @@ mod tests {
 
         assert_eq!(
             r.ids(),
-            vec!["searxng", "duckduckgo", "mojeek", "marginalia", "wikipedia"]
+            vec![
+                "searxng",
+                "duckduckgo",
+                "mojeek",
+                "marginalia",
+                "wikipedia",
+                "hackernews"
+            ]
         );
         assert!(
             r.backends.iter().all(|b| !b.requires_key()),
             "no default backend may require a credential"
         );
+    }
+
+    #[test]
+    fn every_keyless_backend_is_counted() {
+        // M6's exit criteria is "6 free backends in parallel". A count in a document is a claim;
+        // this compares the crate's own list against what the registry builds, so adding a backend
+        // without adding it here (or naming one here that does not build) fails the suite instead
+        // of making the milestone's number quietly wrong.
+        assert_eq!(
+            KEYLESS_BACKENDS.len(),
+            6,
+            "the milestone's \"6 free backends\" has to be a number the code agrees with"
+        );
+
+        let r = BackendRegistry::from_config(
+            &cfg(KEYLESS_BACKENDS, Some("http://localhost:8888")),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        assert_eq!(r.ids(), KEYLESS_BACKENDS.to_vec());
+        assert!(
+            r.backends.iter().all(|b| !b.requires_key()),
+            "a name on the keyless list that needs a credential is a lie about cost"
+        );
+        assert!(
+            r.backends.iter().all(|b| b.kind() != BackendKind::Keyed),
+            "a keyless backend must not report itself as keyed"
+        );
+    }
+
+    #[test]
+    fn hn_is_an_accepted_alias_for_hackernews() {
+        let r = BackendRegistry::from_config(&cfg(&["hn"], None), reqwest::Client::new()).unwrap();
+        assert_eq!(r.ids(), vec!["hackernews"]);
     }
 
     #[test]

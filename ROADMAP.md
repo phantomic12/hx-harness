@@ -315,18 +315,24 @@ command with a button, receive a cron digest in a separate pinned thread.
 **Exit criteria:** a research task runs 6 free backends in parallel, dedupes, RRF-ranks,
 extracts the top 8, and cites them — with zero paid API calls.
 
-**What has landed so far (search).** The backend set is now one file per engine, and three more
+**What has landed so far (search).** The backend set is now one file per engine, and four more
 keyless engines are wired into the registry: **Mojeek** (its own crawler, so its results are
 independent evidence rather than a second view of another engine's index), **Marginalia** (the
 non-commercial web — the most *diverse* backend in the fan-out, and the one whose top ten share
-least with DuckDuckGo's) and **Wikipedia** (the only member that is a documented API rather than a
-scrape, and the one whose live path is genuinely exercised). Each parser is tested against a
-captured response: Wikipedia against a real live JSON capture, Marginalia against a real HTML
-capture, and Mojeek against a **transcription** of its markup because its live path is bot-walled
-from here (`curl` UA → 403, browser UA → 200 with `<title>Captcha</title>`) — that path has **not**
-been exercised, and both the module doc and `TESTING.md` say so rather than implying otherwise.
-`&` in a Wikipedia article URL is escaped as `%26` and `+` is left alone, pinned on the final URL
-string.
+least with DuckDuckGo's), **Wikipedia** (the only member that is a documented API rather than a
+scrape) and **Hacker News via the Algolia index** (a *filtered* corpus rather than a web index,
+which is what makes its agreement with the general engines meaningful). Each parser is tested
+against a captured response: Wikipedia against a real live JSON capture, Marginalia against a real
+HTML capture, Hacker News against two real live Algolia captures, and Mojeek against a
+**transcription** of its markup because its live path is bot-walled from here (`curl` UA → 403,
+browser UA → 200 with `<title>Captcha</title>`) — that path has **not** been exercised, and both
+the module doc and `TESTING.md` say so rather than implying otherwise. `&` in a Wikipedia article
+URL is escaped as `%26` and `+` is left alone, pinned on the final URL string.
+
+The milestone's "6 free backends" is now a number the code holds, not one a document asserts:
+`KEYLESS_BACKENDS` lists them and `every_keyless_backend_is_counted` compares that list against what
+the registry actually builds. SearXNG is on it but is deliberately **not** a default — it cannot be
+constructed without `searxng_url`, so a deployment that wants it names it explicitly.
 
 `default_backends()` was also wrong and is fixed: it named `searxng`, which cannot be constructed
 without `searxng_url`, and the registry treats a named-but-unconfigured backend as a loud error — so

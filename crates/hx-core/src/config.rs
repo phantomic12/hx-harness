@@ -536,8 +536,8 @@ pub struct ConnectorConfig {
 #[serde(deny_unknown_fields)]
 pub struct SearchConfig {
     /// Backend ids in preference order. The keyless set is `searxng`, `duckduckgo` (alias
-    /// `ddg`), `mojeek`, `marginalia`, `wikipedia`; `brave` and `google_cse` exist but require a
-    /// credential and are therefore never defaults.
+    /// `ddg`), `mojeek`, `marginalia`, `wikipedia`, `hackernews` (alias `hn`); `brave` and
+    /// `google_cse` exist but require a credential and are therefore never defaults.
     #[serde(default = "default_backends")]
     pub backends: Vec<String>,
     /// How many backends to query in parallel per search.
@@ -585,6 +585,7 @@ fn default_backends() -> Vec<String> {
         "mojeek".into(),
         "marginalia".into(),
         "wikipedia".into(),
+        "hackernews".into(),
     ]
 }
 fn default_fanout() -> usize {
@@ -795,7 +796,13 @@ roles:
             !c.search.backends.iter().any(|b| b == "searxng"),
             "searxng cannot be a default: it needs a URL the default does not have"
         );
-        for keyless in ["duckduckgo", "mojeek", "marginalia", "wikipedia"] {
+        for keyless in [
+            "duckduckgo",
+            "mojeek",
+            "marginalia",
+            "wikipedia",
+            "hackernews",
+        ] {
             assert!(
                 c.search.backends.iter().any(|b| b == keyless),
                 "the keyless backend {keyless} should be on by default: {:?}",
