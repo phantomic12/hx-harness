@@ -1379,6 +1379,7 @@ dependencies = [
  "axum",
  "chrono",
  "futures",
+ "http-body-util",
  "hx-agent",
  "hx-core",
  "hx-remote",
@@ -1393,7 +1394,9 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
+ "tower",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
