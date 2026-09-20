@@ -115,6 +115,7 @@
 pub mod host;
 pub mod names;
 pub mod server;
+pub mod server_http;
 pub mod tool;
 
 mod conn;
@@ -124,4 +125,5 @@ mod stdio;
 pub use host::{HealthState, McpHost, RestartBudget, ServerHealth};
 pub use names::{namespaced, sanitize, split, MAX_NAMESPACE_CHARS, MAX_NAME_CHARS, SEPARATOR};
 pub use server::{default_registry, CallOutcome, McpServer, ServerStats};
+pub use server_http::{bind_and_serve, router};
 pub use tool::{requirement_for, McpTool, RemoteTool, MAX_SCHEMA_CHARS};

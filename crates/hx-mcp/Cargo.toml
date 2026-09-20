@@ -41,6 +41,7 @@ hx-agent.workspace = true
 hx-remote.workspace = true
 rmcp.workspace = true
 async-trait.workspace = true
+axum.workspace = true
 chrono.workspace = true
 futures.workspace = true
 indexmap.workspace = true
@@ -54,6 +55,5 @@ tracing.workspace = true
 [dev-dependencies]
 # The streamable-HTTP suite runs a *real* MCP server over a real socket: `rmcp`'s own server
 # transport on `axum`. Both are already in the workspace graph, so this adds no crate to it.
-axum.workspace = true
 reqwest.workspace = true
 tempfile.workspace = true
