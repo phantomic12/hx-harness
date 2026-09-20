@@ -231,7 +231,9 @@ attempted capability escalation shows up as a denial event, not a hang.
   by `the_far_daemon_rejects_l2_userns_remapping_when_it_is_not_configured`, and it is why the lifecycle
   test exercises L1 with a read-only root forced (L1 sends no `--userns`). Open still: place the proxy
   sidecar on the far host so remote egress can be enforced, and decide how a profile should behave when
-  the far daemon has no userns remap (refuse L2/L3 up front, or degrade to L1 and say so).
+  the far daemon has no userns remap (refuse L2/L3 up front, or degrade to L1 and say so). Wired and
+  live-verified, so the runtime half of this item is done; remote **egress** enforcement is not, which
+  is why the item stays 🔶.
 - ✅ **Remote terminal (a PTY straight to a remote host)** — `POST /v1/terminals` takes an optional
   `host`, and the daemon adopts the session as a terminal like any other, so the terminal pane and
   the WebSocket contract are unchanged: a client attaches to a remote shell the same way it attaches
@@ -244,12 +246,21 @@ attempted capability escalation shows up as a denial event, not a hang.
 **Exit criteria:** drive a Linux box, a Mac, and a Windows host from the browser; no private
 key ever enters the model context or a sandbox.
 
-*Status: five of the seven items are done, and with the remote terminal in place the browser drives a
-remote box for real — browse, run, and an interactive shell — rather than only the first two. The exit
-criteria is still not met: remote sandboxes are now wired into `hx-server` (a `host:` profile key
-resolves to a per-host `RemoteSandboxRuntime` manager) but are not yet verified against a live remote
-daemon, and Unix-only CI means the Windows transport is exercised by unit tests rather than against a live
-host.*
+*Status: seven of the eight items are done. The remote terminal is in place, so the browser drives a
+remote box for real — browse, run, and an interactive shell — rather than only the first two, and the
+Mac leg is proven: the same SSH transport runs against a real Apple-signed macOS VM in CI (the
+`macos-ssh` integration job — a `macos-latest` runner boots in about a minute, whereas the
+`dockur/macos` container I kept needed a 10-30 minute interactive GUI install before sshd even
+existed). Remote sandboxes are wired into `hx-server` (a `host:` profile key resolves to a per-host
+`RemoteSandboxRuntime` manager) **and verified against a live remote daemon** — a real `SshHost` drives
+create → start → exec → stop → remove on rainbowone and the security properties are read back from
+`docker inspect` on the far host, which is also how the `--userns=private` defect was found.
+
+The exit criteria is still not met, for two reasons. **No browser has driven a live Windows host**:
+`WinRmHost` is exercised by unit tests and by a live suite that needs a box, and Unix-only CI means the
+Windows transport is never run against a real machine there. And **remote sandbox egress is still
+fail-closed** — an allowlist is refused rather than enforced, because the proxy sidecar lives on the
+near host; closing that is what the remaining 🔶 needs.*
 
 ---
 
