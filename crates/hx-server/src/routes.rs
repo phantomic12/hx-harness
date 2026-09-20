@@ -48,7 +48,12 @@ async fn web_client() -> impl IntoResponse {
 }
 
 /// Build the application router.
+///
+/// The bearer-token middleware is applied to the whole router, so it runs before routing and before
+/// any extractor: a request without a valid token never reaches a handler, and does not get a
+/// different answer from an unknown route either. See [`crate::auth`] for what is exempt and why.
 pub fn app(state: Arc<AppState>) -> Router {
+    let auth = Arc::clone(&state);
     Router::new()
         .route("/healthz", get(healthz))
         // The web client, served at the root. Embedded in the binary rather than read from a path:
@@ -92,6 +97,13 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{id}", post(answer_approval))
         .with_state(state)
+        // Applied last, so it wraps every route including the WebSocket upgrades. `from_fn_with_state`
+        // rather than `from_fn`: the token lives on `AppState`, and reading it from a request
+        // extension would be a second place for it to be.
+        .layer(axum::middleware::from_fn_with_state(
+            auth,
+            crate::auth::require_bearer,
+        ))
 }
 
 /// An error rendered for a client.

@@ -11,6 +11,7 @@
 //! a single, bounded `std::fs::read`; everything else here remains IO-free.
 
 pub mod allowlist;
+pub mod api_auth;
 pub mod approval;
 pub mod capability;
 pub mod config;
@@ -19,6 +20,7 @@ pub mod event;
 pub mod ids;
 pub mod message;
 
+pub use api_auth::{bind_is_loopback, require_token_for_bind, ApiToken, API_TOKEN_ENV};
 pub use approval::{
     classify_command, ActionRequest, ApprovalOption, ApprovalPolicy, ApprovalRequest,
     ApprovalSession, AutonomyLevel, Classification, RememberedDecision, RiskClass, Rule, Verdict,

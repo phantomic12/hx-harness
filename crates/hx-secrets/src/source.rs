@@ -23,6 +23,7 @@
 //!   not silently be reading `$OPENAI_API_KEY` instead.
 
 use crate::vault::{Secret, Vault, VaultError};
+use hx_core::api_auth::{ApiToken, API_TOKEN_ENV};
 use hx_core::config::SecretRef;
 use hx_core::error::{HxError, Result};
 use std::collections::BTreeMap;
@@ -232,6 +233,83 @@ impl SecretSource for FixedSecrets {
     }
 }
 
+/// The daemon API's bearer token, resolved the one way every other credential is.
+///
+/// ## Why this lives here rather than in `hx-server`
+///
+/// Both the daemon and the `hx` CLI need the same answer to "what token is this deployment using",
+/// and a second implementation in the CLI would be a second set of rules about what a `store:name`
+/// reference means. This crate is the one that owns "where a key comes from", so the rule is stated
+/// once, here, next to [`SecretStores`].
+///
+/// ## The rule, in full
+///
+/// 1. `config.api.token`, when it is set to something non-blank, wins. A value containing a `:` is a
+///    `store:name` reference and is resolved through the configured sources; a value with no `:` is
+///    a literal token.
+/// 2. Otherwise `HX_API_TOKEN` in the process environment, which is the form a container or a CI job
+///    uses. An **empty** variable counts as absent — an empty token is not a token, and treating it
+///    as one would be a credential every caller could guess.
+/// 3. Otherwise `None`: no token, which is legal only on a loopback bind.
+///
+/// ## What it refuses, and why the message never quotes the value
+///
+/// A reference naming a store that is not configured is an error rather than a literal. A literal
+/// token can contain a `:`, and the value at this point is *exactly* the thing that must not be
+/// printed — so the refusal names the configured stores and the environment variable to use
+/// instead, and never the value it refused. A reference that names a configured store but a missing
+/// entry fails with that source's own message, which names the reference and never the secret.
+pub fn resolve_api_token(
+    config: &hx_core::config::Config,
+    secrets: &SecretStores,
+) -> hx_core::error::Result<Option<ApiToken>> {
+    if let Some(configured) = config
+        .api
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !configured.contains(':') {
+            return Ok(Some(ApiToken::new(configured)));
+        }
+
+        let reference = SecretRef::parse(configured)?;
+        if !secrets.stores().contains(&reference.store.as_str()) {
+            let known = if secrets.is_empty() {
+                "none are configured".to_string()
+            } else {
+                format!("configured stores: {}", secrets.stores().join(", "))
+            };
+            return Err(HxError::Config(format!(
+                "`api.token` is written as a `store:name` reference but '{}' is not a store this \
+                 deployment has ({known}). Use one of those, or — if this is a literal token that \
+                 happens to contain a colon — set it in {} instead.",
+                reference.store, API_TOKEN_ENV
+            )));
+        }
+
+        let secret = secrets.resolve(&reference).map_err(|err| {
+            HxError::Config(format!(
+                "`api.token` could not be resolved: {err}. The daemon refuses to start rather than \
+                 serving an API whose token it cannot check."
+            ))
+        })?;
+        return Ok(Some(ApiToken::new(secret.expose())));
+    }
+
+    Ok(env_api_token())
+}
+
+/// `HX_API_TOKEN`, if it is set to something non-blank.
+fn env_api_token() -> Option<ApiToken> {
+    std::env::var(API_TOKEN_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(ApiToken::new)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,5 +473,152 @@ mod tests {
         let printed = format!("{stores:?} {source:?}");
         assert!(!printed.contains("sk-"), "{printed}");
         assert!(printed.contains("vault"), "{printed}");
+    }
+
+    // -- the API token -------------------------------------------------------
+
+    /// The sentinel is the value the leak tests search for. It is deliberately *not* key-shaped, so
+    /// the read-side redaction that masks `sk-…` in a file display cannot hide it from an assertion
+    /// and make a leak test pass for the wrong reason.
+    const API_SENTINEL: &str = "hx-api-token-1f4e7c9a-must-not-be-printed";
+
+    fn config_with_token(token: Option<&str>) -> hx_core::config::Config {
+        let yaml = match token {
+            Some(value) => format!("api:\n  token: \"{value}\"\n"),
+            None => "roles: {}\n".to_string(),
+        };
+        hx_core::config::Config::from_yaml(&yaml).expect("config parses")
+    }
+
+    #[test]
+    fn a_literal_token_in_the_config_is_used_as_written() {
+        // No `:` means no reference, so this is the value itself. A token like this is what a
+        // machine-local daemon uses when it has no vault and no orchestrator.
+        let config = config_with_token(Some(API_SENTINEL));
+        let stores = SecretStores::new().with(Arc::new(EnvSecrets));
+
+        let token = resolve_api_token(&config, &stores)
+            .expect("a literal resolves")
+            .expect("a token is configured");
+        assert!(token.matches(API_SENTINEL));
+        assert!(!token.matches("something-else"));
+    }
+
+    #[test]
+    fn a_store_reference_in_the_config_is_resolved_through_the_sources() {
+        // The point of the reference form: the value lives in the vault and the config holds a name.
+        let config = config_with_token(Some("vault:api/daemon"));
+        let stores = SecretStores::new().with(Arc::new(
+            FixedSecrets::vault().set("api/daemon", API_SENTINEL),
+        ));
+
+        let token = resolve_api_token(&config, &stores)
+            .expect("resolves")
+            .expect("configured");
+        assert!(token.matches(API_SENTINEL));
+    }
+
+    #[test]
+    fn an_env_reference_resolves_to_the_variable_it_names() {
+        // `env:NAME` is the form a container writes, and it must go through `EnvSecrets` rather
+        // than a second reader here — otherwise the "set but empty" rule would differ between this
+        // path and every other credential.
+        std::env::set_var("HX_TEST_API_TOKEN_VARIABLE", API_SENTINEL);
+        let config = config_with_token(Some("env:HX_TEST_API_TOKEN_VARIABLE"));
+        let stores = SecretStores::new().with(Arc::new(EnvSecrets));
+
+        let token = resolve_api_token(&config, &stores)
+            .expect("resolves")
+            .expect("configured");
+        assert!(token.matches(API_SENTINEL));
+
+        // And the same variable set to blank is refused, exactly as it is for a provider key.
+        std::env::set_var("HX_TEST_API_TOKEN_VARIABLE", "   ");
+        let err = resolve_api_token(&config, &stores).unwrap_err().to_string();
+        assert!(err.contains("set but empty"), "{err}");
+        assert!(!err.contains(API_SENTINEL), "{err}");
+
+        std::env::remove_var("HX_TEST_API_TOKEN_VARIABLE");
+    }
+
+    #[test]
+    fn a_reference_naming_an_unconfigured_store_is_refused_without_quoting_the_value() {
+        // The trap: a literal token may contain a colon, and a message that echoed the reference
+        // back would be printing a credential. This one names the stores that *would* work.
+        let colon_literal = format!("literal:with-a-colon-{API_SENTINEL}");
+        let config = config_with_token(Some(&colon_literal));
+        let stores = SecretStores::new().with(Arc::new(EnvSecrets));
+
+        let err = resolve_api_token(&config, &stores).unwrap_err().to_string();
+        assert!(
+            !err.contains(API_SENTINEL),
+            "the refusal must not carry the value: {err}"
+        );
+        assert!(err.contains("literal"), "it names the store: {err}");
+        assert!(
+            err.contains(API_TOKEN_ENV),
+            "and the way to use a colon-containing literal: {err}"
+        );
+        assert!(err.contains("env"), "listing the configured stores: {err}");
+    }
+
+    #[test]
+    fn a_blank_config_token_falls_through_to_the_environment() {
+        // One test owns `HX_API_TOKEN` for the whole binary: tests run in parallel threads, and two
+        // of them mutating the same variable would make both flaky rather than wrong.
+        std::env::remove_var(API_TOKEN_ENV);
+
+        // Absent everywhere: no token, which is what a loopback daemon with no auth configured
+        // looks like — and the reason `require_token_for_bind` is a separate question.
+        let config = config_with_token(None);
+        let stores = SecretStores::new().with(Arc::new(EnvSecrets));
+        assert!(resolve_api_token(&config, &stores)
+            .expect("no token is not an error")
+            .is_none());
+
+        // A blank config value is absent, not an empty token: it must not shadow the environment.
+        let blank = config_with_token(Some("   "));
+        assert!(resolve_api_token(&blank, &stores)
+            .expect("absent")
+            .is_none());
+
+        // The environment supplies one, and it is used when the config names nothing.
+        std::env::set_var(API_TOKEN_ENV, API_SENTINEL);
+        let token = resolve_api_token(&config, &stores)
+            .expect("resolves")
+            .expect("the environment supplied one");
+        assert!(token.matches(API_SENTINEL));
+
+        // An empty variable counts as absent rather than as an empty token every caller could
+        // guess — the same rule the audit chain's key follows.
+        std::env::set_var(API_TOKEN_ENV, "");
+        assert!(resolve_api_token(&config, &stores)
+            .expect("absent")
+            .is_none());
+
+        // And the config wins over the environment, so "which token is this daemon checking" is
+        // answerable from the config alone.
+        std::env::set_var(API_TOKEN_ENV, "from-the-environment");
+        let configured = config_with_token(Some(API_SENTINEL));
+        let token = resolve_api_token(&configured, &stores)
+            .expect("resolves")
+            .expect("configured");
+        assert!(token.matches(API_SENTINEL));
+        assert!(!token.matches("from-the-environment"));
+
+        std::env::remove_var(API_TOKEN_ENV);
+    }
+
+    #[test]
+    fn a_config_that_names_an_unresolvable_token_is_an_error_and_not_a_daemon_without_one() {
+        // Fail closed at startup: a `vault:` reference against a deployment with no vault source
+        // must not quietly degrade into "no token configured", which would leave a non-loopback
+        // daemon unprotected while its config says otherwise.
+        let config = config_with_token(Some("vault:api/daemon"));
+        let stores = SecretStores::new().with(Arc::new(EnvSecrets));
+
+        let err = resolve_api_token(&config, &stores).unwrap_err().to_string();
+        assert!(err.contains("api.token"), "{err}");
+        assert!(!err.contains(API_SENTINEL), "{err}");
     }
 }

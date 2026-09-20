@@ -235,6 +235,9 @@ async fn harness() -> Option<(Arc<AppState>, std::path::PathBuf, tempfile::TempD
         sandboxes: Some(manager),
         sandbox_unavailable_reason: None,
         started_at: now,
+        // No token: these tests bind loopback, which is exactly the deployment where a token is
+        // optional. A test that needed one here would mean the rule, not the test, was wrong.
+        api_token: None,
     });
 
     Some((state, workspace, dir))

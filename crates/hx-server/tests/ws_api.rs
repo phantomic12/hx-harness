@@ -126,6 +126,11 @@ async fn harness() -> Server {
 }
 
 async fn harness_with(models: Arc<dyn ModelFactory>) -> Server {
+    harness_with_token(models, None).await
+}
+
+/// The same daemon, optionally requiring a bearer token.
+async fn harness_with_token(models: Arc<dyn ModelFactory>, token: Option<&str>) -> Server {
     let mut config = hx_core::config::Config::from_yaml(CONFIG).expect("config parses");
     let dir = tempfile::tempdir().expect("temp dir");
     // `dir.path()` borrows rather than consuming (unlike `keep`), so the TempDir can still be held in
@@ -157,6 +162,10 @@ async fn harness_with(models: Arc<dyn ModelFactory>) -> Server {
         sandboxes: None,
         sandbox_unavailable_reason: Some("no container engine in a test".to_string()),
         started_at: now,
+        // No token by default: these tests bind loopback, which is exactly the deployment where a
+        // token is optional. A test that needed one here would mean the rule, not the test, was
+        // wrong.
+        api_token: token.map(hx_core::api_auth::ApiToken::new),
     });
 
     let a = state
@@ -454,4 +463,70 @@ async fn a_real_chat_run_publishes_its_events_to_a_second_attached_client() {
         assert_eq!(f["session"], server.session.as_str(), "{f}");
         assert!(f["seq"].as_u64().is_some(), "{f}");
     }
+}
+
+#[tokio::test]
+async fn a_websocket_connect_authenticates_by_header_or_by_query_string_and_by_nothing_else() {
+    // The one request shape with no alternative. A browser cannot set an `Authorization` header on a
+    // WebSocket handshake, so the daemon accepts the token in `?token=` — but *only* on an upgrade
+    // request, which is why the same query string on a plain GET is worth nothing (asserted in
+    // `api_auth.rs`). This test is the browser's half: over a real socket, with a real
+    // tokio-tungstenite client, the query string opens the stream.
+    const TOKEN: &str = "hx-ws-sentinel-7c1d";
+    let server = harness_with_token(Arc::new(Dead(Arc::new(DeadModel))), Some(TOKEN)).await;
+    let plain = format!(
+        "ws://{}/v1/sessions/{}/ws",
+        server.addr,
+        server.session.as_str()
+    );
+
+    // No credential at all: the handshake is refused with the same 401 the HTTP routes give, rather
+    // than upgraded into a stream that then says nothing.
+    let refused = tokio_tungstenite::connect_async(&plain).await;
+    match refused {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(
+                response.status().as_u16(),
+                401,
+                "a refused upgrade is a 401"
+            );
+        }
+        other => panic!("an unauthenticated upgrade must be refused, got {other:?}"),
+    }
+
+    // The token as a query parameter, which is what the embedded page sends.
+    let (socket, _) = tokio_tungstenite::connect_async(format!("{plain}?token={TOKEN}"))
+        .await
+        .expect("the query string opens the stream");
+
+    // And it is a real stream, not just an accepted socket: the stored events arrive.
+    push(&server.state, &server.session, 1).await;
+    let mut client = WsClient { socket };
+    let first = frame(&mut client).await;
+    assert_eq!(first["seq"], 1, "the replayed event arrived: {first}");
+
+    // A *wrong* token in the query string is refused exactly as a missing one is.
+    let wrong = tokio_tungstenite::connect_async(format!("{plain}?token=not-the-token")).await;
+    assert!(
+        matches!(
+            wrong,
+            Err(tokio_tungstenite::tungstenite::Error::Http(ref response))
+                if response.status().as_u16() == 401
+        ),
+        "a wrong token must be refused, got {wrong:?}"
+    );
+
+    // The header works too, which is what a non-browser client uses.
+    let mut request =
+        tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+            plain.as_str(),
+        )
+        .expect("a request");
+    request.headers_mut().insert(
+        "authorization",
+        format!("Bearer {TOKEN}").parse().expect("a header value"),
+    );
+    tokio_tungstenite::connect_async(request)
+        .await
+        .expect("the header opens the stream");
 }

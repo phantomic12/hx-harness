@@ -15,6 +15,7 @@
 //! approval push channel — which is why the daemon's approver refuses every prompt with the reason
 //! instead of waiting for an answer that cannot arrive. See `ROADMAP.md` — M1 and M2.
 
+pub mod auth;
 pub mod chat;
 pub mod hosts;
 pub mod remote_sandbox;
