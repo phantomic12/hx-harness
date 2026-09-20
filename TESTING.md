@@ -1156,6 +1156,32 @@ That output is what makes the two defects in §7 of `docs/approvals.md` *visible
 single `*rm -rf /*` that also matched `/tmp`, and a config with no `agent:` section printed no rules at
 all until `AgentConfig::default()` was fixed.
 
+## The desktop shell's desktop three (M7)
+
+`apps/hx-desktop` — a Tauri 2 desktop shell — now carries the three desktop features that make it an
+*app* rather than a window: a **system tray**, a **global hotkey**, and **OS notifications** for approval
+requests. The real tray icon, a live hotkey binding, and a raised notification all need a desktop session
+and a display server, which CI does not have — so what is tested, headlessly, is each feature's pure core:
+
+- **Tray menu definition** (`src/tray.rs`): the exact item set (`toggle-window`, `open-approvals`,
+  `quit`), that every id resolves to a real [`TrayAction`], and that a stray id is not ours. The real
+  `build_tray` maps each id to its action and **degrades to a working window with a reported warning** if the
+  tray cannot be created.
+- **Global hotkey** (`src/hotkey.rs`): the shortcut string parser and the refusal **surfacing** behind a
+  `HotkeyBackend` trait — a fake refuses on demand and the test asserts the refusal becomes a
+  `HotkeyOutcome::Refused` naming the reason, never a silent `Registered`, and never a dropped event. An
+  unparseable string is a `HotkeyError::Invalid`. `register_plugin_shortcut` records a refused/unknown
+  binding as a warning and still lets the window start. A real compositor binding is not exercised.
+- **Approval notification body** (`src/notification.rs`): `build_approval_notification` names the tool and
+  the session, and **never leaks a token or a path outside the workspace** — the summary is redacted
+  per-token by shape (a ≥16-char all-alphanumeric token, or an absolute path that is not under the
+  workspace root). An unknown session is labeled, not omitted. Raising the actual notification (the plugin call)
+  is not exercised.
+
+Each assertion was proven to fail by mutating the production code: removing the tray `toggle-window` mapping,
+swallowing a refused hotkey as `Registered`, dropping the token redaction, dropping the path-outside check, and
+omitting the unknown-session label each turned its specific test red.
+
 ## Running the suite
 
 ```bash
@@ -1168,6 +1194,7 @@ cargo test -p hx-sandbox        # 94 — includes the ladder and the rollback in
 cargo test -p hx-remote         # 132 — includes known_hosts parsing and the host key policy
 cargo test -p hx-gateway        # 44 — the connector trait, the Telegram wire, and the approval loop-back
 cargo test -p hx-core           # 120 — classification, the policy ladder, and the ceiling comparison
+cargo test -p hx-desktop       # 25 — the shell: endpoint resolution, bundle identity, and the desktop three's testable cores
 cargo build --workspace         # clean: 0 warnings, 0 deprecations
 cargo clippy --workspace --all-targets --locked -- -D warnings   # clean (this is what CI runs)
 

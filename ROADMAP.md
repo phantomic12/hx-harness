@@ -621,7 +621,10 @@ promise about how it is used.
 ## M7 — Native apps
 
 - Tauri 2 shell reusing the exact web UI bundle; local or remote `hxd`
-- Desktop: system tray, global hotkey, OS notifications, native file pickers
+- Desktop: system tray (toggle window / open approvals / quit), global hotkey (reported when the OS
+  refuses the binding), OS notifications for approval requests — **landed**; native file pickers not yet
+- The **phone-approval exit criterion is still unmet**: approving from a phone lock screen needs Mobile
+  (iOS/Android push), which is not reachable from this environment
 - Mobile (iOS + Android): chat, session browse, log view, approval queue, push notifications
   via APNs/FCM; device token in Keychain/Keystore
 - Auto-update, code signing, CI matrix for all five targets
