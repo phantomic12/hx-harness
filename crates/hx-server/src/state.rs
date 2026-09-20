@@ -387,11 +387,41 @@ impl AppState {
             .await
             .map_err(|err| HxError::Sandbox(format!("cannot run sandbox on host {id:?}: {err}")))?;
         let runner = Arc::new(crate::remote_sandbox::HostCommandRunner::new(host));
-        let runtime = Arc::new(hx_sandbox::RemoteSandboxRuntime::new(runner));
+        let runtime = Arc::new(self.remote_runtime_for(id, runner));
         Ok(Arc::new(hx_sandbox::SandboxManager::new(
             runtime,
             self.config.agent.max_concurrent_subagents as usize,
         )))
+    }
+
+    /// The [`RemoteSandboxRuntime`](hx_sandbox::RemoteSandboxRuntime) for host `id`, over `runner`.
+    ///
+    /// Split out from [`AppState::build_remote_manager`] so the wiring from a host's config to the
+    /// runtime is one testable act rather than a line buried in an async resolve. What it carries
+    /// that matters: the far host's `hx-egress-proxy` path, from that host's own
+    /// [`HostConfig::egress_proxy_bin`](hx_core::config::HostConfig::egress_proxy_bin), because the
+    /// binary must exist on the *far* filesystem and only the deployment knows where it put it there.
+    /// Without it the runtime refuses every remote spec with an allowlist ("no proxy binary path was
+    /// configured") — which is exactly what the daemon did, so "remote egress is enforced" was true
+    /// of the library and of the live test but not of the daemon. It is left unset rather than
+    /// guessed: a path invented here would be wrong at runtime, and the refusal names the config key.
+    pub fn remote_runtime_for(
+        &self,
+        id: &str,
+        runner: Arc<dyn hx_sandbox::RemoteCommandRunner>,
+    ) -> hx_sandbox::RemoteSandboxRuntime {
+        hx_sandbox::RemoteSandboxRuntime::new(runner).with_proxy_bin(self.egress_proxy_bin_for(id))
+    }
+
+    /// The `hx-egress-proxy` path configured for host `id`, or `None` when it names none.
+    ///
+    /// The config half of [`AppState::remote_runtime_for`]: this is the one line that decides whether
+    /// a remote sandbox with an allowlist can be enforced at all.
+    pub fn egress_proxy_bin_for(&self, id: &str) -> Option<String> {
+        self.config
+            .hosts
+            .get(id)
+            .and_then(|host| host.egress_proxy_bin.clone())
     }
 
     /// Resolve a host id to something that can be driven.

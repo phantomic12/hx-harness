@@ -210,6 +210,17 @@ impl RemoteSandboxRuntime {
         self
     }
 
+    /// The far-host path this runtime was told the egress proxy binary lives at, if any.
+    ///
+    /// A plain read of [`RemoteSandboxRuntime::with_proxy_bin`]'s value, and it exists because
+    /// whether it is set is the difference between a remote sandbox's allowlist being *enforced* and
+    /// being *refused*. Without a way to read it back, the wiring from a deployment's config to this
+    /// runtime (in `hx-server`) could only be asserted by reading the one line that does it, which is
+    /// how "remote egress is enforced" stayed true of the library and false of the daemon.
+    pub fn proxy_bin(&self) -> Option<&str> {
+        self.proxy_bin.as_deref()
+    }
+
     /// Whether this sandbox needs an egress proxy on the far host: a networked spec with a non-empty,
     /// enforceable allowlist.
     fn egress_active(spec: &SandboxSpec) -> bool {

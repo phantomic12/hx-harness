@@ -220,6 +220,13 @@ attempted capability escalation shows up as a denial event, not a hang.
   (**the control** — a blanket "always remote" would fail it), and a `host:` naming an unknown machine
   is refused by name. One manager is cached per host, installed under the lock after an async resolve,
   so concurrent requests share it and a raced build is dropped unused rather than replacing the winner.
+  The daemon also passes the far host's egress proxy path through, from that host's own
+  `egress_proxy_bin` in `hosts:` — it has to be per host, because the binary must exist on the *far*
+  filesystem and the local "sibling of the running executable" rule describes the near one. Before
+  that key existed the daemon built a runtime with no proxy binary at all, so **every remote spec with
+  an allowlist was refused through the daemon** ("no proxy binary path was configured") and "remote
+  egress is enforced" was true of the library and of the live test but not of the daemon. Unset stays
+  unset rather than guessed, and the refusal names the key to set.
   **Now exercised against a live remote daemon** (`crates/hx-sandbox/tests/remote_live.rs`, rainbowone,
   Docker 29.3.1): a real `SshHost` drives create → start → exec → stop → remove, and the security
   properties are checked by parsing `docker inspect` **on the far host** rather than re-reading the
