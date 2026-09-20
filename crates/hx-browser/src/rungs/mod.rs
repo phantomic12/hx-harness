@@ -13,3 +13,4 @@ pub mod stealth;
 
 pub use http::HttpRung;
 pub use stealth::StealthRung;
+pub mod chromium;

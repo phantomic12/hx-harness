@@ -14,6 +14,13 @@ reqwest.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 url.workspace = true
+# CDP is spoken over a WebSocket, and this is the one crate that speaks the protocol: the handshake,
+# the masking, the fragmentation and the ping/pong keepalive that a hand-rolled client gets subtly
+# wrong. It is **not a new crate in the graph** — `hx-server` already declares it for its own
+# integration tests, so it already sits in the workspace lock and is already compiled. That is the
+# same argument `hx-server`'s manifest makes for `nix`: the offline gate cannot reach crates.io, so a
+# dependency that is not already vendored is not available, and one that is costs nothing new.
+tokio-tungstenite = "0.30"
 
 [dev-dependencies]
 tempfile.workspace = true
