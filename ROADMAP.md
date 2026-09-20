@@ -133,10 +133,10 @@ killed an idle daemon while looking like a pass).
   It is a client in the strict sense: the terminal is created once under a fixed id and reattached,
   so a refresh rejoins the running shell; the session socket resumes with `since_seq` so a reconnect
   renders the gap rather than the whole history.
-- Frontend, still to come: a diff/review pane, and the remaining unattended budget on the approval
-  pane. The tree and the queue themselves are built — the host directory browser with a file
-  viewer/editor and a command runner, and a pane that polls `GET /v1/approvals` and renders each
-  question's risk class, reason and undo line
+- Frontend, still to come: a diff/review pane. The tree and the queue themselves are built — the host
+  directory browser with a file viewer/editor and a command runner, and a pane that polls
+  `GET /v1/approvals` and renders each question's risk class, reason, undo line and remaining
+  unattended budget
 - **Two clients on one session simultaneously** (TUI + browser) — this is the real test that
   the daemon/client split is honest and not cosmetic
 
@@ -172,9 +172,16 @@ through a rendered page.
   count of rows written before the chain existed, which is never folded into `intact`. Verified live
   against a daemon: 8 chained events report intact, one row rewritten with raw SQL reports TRAIL
   ALTERED at that row.
-- ◐ Web UI: the sandbox/container status strip and an approval queue showing the risk class, the
-  reason and the undo line are built (`crates/hx-server/static/index.html`). The one part still
-  open is the **remaining unattended budget** — the page has no `unattended`/`budget` anywhere
+- ✅ Web UI: the sandbox/container status strip, an approval queue showing the risk class, the
+  reason, the undo line and the **remaining unattended budget** (`crates/hx-server/static/index.html`).
+  The budget rides on the question itself (`ApprovalRequest::unattended`), because the counter that
+  spends it lives in the run's `ApprovalSession` and a run that has asked is *waiting*: nothing spends
+  the budget while a question is open, so the number on the card is the number in force, and it is the
+  same `budget − spent` the engine compares against to decide to check in. Absent when the policy sets
+  no cadence, and the card then says nothing rather than `0` or `∞`. Proven over the wire in
+  `crates/hx-server/tests/web_client_api.rs` — two policies differing only in the budget serve two
+  different remainders, so the number cannot be a constant — with the card's own rendering left to the
+  browser, which is stated in that test rather than implied
 
 **Exit criteria:** an agent asked to "build this untrusted code and run it" does so in L2 with
 no network, is killed at TTL, and its workspace survives while the sandbox doesn't. An

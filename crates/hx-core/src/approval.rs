@@ -1631,6 +1631,28 @@ impl ApprovalOption {
     }
 }
 
+/// How much of the unattended budget was left when a question was asked.
+///
+/// The budget is the policy's "run free, then check in" cadence
+/// ([`ApprovalPolicy::unattended_budget`]) and [`ApprovalSession`] spends it one auto-approved
+/// action at a time. This carries that accounting on the question itself, because the counter lives
+/// inside the run that is asking and **that run is waiting**: while a question is open nothing
+/// spends the budget, so the number on the question is the number in force for exactly as long as
+/// the question is up.
+///
+/// It hangs off the request as an `Option` because a policy that sets no budget has no rope to
+/// report. A surface that showed `0` or `∞` for that case would be inventing a number nobody is
+/// bound by, which is worse than saying nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnattendedBudget {
+    /// The cadence the policy in force sets: a check-in is forced after this many consecutive
+    /// actions nobody reviewed.
+    pub budget: u64,
+    /// How many of them are still allowed before that check-in. `0` means **this question is the
+    /// check-in** — running out of budget is what made the run stop and ask.
+    pub remaining: u64,
+}
+
 /// A prompt to put in front of the user.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRequest {
@@ -1650,6 +1672,14 @@ pub struct ApprovalRequest {
     /// How the effect can be taken back, in the tool's own words, when it can be.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undo: Option<String>,
+    /// What the unattended budget looked like when this question was asked. See
+    /// [`UnattendedBudget`].
+    ///
+    /// `None` — the honest default, and what every hand-built request gets — means the policy sets
+    /// no check-in cadence, so there is no rope to show. It is not the same fact as a budget of
+    /// zero, which cannot be configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unattended: Option<UnattendedBudget>,
     /// Where the call will run, so the person answering knows whether the effect lands on their machine.
     #[serde(default, skip_serializing_if = "Confinement::is_host")]
     pub confined: Confinement,
@@ -2273,6 +2303,20 @@ impl ApprovalSession {
             confined: req.confined,
             default_on_timeout: ApprovalOption::Deny,
             timeout_secs: None,
+            // Read from *this* session rather than from the config: the level can be overridden per
+            // request and the counter is the run's own, so the config would answer a different
+            // question than "how much rope does the run that is asking have left".
+            //
+            // `saturating_sub` and not `-`: the check-in fires at `consecutive_auto >= budget`, so
+            // the difference is zero there and never negative today. A subtraction that can only be
+            // explained by a comparison elsewhere is one edit away from a panic in a report.
+            unattended: self
+                .policy
+                .unattended_budget
+                .map(|budget| UnattendedBudget {
+                    budget,
+                    remaining: budget.saturating_sub(self.consecutive_auto),
+                }),
         };
         self.outstanding = Some(request.clone());
         request

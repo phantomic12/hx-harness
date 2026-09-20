@@ -479,6 +479,7 @@ mod tests {
             targets: vec![],
             reversible: false,
             undo: None,
+            unattended: None,
             confined: Default::default(),
             default_on_timeout: ApprovalOption::Deny,
             timeout_secs: None,

@@ -91,6 +91,9 @@
   .approval .summary { color: var(--text); margin: 4px 0; font-size: 13px; }
   .approval .reason { color: var(--dim); font-size: 12px; }
   .approval .undo { color: var(--dim); font-size: 12px; font-style: italic; margin-top: 3px; }
+  /* The rope left before the run checks in. Same weight as the undo line, because both are context
+     a person answers *with* rather than the question itself. */
+  .approval .unattended { color: var(--dim); font-size: 12px; margin-top: 3px; }
   .approval .opts { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
   .approval .opts button {
     font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 4px; cursor: pointer;
@@ -651,6 +654,24 @@ function renderApproval(req) {
     // Said explicitly, because "no undo line" must not read as "there is nothing more to know".
     undo.textContent = "this cannot be undone";
     el.appendChild(undo);
+  }
+
+  // The remaining unattended budget, when the run that asked has one.
+  //
+  // Shown only when the daemon sent it. A policy with no check-in cadence sends nothing, and a `0`
+  // or an `∞` invented here would be a number nobody is bound by — worse than saying nothing. When
+  // it *is* sent, `0` is the interesting case: it means this question is the check-in the budget
+  // forced, which is what a person deciding whether to let the run keep going needs to know.
+  if (req.unattended && typeof req.unattended.budget === "number") {
+    const rope = document.createElement("div");
+    rope.className = "unattended";
+    const left =
+      typeof req.unattended.remaining === "number" ? req.unattended.remaining : req.unattended.budget;
+    rope.textContent =
+      left === 0
+        ? `unattended: this is the check-in (0 of ${req.unattended.budget} left)`
+        : `unattended: ${left} of ${req.unattended.budget} left before a check-in`;
+    el.appendChild(rope);
   }
 
   const opts = document.createElement("div");

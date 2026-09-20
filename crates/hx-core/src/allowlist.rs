@@ -377,6 +377,9 @@ risk = "destructive"
             reversible: true,
             targets: vec![],
             undo: None,
+            // No budget on this fixture: the field is absent for a hand-built request, which is the
+            // same shape a policy with no check-in cadence produces.
+            unattended: None,
             confined: crate::approval::Confinement::Host,
             default_on_timeout: crate::approval::ApprovalOption::Deny,
             timeout_secs: None,
@@ -411,6 +414,9 @@ risk = "destructive"
             reversible: false,
             targets: vec![],
             undo: None,
+            // No budget on this fixture: the field is absent for a hand-built request, which is the
+            // same shape a policy with no check-in cadence produces.
+            unattended: None,
             confined: crate::approval::Confinement::Host,
             default_on_timeout: crate::approval::ApprovalOption::Deny,
             timeout_secs: None,
@@ -434,6 +440,9 @@ risk = "destructive"
             reversible: false,
             targets: vec![],
             undo: None,
+            // No budget on this fixture: the field is absent for a hand-built request, which is the
+            // same shape a policy with no check-in cadence produces.
+            unattended: None,
             confined: crate::approval::Confinement::Host,
             default_on_timeout: crate::approval::ApprovalOption::Deny,
             timeout_secs: None,
