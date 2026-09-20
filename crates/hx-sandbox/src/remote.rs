@@ -274,6 +274,56 @@ pub fn create_command(
     Ok((name.to_string(), tokens.join(" ")))
 }
 
+/// The error text every Docker daemon without `userns-remap` configured produces for `--userns`:
+///
+/// ```text
+/// docker: --userns: invalid USER mode        (exit 125)
+/// ```
+///
+/// Matching on this exact string — not on a catch-all — is what keeps an unrelated create failure
+/// (a missing image, a broken network, a bad bind) from being mislabelled as a remap problem. A
+/// rewrite that fired on *any* failure would surrender the engine's real message, which is worse
+/// than the raw text. The original error is kept in the rewritten message so the operator still sees
+/// exactly what the engine said; the rewrite only prepends the cause and the way out.
+const USERNS_INVALID_USER_MODE: &str = "invalid USER mode";
+
+/// Rewrite the digestible `--userns=private` rejection into a message that names the cause and the
+/// way out, leaving every other create failure untouched.
+///
+/// Today an L2/L3 profile against a daemon with no `userns-remap` in its `daemon.json` dies
+/// with `docker: --userns: invalid USER mode (exit 125)` — a message that names the flag but not
+/// why the daemon refused it or what to do. This turns that one specific failure into a refusal that
+/// says: the far daemon has no user-namespace remapping configured; either configure remap on that
+/// daemon, run this profile on a daemon that has it, or — only when a weaker boundary is
+/// *explicitly* acceptable — use L1. It deliberately does **not** silently downgrade L2/L3 to L1:
+/// the isolation level is the promise the operator made, and degrading on its own would be the
+/// failure the whole isolation ladder exists to prevent. The operator, having been told the trade, may
+/// choose L1; the runtime will not.
+///
+/// The narrow match is the whole point. A `userns_remap_advice` that fired on any create error
+/// would rewrite a missing-image or networking failure as a remap problem, sending the operator down
+/// the wrong path. It fires only when (a) the command actually asked for `--userns` remapping and
+/// (b) the engine said `invalid USER mode`.
+fn userns_remap_advice(command: &str, err: &HxError) -> Option<HxError> {
+    let message = err.to_string();
+    // Both halves must be true: the create command carried the remap flag (L2/L3 with remap
+    // configured sets it; a profile that never asked for remap cannot hit this), and the engine
+    // answered with the specific mode rejection.
+    if !message.contains(USERNS_INVALID_USER_MODE) {
+        return None;
+    }
+    if !command.contains("--userns") {
+        return None;
+    }
+    // The original message is preserved verbatim so the operator can still see what the engine said.
+    Some(remote_error(format!(
+        "the far daemon has no user-namespace remapping (`userns-remap`) configured in its \
+         daemon.json, so it refuses the --userns=private this L2/L3 profile requests. Configure \
+         userns-remap on that daemon, or run this profile on a daemon that has it, or — only if \
+         a weaker boundary is explicitly acceptable — use L1. The daemon's own message: {message}"
+    )))
+}
+
 /// `docker start <id>`
 pub fn start_command(runtime_id: &str) -> String {
     format!("{DOCKER} start {runtime_id}")
@@ -343,7 +393,15 @@ impl SandboxRuntime for RemoteSandboxRuntime {
     ) -> Result<String> {
         let name = self.container_name(id);
         let (name, command) = create_command(&name, spec, settings)?;
-        self.run_docker(&command).await?;
+        if let Err(err) = self.run_docker(&command).await {
+            // The one digestible rejection the engine produces — a daemon with no `userns-remap`
+            // in `daemon.json` refuses every L2/L3 create with `--userns: invalid USER mode`.
+            // Naming the cause and the way out here is what makes the failure actionable; the raw
+            // engine text says which flag, not why or what to do. Only this specific failure is
+            // rewritten — never a catch-all, which would mislabel a networking or image error as a
+            // remap problem (see `userns_remap_advice`).
+            return Err(userns_remap_advice(&command, &err).unwrap_or(err));
+        }
         // The runtime handle is the container *name*, stable across recreates and what later
         // commands match on — the id docker prints is not returned, for the same reason
         // `DockerRuntime::create` returns the name. With `--name` set we already know it.
@@ -660,6 +718,108 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("exit 125"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_create_that_rejects_userns_remapping_names_the_cause_and_the_way_out() {
+        // L2/L3 against a daemon whose `daemon.json` has no `userns-remap` dies at create with
+        // `--userns: invalid USER mode`. The raw engine text names the flag but not why or what to
+        // do; the runtime must rewrite this one specific failure into a message that says the far
+        // daemon has no remap configured and how to proceed — without degrading the level to L1 on
+        // its own (the isolation ladder's promise is the operator's to relax, explicitly).
+        let s = spec(IsolationLevel::L2);
+        let settings = s.host_settings();
+        let (_, expected) = create_command("hx-sbx_abc123", &s, &settings).unwrap();
+        let failed = RemoteCommandOutput {
+            stdout: String::new(),
+            stderr: "docker: --userns: invalid USER mode            (exit 125)".into(),
+            exit_code: Some(125),
+        };
+        let runner = Arc::new(RecordingRunner::new(vec![(expected.as_str(), failed)]));
+        let runtime = RemoteSandboxRuntime::new(runner);
+        let err = runtime
+            .create(&SandboxId::from_raw("sbx_abc123"), &s, &settings)
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        // The cause.
+        assert!(
+            message.contains("no user-namespace remapping") && message.contains("userns-remap"),
+            "the failure must name the missing remap as the cause: {message}"
+        );
+        // The way out, including the explicitly-excepted L1.
+        assert!(
+            message.contains("Configure userns-remap on that daemon"),
+            "the failure has to offer the real fix: {message}"
+        );
+        assert!(
+            message.contains("use L1") && message.contains("explicitly acceptable"),
+            "L1 is offered only as an explicit, weaker-boundary choice: {message}"
+        );
+        // The original engine text is preserved so the operator still sees exactly what the daemon said.
+        assert!(
+            message.contains("invalid USER mode"),
+            "the engine's own message must survive: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_create_failure_is_never_rewritten_as_a_remap_problem() {
+        // The control for the rewrite above, and the reason it is a narrow match: a failure that is
+        // *not* the `invalid USER mode` rejection (a missing image, here) must surface as the
+        // engine's raw text. A catch-all rewrite would mislabel every create error as a remap
+        // problem, which is worse than the raw text — the engine knows what is wrong, and a message
+        // that claims a wrong cause sends the operator down the wrong path. The level is L2 (so the
+        // command really does carry `--userns`), which proves the guard is the error text, not the
+        // mere presence of the flag.
+        let s = spec(IsolationLevel::L2);
+        let settings = s.host_settings();
+        let (_, expected) = create_command("hx-sbx_abc123", &s, &settings).unwrap();
+        let failed = RemoteCommandOutput {
+            stdout: String::new(),
+            stderr: "no such image: ubuntu:24.04".into(),
+            exit_code: Some(125),
+        };
+        let runner = Arc::new(RecordingRunner::new(vec![(expected.as_str(), failed)]));
+        let runtime = RemoteSandboxRuntime::new(runner);
+        let err = runtime
+            .create(&SandboxId::from_raw("sbx_abc123"), &s, &settings)
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("no such image: ubuntu:24.04"), "{message}");
+        assert!(
+            !message.contains("userns-remap"),
+            "an unrelated failure must not be relabelled as a remap problem: {message}"
+        );
+    }
+
+    #[test]
+    fn userns_remap_advice_fires_only_on_the_digestible_rejection() {
+        // The pure guard, pinned directly: it fires only when the command carried `--userns` AND the
+        // engine said the specific `invalid USER mode` rejection. Either half alone is not enough.
+        let remap_command = "docker create --name='x' --userns='private' ubuntu:24.04";
+        let remap_err = remote_error("`docker create …` failed with exit 125: docker: --userns: invalid USER mode");
+        assert!(
+            userns_remap_advice(remap_command, &remap_err).is_some(),
+            "the remap rejection must be rewritten"
+        );
+
+        // The rejection text without the flag in the command: not a remap create, leave untouched.
+        let plain_err = remote_error(
+            "`docker create …` failed with exit 125: docker: --userns: invalid USER mode",
+        );
+        assert!(
+            userns_remap_advice("docker create --name='x' ubuntu:24.04", &plain_err).is_none(),
+            "without the flag in the command, do not call it a remap problem"
+        );
+
+        // The flag present but a different error text: not the rejection we map.
+        let other_err = remote_error("`docker create …` failed with exit 125: no such image");
+        assert!(
+            userns_remap_advice(remap_command, &other_err).is_none(),
+            "an unrelated error must not be rewritten"
+        );
     }
 
     #[tokio::test]

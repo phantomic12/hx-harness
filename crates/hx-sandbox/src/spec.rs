@@ -313,9 +313,12 @@ impl SandboxSpec {
                 // against a daemon without remap configured fails at `create` with an engine error
                 // rather than silently downgrading. That is the honest failure — it must not
                 // degrade to L1 on its own, because the level is the promise the operator made.
-                // Pinned by `the_far_daemon_rejects_l2_userns_remapping_when_it_is_not_configured`
-                // in `crates/hx-sandbox/tests/remote_live.rs`. Whether the runtime should instead
-                // *refuse* such a profile up front (naming the daemon's missing remap) is open.
+                // The runtime turns that one specific engine error into a message that names the cause
+                // (no `userns-remap` on the far daemon) and the way out (configure remap there,
+                // run on a daemon that has it, or explicitly choose L1) — see `userns_remap_advice`
+                // in `crates/hx-sandbox/src/remote.rs`, and
+                // `the_far_daemon_rejects_l2_userns_remapping_when_it_is_not_configured`
+                // in `crates/hx-sandbox/tests/remote_live.rs`.
                 settings.userns_mode = Some(USERNS_REMAPPED.to_string());
             }
             IsolationLevel::L3 => {
