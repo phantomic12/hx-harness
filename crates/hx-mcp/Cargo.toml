@@ -22,8 +22,14 @@ hx-secrets.workspace = true
 # implement `hx_tools::Tool` directly rather than being adapted at the call site. That is the whole
 # point of the edge: an MCP tool is a tool, not a special case the loop has to know about.
 hx-tools.workspace = true
+# The server half's gate reuses `hx-agent`'s pieces rather than re-implementing them: `risk_of` is
+# the risk table an MCP call is classified by, and `ApprovalQueue` is the daemon's approval surface
+# the tests hold a refusal against. A second copy of either is a copy that can drift from the policy
+# the local path applies — which is the one thing a remote surface must not do.
+hx-agent.workspace = true
 rmcp.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
 futures.workspace = true
 indexmap.workspace = true
 serde.workspace = true

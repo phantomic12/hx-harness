@@ -403,7 +403,24 @@ command with a button, receive a cron digest in a separate pinned thread.
   against a real third-party server. Every wire-level property is currently verified against a double
   this crate also wrote. Run it against `npx -y @modelcontextprotocol/server-filesystem /tmp` and an
   HTTP endpoint before calling the host proven.
-- `rmcp` server: expose `hx`'s tools to other agents/IDEs
+- ✅ `rmcp` **server**: expose `hx`'s tools to other agents/IDEs over **stdio only**. The server half
+  is `hx-mcp/src/server.rs` plus the `hx-mcp-server` binary: it advertises `hx_tools::ToolRegistry`'s
+  tools with the registry's own names and schemas (not hand-written duplicates), and every
+  `tools/call` goes through the same requirement/risk/approval path a local call takes — the same
+  `ToolRegistry::prepare`, the same capability check, `hx-agent`'s `risk_of` table (exported for this,
+  so there is one table rather than two that agree today), the same `ApprovalSession`. A call the
+  policy would ask a person about is **refused immediately**, with a reason naming the tool, the risk
+  and the two ways to allow it: a stdio connection has nobody to ask, so the server has **no approver
+  field and no approval-posting path**, and a refusal leaves nothing outstanding
+  (`session.outstanding()` is `None`; the daemon's `ApprovalQueue` never sees it). `tests/server_stdio.rs`
+  drives a hand-rolled MCP client against the real binary over a real pipe and asserts that, including
+  the control (the same call under a policy that allows it runs) and a refused `delete` whose file is
+  still on disk. See TESTING.md's `hx-mcp` row.
+- ⬜ **Open, from this item:** there is no streamable-HTTP MCP **server** transport. `rmcp`'s is
+  already in this crate's dependency graph — `tests/http.rs` runs one on `axum` — so what is missing
+  is not a dependency but an **authentication story**: who the client is, what it may do, and how
+  that is proven. Until there is one, an endpoint that runs tools for whoever can reach the port
+  would be exactly the hole the stdio-only decision exists to not be.
 - Browser pool: crw (Rust, Firecrawl-compat) → camoufox (stealth) → Chromium (interactive CDP),
   per-container profile isolation, challenge escalation to a human-in-the-loop browser pane
   - ◐ **Profiles.** Per-session isolation in `crates/hx-browser/src/profile.rs`: a session's

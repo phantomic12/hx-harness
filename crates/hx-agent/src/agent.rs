@@ -560,7 +560,14 @@ impl CallOutcome {
 ///
 /// Deliberately coarse: the classifier does the fine-grained work for commands, and a capability
 /// check has already decided whether the agent may touch this at all.
-fn risk_of(resource: &Resource, action: Action) -> (RiskClass, String) {
+///
+/// **Public, and shared with `hx-mcp`'s server half**, because the alternative is a second table that
+/// can drift: a tool call made by a third-party MCP client is classified by exactly this function, so
+/// "the same requirement/risk path as a local call" is one implementation rather than two that agree
+/// today. It reads a [`Resource`] and an [`Action`] — both `hx-core` types — and returns the class the
+/// approval policy judges, which is why it belongs beside the loop that consults it rather than in the
+/// surface that calls it.
+pub fn risk_of(resource: &Resource, action: Action) -> (RiskClass, String) {
     match (resource, action) {
         (Resource::FsPath { path }, Action::Read) => (RiskClass::Read, format!("reads {path}")),
         (Resource::FsPath { path }, Action::Delete) => {
