@@ -427,10 +427,23 @@ command with a button, receive a cron digest in a separate pinned thread.
   opted in, or in its own `env:` — a name nobody thought to check fails the test. `hx.example.yaml`
   documents the key, and `McpServerConfig::validate` refuses an `env_passthrough` entry that is not a
   variable name, because a typo there fails closed and looks like the server's fault.
-- ⬜ **Open, from this item:** the live MCP canary (`hx-mcp/tests/mcp_live.rs`) has never been run
-  against a real third-party server. Every wire-level property is currently verified against a double
-  this crate also wrote. Run it against `npx -y @modelcontextprotocol/server-filesystem /tmp` and an
-  HTTP endpoint before calling the host proven.
+- ✅ **Closed, from this item (stdio half):** the live MCP canary (`hx-mcp/tests/mcp_live.rs`) had
+  never been run against a real third-party server. It has now been run, unmodified, against
+  `npx -y @modelcontextprotocol/server-filesystem /tmp`: the real `secure-filesystem-server` 0.2.0 was
+  spawned by `hx-mcp`'s own `stdio::connect`, completed a real `initialize` + `tools/list` handshake,
+  had its tools published namespaced under `live__`, and answered a real `tools/call` as a
+  `ToolOutcome`. **No defect was found** — the wire-level properties the suite had only ever verified
+  against a double this crate also wrote hold against a server nobody here wrote. Confirmed
+  independently by speaking the same three JSON-RPC messages to the package over a shell pipe, and the
+  canary was checked to *fail* (with a readable sentence) when pointed at a package that does not
+  exist, so the pass is evidence rather than a canary that cannot fail. Recorded in TESTING.md. The
+  canary stays `#[ignore]`d — it needs a package and a network, so it is not a CI default.
+- ⬜ **Still open, from this item:** the **streamable-HTTP** half of the canary (`HX_MCP_LIVE_URL`) is
+  still unrun: no third-party endpoint is available in this environment, and the HTTP suite's happy
+  path drives `rmcp`'s own server, which this project also built. So the session header, the SSE
+  framing and the `Last-Event-ID` resume are verified against an implementation we did not write but
+  *did* choose, not against a third party. Also unproven by the run: the canary calls one tool with
+  `{}`, so the round-trip is proven and a tool's *arguments* are not.
 - `rmcp` server: expose `hx`'s tools to other agents/IDEs
 - Browser pool: crw (Rust, Firecrawl-compat) → camoufox (stealth) → Chromium (interactive CDP),
   per-container profile isolation, challenge escalation to a human-in-the-loop browser pane

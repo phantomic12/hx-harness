@@ -727,7 +727,7 @@ the failure is silent:
 | DuckDuckGo keyless scraping — the *success* path | Every attempt from a plain HTTP client is answered with an `anomaly` challenge: a TLS-fingerprint wall, not a markup change. The failure path is verified live; the success path needs a browser-fingerprint client (M6) | Medium — search silently loses a source, but `SearchReport` names it |
 | Vault written to disk and reopened in a **new process** | Untested | Medium — in-process round-trip only |
 | `hxd` reaper loop, `axum::serve` under load | Manual only | Low |
-| **`hx-mcp` against a real third-party MCP server** | No real server can be assumed on a build machine, so the live canary (`tests/mcp_live.rs`) is `#[ignore]`d and reads its target from `HX_MCP_LIVE_COMMAND`/`HX_MCP_LIVE_URL`. It has **never been run**. Everything the suite verifies about the wire is verified against a double this crate also wrote — real JSON-RPC over a real pipe, but our reading of the protocol at both ends. The one test in that file that needs no environment (`a_live_target_that_is_not_there_is_a_readable_failure_and_not_a_hang`) *does* run, and covers the commonest real state: a misconfigured server | Medium — a `rmcp` behaviour we have misread would pass every test here and fail on first contact. `rmcp` is the mitigation, and it is not under test |
+| **`hx-mcp` against a real third-party MCP server over streamable-HTTP** | The **stdio** half of the canary has now been run against a real server (see *The live MCP canary* below). The streamable-HTTP half (`HX_MCP_LIVE_URL`) has **never been run**: there is no third-party endpoint configured for this environment, and the HTTP suite's happy path uses `rmcp`'s own server, which this project also built. So the HTTP session header, SSE framing and `Last-Event-ID` resume are verified against an implementation we did not write but *did* choose, and not against a third party | Medium — a `rmcp` behaviour we have misread would pass every test here and fail on first contact. `rmcp` is the mitigation, and it is not under test |
 
 ### Tier D — absent
 
@@ -864,6 +864,72 @@ over HTTP for exactly that reason. The `HX_WINRM_*` matrix above is what the liv
 with. One consequence worth knowing before deploying: the live tests pass through a TLS-terminating
 proxy in front of a plain listener, because configuring an HTTPS listener on the guest was more
 moving parts than the code under test.
+
+## The live MCP canary, against a real third-party server (2026-09-20, recorded)
+
+`crates/hx-mcp/tests/mcp_live.rs` is `#[ignore]`d because it needs a package and a network, and it had
+never been run. It has now been run, on the machine this build was made on, against the real
+`@modelcontextprotocol/server-filesystem`:
+
+```console
+$ HX_MCP_LIVE_COMMAND=npx \
+  HX_MCP_LIVE_ARGS="-y @modelcontextprotocol/server-filesystem /tmp" \
+  cargo test -p hx-mcp --test mcp_live -- --ignored --nocapture \
+      a_real_stdio_server_is_spawned_handshaken_and_called
+
+test a_real_stdio_server_is_spawned_handshaken_and_called ... ok
+test result: ok. 1 passed; 0 failed; 2 filtered out; finished in 0.85s
+```
+
+`node` 26.7.0 and `npx` 11.19.0 were present and the registry was reachable, so the canary ran
+unmodified — no test was relaxed and nothing was asserted that the run did not produce. 0.85 s is a
+**warm `npx` cache**, not a fast server: the same command from a shell starts in the same fraction of a
+second, and the test's own bound (120 s) is what a cold install would have to fit inside.
+
+**What that establishes.** A real third-party server, spawned by `hx-mcp`'s own `stdio::connect`,
+completed a real `initialize` + `tools/list` handshake; its tools were published namespaced under
+`live__`; and a real `tools/call` round-tripped as a `ToolOutcome` rather than hanging. The wire-level
+properties this crate had only ever verified against a double it also wrote — the JSON-RPC framing, the
+handshake shape, the namespacing of names a third party chose — hold against a server nobody here
+wrote. **No defect was found.** The canary was left exactly as it was, and it stays `#[ignore]`d: it
+needs a package and a network, so it is not a CI default.
+
+**Independent confirmation, so the pass is not just the canary agreeing with itself.** The same
+package, spoken to directly over a shell pipe with three newline-delimited JSON-RPC messages:
+
+```console
+$ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize",…}' … | npx -y @modelcontextprotocol/server-filesystem /tmp
+{"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":true}},
+ "serverInfo":{"name":"secure-filesystem-server","version":"0.2.0"}},"jsonrpc":"2.0","id":1}
+{"result":{"tools":[{"name":"read_file",…,"annotations":{"readOnlyHint":true,…},
+ "execution":{"taskSupport":"forbidden"},"outputSchema":{…}},…]},"jsonrpc":"2.0","id":2}
+```
+
+So the server is `secure-filesystem-server` 0.2.0, it answers both methods, and its `tools/list` is
+richer than the double's — `outputSchema`, `annotations` and `execution` are all present, and `rmcp`
+parsed the lot. The canary also passes with `HX_MCP_LIVE_TOOL=live__list_allowed_directories` named
+explicitly (0.42 s), which is the path a caller takes when it wants one particular tool rather than the
+first one the server lists.
+
+**The check that the canary can fail, run before trusting the pass.** Pointed at a package that does
+not exist:
+
+```console
+$ HX_MCP_LIVE_ARGS="-y @modelcontextprotocol/server-that-does-not-exist-hx-canary" cargo test … --ignored
+thread 'a_real_stdio_server_is_spawned_handshaken_and_called' panicked at mcp_live.rs:186:
+a real server must come up: Down { reason: "the handshake failed: connection closed: initialize
+response", retrying: true }
+```
+
+It fails, on the assertion it is supposed to fail on, with a sentence a model could read. A canary
+that cannot fail is not evidence, and this one can.
+
+**What is still not covered by this run.** The canary calls one tool with `{}` — the call that needs no
+knowledge of the schema — so the round-trip is proven and the *arguments* are not; a tool that takes a
+path is exercised by `tests/stdio.rs` against the double, not here. And the streamable-HTTP canary
+(`HX_MCP_LIVE_URL`) is still unrun: there is no third-party endpoint available in this environment, and
+the HTTP suite's happy path drives `rmcp`'s own server, which this project also built. That is the
+remaining Tier C row.
 
 ## Tier C — a real model through the daemon (manual, recorded)
 
