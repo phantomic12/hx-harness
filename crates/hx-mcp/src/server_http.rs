@@ -78,10 +78,7 @@ pub fn router(server: Arc<McpServer>, token: Option<ApiToken>) -> axum::Router {
         .route("/healthz", axum::routing::get(healthz))
         .nest_service("/mcp", service.clone())
         .fallback_service(service)
-        .layer(axum::middleware::from_fn_with_state(
-            token,
-            require_bearer,
-        ))
+        .layer(axum::middleware::from_fn_with_state(token, require_bearer))
 }
 
 /// Liveness probe: returns `ok` and reveals no server state.

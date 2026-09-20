@@ -275,13 +275,9 @@ async fn serve_http(args: Args, bind: String) -> Result<(), String> {
     ));
 
     let token = args.resolved_token().map(ApiToken::new);
-    let (addr, task) = hx_mcp::server_http::bind_and_serve(
-        Arc::clone(&server),
-        &bind,
-        token,
-    )
-    .await
-    .map_err(|err| err.to_string())?;
+    let (addr, task) = hx_mcp::server_http::bind_and_serve(Arc::clone(&server), &bind, token)
+        .await
+        .map_err(|err| err.to_string())?;
 
     eprintln!(
         "hx-mcp-server: {} tools over HTTP at http://{addr}/mcp, policy {}, workspace {}. A call that needs approval is refused: this connection has no surface to ask.",

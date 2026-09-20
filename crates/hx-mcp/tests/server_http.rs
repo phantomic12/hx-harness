@@ -106,9 +106,7 @@ fn policy_asking_about_reads() -> ApprovalPolicy {
 }
 
 fn stores_with(token: &str) -> Arc<SecretStores> {
-    Arc::new(SecretStores::new().with(Arc::new(
-        FixedSecrets::vault().set("mcp/test", token),
-    )))
+    Arc::new(SecretStores::new().with(Arc::new(FixedSecrets::vault().set("mcp/test", token))))
 }
 
 fn config_map(key: &str, url: &str, token_ref: Option<&str>) -> IndexMap<String, McpServerConfig> {
@@ -130,7 +128,9 @@ async fn no_token_is_a_401_and_does_not_reach_the_handler() {
     // Proven with a side effect outside the process: a write_file tool call aimed
     // at a fresh path. If unauthenticated requests reach the handler, the file appears.
     let fixture = Fixture::new();
-    let server = fixture.server(ApprovalPolicy::at(AutonomyLevel::Balanced)).await;
+    let server = fixture
+        .server(ApprovalPolicy::at(AutonomyLevel::Balanced))
+        .await;
     let token = ApiToken::new(SENTINEL);
 
     let (addr, task) = bind_and_serve(Arc::clone(&server), "127.0.0.1:0", Some(token))
@@ -200,7 +200,9 @@ async fn no_token_is_a_401_and_does_not_reach_the_handler() {
 #[tokio::test]
 async fn correct_token_handshake_succeeds_and_tools_list_returns_registry_tools() {
     let fixture = Fixture::new();
-    let server = fixture.server(ApprovalPolicy::at(AutonomyLevel::Balanced)).await;
+    let server = fixture
+        .server(ApprovalPolicy::at(AutonomyLevel::Balanced))
+        .await;
     let token = ApiToken::new(SENTINEL);
 
     let (addr, task) = bind_and_serve(server, "127.0.0.1:0", Some(token))
@@ -231,7 +233,9 @@ async fn correct_token_handshake_succeeds_and_tools_list_returns_registry_tools(
 #[tokio::test]
 async fn a_correct_prefix_of_the_token_is_refused() {
     let fixture = Fixture::new();
-    let server = fixture.server(ApprovalPolicy::at(AutonomyLevel::Balanced)).await;
+    let server = fixture
+        .server(ApprovalPolicy::at(AutonomyLevel::Balanced))
+        .await;
     let token = ApiToken::new(SENTINEL);
     let app = router(server, Some(token));
 
@@ -258,7 +262,9 @@ async fn a_correct_prefix_of_the_token_is_refused() {
 #[tokio::test]
 async fn missing_token_and_wrong_token_are_indistinguishable() {
     let fixture = Fixture::new();
-    let server = fixture.server(ApprovalPolicy::at(AutonomyLevel::Balanced)).await;
+    let server = fixture
+        .server(ApprovalPolicy::at(AutonomyLevel::Balanced))
+        .await;
     let token = ApiToken::new(SENTINEL);
     let app = router(server, Some(token));
 
@@ -356,11 +362,16 @@ async fn a_call_needing_approval_is_refused_over_http_and_no_approval_request_wa
 
     // Control: under a policy that allows it, the same call runs.
     let allowed_fixture = Fixture::new();
-    let allowed_server = allowed_fixture.server(ApprovalPolicy::at(AutonomyLevel::Balanced)).await;
-    let (allowed_addr, allowed_task) =
-        bind_and_serve(Arc::clone(&allowed_server), "127.0.0.1:0", Some(ApiToken::new(SENTINEL)))
-            .await
-            .expect("bind and serve");
+    let allowed_server = allowed_fixture
+        .server(ApprovalPolicy::at(AutonomyLevel::Balanced))
+        .await;
+    let (allowed_addr, allowed_task) = bind_and_serve(
+        Arc::clone(&allowed_server),
+        "127.0.0.1:0",
+        Some(ApiToken::new(SENTINEL)),
+    )
+    .await
+    .expect("bind and serve");
 
     let allowed_url = format!("http://{allowed_addr}/mcp");
     let allowed_host = McpHost::from_config(
@@ -468,7 +479,9 @@ async fn the_daemons_approval_queue_shows_a_local_question_and_never_sees_an_mcp
 #[tokio::test]
 async fn a_destructive_tool_is_refused_and_the_path_it_names_is_untouched() {
     let fixture = Fixture::new();
-    let server = fixture.server(ApprovalPolicy::at(AutonomyLevel::Balanced)).await;
+    let server = fixture
+        .server(ApprovalPolicy::at(AutonomyLevel::Balanced))
+        .await;
     let (addr, task) = bind_and_serve(
         Arc::clone(&server),
         "127.0.0.1:0",
@@ -510,10 +523,13 @@ async fn a_destructive_tool_is_refused_and_the_path_it_names_is_untouched() {
     let mut policy = ApprovalPolicy::at(AutonomyLevel::Balanced);
     policy.allow.push(Rule::tool("delete"));
     let allowed_server = allowed_fixture.server(policy).await;
-    let (allowed_addr, allowed_task) =
-        bind_and_serve(Arc::clone(&allowed_server), "127.0.0.1:0", Some(ApiToken::new(SENTINEL)))
-            .await
-            .expect("bind and serve");
+    let (allowed_addr, allowed_task) = bind_and_serve(
+        Arc::clone(&allowed_server),
+        "127.0.0.1:0",
+        Some(ApiToken::new(SENTINEL)),
+    )
+    .await
+    .expect("bind and serve");
 
     let allowed_url = format!("http://{allowed_addr}/mcp");
     let allowed_host = McpHost::from_config(
@@ -545,12 +561,13 @@ async fn a_destructive_tool_is_refused_and_the_path_it_names_is_untouched() {
 #[tokio::test]
 async fn a_non_loopback_bind_with_no_token_is_refused_at_startup() {
     let fixture = Fixture::new();
-    let server = fixture.server(ApprovalPolicy::at(AutonomyLevel::Balanced)).await;
+    let server = fixture
+        .server(ApprovalPolicy::at(AutonomyLevel::Balanced))
+        .await;
 
     let err = bind_and_serve(server, "0.0.0.0:8787", None)
         .await
-        .err()
-        .expect("non-loopback bind without token must fail startup");
+        .expect_err("non-loopback bind without token must fail startup");
     let msg = err.to_string();
 
     assert!(msg.contains("api.token"), "must name api.token: {msg}");
@@ -561,7 +578,9 @@ async fn a_non_loopback_bind_with_no_token_is_refused_at_startup() {
     assert!(msg.contains("0.0.0.0:8787"), "must name address: {msg}");
 
     // Control: loopback bind with no token succeeds.
-    let server2 = fixture.server(ApprovalPolicy::at(AutonomyLevel::Balanced)).await;
+    let server2 = fixture
+        .server(ApprovalPolicy::at(AutonomyLevel::Balanced))
+        .await;
     let (addr, task) = bind_and_serve(server2, "127.0.0.1:0", None)
         .await
         .expect("loopback bind needs no token");
@@ -609,11 +628,12 @@ fn the_token_appears_in_no_error_body_no_log_line_and_no_debug_output() {
 
     let err_msg = runtime
         .block_on(async {
-            let server = fixture.server(ApprovalPolicy::at(AutonomyLevel::Balanced)).await;
+            let server = fixture
+                .server(ApprovalPolicy::at(AutonomyLevel::Balanced))
+                .await;
             bind_and_serve(server, "0.0.0.0:8787", None).await
         })
-        .err()
-        .unwrap()
+        .unwrap_err()
         .to_string();
     assert!(
         !err_msg.contains(SENTINEL),
@@ -633,7 +653,9 @@ fn the_token_appears_in_no_error_body_no_log_line_and_no_debug_output() {
 
         runtime.block_on(async {
             let fixture = Fixture::new();
-            let server = fixture.server(ApprovalPolicy::at(AutonomyLevel::Balanced)).await;
+            let server = fixture
+                .server(ApprovalPolicy::at(AutonomyLevel::Balanced))
+                .await;
             let app = router(server, Some(token));
 
             // Drive 401 path
