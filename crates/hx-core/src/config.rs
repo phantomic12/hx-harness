@@ -535,8 +535,9 @@ pub struct ConnectorConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchConfig {
-    /// Backend ids in preference order: `searxng`, `ddg`, `mojeek`, `marginalia`, `brave`,
-    /// `google_cse`, `wikipedia`.
+    /// Backend ids in preference order. The keyless set is `searxng`, `duckduckgo` (alias
+    /// `ddg`), `mojeek`, `marginalia`, `wikipedia`; `brave` and `google_cse` exist but require a
+    /// credential and are therefore never defaults.
     #[serde(default = "default_backends")]
     pub backends: Vec<String>,
     /// How many backends to query in parallel per search.
@@ -570,9 +571,17 @@ impl Default for SearchConfig {
 }
 
 fn default_backends() -> Vec<String> {
+    // The keyless set, and only the keyless set. `searxng` is deliberately absent even though
+    // it is the most valuable backend: it cannot work without `searxng_url`, and `from_config`
+    // treats a named-but-unconfigured backend as a loud error rather than a skip. Shipping it as
+    // a default would therefore make the *default configuration* fail to build a registry —
+    // which is what it did. A deployment with a SearXNG names it explicitly (see
+    // `hx.example.yaml`).
+    //
+    // Every name here needs no URL and no credential, which is what makes "zero paid API calls"
+    // a property of the defaults rather than a promise about how they are used.
     vec![
-        "searxng".into(),
-        "ddg".into(),
+        "duckduckgo".into(),
         "mojeek".into(),
         "marginalia".into(),
         "wikipedia".into(),
@@ -773,6 +782,50 @@ roles:
         assert_eq!(c.sandbox_profiles.len(), 0);
         assert!(!c.search.backends.is_empty());
         assert_eq!(c.daemon.http_addr, "127.0.0.1:8787");
+    }
+
+    #[test]
+    fn the_default_search_backends_need_neither_a_url_nor_a_credential() {
+        // The default configuration has to be *buildable*. It was not: `default_backends()`
+        // listed `searxng`, which cannot be constructed without `searxng_url`, and the registry
+        // treats a named-but-unconfigured backend as a hard error. Every name here is keyless,
+        // so a deployment that configures nothing still pays nothing.
+        let c = Config::default();
+        assert!(
+            !c.search.backends.iter().any(|b| b == "searxng"),
+            "searxng cannot be a default: it needs a URL the default does not have"
+        );
+        for keyless in ["duckduckgo", "mojeek", "marginalia", "wikipedia"] {
+            assert!(
+                c.search.backends.iter().any(|b| b == keyless),
+                "the keyless backend {keyless} should be on by default: {:?}",
+                c.search.backends
+            );
+        }
+        assert!(
+            !c.search
+                .backends
+                .iter()
+                .any(|b| b == "brave" || b == "google_cse"),
+            "a keyed backend must never be a default: {:?}",
+            c.search.backends
+        );
+    }
+
+    #[test]
+    fn a_search_section_that_names_only_keyless_backends_still_parses() {
+        // The shape every existing config has; adding backends must not break it.
+        let yaml = r#"
+search:
+  backends: [duckduckgo, mojeek]
+  fanout: 2
+  top_k: 5
+"#;
+        let c = Config::from_yaml(yaml).unwrap();
+        assert_eq!(c.search.backends, vec!["duckduckgo", "mojeek"]);
+        assert_eq!(c.search.fanout, 2);
+        assert_eq!(c.search.top_k, 5);
+        assert_eq!(c.search.cache_ttl_secs, 3600, "the default still applies");
     }
 
     #[test]

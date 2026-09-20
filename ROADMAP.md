@@ -315,6 +315,25 @@ command with a button, receive a cron digest in a separate pinned thread.
 **Exit criteria:** a research task runs 6 free backends in parallel, dedupes, RRF-ranks,
 extracts the top 8, and cites them — with zero paid API calls.
 
+**What has landed so far (search).** The backend set is now one file per engine, and three more
+keyless engines are wired into the registry: **Mojeek** (its own crawler, so its results are
+independent evidence rather than a second view of another engine's index), **Marginalia** (the
+non-commercial web — the most *diverse* backend in the fan-out, and the one whose top ten share
+least with DuckDuckGo's) and **Wikipedia** (the only member that is a documented API rather than a
+scrape, and the one whose live path is genuinely exercised). Each parser is tested against a
+captured response: Wikipedia against a real live JSON capture, Marginalia against a real HTML
+capture, and Mojeek against a **transcription** of its markup because its live path is bot-walled
+from here (`curl` UA → 403, browser UA → 200 with `<title>Captcha</title>`) — that path has **not**
+been exercised, and both the module doc and `TESTING.md` say so rather than implying otherwise.
+`&` in a Wikipedia article URL is escaped as `%26` and `+` is left alone, pinned on the final URL
+string.
+
+`default_backends()` was also wrong and is fixed: it named `searxng`, which cannot be constructed
+without `searxng_url`, and the registry treats a named-but-unconfigured backend as a loud error — so
+the **default configuration could not build a registry at all**. The defaults are now the keyless
+set only, which is what makes "zero paid API calls" a property of the shipped config rather than a
+promise about how it is used.
+
 ---
 
 ## M7 — Native apps

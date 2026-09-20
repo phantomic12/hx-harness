@@ -34,6 +34,10 @@ pub mod backends;
 pub mod types;
 
 pub use aggregate::{fanout, BackendFailure, SearchReport, DEFAULT_BACKEND_TIMEOUT};
-pub use backend::{BackendKind, BackendRegistry, SearchBackend, SearchError};
-pub use backends::{DuckDuckGoBackend, SearxngBackend};
-pub use types::{canonicalize_url, fuse, FusedResult, Recency, SearchQuery, SearchResult, RRF_K};
+pub use backend::{BackendKind, BackendRegistry, SearchBackend, SearchError, KNOWN_BACKENDS};
+pub use backends::{
+    DuckDuckGoBackend, MarginaliaBackend, MojeekBackend, SearxngBackend, WikipediaBackend,
+};
+pub use types::{
+    canonicalize_url, fuse, host_matches, FusedResult, Recency, SearchQuery, SearchResult, RRF_K,
+};

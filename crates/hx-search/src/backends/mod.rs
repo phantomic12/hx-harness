@@ -30,10 +30,16 @@
 //! job instead of an afternoon.
 
 mod duckduckgo;
+mod marginalia;
+mod mojeek;
 mod searxng;
+mod wikipedia;
 
 pub use duckduckgo::{parse_ddg_lite, unwrap_ddg_redirect, DuckDuckGoBackend};
+pub use marginalia::{marginalia_search_url, parse_marginalia_html, MarginaliaBackend};
+pub use mojeek::{mojeek_result_count, mojeek_search_url, parse_mojeek_html, MojeekBackend};
 pub use searxng::{searxng_search_url, SearxngBackend};
+pub use wikipedia::{wikipedia_article_url, wikipedia_search_url, WikipediaBackend};
 
 use regex::Regex;
 use std::sync::OnceLock;
@@ -62,9 +68,21 @@ pub(crate) fn tag_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"(?is)<[^>]*>").expect("valid regex"))
 }
 
+/// `<wbr>` — a word-break *opportunity*, not a word boundary.
+///
+/// It has to be removed before the generic tag strip turns it into a space, because it does not
+/// render as one: Marginalia sprinkles it through both titles and URLs, so `Rust (<wbr>programming
+/// language)` would come out as `Rust ( programming language)` — a visible defect in a title the
+/// model reads.
+fn wbr_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?is)</?wbr\s*/?>").expect("valid regex"))
+}
+
 /// Strip tags, decode entities, and collapse whitespace.
 pub fn clean_text(html: &str) -> String {
-    let without_tags = tag_re().replace_all(html, " ");
+    let without_breaks = wbr_re().replace_all(html, "");
+    let without_tags = tag_re().replace_all(&without_breaks, " ");
     let decoded = decode_entities(&without_tags);
     decoded.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -223,6 +241,20 @@ mod tests {
             clean_text("  <b>bold</b>\n   text  <i>x</i> "),
             "bold text x"
         );
+    }
+
+    #[test]
+    fn a_word_break_opportunity_is_not_a_space() {
+        // `<wbr>` renders as nothing, so turning it into a space invents a gap in a title.
+        assert_eq!(
+            clean_text("Rust (<wbr>programming language)<wbr>"),
+            "Rust (programming language)"
+        );
+        assert_eq!(
+            clean_text("https:<wbr>/<wbr>/<wbr>a.test/"),
+            "https://a.test/"
+        );
+        assert_eq!(clean_text("<wbr/>x"), "x");
     }
 
     #[test]

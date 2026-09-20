@@ -1,7 +1,9 @@
 //! The backend trait and the registry built from configuration.
 
 use crate::aggregate::{fanout, SearchReport, DEFAULT_BACKEND_TIMEOUT};
-use crate::backends::{DuckDuckGoBackend, SearxngBackend};
+use crate::backends::{
+    DuckDuckGoBackend, MarginaliaBackend, MojeekBackend, SearxngBackend, WikipediaBackend,
+};
 use crate::types::{SearchQuery, SearchResult};
 use async_trait::async_trait;
 use hx_core::config::SearchConfig;
@@ -9,6 +11,10 @@ use hx_core::error::{HxError, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Every backend name `search.backends` accepts, in one place so the "unknown backend" error
+/// cannot drift out of step with what the registry actually builds.
+pub const KNOWN_BACKENDS: &str = "searxng, duckduckgo (alias: ddg), mojeek, marginalia, wikipedia";
 
 /// Which family a backend belongs to. Useful for status output and for grouping sources.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,10 +119,13 @@ impl BackendRegistry {
                     })?;
                     Arc::new(SearxngBackend::new(base))
                 }
-                "duckduckgo" => Arc::new(DuckDuckGoBackend::new()),
+                "duckduckgo" | "ddg" => Arc::new(DuckDuckGoBackend::new()),
+                "mojeek" => Arc::new(MojeekBackend::new()),
+                "marginalia" => Arc::new(MarginaliaBackend::new()),
+                "wikipedia" => Arc::new(WikipediaBackend::new()),
                 other => {
                     return Err(HxError::Config(format!(
-                        "unknown search backend '{other}'; known backends: searxng, duckduckgo"
+                        "unknown search backend '{other}'; known backends: {KNOWN_BACKENDS}"
                     )))
                 }
             };
@@ -189,6 +198,37 @@ mod tests {
 
         assert_eq!(r.ids(), vec!["searxng", "duckduckgo"]);
         assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn every_keyless_backend_builds_with_no_configuration_at_all() {
+        // The $0 promise, at the registry: the keyless set needs no URL and no credential, so a
+        // config that names them and nothing else must build.
+        let r = BackendRegistry::from_config(
+            &cfg(
+                &["searxng", "ddg", "mojeek", "marginalia", "wikipedia"],
+                Some("http://localhost:8888"),
+            ),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            r.ids(),
+            vec!["searxng", "duckduckgo", "mojeek", "marginalia", "wikipedia"]
+        );
+        assert!(
+            r.backends.iter().all(|b| !b.requires_key()),
+            "no default backend may require a credential"
+        );
+    }
+
+    #[test]
+    fn ddg_is_an_accepted_alias_for_duckduckgo() {
+        // `search.backends` shipped with the short name in `default_backends()`, so the long
+        // name alone would make the shipped default a configuration error.
+        let r = BackendRegistry::from_config(&cfg(&["ddg"], None), reqwest::Client::new()).unwrap();
+        assert_eq!(r.ids(), vec!["duckduckgo"]);
     }
 
     #[test]
