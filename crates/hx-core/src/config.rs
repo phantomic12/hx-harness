@@ -29,6 +29,10 @@ pub struct Config {
     /// Maps an agent role (`builder`, `scout`, `reviewer`) to a pool name.
     #[serde(default)]
     pub roles: IndexMap<String, String>,
+    /// M8 model pools — each names the per-child model members a future spawner draws from.
+    /// Additive: a config with no `model_pools` section still loads.
+    #[serde(default)]
+    pub model_pools: IndexMap<String, Vec<crate::pool::ModelPoolMemberConfig>>,
     #[serde(default)]
     pub hosts: IndexMap<String, HostConfig>,
     #[serde(default)]
@@ -175,6 +179,19 @@ impl Config {
                 None => return Ok(pool),
             }
         }
+    }
+
+    /// Build the M8 model pool of `name` from this config, or an error naming the pool.
+    ///
+    /// Every member is a reference (never a value) and starts healthy. Nothing constructs — or draws from —
+    /// a model pool yet; this is the boundary a future spawner will call.
+    pub fn model_pool(&self, name: &str) -> Result<crate::pool::ModelPool> {
+        let members = self
+            .model_pools
+            .get(name)
+            .cloned()
+            .ok_or_else(|| HxError::Config(format!("model pool {name:?} not found")))?;
+        Ok(crate::pool::ModelPool::from_config(members))
     }
 }
 
