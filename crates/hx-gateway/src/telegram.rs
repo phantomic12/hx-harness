@@ -167,8 +167,18 @@ pub fn build_edit_body(conversation: &Conversation, message_id: i64, text: &str)
 }
 
 /// The message id Telegram returns when it accepts a send. Parsed so a stream can edit it next.
+///
+/// The Bot API answers `sendMessage` with a **Message object** — `{"ok":true,"result":{"message_id":9,
+/// …}}` — not with a bare integer. Reading `result` as a number therefore finds nothing against the
+/// real API, and a streaming driver that never learns the id can only ever send whole answers: the
+/// visible message would never grow. A bare integer is still tolerated, because the field is
+/// unambiguous and a proxy may flatten the object.
 pub fn sent_message_id(response: &Value) -> Option<i64> {
-    response.get("result").and_then(Value::as_i64)
+    let result = response.get("result")?;
+    result
+        .get("message_id")
+        .and_then(Value::as_i64)
+        .or_else(|| result.as_i64())
 }
 
 /// A pure accumulator for coalesced streamed output.
@@ -548,5 +558,42 @@ mod tests {
         assert_eq!(body["chat_id"], "5");
         assert_eq!(body["message_id"], 99);
         assert_eq!(body["text"], "accumulated");
+    }
+
+    #[test]
+    fn a_send_response_reports_the_message_id_the_bot_api_actually_returns() {
+        // The real wire shape, taken from the Bot API's own `sendMessage` result: a Message *object*.
+        // The previous implementation read `result` as an integer, which is never true of this
+        // response, so the id was silently `None` for every real send — and the whole edit path of a
+        // streaming answer depends on it.
+        let wire = json!({
+            "ok": true,
+            "result": {
+                "message_id": 1234,
+                "date": 1700000000,
+                "chat": { "id": 777, "type": "private" },
+                "text": "hi"
+            }
+        });
+        assert_eq!(sent_message_id(&wire), Some(1234));
+    }
+
+    #[test]
+    fn a_send_response_without_a_message_reports_no_id_rather_than_guessing() {
+        // The control. A refusal carries no Message object, and an id invented from nothing would have
+        // the driver edit a message that does not exist instead of reporting the failure.
+        let refusal = json!({ "ok": false, "error_code": 403, "description": "Forbidden" });
+        assert_eq!(sent_message_id(&refusal), None);
+        let empty = json!({ "ok": true, "result": {} });
+        assert_eq!(sent_message_id(&empty), None);
+    }
+
+    #[test]
+    fn a_flattened_send_response_is_still_understood() {
+        // A bare integer is tolerated: the field is unambiguous, and a proxy may flatten the object.
+        assert_eq!(
+            sent_message_id(&json!({ "ok": true, "result": 55 })),
+            Some(55)
+        );
     }
 }
