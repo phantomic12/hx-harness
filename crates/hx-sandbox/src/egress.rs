@@ -61,7 +61,7 @@ const OUTER_NETWORK: &str = "bridge";
 /// The image the proxy sidecar runs. Ubuntu 24.04 is used both for the sandbox and here, so a
 /// binary compiled against the same glibc the sandbox images carry loads without a version mismatch —
 /// a host built against a newer glibc must not be expected to run in an older-container libc.
-const PROXY_IMAGE: &str = "ubuntu:24.04";
+pub const PROXY_IMAGE: &str = "ubuntu:24.04";
 
 /// What a sandbox with a non-empty allowlist owns and must tear down when it dies.
 #[derive(Clone, Debug, PartialEq)]
