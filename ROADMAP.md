@@ -522,6 +522,18 @@ command with a button, receive a cron digest in a separate pinned thread.
     connects to it**, so a page cannot redirect the fetcher into the local network or at the
     metadata service. The stealth rung puts the URL and the session's cookies on **stdin, never in
     argv**, which every other process on the machine can read.
+  - ◐ **The interactive Chromium rung.** `crates/hx-browser/src/rungs/chromium.rs` is a real
+    headless Chromium driven over CDP, with `Fetch.enable` request interception on every request so a
+    loaded page cannot turn the browser into an internal scanner or an IAM exfiltration pipe. Its
+    security guarantee is stated at the **request** boundary, not the socket boundary, and verified
+    against real Chromium (`/usr/lib/chromium/chromium`, present on the build host only so the
+    chromium tests always run locally): a refused subresource guarantees **zero TCP connections**, while a
+    refused top-level navigation may open speculative preconnect sockets carrying **zero request bytes** —
+    the `--disable-features=Preconnect,SpeculativeServiceWorker,NavigationPredictor,NetworkPrediction`
+    flag was tried and is insufficient, so the guarantee is pinned at the request line, and the rung's
+    doc says why. The browser child is reaped on every exit path (success, transport failure, timeout,
+    future drop), both of which are asserted against a real `/proc` pid. **The pool still has no
+    production caller**: nothing in `hx-server` or `hx-search` launches a browser yet.
 - Search: SearXNG, DDG, Mojeek, Marginalia, Brave, Google PSE, Wikipedia, plus the
   extraction ladder and URL/ETag caching
   - ◐ **The extraction ladder.** `crates/hx-search/src/extract.rs` is a hand-rolled ladder — plain

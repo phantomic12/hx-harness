@@ -240,9 +240,8 @@ impl Fetcher for ChromiumRung {
         let admission = self.admission;
         let timeout = request.timeout;
 
-        let cdp_task = tokio::task::spawn_blocking(move || {
-            drive_cdp(ws_url, target, admission, timeout)
-        });
+        let cdp_task =
+            tokio::task::spawn_blocking(move || drive_cdp(ws_url, target, admission, timeout));
 
         let result = match tokio::time::timeout(request.timeout, cdp_task).await {
             Ok(Ok(outcome)) => outcome,
@@ -295,12 +294,11 @@ fn drive_cdp(
         r#"{{"id":{},"method":"Target.createTarget","params":{{"url":"about:blank"}}}}"#,
         create_target_id
     );
-    ws.send(Message::Text(create_cmd.into())).map_err(|err| {
-        FetchError::Transport {
+    ws.send(Message::Text(create_cmd.into()))
+        .map_err(|err| FetchError::Transport {
             rung: RungKind::Interactive,
             reason: format!("failed to send Target.createTarget: {err}"),
-        }
-    })?;
+        })?;
 
     let start = std::time::Instant::now();
     let mut target_id = None;
@@ -337,12 +335,11 @@ fn drive_cdp(
         r#"{{"id":{},"method":"Target.attachToTarget","params":{{"targetId":"{}","flatten":true}}}}"#,
         attach_id, target_id
     );
-    ws.send(Message::Text(attach_cmd.into())).map_err(|err| {
-        FetchError::Transport {
+    ws.send(Message::Text(attach_cmd.into()))
+        .map_err(|err| FetchError::Transport {
             rung: RungKind::Interactive,
             reason: format!("failed to send Target.attachToTarget: {err}"),
-        }
-    })?;
+        })?;
 
     let mut session_id = None;
     while start.elapsed() < timeout {
@@ -414,12 +411,11 @@ fn drive_cdp(
         session_id,
         target.request_url()
     );
-    ws.send(Message::Text(nav_cmd.into())).map_err(|err| {
-        FetchError::Transport {
+    ws.send(Message::Text(nav_cmd.into()))
+        .map_err(|err| FetchError::Transport {
             rung: RungKind::Interactive,
             reason: format!("failed to send Page.navigate: {err}"),
-        }
-    })?;
+        })?;
 
     // 5. Process events
     let mut initial_nav_admitted = false;

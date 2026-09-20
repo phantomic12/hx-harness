@@ -397,14 +397,8 @@ async fn a_wall_status_escalates_and_a_challenge_marker_escalates_too() {
 
     let chal_req = request_for(&challenged.url("/"), Admission::AllowLocal, session_profile);
     let chal_err = rung.fetch(&chal_req).await.expect_err("challenge error");
-    assert!(
-        chal_err.is_refusal(),
-        "challenge must escalate: {chal_err}"
-    );
-    assert!(
-        chal_err.to_string().contains("just a moment"),
-        "{chal_err}"
-    );
+    assert!(chal_err.is_refusal(), "challenge must escalate: {chal_err}");
+    assert!(chal_err.to_string().contains("just a moment"), "{chal_err}");
 }
 
 #[tokio::test]

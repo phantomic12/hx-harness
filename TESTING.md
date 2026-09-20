@@ -334,9 +334,10 @@ is `hx-mcp`'s doing.
 
 ## The browser pool (M6)
 
-The escalation ladder, the pool and the two cheap rungs are built. **No browser is driven anywhere
-below**: `camoufox`, Chromium and CDP are not exercised in this environment, and nothing here claims
-otherwise. The stealth rung launches a configured tool, and no such tool is present here.
+The escalation ladder, the pool and the three rungs are built. **The interactive Chromium rung is
+driven against real Chromium** (`/usr/lib/chromium/chromium`, installed on this host and not on the
+build host, so `tests/chromium_rung.rs` always runs locally and never in CI). `camoufox` is not
+exercised: the stealth rung launches a configured tool, and no such tool is present here.
 
 **Per-session profile isolation** (`crates/hx-browser/src/profile.rs`, 10 tests). The property is
 that two sessions never share a directory, a cookie jar or a storage area, and it is asserted on a
@@ -420,6 +421,20 @@ version of that test built its pool with `Admission::AllowLocal` and therefore a
 failed the gate. The refusal test now uses the default policy, and a helper exists for each. A
 session id that escapes the root is reported as a stopped fetch rather than a panic, and a token in
 the query never renders in a report's summary or its `Debug`.
+
+**The interactive Chromium rung** (`src/rungs/chromium.rs`, `tests/chromium_rung.rs`, 9 tests
+against real Chromium at `/usr/lib/chromium/chromium`). The rung's security property is pinned at
+the **request** boundary, not the socket boundary, and the two are told apart. A page whose script
+`fetch()`es a private address is blocked and the listener accepts **zero TCP connections**. A page whose
+script **navigates** to a private address is refused (`BlockReason`-labelled `Redirected`), and the
+listener records **zero HTTP request lines** — but it *may* accept raw TCP connections, because
+Chromium's speculative preconnect opens sockets below the CDP interception layer; the
+`--disable-features=Preconnect,…` flag was tried and does not stop it. The subresource test is kept
+on zero connections and the navigation test on zero requests **on purpose**: that asymmetry is the finding.
+The test proves it can fail: removing the admission check lets a real `GET /stolen HTTP/1.1` reach
+the listener, and disabling the reaper lets the browser pid survive — both flip the test red. The browser
+child is reaped on every exit path (success, transport failure, a genuine timeout via a stub that holds
+the connection with `std::future::pending`, and future drop), each asserted against a real `/proc/{pid}`.
 
 ## The four tiers
 
