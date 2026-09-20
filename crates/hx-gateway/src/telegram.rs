@@ -259,7 +259,10 @@ impl TelegramConnector {
             .await
             .map_err(|err| HxError::Connector {
                 connector: self.id.to_string(),
-                reason: format!("could not reach Telegram: {err}"),
+                // `without_url` is load-bearing, not tidiness: the token authenticates in the request
+                // path, and reqwest's `Display` includes that URL, so an error built from the raw
+                // error prints the credential.
+                reason: format!("could not reach Telegram: {}", err.without_url()),
             })?;
         let status = response.status();
         let text = response
@@ -366,7 +369,10 @@ impl Connector for TelegramConnector {
             .await
             .map_err(|err| HxError::Connector {
                 connector: self.id.to_string(),
-                reason: format!("could not reach Telegram: {err}"),
+                // `without_url` is load-bearing, not tidiness: the token authenticates in the request
+                // path, and reqwest's `Display` includes that URL, so an error built from the raw
+                // error prints the credential.
+                reason: format!("could not reach Telegram: {}", err.without_url()),
             })?;
         let status = response.status();
         let text = response
@@ -403,7 +409,10 @@ impl Connector for TelegramConnector {
             .await
             .map_err(|err| HxError::Connector {
                 connector: self.id.to_string(),
-                reason: format!("could not reach Telegram: {err}"),
+                // `without_url` is load-bearing, not tidiness: the token authenticates in the request
+                // path, and reqwest's `Display` includes that URL, so an error built from the raw
+                // error prints the credential.
+                reason: format!("could not reach Telegram: {}", err.without_url()),
             })?;
         let status = response.status();
         let text = response

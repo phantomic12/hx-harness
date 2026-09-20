@@ -397,8 +397,31 @@ async fn an_unauthed_token_is_reported_as_such_and_never_in_the_body() {
     let message = err.to_string();
     assert!(message.contains("401"), "{message}");
     assert!(
-        !message.contains("TESTBOT-token"),
+        !message.contains(token().expose()),
         "the token must never appear in an error: {message}"
+    );
+}
+
+#[tokio::test]
+async fn an_unreachable_host_does_not_put_the_token_in_the_error() {
+    // The token authenticates in the request *path*, and `reqwest::Error`'s Display carries the URL
+    // it failed on. An error built from that error therefore carries the credential — the one place
+    // this crate promised it would never be. Nothing is listening on port 1, so this is the real
+    // transport-failure path, not a stub.
+    let con = connector("http://127.0.0.1:1");
+    let err = con
+        .deliver(
+            &token(),
+            &Target::Conversation(Conversation::telegram("1", "")),
+            "x",
+        )
+        .await
+        .expect_err("nothing is listening");
+    let message = err.to_string();
+    assert!(message.contains("could not reach"), "{message}");
+    assert!(
+        !message.contains(token().expose()),
+        "the token must never appear in an error, and this one is built from a URL: {message}"
     );
 }
 
