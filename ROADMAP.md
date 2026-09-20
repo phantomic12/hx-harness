@@ -210,9 +210,21 @@ attempted capability escalation shows up as a denial event, not a hang.
   proxy sidecar placed on the *near* host, which a far daemon cannot host, so a remote sandbox
   whose spec asks for a non-empty egress allowlist is refused at `create` time (before anything
   reaches the far host) with a reason naming the way out, rather than half-enforced. An isolated
-  remote sandbox — empty allowlist and the network off — needs no proxy and **works**. Still to do
-  before the item is ✅: place the proxy sidecar on the far host so remote egress can be enforced,
-  wire the runtime into `hx-server`, and exercise it against a live remote daemon.
+  remote sandbox — empty allowlist and the network off — needs no proxy and **works**.
+  **Now exercised against a live remote daemon** (`crates/hx-sandbox/tests/remote_live.rs`, rainbowone,
+  Docker 29.3.1): a real `SshHost` drives create → start → exec → stop → remove, and the security
+  properties are checked by parsing `docker inspect` **on the far host** rather than re-reading the
+  command this code built — `ReadonlyRootfs == true`, `Privileged == false`, `CapDrop` contains `ALL`,
+  `NetworkMode == "none"`, `PidsLimit == 128`, the workspace bind-mounted. A write outside the mount is
+  denied while `/workspace` stays writable, and removal is idempotent with nothing left behind.
+  **A real defect the unit tests could not see**, found by that run: L2/L3 sends `--userns=private`,
+  which a daemon **without** `userns-remap` in its `daemon.json` refuses at `create` with
+  `docker: --userns: invalid USER mode` (exit 125). The module doc claimed the CLI flag was a no-op on
+  such a daemon — it is not; the bollard API value is interpreted differently from the CLI flag. Pinned
+  by `the_far_daemon_rejects_l2_userns_remapping_when_it_is_not_configured`, and it is why the lifecycle
+  test exercises L1 with a read-only root forced (L1 sends no `--userns`). Open still: place the proxy
+  sidecar on the far host so remote egress can be enforced, and decide how a profile should behave when
+  the far daemon has no userns remap (refuse L2/L3 up front, or degrade to L1 and say so).
 - ✅ **Remote terminal (a PTY straight to a remote host)** — `POST /v1/terminals` takes an optional
   `host`, and the daemon adopts the session as a terminal like any other, so the terminal pane and
   the WebSocket contract are unchanged: a client attaches to a remote shell the same way it attaches

@@ -1373,6 +1373,8 @@ dependencies = [
  "chrono",
  "futures",
  "hx-core",
+ "hx-remote",
+ "hx-secrets",
  "serde",
  "serde_json",
  "tempfile",
