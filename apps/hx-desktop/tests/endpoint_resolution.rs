@@ -51,12 +51,14 @@ fn a_remote_target_without_a_token_fails_eagerly_with_actionable_error() {
     // is a guaranteed failure; catching it before launching the webview gives immediate feedback.
     let err = resolve_daemon_target_pure("192.168.1.50:8787", None, None)
         .expect_err("remote daemon without a token must be rejected");
+    // Rendered before the match below destructures `err`: the `url` binding moves a `String` out of
+    // it, so borrowing `err` afterwards would not compile.
+    let message = err.to_string();
 
     match err {
         DesktopConfigError::RemoteMissingToken { url, env_var } => {
             assert_eq!(url, "http://192.168.1.50:8787");
             assert_eq!(env_var, API_TOKEN_ENV);
-            let message = err.to_string();
             assert!(
                 message.contains("api.token"),
                 "error must name the config setting"
