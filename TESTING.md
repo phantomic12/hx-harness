@@ -51,7 +51,7 @@ answer route requires the *caller* to declare its ceiling, and a declared ceilin
 the caller, so under `--bind 0.0.0.0` it was no defence at all. The daemon now refuses to start on a
 non-loopback bind with no token, which is the half that matters: a warning in a log is not a control.
 
-What was actually run (`cargo test -p hx-server --test api_auth`, 11 tests, plus the unit tests in both
+What was actually run (`cargo test -p hx-server --test api_auth`, 12 tests, plus the unit tests in both
 modules and the two client suites):
 
 | Test | What it establishes |
@@ -60,6 +60,7 @@ modules and the two client suites):
 | `a_correct_prefix_of_the_token_is_refused` | Every prefix length of the token, not one: a comparison that returned on the first differing byte is caught at any offset. This is the test that would fail if `constant_time_eq` grew an early return |
 | `a_missing_token_and_a_wrong_one_are_indistinguishable` | The two 401s are compared **byte for byte**, headers included, so the response is not an oracle for "is a token configured" or "was a guess close" |
 | `a_token_is_accepted_only_as_a_bearer_credential` | A bare token, `Basic`, `Token`, `Bearerx`, and `Bearer` with nothing after it are all refused; `bearer` in any case is accepted |
+| `a_token_in_a_query_string_with_upgrade_headers_on_a_non_websocket_route_is_refused` | `?token=` sent with `Connection: Upgrade` and `Upgrade: websocket` on `/v1/status` is refused `401`: upgrade headers on a non-WebSocket route do not turn query parameters into a credential channel |
 | `a_non_loopback_bind_with_no_token_is_refused_by_the_check_the_daemon_runs` | The composition `hxd` performs, asserted on the **returned error** and not on a log line: `0.0.0.0:8787` with no token errors and names `api.token` and `HX_API_TOKEN`; `127.0.0.1:8787` without one is fine |
 | `a_config_naming_a_token_it_cannot_resolve_fails_to_build…` | A `vault:` reference against a deployment with no vault fails the *build*, rather than degrading to a daemon that serves unauthenticated while its config says otherwise |
 | `nothing_on_the_refusal_paths_logs_the_token` | A real `tracing` subscriber capturing everything it is handed while both refusal paths (401, startup) and the resolution failure are driven, searched for the sentinel. Its control is a marker event of the test's own, so the capture is proven live rather than assumed — a machine with a container engine emits none of the ambient warnings |

@@ -323,6 +323,22 @@ async fn a_token_in_a_query_string_is_not_a_credential_on_an_ordinary_request() 
 }
 
 #[tokio::test]
+async fn a_token_in_a_query_string_with_upgrade_headers_on_a_non_websocket_route_is_refused() {
+    // Finding F2: ?token= is accepted only on routes that genuinely are WebSocket upgrades
+    // (/v1/sessions/{id}/ws, /v1/terminals/{id}/ws). An ordinary route claiming upgrade
+    // headers must not consult the query parameter as a credential.
+    let state = state(Some(SENTINEL)).await;
+    let request = Request::builder()
+        .uri(format!("/v1/status?token={SENTINEL}"))
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .body(Body::empty())
+        .unwrap();
+    let response = app(state).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn a_non_loopback_bind_with_no_token_is_refused_by_the_check_the_daemon_runs() {
     // The composition `hxd` performs, asserted on the returned error and not on a log line: a
     // config with no token produces a state with no token, and the startup rule then refuses a

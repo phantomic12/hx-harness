@@ -1570,6 +1570,7 @@ dependencies = [
  "hx-sandbox",
  "hx-server",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

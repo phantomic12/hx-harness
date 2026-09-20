@@ -49,14 +49,15 @@
 //! ## The WebSocket exception to "the header, or nothing"
 //!
 //! A browser cannot set headers on a WebSocket handshake, so a page that must attach to
-//! `/v1/sessions/{id}/ws` has no way to present a bearer header. The route therefore accepts the
-//! token from `?token=` **only on a WebSocket upgrade request** — a plain `GET` with a query
-//! parameter is refused like any other unauthenticated request. The honest cost, written down rather
-//! than hidden: a value in a query string can reach an access log or a `Referer`, which is why the
-//! header remains the form the CLI and every non-browser client use, and why the parameter is
-//! narrowed to the one request shape that has no alternative. The alternative considered and
-//! rejected was exempting the WebSocket routes, which would have left the live event stream and the
-//! terminal — the two routes that hand over a shell — unauthenticated.
+//! `/v1/sessions/{id}/ws` has no way to present a bearer header. The WebSocket routes therefore
+//! accept the token from `?token=` **only on a WebSocket upgrade request** — a plain `GET` with a
+//! query parameter is refused like any other unauthenticated request, and upgrade headers on a
+//! non-WebSocket route are ignored. The honest cost, written down rather than hidden: a value in a
+//! query string can reach an access log or a `Referer`, which is why the header remains the form
+//! the CLI and every non-browser client use, and why the parameter is narrowed to the one request
+//! shape that has no alternative. The alternative considered and rejected was exempting the
+//! WebSocket routes, which would have left the live event stream and the terminal — the two routes
+//! that hand over a shell — unauthenticated.
 
 use crate::state::AppState;
 use axum::extract::{Request, State};
@@ -68,6 +69,34 @@ use std::sync::Arc;
 /// Routes answered without a token. See the module doc for the reasoning behind each.
 pub fn is_exempt(path: &str) -> bool {
     path == "/healthz" || path == "/"
+}
+
+/// Routes that are WebSocket upgrades.
+///
+/// A browser cannot set an `Authorization` header on a WebSocket handshake, so these routes accept
+/// `?token=`. All other routes require the header.
+pub fn is_websocket_route(path: &str) -> bool {
+    let mut segments = path.split('/');
+    // Path must start with '/' (first item "") and have exactly 5 segments:
+    // ["", "v1", "sessions" | "terminals", <id>, "ws"]
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (
+            Some(""),
+            Some("v1"),
+            Some("sessions" | "terminals"),
+            Some(id),
+            Some("ws"),
+            None,
+        ) if !id.is_empty()
+    )
 }
 
 /// The middleware. Applied to the whole router, so a request that fails it never reaches a handler.
@@ -98,12 +127,12 @@ pub async fn require_bearer(
 /// The token a request presents, if any.
 ///
 /// The header is checked first and is the only channel for a non-browser client. The query parameter
-/// is consulted only for a WebSocket upgrade — see the module doc.
+/// is consulted only for a WebSocket upgrade on a WebSocket route — see the module doc.
 fn presented_token(request: &Request) -> Option<String> {
     if let Some(token) = bearer_from_headers(request.headers()) {
         return Some(token.to_string());
     }
-    if is_websocket_upgrade(request.headers()) {
+    if is_websocket_route(request.uri().path()) && is_websocket_upgrade(request.headers()) {
         return query_param(request.uri().query(), "token");
     }
     None
@@ -323,6 +352,30 @@ mod tests {
             "/index.html",
         ] {
             assert!(!is_exempt(path), "{path:?} must require a token");
+        }
+    }
+
+    #[test]
+    fn only_websocket_routes_accept_query_credentials() {
+        assert!(is_websocket_route("/v1/sessions/ses_1/ws"));
+        assert!(is_websocket_route("/v1/terminals/term_1/ws"));
+        for path in [
+            "/v1/status",
+            "/v1/chat",
+            "/v1/sessions",
+            "/v1/sessions/ses_1",
+            "/v1/sessions//ws",
+            "/v1/terminals",
+            "/v1/terminals/term_1",
+            "/v1/terminals/term_1/ws/more",
+            "/v2/sessions/ses_1/ws",
+            "/healthz",
+            "/",
+        ] {
+            assert!(
+                !is_websocket_route(path),
+                "{path:?} is not a WebSocket upgrade route"
+            );
         }
     }
 
