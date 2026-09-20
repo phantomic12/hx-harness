@@ -521,7 +521,9 @@ command with a button, receive a cron digest in a separate pinned thread.
     the client is built with `Policy::none()` and the rung admits **every hop before anything
     connects to it**, so a page cannot redirect the fetcher into the local network or at the
     metadata service. The stealth rung puts the URL and the session's cookies on **stdin, never in
-    argv**, which every other process on the machine can read.
+    argv**, which every other process on the machine can read, and clears the process environment
+    before passing an **allowlist, fail-closed** so a third-party browser binary never inherits the
+    daemon's credentials or API keys.
 - Search: SearXNG, DDG, Mojeek, Marginalia, Brave, Google PSE, Wikipedia, plus the
   extraction ladder and URL/ETag caching
   - ◐ **The extraction ladder.** `crates/hx-search/src/extract.rs` is a hand-rolled ladder — plain
