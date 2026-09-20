@@ -18,9 +18,9 @@
 //! **credential**. A signed URL (`…?X-Amz-Signature=…`, `…?token=…`), a Google PSE call
 //! (`…?key=…`) — the credential is in the query, and the key is what becomes a filename, a `Debug`
 //! line and a log field. Keeping the query in the key would write a live credential into the cache
-//! directory and into every diagnostic that prints an entry. So the query never reaches a filename
-//! and never reaches a log, and `a_token_in_the_query_never_reaches_a_key_or_a_filename` asserts
-//! it against a real fetch.
+//! directory and into every diagnostic that prints an entry. So the query never reaches a filename,
+//! never reaches a log, and never reaches the serialized entry on disk, and
+//! `a_token_in_the_query_never_reaches_a_key_or_a_filename` asserts it against a real fetch.
 //!
 //! **The cost, named honestly:** two URLs that differ only in their query collapse to one entry.
 //! `…/search?page=1` and `…/search?page=2` share a slot, and the second fetch revalidates against
@@ -30,9 +30,11 @@
 //! (keying on the whole URL) puts credentials on disk as filenames. The trade is a rare extra
 //! network round trip against a credential in a directory listing.
 //!
-//! The **full** URL, query and all, is stored inside the entry document. That is the one place it
-//! exists, it is stated rather than implied, and it is there because an entry that could not name
-//! the resource it describes would be undebuggable.
+//! The on-disk entry document deliberately does **not** store the full URL or its query string.
+//! An earlier design stored the full URL so the document would "name its own resource", but that
+//! field was never read and caused live query credentials to sit on disk in plaintext. The
+//! query-stripped [`cache_key`] already names the resource and matches the filename; dropping the
+//! URL field keeps credentials out of the cache directory entirely.
 //!
 //! ## Freshness
 //!
@@ -56,7 +58,7 @@
 //!
 //! ## On disk
 //!
-//! Under a caller-supplied root, one JSON document per entry — `key`, `url`, `etag`,
+//! Under a caller-supplied root, one JSON document per entry — `key`, `etag`,
 //! `last_modified`, `stored_at`, `max_age`, `body` — so a cache problem is diagnosable by reading
 //! one file rather than by attaching a debugger. The filename is the sanitized key (every
 //! non-alphanumeric folded to `_`, cut to 120 characters) **plus a FNV-1a 64-bit suffix over the
@@ -185,15 +187,19 @@ impl CacheOutcome {
 
 /// One cache entry, as it is stored on disk.
 ///
-/// No `Debug`: `url` carries the full URL including any credential in its query, and a derived
-/// `Debug` is exactly how such a value reaches a log line. Diagnostics print the `key`, which is
-/// query-free by construction.
+/// Deliberately does not store the full URL: `key` already names the resource query-free and
+/// matches the filename. The earlier justification — *"Stored so the entry names its own
+/// resource"* — was not load-bearing because no read path ever inspected `Entry::url`, and
+/// storing it wrote live query credentials (`?token=...`) to disk in plaintext. Dropping the
+/// field keeps credentials off disk entirely.
+///
+/// Existing entries on disk written with a `url` field deserialize cleanly because Serde
+/// ignores unknown fields by default; `an_entry_stored_in_the_legacy_format_with_a_url_field_is_read_successfully`
+/// pins this compatibility.
 #[derive(Serialize, Deserialize)]
 struct Entry {
     /// The query-stripped key this entry is filed under. Re-checked on read.
     key: String,
-    /// The full URL as it was fetched, query and all. Stored so the entry names its own resource.
-    url: String,
     etag: Option<String>,
     last_modified: Option<String>,
     /// When this entry was stored, on the cache's clock. This is what "oldest" means for eviction.
@@ -284,6 +290,14 @@ impl UrlCache {
     /// rather than a parallel type, because a failure to reach an origin is the same class of
     /// failure a backend reports and a second error type is surface every caller must convert.
     ///
+    /// Transport failures strip the request URL via [`reqwest::Error::without_url`].
+    /// `reqwest::Error`'s `Display` and `Debug` implementations append the URL, which on a
+    /// credential-bearing query string would leak live tokens into errors read by the model.
+    /// Unlike search backends that mask known keys with [`SearchError::transport_redacted`],
+    /// the cache has no `&Secret` to mask against because it cannot know which query parameter
+    /// is secret. Dropping the URL entirely is the correct answer: the caller already holds the
+    /// URL it passed to `fetch` and does not need it repeated in an error string.
+    ///
     /// **A cache that cannot write is not a failed fetch.** If the directory cannot be created or
     /// the document cannot be written, the fetched body is still returned; only the caching is lost.
     /// The one thing that is never done is returning a body the origin did not send.
@@ -311,7 +325,7 @@ impl UrlCache {
             }
         }
 
-        let response = request.send().await.map_err(SearchError::Transport)?;
+        let response = request.send().await.map_err(transport_error)?;
         let status = response.status();
 
         if status == reqwest::StatusCode::NOT_MODIFIED {
@@ -337,11 +351,10 @@ impl UrlCache {
         let expires = header_string(response.headers(), EXPIRES);
         let now = self.clock.now_secs();
 
-        let body = response.text().await.map_err(SearchError::Transport)?;
+        let body = response.text().await.map_err(transport_error)?;
 
         self.store(&Entry {
             key,
-            url: url.to_string(),
             etag,
             last_modified,
             stored_at: now,
@@ -615,6 +628,21 @@ fn days_from_civil(year: u64, month: u64, day: u64) -> u64 {
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
 
     (era * 146_097 + day_of_era - 719_468) as u64
+}
+
+/// A transport error with the request URL removed via [`reqwest::Error::without_url`].
+///
+/// `reqwest::Error`'s `Display` and `Debug` implementations append the request URL, so an error
+/// on a URL carrying a query token (`?token=...`, `?key=...`) writes a live credential into
+/// an error string that the model reads.
+///
+/// Unlike search backends (e.g. Google PSE) which mask a known key via
+/// [`SearchError::transport_redacted`], the cache cannot know which query parameter is a secret,
+/// so masking against a `&Secret` is not available to it. Dropping the URL entirely is the correct
+/// answer: the caller already holds the URL it passed to `fetch` and does not need it repeated
+/// in the transport error.
+fn transport_error(err: reqwest::Error) -> SearchError {
+    SearchError::Transport(err.without_url())
 }
 
 #[cfg(test)]
@@ -1259,9 +1287,152 @@ mod tests {
                 "a credential must not reach a filename: {name}"
             );
             assert!(!name.contains("token"), "{name}");
+
+            let content = std::fs::read_to_string(dir.join(name)).unwrap();
+            assert!(
+                !content.contains(token),
+                "a credential must not reach the serialized entry on disk: {content}"
+            );
+            assert!(
+                !content.contains("\"url\""),
+                "Entry::url was dropped so the serialized entry has no url field: {content}"
+            );
         }
 
         origin.assert_fully_scripted();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_does_not_contain_the_token_on_display_or_debug() {
+        // A transport failure on a URL carrying a query token must not leak the token into
+        // an error string the model reads. reqwest::Error appends the URL on both Display
+        // and Debug; without_url() strips it.
+        let token = "signed-token-9f3a2b7c";
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("a free port");
+        let addr = listener.local_addr().expect("a bound address");
+        // Drop the listener so TCP connection attempts to this port are immediately refused.
+        drop(listener);
+
+        let dir = temp_dir("transport-token");
+        let cache = UrlCache::new(&dir, 8, 4096);
+        let url = format!("http://{addr}/page?token={token}&other=val");
+
+        // The control: reqwest's raw error genuinely contains the token, proving that the hazard
+        // is real and that the test cannot pass vacuously.
+        let raw_err = client()
+            .get(&url)
+            .send()
+            .await
+            .expect_err("connection is refused");
+        assert!(
+            raw_err.to_string().contains(token),
+            "the premise of this test is that raw reqwest errors print the URL: {raw_err}"
+        );
+        assert!(
+            format!("{raw_err:?}").contains(token),
+            "raw reqwest Debug also prints the URL: {raw_err:?}"
+        );
+
+        let err = cache
+            .fetch(&client(), &url)
+            .await
+            .expect_err("fetch must fail");
+        let display = err.to_string();
+        let debug = format!("{err:?}");
+
+        assert!(
+            !display.contains(token),
+            "transport error Display must not leak the token: {display}"
+        );
+        assert!(
+            !display.contains("token="),
+            "transport error Display must not contain query parameters: {display}"
+        );
+        assert!(
+            !debug.contains(token),
+            "transport error Debug must not leak the token: {debug}"
+        );
+        assert!(
+            !debug.contains("token="),
+            "transport error Debug must not contain query parameters: {debug}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_on_a_token_free_url_still_produces_a_useful_message() {
+        // The control: stripping the URL must not blank the error or discard the failure reason.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("a free port");
+        let addr = listener.local_addr().expect("a bound address");
+        drop(listener);
+
+        let dir = temp_dir("transport-control");
+        let cache = UrlCache::new(&dir, 8, 4096);
+        let url = format!("http://{addr}/page");
+
+        let err = cache
+            .fetch(&client(), &url)
+            .await
+            .expect_err("fetch must fail");
+        let display = err.to_string();
+        let debug = format!("{err:?}");
+
+        assert!(
+            display.contains("transport error"),
+            "SearchError::Transport prefix must be present: {display}"
+        );
+        assert!(
+            display.contains("error sending request") || display.contains("connect"),
+            "underlying transport cause must be preserved: {display}"
+        );
+        assert!(
+            !debug.is_empty() && debug.contains("Transport"),
+            "Debug output must be informative: {debug}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_entry_stored_in_the_legacy_format_with_a_url_field_is_read_successfully() {
+        // Compatibility: entries written before Entry::url was dropped must deserialize cleanly
+        // rather than failing or being discarded as corrupt.
+        let dir = temp_dir("legacy-entry");
+        let clock = TestClock::starting_at(1_000_000);
+        let cache = UrlCache::with_clock(&dir, 8, 4096, Arc::new(clock.clone()));
+
+        let url = "http://example.com/legacy-page?token=old-secret-12345";
+        let key = cache_key(url);
+
+        let legacy_json = serde_json::json!({
+            "key": key,
+            "url": url,
+            "etag": "\"legacy-v1\"",
+            "last_modified": "Sun, 06 Nov 1994 08:49:37 GMT",
+            "stored_at": 1_000_000,
+            "max_age": 300,
+            "body": "legacy cached body"
+        });
+
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            cache.entry_path(&key),
+            serde_json::to_string_pretty(&legacy_json).unwrap(),
+        )
+        .unwrap();
+
+        assert!(cache.contains(url));
+
+        // A fetch while fresh returns the body directly with no network request.
+        let outcome = cache.fetch(&client(), url).await.unwrap();
+        assert_eq!(
+            outcome,
+            CacheOutcome::Fresh("legacy cached body".to_string())
+        );
+        assert_eq!(outcome.body(), Some("legacy cached body"));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
