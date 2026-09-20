@@ -55,5 +55,8 @@ tracing.workspace = true
 [dev-dependencies]
 # The streamable-HTTP suite runs a *real* MCP server over a real socket: `rmcp`'s own server
 # transport on `axum`. Both are already in the workspace graph, so this adds no crate to it.
+http-body-util = "0.1"
 reqwest.workspace = true
 tempfile.workspace = true
+tower = { version = "0.5", features = ["util"] }
+tracing-subscriber.workspace = true
