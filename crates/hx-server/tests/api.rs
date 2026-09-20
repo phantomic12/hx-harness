@@ -365,6 +365,74 @@ async fn a_profile_with_no_host_resolves_to_the_local_manager() {
     );
 }
 
+#[tokio::test]
+async fn the_daemon_hands_a_hosts_configured_egress_proxy_binary_to_that_hosts_runtime() {
+    // The daemon used to build `RemoteSandboxRuntime::new(runner)` and never call `with_proxy_bin`,
+    // so through the daemon every remote spec with an allowlist was refused with "no proxy binary
+    // path was configured" — "remote egress is enforced" was true of the library and of the live
+    // test, and false of the daemon. The path cannot be defaulted: the binary has to exist on the
+    // *far* machine, and the sibling-of-the-executable rule describes the near one. So it is named
+    // per host in the config, and this is the wiring that carries it through.
+    let mut config = CONFIG.to_string();
+    config.push_str(
+        r#"
+hosts:
+  egressbox:
+    kind: local
+    egress_proxy_bin: /opt/hx/hx-egress-proxy
+  plainbox:
+    kind: local
+"#,
+    );
+    let h = harness_with(&config, vec![]).await;
+
+    assert_eq!(
+        h.state.egress_proxy_bin_for("egressbox").as_deref(),
+        Some("/opt/hx/hx-egress-proxy"),
+        "the config key reaches the state"
+    );
+    assert_eq!(
+        h.state.egress_proxy_bin_for("plainbox"),
+        None,
+        "a host that names none stays unset rather than being guessed"
+    );
+    assert_eq!(
+        h.state.egress_proxy_bin_for("ghost"),
+        None,
+        "an unknown host is unset, not an error here — resolving it is what refuses"
+    );
+
+    // And the runtime the daemon builds for the host actually carries it, which is the property
+    // that was missing. The runner is a stub: nothing here runs a command, it is only the transport
+    // seam the runtime is constructed over.
+    let configured = h.state.remote_runtime_for("egressbox", Arc::new(NeverRuns));
+    assert_eq!(
+        configured.proxy_bin(),
+        Some("/opt/hx/hx-egress-proxy"),
+        "a remote sandbox on this host can now have its allowlist enforced"
+    );
+    let unconfigured = h.state.remote_runtime_for("plainbox", Arc::new(NeverRuns));
+    assert_eq!(
+        unconfigured.proxy_bin(),
+        None,
+        "and the control: a host with no key still fails closed"
+    );
+}
+
+/// A transport seam that runs nothing.
+///
+/// The F5 test only constructs a runtime; it never drives it. Panicking rather than returning a
+/// canned output keeps that honest — if a future edit makes this test execute something, it fails
+/// instead of quietly passing on a fabricated result.
+struct NeverRuns;
+
+#[async_trait]
+impl hx_sandbox::RemoteCommandRunner for NeverRuns {
+    async fn run(&self, command: &str) -> Result<hx_sandbox::remote::RemoteCommandOutput> {
+        panic!("this test constructs a runtime; it must never run a command, got {command:?}")
+    }
+}
+
 // -- the harness ---------------------------------------------------------------------------------
 
 const CONFIG: &str = r#"
@@ -395,7 +463,13 @@ struct Harness {
 
 /// Build the daemon with a scripted model and a real store in a temporary directory.
 async fn harness(replies: Vec<Result<ChatResponse>>) -> Harness {
-    let mut config = hx_core::config::Config::from_yaml(CONFIG).expect("config parses");
+    harness_with(CONFIG, replies).await
+}
+
+/// The same, from a caller-supplied config — for the tests that need a `hosts:` section (or the
+/// absence of one) to be part of the fixture rather than part of `CONFIG`.
+async fn harness_with(config_yaml: &str, replies: Vec<Result<ChatResponse>>) -> Harness {
+    let mut config = hx_core::config::Config::from_yaml(config_yaml).expect("config parses");
     let dir = tempfile::tempdir().expect("temp dir");
     let root = dir.keep();
     config.daemon.data_dir = root.join("data").display().to_string();

@@ -27,13 +27,83 @@ use thiserror::Error;
 
 pub use hx_core::config::{IsolationLevel, SandboxProfile};
 
+/// Whether a string is *address-shaped* in the `inet_aton` grammar rather than a name.
+///
+/// This exists because the check it replaces was wrong in a way that was a real hole rather than a
+/// cosmetic one. The allowlist used to be refused only when `host.parse::<IpAddr>()` succeeded, and
+/// that comment called `IpAddr::from_str` "the definitive test". **It is not.** `IpAddr::from_str`
+/// parses canonical dotted-quad only, while the resolver underneath `TcpStream::connect` (and every
+/// HTTP client a sandbox holds) accepts the whole `inet_aton` family:
+///
+/// ```text
+/// 0x01010101      16843009        2130706433      -> decimal
+/// 0x7f000001      0x7f.0.0.1      0x5db8d822      -> hex, whole or per-label
+/// 0177.0.0.1      017700000001                    -> octal
+/// 127.1           10.1                            -> short form: the last label is 24 bits
+/// ```
+///
+/// Every one of those passes the hostname-shape test (its labels are alphanumerics and dots), and
+/// every one is then really dialed. An allowlist entry of `0x01010101` was therefore accepted as a
+/// "hostname", matched by the proxy's exact-string comparison, and dialed — measured on the far host
+/// as `egress ALLOWED 0x01010101:443 → dialed 1.1.1.1`. The operator wrote what looked like a name
+/// and got an address the proxy never reasoned about. Refusing the shape is the only honest answer,
+/// because the proxy matches by *name* and an address is not a name.
+///
+/// The grammar is `inet_aton`'s: one to four dot-separated parts, each of which is a decimal number,
+/// an octal number (`0`-prefixed), or a hexadecimal number (`0x`-prefixed).
+///
+/// ## Deliberately refused, and why that is not an over-reach
+///
+/// A purely numeric name of four labels or fewer — `1234`, `1.2.3.999` — is refused **on purpose**.
+/// It is either genuinely address-shaped (and so would be dialed as an address, which is the hole)
+/// or indistinguishable from one by inspection, and a resolver will happily interpret it. There is no
+/// reading of `2130706433` that is safe to permit: it means 127.0.0.1. An operator who wants a
+/// numeric-looking *name* has the name form — a real DNS label — to write, and the error tells them
+/// so. Being strict here costs a config line; being lax here cost an open door.
+pub fn is_address_shaped(host: &str) -> bool {
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return false;
+    }
+    parts.iter().all(|p| is_inet_aton_number(p))
+}
+
+/// Whether one dot-separated part of a host is a number in `inet_aton`'s grammar.
+///
+/// See [`is_address_shaped`]. A leading `0` with more than one character is octal, so `09` is *not*
+/// a number (and the whole string is then not address-shaped) — which matches `inet_aton`'s own
+/// refusal of `9` as an octal digit.
+fn is_inet_aton_number(part: &str) -> bool {
+    if part.is_empty() {
+        return false;
+    }
+    if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+        !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit())
+    } else if part.len() > 1 && part.starts_with('0') {
+        part.chars().all(|c| ('0'..='7').contains(&c)) // octal
+    } else {
+        part.chars().all(|c| c.is_ascii_digit()) // decimal
+    }
+}
+
 /// Whether an egress allowlist entry can actually be enforced by the proxy.
 ///
-/// The proxy matches a `CONNECT` target by hostname (exact or `*.domain` suffix). A CIDR or a
-/// raw IP is not a hostname, so the proxy cannot decide it — such an entry must be refused at
-/// validation rather than quietly half-enforced. This is the one shape that genuinely remains
-/// unenforceable by the current mechanism, and it is why [`SpecError::EgressNotEnforced`] still
-/// exists.
+/// The proxy matches a `CONNECT` target by hostname (exact or `*.domain` suffix). A CIDR, a raw IP
+/// or anything *address-shaped* is not a hostname, so the proxy cannot decide it — such an entry
+/// must be refused at validation rather than quietly half-enforced. This is the one shape that
+/// genuinely remains unenforceable by the current mechanism, and it is why
+/// [`SpecError::EgressNotEnforced`] still exists.
+///
+/// Three gates, and the third is the one that used to be missing:
+///
+/// 1. the label shape (letters, digits, hyphens, dots) — rejects a CIDR, a `host:port`, an IPv6
+///    literal, a bare `*`;
+/// 2. [`is_address_shaped`] — rejects the whole `inet_aton` family (`0x01010101`, `127.1`,
+///    `2130706433`, `0177.0.0.1`, …), which is *not* rejected by (1) because its labels are
+///    alphanumerics and which is *really dialed* as an address;
+/// 3. `IpAddr::from_str` — kept, and **no longer described as "the definitive test"**, because it is
+///    not one: it parses canonical dotted-quad and IPv6 only. It is retained because it still catches
+///    the IPv6 forms, which (1) already rejects but (3) documents as an address.
 fn is_proxy_enforceable(entry: &str) -> bool {
     let entry = entry.trim().trim_end_matches('.');
     if entry.is_empty() {
@@ -56,7 +126,14 @@ fn is_proxy_enforceable(entry: &str) -> bool {
     // entirely digits, dots and hyphens, so `10.0.0.1` passes it while being an address the proxy
     // cannot decide by name. Matching it as a "hostname" would produce an allowlist entry that is
     // silently never satisfied — a destination the operator believes they permitted and that no
-    // connection ever reaches. `IpAddr::from_str` is the definitive test, so it is the one used.
+    // connection ever reaches.
+    if is_address_shaped(host) {
+        return false;
+    }
+    // The IPv6 forms reach here only if (1) let them through (it does not — a colon is not a label
+    // character), but the parse is kept as the belt to that braces, and the comment above it is
+    // corrected: it used to claim this was the definitive test, which is exactly why the
+    // `inet_aton` hole existed.
     host.parse::<std::net::IpAddr>().is_err()
 }
 
@@ -93,7 +170,7 @@ pub struct SandboxSpec {
     /// Egress allowlist — hostnames or `*.domain` globs the sandbox may reach. Empty means no
     /// egress.
     ///
-    /// Enforced by placing the sandbox on an internal Docker network (no gateway) and routing its
+    /// Enforced by placing the sandbox on an internal Docker network (no *default* route) and routing its
     /// outbound traffic through a proxy sidecar that admits only these destinations — see
     /// [`crate::egress`]. An entry that is not a hostname or a `*.domain` globe (a CIDR, an
     /// IP) cannot be enforced through that proxy, so such an allowlist is refused by
@@ -846,6 +923,131 @@ mod tests {
                 message.contains("hostname") && message.contains("*.domain"),
                 "the error has to say what shape is allowed: {message}"
             );
+        }
+    }
+
+    #[test]
+    fn an_allowlist_entry_that_is_address_shaped_in_the_inet_aton_grammar_is_refused() {
+        // THE HOLE THIS CLOSES. Every entry below passes the hostname-shape test (its labels are
+        // alphanumerics and dots), and every one is *really dialed as an address* by the resolver
+        // under `TcpStream::connect`. The old guard was `host.parse::<IpAddr>().is_err()`, whose
+        // comment called it "the definitive test" — it is not, because `IpAddr::from_str` parses
+        // canonical dotted-quad only. Measured against the real proxy: an allowlist of `0x01010101`
+        // answered `200 Connection established` and dialed 1.1.1.1, and `2130706433`/`127.1`/
+        // `0177.0.0.1` all dial 127.0.0.1. Asserting through the real `validate()` — not a copy of
+        // the predicate — is the point: the copy would agree with itself.
+        for smuggled in [
+            "0x01010101",   // hex, whole address  -> 1.1.1.1
+            "0x7f000001",   // hex, whole address  -> 127.0.0.1
+            "127.1",        // short form          -> 127.0.0.1
+            "2130706433",   // decimal, whole      -> 127.0.0.1
+            "16843009",     // decimal, whole      -> 1.1.1.1
+            "0177.0.0.1",   // octal per label     -> 127.0.0.1
+            "017700000001", // octal, whole        -> 127.0.0.1
+            "0x7f.0.0.1",   // hex per label       -> 127.0.0.1
+            "0x5db8d822",   // hex, whole          -> 93.184.216.34
+            "3232235777",   // decimal, whole      -> 192.168.1.1
+        ] {
+            let mut s = spec(IsolationLevel::L1);
+            s.network = true;
+            s.egress_allow = vec![smuggled.into()];
+            assert_eq!(
+                s.validate(),
+                Err(SpecError::EgressNotEnforced(vec![smuggled.to_string()])),
+                "{smuggled} is address-shaped and must be refused, not matched as a name"
+            );
+        }
+    }
+
+    #[test]
+    fn a_numeric_name_of_four_labels_or_fewer_is_refused_on_purpose() {
+        // Documented in `is_address_shaped`: `1234` and `1.2.3.999` are refused deliberately. They
+        // are either genuinely address-shaped or indistinguishable from one, and the operator has the
+        // name form to write instead. This test exists so the refusal cannot be "fixed" back into a
+        // hole by someone reading it as an over-reach.
+        for numeric in ["1234", "1.2.3.999"] {
+            let mut s = spec(IsolationLevel::L1);
+            s.network = true;
+            s.egress_allow = vec![numeric.into()];
+            assert!(
+                matches!(s.validate(), Err(SpecError::EgressNotEnforced(_))),
+                "{numeric}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_names_an_operator_actually_writes_are_still_accepted() {
+        // The positive control for the refusal above: a guard that refused everything would pass every
+        // smuggled-form test and make the allowlist useless. `123.example.com` is the one that matters
+        // most — a numeric *label* inside a real name must stay allowed, or the strictness has leaked
+        // out of the address grammar and into DNS.
+        for good in [
+            "example.com",
+            "api.example.com",
+            "*.example.com",
+            "123.example.com",
+            "0x01010101.example.com",
+        ] {
+            let mut s = spec(IsolationLevel::L1);
+            s.network = true;
+            s.egress_allow = vec![good.into()];
+            assert_eq!(s.validate(), Ok(()), "{good} is a name and must validate");
+        }
+    }
+
+    #[test]
+    fn the_non_name_shapes_are_still_refused_alongside_the_new_address_guard() {
+        // The guard added above must not have replaced the earlier refusals: a CIDR, a `host:port`, an
+        // IPv6 literal and a bare globe were all refused before, and are refused now.
+        for bad in [
+            "10.0.0.0/8",
+            "1.2.3.4:443",
+            "[::1]",
+            "::1",
+            "2001:db8::1",
+            "*",
+            "*.",
+        ] {
+            let mut s = spec(IsolationLevel::L1);
+            s.network = true;
+            s.egress_allow = vec![bad.into()];
+            assert!(
+                matches!(s.validate(), Err(SpecError::EgressNotEnforced(_))),
+                "{bad} must still be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_address_shape_predicate_matches_the_inet_aton_grammar_it_claims_to() {
+        // The predicate's own table, asserted directly as well as through `validate`: the tests above
+        // prove the *policy*, this one proves the *grammar* (octal `09` is not a number, five labels
+        // is not an address, `0X` upper-case prefix is hex).
+        for shaped in [
+            "0",
+            "0x0",
+            "0X0",
+            "00",
+            "017",
+            "1",
+            "1.2",
+            "1.2.3",
+            "1.2.3.4",
+            "0xffffffff",
+        ] {
+            assert!(is_address_shaped(shaped), "{shaped} is address-shaped");
+        }
+        for not_shaped in [
+            "",
+            "example.com",
+            "123.example.com",
+            "09",
+            "1.2.3.4.5",
+            "0x",
+            "a.1",
+        ] {
+            assert!(!is_address_shaped(not_shaped), "{not_shaped} is not");
         }
     }
 

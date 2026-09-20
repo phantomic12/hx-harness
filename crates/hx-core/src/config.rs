@@ -387,6 +387,22 @@ pub struct HostConfig {
     pub jump: Option<HostId>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Path of the compiled `hx-egress-proxy` binary **on this host**, for a remote sandbox
+    /// created here with a non-empty egress allowlist.
+    ///
+    /// It has to be named per host, because the binary must exist on the *far* machine and the
+    /// daemon has no way to know where a deployment put it there: the local `default_proxy_bin`
+    /// rule (sibling of the running executable) describes the near host's filesystem, which is not
+    /// the far host's. Guessing would fail at the worst moment — the first sandbox that asked for
+    /// an allowlist — so this is left unset rather than defaulted, and a spec that needs it without
+    /// it is **refused**, with a message naming this key.
+    ///
+    /// `#[serde(default)]` so every existing config still parses: this key is additive, and a
+    /// deployment that never runs a remote egress sandbox never needs to write it. See
+    /// `AppState::build_remote_manager` for the wiring and
+    /// `RemoteSandboxRuntime::with_proxy_bin` for what it means to the runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_proxy_bin: Option<String>,
 }
 
 /// A `vault:<name>` reference.
@@ -1067,6 +1083,44 @@ sandbox_profiles:
             Some("buildbox"),
             "a profile with `host` names the machine"
         );
+    }
+
+    #[test]
+    fn a_host_config_without_an_egress_proxy_bin_still_parses_and_one_with_it_round_trips() {
+        // The key is additive, so the test that matters most is the first half: every config written
+        // before it existed must keep parsing, and a host that never runs a remote egress sandbox
+        // must never have to write it. The second half is that when it *is* written it arrives —
+        // it is the only way the daemon can tell the runtime where the far host's binary lives.
+        let yaml = r#"
+hosts:
+  buildbox:
+    kind: ssh
+    address: "10.0.0.5"
+    user: "yoav"
+    auth: { kind: key, secret_ref: "vault:ssh/buildbox" }
+  egressbox:
+    kind: ssh
+    address: "10.0.0.6"
+    user: "yoav"
+    auth: { kind: agent }
+    egress_proxy_bin: /opt/hx/hx-egress-proxy
+"#;
+        let c = Config::from_yaml(yaml).expect("both hosts must parse");
+        assert_eq!(
+            c.hosts["buildbox"].egress_proxy_bin, None,
+            "a host that never names it parses as unset rather than being refused"
+        );
+        assert_eq!(
+            c.hosts["egressbox"].egress_proxy_bin.as_deref(),
+            Some("/opt/hx/hx-egress-proxy")
+        );
+
+        // And it survives a round-trip, so a dumped config is a config that still says where the
+        // binary is.
+        let json = serde_json::to_string(&c.hosts["egressbox"]).unwrap();
+        assert!(json.contains("/opt/hx/hx-egress-proxy"), "{json}");
+        let back: HostConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, c.hosts["egressbox"]);
     }
 
     #[test]

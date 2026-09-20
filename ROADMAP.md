@@ -226,6 +226,13 @@ attempted capability escalation shows up as a denial event, not a hang.
   (**the control** — a blanket "always remote" would fail it), and a `host:` naming an unknown machine
   is refused by name. One manager is cached per host, installed under the lock after an async resolve,
   so concurrent requests share it and a raced build is dropped unused rather than replacing the winner.
+  The daemon also passes the far host's egress proxy path through, from that host's own
+  `egress_proxy_bin` in `hosts:` — it has to be per host, because the binary must exist on the *far*
+  filesystem and the local "sibling of the running executable" rule describes the near one. Before
+  that key existed the daemon built a runtime with no proxy binary at all, so **every remote spec with
+  an allowlist was refused through the daemon** ("no proxy binary path was configured") and "remote
+  egress is enforced" was true of the library and of the live test but not of the daemon. Unset stays
+  unset rather than guessed, and the refusal names the key to set.
   **Now exercised against a live remote daemon** (`crates/hx-sandbox/tests/remote_live.rs`, rainbowone,
   Docker 29.3.1): a real `SshHost` drives create → start → exec → stop → remove, and the security
   properties are checked by parsing `docker inspect` **on the far host** rather than re-reading the
@@ -448,6 +455,40 @@ extracts the top 8, and cites them — with zero paid API calls.
 from the lock screen and the agent continues.
 
 ---
+
+## Open security items
+
+**A remote sandbox can reach the far host's own bridge address.** *(Open. Measured, pinned, not
+closed.)* The internal `-egress` network a remote sandbox rides carries no **default** route, which is
+what makes the proxy sidecar the only way *to the internet* — but "no default route" is not "no
+reachable address". The network's IPAM config still assigns a gateway, and that gateway **is the far
+host's own bridge interface on the same on-link subnet as the sandbox**. On-link delivery needs no
+route at all: the container ARPs for the address and the packet is delivered. Measured from inside a
+sandbox on rainbowone's `10.200.7.0/24` network: `10.200.7.1:22` was **OPEN**, answering with the
+host's own sshd banner, along with `4330`, `9191`, `20140` and `44321-44323`. Container-*published*
+ports are dropped by Docker's network isolation; **host-native services are not.**
+
+So the honest statement of what egress enforcement buys is: *no internet route except the sidecar; the
+far host's own services remain reachable from inside the sandbox.* `crates/hx-sandbox/src/egress.rs`
+and `src/remote.rs` claimed more than that ("literally no route" off the network; the sidecar the only
+way out) and both are corrected, with the correction saying the old claim was wrong so it is not
+"fixed" back. The behaviour is pinned by
+`a_sandbox_reaches_the_far_hosts_own_bridge_address_and_that_is_a_known_hole` in
+`crates/hx-sandbox/tests/remote_live.rs`, which asserts the hole **is still there** *and* that the
+no-default-route half still holds — a test that fails when the hole closes is the point.
+
+The two ways to close it, and why neither is taken now:
+
+- **A `DOCKER-USER` chain rule on the far host** dropping sandbox→bridge traffic. It works and it is
+  the standard answer, but it needs far-host root, it has to be installed and *verified* per host, and
+  the module would then depend on a configuration outside its control — enforcement that silently
+  lapses when the rule is missing is worse than a documented hole, because the docs would still claim
+  it. A version of this belongs in a host-provisioning step, not in the sandbox runtime.
+- **Running the sandbox in a network namespace the runtime controls itself** (rather than letting
+  Docker place it on a bridge). This is the privileged route and it weakens the isolation this module
+  exists to provide.
+
+Closing it is a deliberate, reviewable change with its own test — not a doc edit.
 
 ## Deliberately deferred
 

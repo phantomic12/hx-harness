@@ -213,8 +213,10 @@ impl SandboxRuntime for DockerRuntime {
 
         let mut effective = settings.clone();
         if let Some(proxy) = &egress {
-            // The sandbox rides only the internal network — no gateway, so the *only* way out is
-            // the proxy sidecar, which enforces the allowlist. See `crate::egress`.
+            // The sandbox rides only the internal network — no *default* route, so the *only* way out
+            // to the internet is the proxy sidecar, which enforces the allowlist. See `crate::egress`
+            // for the measurement that corrected this claim (the far host's own bridge address stays
+            // reachable on-link).
             effective.network_mode = proxy.network.clone();
             // No `dns` override. Docker's `Dns` field takes IP addresses, not `host:port`, so a
             // sidecar cannot be named as the resolver — the attempt is rejected by the daemon with

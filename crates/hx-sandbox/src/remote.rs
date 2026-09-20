@@ -40,7 +40,7 @@
 //! ## Remote egress enforcement
 //!
 //! A remote sandbox reaches helpful sites through the *same* mechanism as a local one — an internal
-//! Docker network with no gateway, plus a proxy sidecar — but placed **on the far host** instead of
+//! Docker network with no default route, plus a proxy sidecar — but placed **on the far host** instead of
 //! the near one. The premise of this module was that a proxy sidecar is "fundamentally a local-
 //! socket mechanism"; it is not. The sidecar is created by a few docker CLI commands, which is
 //! exactly what a far daemon already accepts. The only genuinely remote-host-specific requirement is that
@@ -62,11 +62,31 @@
 //!   talks to it — enforcement becomes invisible rather than wrong.
 //!
 //! The property held is the same as locally: a remote sandbox with a non-empty allowlist reaches
-//! exactly and only the hosts it names, and has no other route out (the internal network has no
-//! gateway). An empty allowlist with the network off still needs no proxy and stays the isolated
-//! control. The refusal that remains is honest: an entry the proxy cannot match (a CIDR or raw IP)
-//! is refused up front, the same shape [`SpecError::EgressNotEnforced`](crate::spec::SpecError)
-//! refuses locally.
+//! exactly and only the hosts it names. An empty allowlist with the network off still needs no proxy
+//! and stays the isolated control. The refusal that remains is honest: an entry the proxy cannot
+//! match (a CIDR, a raw IP, or anything address-shaped in the `inet_aton` grammar) is refused up
+//! front, the same shape [`SpecError::EgressNotEnforced`](crate::spec::SpecError) refuses locally.
+//!
+//! ## Refusals come before resources, on every path
+//!
+//! [`RemoteSandboxRuntime::create`] runs `spec.validate()`, then the proxy-binary check, then
+//! [`create_command`], and only *then* creates anything on the far host — and one teardown helper
+//! covers all three failure paths (a failed egress setup, a failed sandbox create, and `remove`).
+//!
+//! The order is a security property rather than tidiness, and it was wrong. The egress setup used to
+//! run first, so `create_command`'s allowlist refusal fired *after* the sidecar had been created,
+//! joined to both networks and **started** — and nothing rolled that back, because the `match`
+//! covered only a sandbox-create failure. A refused `{network: true, egress_allow: ["10.0.0.0/8"]}`
+//! therefore left `hx-…-egress-proxy` and network `hx-…-egress` running on the far host. A leaked
+//! sidecar is not a leftover: it holds a foot on the bridge by design, so it is a **live proxy on
+//! that machine**. The same family had a quieter second member — `network: false` with a non-empty
+//! `egress_allow` never reached `validate()` on this path at all, so it travelled to the far host
+//! and the allowlist was silently ignored rather than refused.
+//!
+//! Pinned by `a_refused_spec_never_runs_a_command_on_the_far_host` and
+//! `an_allowlist_with_networking_off_is_refused_before_the_far_host_is_touched`, whose assertion is
+//! that a runner which panics on any unscripted command was never asked to run one — an assertion on
+//! the error *message* would pass against the broken order too.
 //!
 //! ## What is deliberately NOT done yet
 //!
@@ -190,6 +210,17 @@ impl RemoteSandboxRuntime {
         self
     }
 
+    /// The far-host path this runtime was told the egress proxy binary lives at, if any.
+    ///
+    /// A plain read of [`RemoteSandboxRuntime::with_proxy_bin`]'s value, and it exists because
+    /// whether it is set is the difference between a remote sandbox's allowlist being *enforced* and
+    /// being *refused*. Without a way to read it back, the wiring from a deployment's config to this
+    /// runtime (in `hx-server`) could only be asserted by reading the one line that does it, which is
+    /// how "remote egress is enforced" stayed true of the library and false of the daemon.
+    pub fn proxy_bin(&self) -> Option<&str> {
+        self.proxy_bin.as_deref()
+    }
+
     /// Whether this sandbox needs an egress proxy on the far host: a networked spec with a non-empty,
     /// enforceable allowlist.
     fn egress_active(spec: &SandboxSpec) -> bool {
@@ -225,6 +256,23 @@ impl RemoteSandboxRuntime {
     fn cpus_flag(nano: i64) -> String {
         format!("--cpus={}", nano as f64 / 1_000_000_000.0)
     }
+
+    /// Tear down the egress network and sidecar this runtime created for `name`, best-effort.
+    ///
+    /// One helper for all three failure paths (`create`'s egress-setup failure, `create`'s
+    /// sandbox-create failure, and `remove`), so no path can grow its own slightly-different
+    /// teardown and leave a live proxy behind. The order matters and is
+    /// [`egress_teardown_commands`]'s: the sidecar first, then the network — `docker network rm`
+    /// refuses while anything is still attached to the internal one.
+    ///
+    /// Best-effort by design: every command is `let _`-ed, because this runs *while* an error is
+    /// being reported and a teardown that cannot find its container must not replace the real
+    /// failure with its own.
+    async fn teardown_egress(&self, name: &str) {
+        for teardown in egress_teardown_commands(name) {
+            let _ = self.run_docker(&teardown).await;
+        }
+    }
 }
 
 /// Build the docker command line that *creates* the sandbox container from its spec and settings.
@@ -238,8 +286,9 @@ impl RemoteSandboxRuntime {
 /// egress network (`<name>-egress`) instead of the plain bridge, and handed the proxy `HTTP_PROXY`/
 /// `HTTPS_PROXY` env vars so its tools actually talk to the sidecar (see
 /// [`egress_setup_commands`]). The proxy network + sidecar themselves are created by
-/// [`RemoteSandboxRuntime::create`] running those setup commands first; this builder only wires the
-/// sandbox to them.
+/// [`RemoteSandboxRuntime::create`] — **after** this builder has refused a bad allowlist and
+/// **before** the sandbox container is created, so a refusal can never leave a live sidecar behind;
+/// this builder only wires the sandbox to them.
 pub fn create_command(
     name: &str,
     spec: &SandboxSpec,
@@ -285,9 +334,13 @@ pub fn create_command(
     for opt in &settings.security_opt {
         tokens.push(format!("--security-opt={}", shell_quote(opt)));
     }
-    // With an active allowlist the sandbox rides the internal egress network — no gateway, so the
-    // only way out is the proxy sidecar that enforces the list. Otherwise the spec's network mode
-    // (bridge, or none for an isolated sandbox) applies unchanged.
+    // With an active allowlist the sandbox rides the internal egress network: **no default route**,
+    // so the only way out *to the internet* is the proxy sidecar that enforces the list. It is not a
+    // claim of total unreachability — the far host's own bridge address sits on the same on-link
+    // subnet and stays reachable from inside the sandbox. That is a known hole, measured and pinned
+    // (see `crate::egress`'s module doc and the open security item in `ROADMAP.md`), and the old
+    // wording here said the opposite. Otherwise the spec's network mode (bridge, or none for an
+    // isolated sandbox) applies unchanged.
     let network = if egress {
         egress_network_name(name)
     } else {
@@ -414,11 +467,17 @@ pub fn egress_sidecar_name(name: &str) -> String {
 
 /// Whether an egress allowlist entry can actually be enforced by the proxy sidecar.
 ///
-/// The proxy matches a `CONNECT` target by hostname (exact or `*.domain` suffix); a CIDR or a
-/// raw IP is not a hostname, so it cannot be decided and must be refused rather than half-enforced.
-/// This mirrors [`crate::spec`]'s `is_proxy_enforceable`. A bare IPv4 address *passes* a
-/// hostname-shape check (its labels are alphanumeric), so the explicit `IpAddr` parse is the
-/// guard, exactly as the local validator learned.
+/// The proxy matches a `CONNECT` target by hostname (exact or `*.domain` suffix); a CIDR, a raw IP
+/// or anything *address-shaped* is not a hostname, so it cannot be decided and must be refused
+/// rather than half-enforced. This mirrors [`crate::spec`]'s `is_proxy_enforceable`, and — unlike the
+/// version this replaces — it uses the *same* address grammar rather than an `IpAddr` parse.
+///
+/// The `IpAddr` parse was the hole: a bare IPv4 passes a hostname-shape check (its labels are
+/// alphanumeric), and so does the whole `inet_aton` family, which `IpAddr::from_str` does not
+/// recognise but the resolver really does — `0x01010101` is 1.1.1.1, `127.1` is 127.0.0.1,
+/// `2130706433` is 127.0.0.1. On the far host that produced `egress ALLOWED 0x01010101:443 → dialed
+/// 1.1.1.1`: an allowlist entry that read as a name and dialed an address. The grammar lives once,
+/// in [`crate::spec::is_address_shaped`], so the near and far validators cannot drift apart.
 fn is_egress_enforceable(entry: &str) -> bool {
     let entry = entry.trim().trim_end_matches('.');
     if entry.is_empty() {
@@ -428,7 +487,9 @@ fn is_egress_enforceable(entry: &str) -> bool {
     let looks_hostname = host
         .split('.')
         .all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
-    looks_hostname && host.parse::<std::net::IpAddr>().is_err()
+    looks_hostname
+        && !crate::spec::is_address_shaped(host)
+        && host.parse::<std::net::IpAddr>().is_err()
 }
 
 /// The docker commands that create the internal egress network and the proxy sidecar on the far daemon.
@@ -445,7 +506,7 @@ pub fn egress_setup_commands(name: &str, allowlist: &[String], proxy_bin: &str) 
     let sidecar = egress_sidecar_name(name);
     let allow_env = allowlist.join(",");
     vec![
-        // 1. The internal network: no gateway, so no route off it. Fresh per sandbox, so one
+        // 1. The internal network: no *default* route, so nothing off it is routable. Fresh per sandbox, so one
         //    sandbox's proxy and allowlist never become another sandbox's route.
         format!(
             "{DOCKER} network create --internal --attachable=false {}",
@@ -563,39 +624,70 @@ impl SandboxRuntime for RemoteSandboxRuntime {
     ) -> Result<String> {
         let name = self.container_name(id);
 
-        // Egress needs the proxy binary on the far host. If the deployment has not placed it
-        // there (no `proxy_bin`), refusing is the only honest answer — a networked remote
-        // sandbox with an unenforced allowlist is an open sandbox wearing an allowlist as a
-        // costume.
+        // ---- ORDER IS THE FIX, and it is a security property rather than tidiness ----
+        //
+        // Every refusal that *can* happen must happen before the first far-host resource is created.
+        // The order this used to run in was: egress setup (network create, sidecar create, two network
+        // joins, sidecar start) and only then `create_command`, whose allowlist refusal therefore fired
+        // *after* the sidecar was created, connected and started. Nothing rolled that back on this
+        // path — the `match` below covered only a sandbox-create failure — so a refused spec left
+        // `hx-…-egress-proxy` and network `hx-…-egress` **running** on the far host. Observed with
+        // `{network: true, egress_allow: ["10.0.0.0/8"]}`. A leaked sidecar is not a leftover: it is a
+        // live proxy on that machine, holding a foot on the bridge by design.
+        //
+        // The same family had a second member: `network: false` with a non-empty `egress_allow` never
+        // reached `validate()` at all on this path, so it travelled to the far host and the allowlist
+        // was silently ignored — the operator's stated grant quietly becoming an unrestricted
+        // `network: true` bridge. `validate()` refuses that shape, and it now runs first.
+
+        // 1. The spec validates before anything exists. Mapped into the runtime's error type, naming
+        //    the profile, because this is the message an operator sees when a profile is wrong.
+        spec.validate().map_err(|err| {
+            remote_error(format!(
+                "refusing remote sandbox '{}': {err}. Nothing was created on the far host.",
+                spec.profile
+            ))
+        })?;
+
+        // 2. Egress needs the proxy binary on the far host. If the deployment has not placed it
+        //    there (no `proxy_bin`), refusing is the only honest answer — a networked remote
+        //    sandbox with an unenforced allowlist is an open sandbox wearing an allowlist as a
+        //    costume.
         let egress = RemoteSandboxRuntime::egress_active(spec);
-        if egress {
-            let proxy_bin = self.proxy_bin.clone().ok_or_else(|| {
+        let proxy_bin = if egress {
+            Some(self.proxy_bin.clone().ok_or_else(|| {
                 remote_error(format!(
                     "refusing remote sandbox '{0}': a non-empty egress allowlist {1:?} requires \
                      the `hx-egress-proxy` binary to exist on the far host, but no proxy binary \
-                     path was configured. Without it the allowlist could not be enforced. Configure \
-                     the far-host path with `with_proxy_bin`, or drop the allowlist (and network) \
-                     for an isolated sandbox.",
+                     path was configured. Without it the allowlist could not be enforced. Set \
+                     `egress_proxy_bin` on this host in the config's `hosts:` section (the daemon \
+                     passes it through), or call `with_proxy_bin` when embedding the runtime, or \
+                     drop the allowlist (and network) for an isolated sandbox.",
                     spec.profile, spec.egress_allow
                 ))
-            })?;
-            // Create the internal network + proxy sidecar on the far daemon *first*, so a failing
-            // setup never leaves a half-enforced sandbox. If any setup command fails, roll back the
-            // ones that preceded it: a partial internal network / sidecar left on a remote daemon is an
-            // orphan this runtime made, and it must not outlive a failed create. The rollback itself
-            // is best-effort (`run_docker` failure on an already-gone thing is ignored via `let _`),
-            // so the original error is what surfaces.
-            for cmd in egress_setup_commands(&name, &spec.egress_allow, &proxy_bin) {
+            })?)
+        } else {
+            None
+        };
+
+        // 3. Build the create command *before* creating anything: it carries its own allowlist
+        //    refusal, and a refusal that fires after a sidecar exists is the leak this ordering
+        //    removes.
+        let (name, command) = create_command(&name, spec, settings)?;
+
+        // 4. Now the egress network + sidecar. A failure here rolls back whatever the setup had
+        //    already made — a partial internal network or sidecar left on a remote daemon is an
+        //    orphan this runtime made and must not outlive a failed create.
+        if let Some(proxy_bin) = &proxy_bin {
+            for cmd in egress_setup_commands(&name, &spec.egress_allow, proxy_bin) {
                 if let Err(err) = self.run_docker(&cmd).await {
-                    for teardown in egress_teardown_commands(&name) {
-                        let _ = self.run_docker(&teardown).await;
-                    }
+                    self.teardown_egress(&name).await;
                     return Err(err);
                 }
             }
         }
 
-        let (name, command) = create_command(&name, spec, settings)?;
+        // 5. And only now the sandbox itself, with the same rollback on failure.
         match self.run_docker(&command).await {
             Ok(_) => {
                 if egress {
@@ -616,9 +708,7 @@ impl SandboxRuntime for RemoteSandboxRuntime {
                 // drops the work and leaks the proxy on every failed create. The teardown is
                 // best-effort so the create's own error surfaces.
                 if egress {
-                    for teardown in egress_teardown_commands(&name) {
-                        let _ = self.run_docker(&teardown).await;
-                    }
+                    self.teardown_egress(&name).await;
                 }
                 // The one digestible rejection the engine produces — a daemon with no `userns-remap`
                 // in `daemon.json` refuses every L2/L3 create with `--userns: invalid USER mode`.
@@ -659,9 +749,7 @@ impl SandboxRuntime for RemoteSandboxRuntime {
             }
         };
         if had_egress {
-            for teardown in egress_teardown_commands(runtime_id) {
-                let _ = self.run_docker(&teardown).await;
-            }
+            self.teardown_egress(runtime_id).await;
         }
         Ok(())
     }
@@ -832,7 +920,8 @@ mod tests {
     #[test]
     fn an_enforceable_egress_allowlist_is_accepted_and_rides_the_internal_network_with_proxy_env() {
         // The heart of this milestone: a non-empty allowlist that the proxy *can* match (a hostname)
-        // is no longer refused. The sandbox is placed on its internal egress network (no gateway,
+        // is no longer refused. The sandbox is placed on its internal egress network (no *default*
+        // route — the host's own bridge address stays reachable on-link, see `crate::egress`),
         // so no route out except the sidecar) and handed the proxy env vars so tools inside actually talk
         // to it. Assert the rendered command, so a dropped proxy var or a reused plain `bridge` cannot
         // return silently — either would be a half-enforced open sandbox.
@@ -874,6 +963,33 @@ mod tests {
             message.contains("cannot be enforced") && message.contains("93.184.216.34"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn an_address_shaped_allowlist_entry_is_refused_on_the_far_path_too() {
+        // The same hole as `spec.rs`'s, reached through the remote path. `0x01010101` and the rest of
+        // the `inet_aton` family pass a hostname-shape check (their labels are alphanumerics) and are
+        // *really dialed as addresses* — on the far host the old guard produced
+        // `egress ALLOWED 0x01010101:443 → dialed 1.1.1.1`. `create_command` refuses the shape before
+        // building any command, so the far daemon is never handed a "hostname" that is an address.
+        for smuggled in [
+            "0x01010101",
+            "127.1",
+            "2130706433",
+            "0177.0.0.1",
+            "0x7f000001",
+        ] {
+            let mut s = spec(IsolationLevel::L1);
+            s.network = true;
+            s.egress_allow = vec![smuggled.into()];
+            let settings = s.host_settings();
+            let err = create_command("hx-sbx_x", &s, &settings).unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("cannot be enforced") && message.contains(smuggled),
+                "{message}"
+            );
+        }
     }
 
     #[test]
@@ -1157,6 +1273,175 @@ mod tests {
             message.contains("proxy binary") && message.contains("crates.io"),
             "the refusal has to name the missing far-host binary and the allowlist: {message}"
         );
+        // And it has to name the *config key* the daemon reads, because through the daemon that is
+        // the only lever the operator has — `with_proxy_bin` is a library call. See
+        // `hx-core`'s `HostConfig::egress_proxy_bin` and `AppState::build_remote_manager`.
+        assert!(
+            message.contains("egress_proxy_bin"),
+            "the refusal must name the config key that fixes it: {message}"
+        );
+    }
+
+    // ---- ORDERING: nothing is created before anything can refuse ----
+    //
+    // These are the tests for the leak this ordering removes. Their assertion is *not* the error
+    // message — it is that the recording runner, whose script is empty and which panics on any
+    // command it was not scripted for, was never asked to run anything. A test that only checked the
+    // message would pass against the broken order too, which is exactly how the leak survived.
+
+    #[tokio::test]
+    async fn a_refused_spec_never_runs_a_command_on_the_far_host() {
+        // The observed leak: `{network: true, egress_allow: ["10.0.0.0/8"]}` created the internal
+        // network and the `-egress-proxy` sidecar, joined it to both networks and *started* it, and
+        // only then did `create_command` refuse the entry — with no rollback on that path. A leaked
+        // sidecar is a live proxy on the far host, not a harmless leftover. A proxy binary is
+        // configured here precisely so the old order would have gone straight into the setup loop.
+        let mut s = spec(IsolationLevel::L1);
+        s.network = true;
+        s.egress_allow = vec!["10.0.0.0/8".into()];
+        let settings = s.host_settings();
+        let runner = Arc::new(RecordingRunner::new(vec![]));
+        let runtime = RemoteSandboxRuntime::new(runner)
+            .with_proxy_bin(Some("/opt/hx-egress-proxy".to_string()));
+
+        let err = runtime
+            .create(&SandboxId::from_raw("sbx_abc123"), &s, &settings)
+            .await
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("cannot be enforced") && message.contains("10.0.0.0/8"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Nothing was created on the far host"),
+            "the refusal has to say the far host is untouched: {message}"
+        );
+        // The runner's script is still empty and was never asked for anything: an empty script panics
+        // on the first `run`, so reaching this line *is* the proof that nothing was created.
+    }
+
+    #[tokio::test]
+    async fn an_allowlist_with_networking_off_is_refused_before_the_far_host_is_touched() {
+        // The second member of the same family, and the quieter one: with `network: false` and a
+        // non-empty allowlist, `egress_active` is false, so the old `create` skipped the proxy
+        // entirely, built `docker create … --network='none'` and ran it on the far host — the
+        // allowlist silently ignored rather than refused. Nothing on that path called `validate()`.
+        // Now it does, first, and the empty script proves the far host was never dialed.
+        let mut s = spec(IsolationLevel::L1);
+        s.network = false;
+        s.egress_allow = vec!["crates.io".into()];
+        let settings = s.host_settings();
+        let runner = Arc::new(RecordingRunner::new(vec![]));
+        let runtime = RemoteSandboxRuntime::new(runner);
+
+        let err = runtime
+            .create(&SandboxId::from_raw("sbx_abc123"), &s, &settings)
+            .await
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("networking is disabled") && message.contains("crates.io"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Nothing was created on the far host"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn any_invalid_spec_is_refused_before_the_far_host_is_touched() {
+        // `validate()` is the whole spec's, not only the egress rules: an empty image (the engine
+        // would refuse it, after the egress network and sidecar already existed) is refused here too.
+        let mut s = spec(IsolationLevel::L1);
+        s.image = "   ".into();
+        let settings = s.host_settings();
+        let runner = Arc::new(RecordingRunner::new(vec![]));
+        let runtime = RemoteSandboxRuntime::new(runner);
+
+        let err = runtime
+            .create(&SandboxId::from_raw("sbx_abc123"), &s, &settings)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no image"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_egress_setup_rolls_the_sidecar_and_network_back() {
+        // The rollback for the setup path, asserted by the *commands* rather than by a message: the
+        // script names the network create, then a failing sidecar create, then exactly the two
+        // teardown commands in their required order (sidecar first, then the network — `network rm`
+        // refuses while anything is attached). An exhausted script is the proof nothing else ran.
+        let mut s = spec(IsolationLevel::L1);
+        s.network = true;
+        s.egress_allow = vec!["crates.io".into()];
+        let settings = s.host_settings();
+        let name = "hx-sbx_abc123";
+        let setup = egress_setup_commands(name, &["crates.io".to_string()], "/opt/hx-egress-proxy");
+        assert_eq!(setup.len(), 5, "network + sidecar + two joins + start");
+
+        let failed = RemoteCommandOutput {
+            stdout: String::new(),
+            stderr: "Error response from daemon: no such image: ubuntu:24.04".into(),
+            exit_code: Some(125),
+        };
+        let mut script: Vec<(&str, RemoteCommandOutput)> = vec![(leaked(setup[0].clone()), ok(""))];
+        script.push((leaked(setup[1].clone()), failed));
+        for teardown in egress_teardown_commands(name) {
+            script.push((leaked(teardown), ok("")));
+        }
+
+        let runner: Arc<dyn RemoteCommandRunner> = Arc::new(RecordingRunner::new(script));
+        let runtime = RemoteSandboxRuntime::new(runner)
+            .with_proxy_bin(Some("/opt/hx-egress-proxy".to_string()));
+        let err = runtime
+            .create(&SandboxId::from_raw("sbx_abc123"), &s, &settings)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no such image"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_that_fails_to_create_tears_its_egress_sidecar_and_network_down() {
+        // The other rollback path, and the one that used to be the *only* one covered: the egress
+        // setup succeeds, the sandbox create fails, and the sidecar + network just made for it must
+        // not survive the failure. Same proof shape — the script names every command in order, so a
+        // missing teardown leaves the runner with work it was not scripted for and the test fails.
+        let mut s = spec(IsolationLevel::L1);
+        s.network = true;
+        s.egress_allow = vec!["crates.io".into()];
+        let settings = s.host_settings();
+        let name = "hx-sbx_abc123";
+        let (_, sandbox_cmd) = create_command(name, &s, &settings).unwrap();
+
+        let mut script: Vec<(&str, RemoteCommandOutput)> =
+            egress_setup_commands(name, &["crates.io".to_string()], "/opt/hx-egress-proxy")
+                .into_iter()
+                .map(|cmd| (leaked(cmd), ok("")))
+                .collect();
+        script.push((
+            leaked(sandbox_cmd),
+            RemoteCommandOutput {
+                stdout: String::new(),
+                stderr: "no such image: ubuntu:24.04".into(),
+                exit_code: Some(125),
+            },
+        ));
+        for teardown in egress_teardown_commands(name) {
+            script.push((leaked(teardown), ok("")));
+        }
+
+        let runner: Arc<dyn RemoteCommandRunner> = Arc::new(RecordingRunner::new(script));
+        let runtime = RemoteSandboxRuntime::new(runner)
+            .with_proxy_bin(Some("/opt/hx-egress-proxy".to_string()));
+        let err = runtime
+            .create(&SandboxId::from_raw("sbx_abc123"), &s, &settings)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no such image"), "{err}");
     }
 
     #[tokio::test]

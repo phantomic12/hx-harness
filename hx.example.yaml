@@ -87,6 +87,13 @@ hosts:
     port: 22
     user: deploy
     auth: { kind: key, secret_ref: "vault:ssh/buildbox" }
+    # A sandbox profile with `host: buildbox` and an `egress:` allowlist needs the compiled
+    # `hx-egress-proxy` binary to exist **on buildbox** — the proxy sidecar runs there, and it
+    # bind-mounts the binary from that machine's filesystem. The daemon cannot guess where a
+    # deployment put it (the local "sibling of the running executable" rule describes *this*
+    # machine), so the path is named per host here. Omit it and a remote egress allowlist is
+    # refused, with a message naming this key: never silently unenforced.
+    # egress_proxy_bin: /usr/local/bin/hx-egress-proxy
 
 # ---------------------------------------------------------------------------
 # Sandbox profiles: what "isolated" means, per level.

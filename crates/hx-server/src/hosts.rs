@@ -342,6 +342,7 @@ hosts:
             },
             jump: None,
             tags: vec![],
+            egress_proxy_bin: None,
         };
         let err = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
