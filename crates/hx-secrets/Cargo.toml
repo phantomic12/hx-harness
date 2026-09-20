@@ -5,6 +5,16 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# A test probe, not a product entry point: nothing in `apps/` calls it and no release packaging
+# ships it. It exists because the vault's cross-process behaviour is the property under test, and
+# the only way to observe that is from a process sharing nothing with the test — see
+# `src/bin/vault_probe.rs`. Declared as a `[[bin]]` rather than an example because
+# `CARGO_BIN_EXE_hx-vault-probe` is defined only for binary targets, which is how the test names it
+# without guessing at a path under `target/`.
+[[bin]]
+name = "hx-vault-probe"
+path = "src/bin/vault_probe.rs"
+
 [dependencies]
 hx-core.workspace = true
 serde.workspace = true
@@ -17,3 +27,6 @@ getrandom.workspace = true
 base64.workspace = true
 subtle.workspace = true
 regex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

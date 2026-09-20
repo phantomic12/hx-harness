@@ -27,7 +27,10 @@ exist before anything can hide behind an integration test.
 `hx-store` came after M0 and are covered in the M1/M2 sections.
 
 What the tests actually pin down: the vault round-trips and rejects both a wrong passphrase and a
-tampered ciphertext; redaction masks known secrets and provider-shaped tokens; the risk classifier
+tampered ciphertext, and — in a real second process, not a second handle in the same one
+(`crates/hx-secrets/tests/vault_process.rs`) — cannot be read without unlocking, is never recreated
+over, and is never left torn by two writers saving at once; redaction masks known secrets and
+provider-shaped tokens; the risk classifier
 escalates command chains, nested substitutions and `curl | sh`; approval policy honours level,
 ceiling, unattended budget and expiry; buckets refuse when exhausted and recover on refill; pools
 fail over and bench unhealthy credentials; RRF dedupes `?utm_source=` variants of one URL; a
