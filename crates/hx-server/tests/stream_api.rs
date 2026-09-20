@@ -93,7 +93,12 @@ async fn harness(replies: Vec<Result<ChatResponse>>) -> Arc<AppState> {
     let providers =
         ProviderRegistry::from_config(&config, reqwest::Client::new()).expect("providers build");
     let client = reqwest::Client::new();
-    let search = BackendRegistry::from_config(&config.search, client.clone()).expect("search");
+    let search = BackendRegistry::from_config(
+        &config.search,
+        client.clone(),
+        &hx_secrets::SecretStores::new(),
+    )
+    .expect("search");
     // Built before `config` moves into the state below.
     let store = Store::from_config(&config).expect("store opens");
 

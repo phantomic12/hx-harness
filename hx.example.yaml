@@ -176,6 +176,14 @@ search:
   searxng_url: http://127.0.0.1:8888
   fanout: 2
   top_k: 10
+  # Keyed backends are opt-in and never defaults. A credential is a *reference* — `vault:name` or
+  # `env:NAME` — never the value itself: a key in a committed file is a key an attacker already has.
+  #
+  # backends: [duckduckgo, brave, google_cse]
+  # credentials:
+  #   brave: "vault:brave/search"        # or "env:BRAVE_SEARCH_KEY"
+  #   google_cse: "env:GOOGLE_CSE_KEY"
+  # google_cse_cx: "0123456789abcdef0"   # the engine id, not a secret
 
 # ---------------------------------------------------------------------------
 # Chat connectors (M5 in the roadmap).

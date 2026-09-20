@@ -334,6 +334,30 @@ The milestone's "6 free backends" is now a number the code holds, not one a docu
 the registry actually builds. SearXNG is on it but is deliberately **not** a default — it cannot be
 constructed without `searxng_url`, so a deployment that wants it names it explicitly.
 
+**Brave and Google PSE are wired as opt-in keyed backends.** Neither is keyless, neither is a
+default, and a test asserts the registry built from a default config contains no keyed backend at
+all — so "zero paid API calls" stays a property of the shipped configuration rather than a promise
+about how it is used. The credential is a **reference** through `hx-secrets`:
+`search.credentials.brave: "vault:brave/search"` or `env:BRAVE_SEARCH_KEY`, resolved once at
+registry construction. The field this replaces was `brave_key: Option<String>` — a literal key in a
+config file that nothing read — and it is gone, so the old spelling is now a parse error rather than
+a key sitting in a file a status command would print.
+
+Two things about Google PSE are worth naming, because they are security properties rather than
+features. First, its API takes the key as a **query parameter**, so the request URL carries a
+credential — which means `reqwest::Error`'s `Display` (it prints the URL) would have put a live key
+into an error the model reads. Every failure in that backend converts through a redacting helper
+instead, and the test for it builds a **real** `reqwest::Error` containing a sentinel key, asserts
+the raw error genuinely contains it, and only then asserts the converted one does not: without the
+first half the test would pass on a redaction that never had anything to hide. Second, `cx` is
+deliberately *not* a credential — it names a search engine and appears in every result URL, so it is
+a plain config value and hiding it would obscure something that is not hidden.
+
+Both keyed parsers are tested against the **documented** response shape rather than a capture: a live
+call needs a paid key this build does not have. That is weaker evidence than the live captures the
+keyless backends are tested against, and the module docs and `TESTING.md` say so rather than
+implying a call was made.
+
 `default_backends()` was also wrong and is fixed: it named `searxng`, which cannot be constructed
 without `searxng_url`, and the registry treats a named-but-unconfigured backend as a loud error — so
 the **default configuration could not build a registry at all**. The defaults are now the keyless

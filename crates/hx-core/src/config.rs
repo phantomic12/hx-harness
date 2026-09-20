@@ -11,6 +11,7 @@ use crate::error::{HxError, Result};
 use crate::ids::{CredentialId, HostId, ProviderId};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
 // Top level
@@ -548,8 +549,23 @@ pub struct SearchConfig {
     pub top_k: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub searxng_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub brave_key: Option<String>,
+    /// Credential **references** for the keyed backends, by backend id.
+    ///
+    /// A reference (`vault:brave/search`, `env:BRAVE_SEARCH_KEY`) — never a value. A key in a
+    /// committed file is a key an attacker already has, and a key in a config that a status command
+    /// or a log line prints is a key in a log; the previous shape of this struct had
+    /// `brave_key: Option<String>`, which was exactly that mistake, and nothing read it.
+    ///
+    /// Resolved once at registry construction through `hx-secrets`, and an error names the
+    /// *reference* and never the value.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub credentials: BTreeMap<String, String>,
+    /// Google Programmable Search's engine id (the API's `cx` parameter).
+    ///
+    /// Deliberately a plain value rather than a credential: `cx` names a search engine the operator
+    /// configured in Google's console and it appears in every result URL, so hiding it would obscure
+    /// something that is not hidden. The *key* that goes beside it is a credential and belongs in
+    /// `credentials`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub google_cse_cx: Option<String>,
     #[serde(default = "default_cache_ttl")]
@@ -563,7 +579,7 @@ impl Default for SearchConfig {
             fanout: default_fanout(),
             top_k: default_top_k(),
             searxng_url: None,
-            brave_key: None,
+            credentials: BTreeMap::new(),
             google_cse_cx: None,
             cache_ttl_secs: default_cache_ttl(),
         }
@@ -833,6 +849,56 @@ search:
         assert_eq!(c.search.fanout, 2);
         assert_eq!(c.search.top_k, 5);
         assert_eq!(c.search.cache_ttl_secs, 3600, "the default still applies");
+    }
+
+    #[test]
+    fn a_search_section_names_credentials_by_reference_and_never_by_value() {
+        // A reference is the only thing that belongs in a config: the value lives in the vault or
+        // the environment and is resolved once at registry construction.
+        let yaml = r#"
+search:
+  backends: [duckduckgo, brave, google_cse]
+  credentials:
+    brave: "vault:brave/search"
+    google_cse: "env:GOOGLE_CSE_KEY"
+  google_cse_cx: "0123456789abcdef0"
+"#;
+        let c = Config::from_yaml(yaml).unwrap();
+        assert_eq!(
+            c.search.credentials.get("brave").map(String::as_str),
+            Some("vault:brave/search")
+        );
+        assert_eq!(
+            c.search.credentials.get("google_cse").map(String::as_str),
+            Some("env:GOOGLE_CSE_KEY")
+        );
+        // The engine id is not a secret and is a plain value on purpose.
+        assert_eq!(c.search.google_cse_cx.as_deref(), Some("0123456789abcdef0"));
+    }
+
+    #[test]
+    fn a_config_cannot_carry_a_brave_key_as_a_literal() {
+        // The field this replaces (`brave_key: Option<String>`) held the key itself, and nothing
+        // read it. `deny_unknown_fields` makes the old spelling a loud parse error rather than a
+        // key sitting in a file that a status command or a log line would print.
+        let yaml = r#"
+search:
+  backends: [brave]
+  brave_key: "BSA-a-literal-key-in-a-committed-file"
+"#;
+        let err = Config::from_yaml(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("brave_key"),
+            "the field must be gone, and saying so is the error: {err}"
+        );
+    }
+
+    #[test]
+    fn the_default_search_credentials_are_empty() {
+        // Nothing keyed is configured until an operator configures it, which is what keeps a
+        // default run free.
+        assert!(Config::default().search.credentials.is_empty());
+        assert!(Config::default().search.google_cse_cx.is_none());
     }
 
     #[test]

@@ -38,8 +38,8 @@ pub use backend::{
     BackendKind, BackendRegistry, SearchBackend, SearchError, KEYLESS_BACKENDS, KNOWN_BACKENDS,
 };
 pub use backends::{
-    DuckDuckGoBackend, HnAlgoliaBackend, MarginaliaBackend, MojeekBackend, SearxngBackend,
-    WikipediaBackend,
+    BraveBackend, DuckDuckGoBackend, GoogleCseBackend, HnAlgoliaBackend, MarginaliaBackend,
+    MojeekBackend, SearxngBackend, WikipediaBackend,
 };
 pub use types::{
     canonicalize_url, fuse, host_matches, FusedResult, Recency, SearchQuery, SearchResult, RRF_K,

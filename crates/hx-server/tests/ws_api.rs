@@ -136,7 +136,12 @@ async fn harness_with(models: Arc<dyn ModelFactory>) -> Server {
     let providers =
         ProviderRegistry::from_config(&config, reqwest::Client::new()).expect("providers build");
     let client = reqwest::Client::new();
-    let search = BackendRegistry::from_config(&config.search, client.clone()).expect("search");
+    let search = BackendRegistry::from_config(
+        &config.search,
+        client.clone(),
+        &hx_secrets::SecretStores::new(),
+    )
+    .expect("search");
     let store = Store::from_config(&config).expect("store opens");
 
     let state = AppState::from_parts(AppStateParts {

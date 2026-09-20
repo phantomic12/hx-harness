@@ -1387,6 +1387,7 @@ dependencies = [
  "async-trait",
  "futures",
  "hx-core",
+ "hx-secrets",
  "regex",
  "reqwest",
  "serde",
