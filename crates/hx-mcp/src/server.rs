@@ -290,7 +290,7 @@ impl McpServer {
         // Phase 3: the policy. This is the step a local call would turn into a prompt, and the step
         // this surface turns into a refusal.
         if let Some(requirement) = prepared.requirement() {
-            let (risk, reason) = hx_agent::risk_of(&requirement);
+            let (risk, reason) = hx_agent::risk_of(requirement);
             let action =
                 ActionRequest::tool(prepared.name(), requirement.describes.clone(), risk, reason)
                     // What the call will touch, measured before anyone is asked — a local call measures it
