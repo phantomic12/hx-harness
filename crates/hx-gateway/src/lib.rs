@@ -18,6 +18,9 @@
 //!   the channel's ceiling, applied to the queue the run is waiting on, and attributed to its channel
 //!   in the audit trail.
 //! - [`telegram`] — the first real connector, proving the trait against the actual Telegram Bot API.
+//! - [`telegram_stream`] — the live streaming driver: a model's token stream driving coalesced
+//!   `editMessageText` updates, with the Bot API's real edge cases (`429`/`retry_after`, an identical
+//!   edit, a failure mid-answer, a final write that always lands) handled rather than hoped about.
 //!
 //! [`Conversation`]: crate::types::Conversation
 //! [`Target`]: crate::types::Target
@@ -29,6 +32,7 @@ pub mod bridge;
 pub mod connector;
 pub mod router;
 pub mod telegram;
+pub mod telegram_stream;
 pub mod types;
 
 pub use bridge::{AnswerOutcome, AnswerSource, AnsweringChannel, ApprovalBridge, ChannelApprover};
