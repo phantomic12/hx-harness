@@ -287,7 +287,7 @@ jobs:
 
       - name: Upload the live output so it can be read without re-running
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ssh-live-darwin
           path: /tmp/ssh-live-darwin.log
