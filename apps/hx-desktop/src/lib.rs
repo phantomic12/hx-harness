@@ -3,9 +3,22 @@
 //! ## Property this crate exists to hold
 //!
 //! Requirement #3 demands a web UI that can do everything a terminal can, and M7 brings that
-//! interface to the desktop. This crate provides a native desktop shell around the **exact same**
-//! web client that `hxd` serves, connecting to either a local or remote `hxd` daemon and presenting
+//! interface to the desktop. This crate provides a native desktop shell around the **exact same** web
+//! client that `hxd` serves, connecting to either a local or remote `hxd` daemon and presenting
 //! the API bearer token when one is configured.
+//!
+//! ## The desktop three (M7)
+//!
+//! Three desktop features make the shell an *app* rather than a window, each in its own module and each
+//! **degrading to a working window with a reported warning** if the desktop session cannot provide it:
+//!
+//! - [`tray`] — a system tray icon with a menu (toggle the window, open approvals, quit). The menu
+//!   item set and id→action mapping are pure and tested; the icon itself needs a live desktop session.
+//! - [`hotkey`] — a system-wide shortcut that summons the window, configurable, and **reported** when the
+//!   OS refuses the binding (a hotkey that silently fails to register is worse than none). Parsing and
+//!   refusal-surfacing are tested behind a [`hotkey::HotkeyBackend`] trait.
+//! - [`notification`] — a native notification when an approval is requested. The body is a pure value,
+//!   asserted **not** to leak a token or a path outside the workspace.
 //!
 //! ## Why the web bundle is not forked
 //!
@@ -35,8 +48,6 @@
 //! - **Mobile (iOS / Android) is not started:** Mobile requires the Android NDK/SDK and a macOS host
 //!   for iOS compilation and signing. Neither is available in this environment. Mobile is explicitly
 //!   deferred to subsequent M7 milestones.
-//! - **System tray, global hotkeys, OS notifications, native file pickers:** These desktop features
-//!   are scheduled for later M7 phases.
 //! - **Auto-update and code signing:** Infrastructure for release signing and auto-updating will land
 //!   with the release matrix.
 //!
@@ -48,10 +59,18 @@
 //!    and eager remote misconfiguration detection).
 //! 2. The bundle path identity asserting that the frontend asset configured for Tauri resolves to the
 //!    exact same file that `hx-server` embeds and serves.
+//! 3. The desktop-three testable cores: the tray menu's item set and id→action mapping, the hotkey
+//!    string parsing and refusal-surfacing (behind a trait), and the approval-notification body with its
+//!    no-leak guarantees. The actual tray icon, a real hotkey binding, and a raised notification all
+//!    need a live desktop session and are **not** asserted here — each module's doc says so.
 
 use hx_core::api_auth::{bind_is_loopback, ApiToken, API_TOKEN_ENV};
 use hx_core::config::Config;
 use hx_secrets::SecretStores;
+
+pub mod hotkey;
+pub mod notification;
+pub mod tray;
 
 /// Relative path from `apps/hx-desktop` to the shared web UI bundle.
 pub const BUNDLE_RELATIVE_PATH: &str = "../../crates/hx-server/static/index.html";
@@ -196,6 +215,8 @@ pub fn run(target: DaemonTarget) -> Result<(), Box<dyn std::error::Error>> {
     let target_url = target.base_url.clone();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(move |app| {
             let mut builder = tauri::WebviewWindowBuilder::new(
                 app,
@@ -210,6 +231,24 @@ pub fn run(target: DaemonTarget) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             builder.build()?;
+
+            // System tray: degrade to a working window if the tray cannot be shown.
+            if let Err(e) = crate::tray::build_tray(app.handle()) {
+                tracing::warn!("system tray unavailable, continuing without it: {e}");
+            }
+
+            // Global hotkey: summon the window. A refused/unparseable binding is **reported**, never
+            // swallowed, and never prevents the window from starting.
+            let outcome = crate::hotkey::register_plugin_shortcut(app.handle(), "Control+Shift+H");
+            match &outcome {
+                crate::hotkey::HotkeyOutcome::Registered(spec) => {
+                    tracing::info!("registered global hotkey {spec}");
+                }
+                crate::hotkey::HotkeyOutcome::Refused { spec, reason } => {
+                    tracing::warn!("global hotkey {spec} could not be registered: {reason}");
+                }
+            }
+
             Ok(())
         })
         .run(tauri::generate_context!())?;
