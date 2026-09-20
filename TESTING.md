@@ -218,6 +218,95 @@ the prompt has always had. A **channel** does not answer through this route at a
 is honest and named: with `--bind 0.0.0.0` and no auth on the API, a declared ceiling is not a defence
 against a remote caller, because the API's own authentication is the missing control, not the ceiling.
 
+## The browser pool (M6)
+
+The escalation ladder, the pool and the two cheap rungs are built. **No browser is driven anywhere
+below**: `camoufox`, Chromium and CDP are not exercised in this environment, and nothing here claims
+otherwise. The stealth rung launches a configured tool, and no such tool is present here.
+
+**Per-session profile isolation** (`crates/hx-browser/src/profile.rs`, 10 tests). The property is
+that two sessions never share a directory, a cookie jar or a storage area, and it is asserted on a
+real filesystem rather than derived: a cookie written for one session is read back by that session
+and is *absent* for another (its file is never even created), a session id of `../other`, `a/b`,
+`/absolute`, `..` or `` is refused by a whitelist rather than a `..` blacklist, an **uppercase** id
+is refused because `Session_A` and `session_a` are one directory on macOS and Windows, and a
+Windows device name (`con`, `nul`, `com1`) is refused by name. Eight sessions are created from
+eight threads at once and every path is distinct, and every directory canonicalises inside the pool
+root.
+
+**The escalation ladder** (`src/ladder.rs`, `src/rung.rs`, `src/error.rs`, 18 tests). The decision
+is the design, and it is asserted against scripted rungs that **panic when called with no script
+left** — so "a success does not escalate" fails the test rather than passing because a double
+answered anyway. A refusal escalates and the page comes from the dearer rung; a success ends the
+climb with the stealth and interactive rungs *never called*; a transport error and a rung timeout
+both stop it, with no browser launched and no person asked; a 404 stops it; a `Blocked` error from a
+rung stops it; an unavailable rung (no camoufox installed) is reported and the climb continues; every
+attempt is recorded in order with its own reason; and the attempt ceiling stops the climb even when
+the site keeps refusing. Reports are asserted never to carry a token from the query string, and a
+fetched body is asserted never to render in `Debug`.
+
+**The rungs** (`src/rungs/http.rs`, `src/rungs/stealth.rs`, 88 lib tests + 10 integration tests). The
+two rungs are real implementations rather than scripted doubles, and the interesting one is the
+redirect guard.
+
+`HttpRung` is a real `reqwest` client built with `Policy::none()` — deliberately *not* following
+redirects itself, because a client that does has already opened the socket by the time any check could
+run. The rung follows redirects itself and admits **every hop before anything connects to it**. The
+test is built so it can fail: the redirect target is a *real listener*, so a guard that ran after
+connecting would move its connection counter. It is `0`. A redirect to `169.254.169.254` is refused
+with a report naming the page that sent us there — `BlockReason::Redirected`, not a bare "private
+host", because only one of those means the page's author chose the destination — a relative `Location`
+resolves against the hop that sent it, a redirect loop is bounded at 5 hops, a body over 4 MiB is
+refused rather than buffered, a non-text body is refused on the site's own declared type, and a failed
+fetch carries no URL (so no token) in its error.
+
+`StealthRung` launches a configured subprocess and speaks a documented protocol: the URL, the session's
+profile directory, the cookie jar and the budget on **stdin** (never in argv, which every process on the
+machine can read), and the exit code as the verdict — `0` a body, `3` a wall, any other non-zero a
+transport failure. The tool's stderr is deliberately not quoted into an error: it is unbounded, written
+by something this crate does not control, and can contain the URL it was handed.
+
+**What is not exercised: the tool itself.** No stealth browser exists here, so the protocol is verified
+against `/bin/sh` scripts that speak it — real processes over a real pipe, but our reading of the
+protocol at both ends. The browser rung is defined by the `Fetcher` trait and deliberately not wired;
+the interactive rung is a pane a person drives, not a subprocess.
+
+**Target admission** (`src/target.rs`, 13 tests). `file://`, `data:`, `gopher://` and `chrome://` are
+refused by scheme; loopback, RFC 1918, link-local (`169.254.169.254`, the metadata service), CGNAT,
+multicast, IPv6 unique-local and link-local, and IPv4-mapped spellings of the same are refused by
+address; `localhost`, `localhost.` (the trailing dot is a one-character bypass), `.local`,
+`.internal`, `.home.arpa`, the metadata hostnames and any single-label name are refused by name; and
+public addresses and hostnames are the control that proves the rule is a list of ranges and not
+"refuse IP literals". `Admission::AllowLocal` — the named escape hatch the hermetic suite uses — is
+asserted **not** to lift the scheme rule. A three-failure run of this suite is what caught IPv6
+literals being judged as *hostnames*: `Url::host_str` keeps the brackets, so `"[::1]"` never parsed
+as an address and fell through to the name rules, where it was refused for the wrong reason. The
+check now uses `url.host()`, which cannot be fooled by spelling.
+
+**The human-in-the-loop contract** (`src/interactive.rs`, 10 tests). The pane's interface is real and
+its absence fails closed. With no pane attached the rung returns an unavailable error that the ladder
+reports and moves past — it does not wait, retry, or invent a result. A pane that never answers is
+abandoned on the rung's own budget, asserted by wrapping the call in a *longer* outer timeout and
+requiring the rung's error to come back first, so a hang fails the test. The challenge a pane is
+handed is asserted to carry the session's **own** profile directory (a pane that picked its own would
+break the isolation the pool is built on), a URL with the query string stripped (a challenge URL
+routinely carries a return-to token), the budget the rung will actually enforce, and a distinct id
+per challenge. A person who clears the wall ends the rung with a reason saying what to do next —
+re-run the ladder in that session — because reading the page needs a CDP driver this crate does not
+have yet, and saying so is better than returning an empty page.
+
+**The pool** (`src/pool.rs`, 11 tests). The two things the pool adds over the ladder, both asserted
+rather than described. *Identity*: the same session id returns the same handle (`Arc::ptr_eq`, not a
+path comparison — the handle is what the rungs are handed) and eight concurrent callers get that one
+handle, while distinct ids get distinct directories. *Admission before anything exists*: for
+`file://`, the metadata address, loopback and `localhost` the report carries **no attempts** and the
+pool holds **no session**, asserted under a rung that panics if it is called at all. The first
+version of that test built its pool with `Admission::AllowLocal` and therefore asserted nothing —
+`AllowLocal` admits the metadata address by design, the rung ran, and the rung's own panic is what
+failed the gate. The refusal test now uses the default policy, and a helper exists for each. A
+session id that escapes the root is reported as a stopped fetch rather than a panic, and a token in
+the query never renders in a report's summary or its `Debug`.
+
 ## The four tiers
 
 Every claim in the repo falls into one of these. The gap that bites is B→C.
@@ -561,12 +650,11 @@ the failure is silent:
 
 Two crates are one line each — placeholder `lib.rs` with a doc comment and nothing else:
 
-`hx-browser`
-
-They are declared as workspace members, so `cargo test` reports nothing for them and the build is
-green. **A green suite says nothing about them.** Also absent: the Tauri desktop/mobile apps, host
-certificates, `ssh-agent` auth, and SSH file transfer to a Windows host (the POSIX-only paths refuse
-via a capability check).
+**No typed stubs remain.** `hx-browser`, `hx-gateway` and `hx-mcp` were each declared as a workspace
+member with only a typed interface, so `cargo test` reported nothing for them and the build stayed
+green — **a green suite says nothing about a stub.** All three have now been replaced by real
+implementations. Also absent: the Tauri desktop/mobile apps, host certificates, `ssh-agent` auth, and
+SSH file transfer to a Windows host (the POSIX-only paths refuse via a capability check).
 
 ## The defect this audit found in the suite itself
 
@@ -876,8 +964,8 @@ HX_SSH_TEST_HOST=<host> HX_SSH_TEST_USER=<user> HX_SSH_TEST_KEY=~/.ssh/id_ed2551
   network. What is *not* covered here: a real bot answering a real stream has not been run from this
   checkout — `tests/telegram_live.rs` exists and is `#[ignore]`d, and running it is deliberate, since it
   needs a token and a chat.
-- **11 crates with logic**: unit-tested at the level of pure functions and in-process lifecycles.
-- **2 crates**: empty (`hx-browser`, `hx-mcp`). The green suite does not cover them.
+- **13 crates with logic**: unit-tested at the level of pure functions and in-process lifecycles. There
+  are no empty crates left — `hx-browser` and `hx-mcp` were the last two, and both now carry tests.
 - **The store's resume path is tested across a real process boundary, in the only way a test can**:
   four tests in `crates/hx-store/tests/resume.rs` drop the `Store` and open a *new connection* to
   the same file, then continue the conversation. One of them is the case M1's exit criterion turns

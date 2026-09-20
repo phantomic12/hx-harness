@@ -399,6 +399,35 @@ command with a button, receive a cron digest in a separate pinned thread.
 - `rmcp` server: expose `hx`'s tools to other agents/IDEs
 - Browser pool: crw (Rust, Firecrawl-compat) → camoufox (stealth) → Chromium (interactive CDP),
   per-container profile isolation, challenge escalation to a human-in-the-loop browser pane
+  - ◐ **Profiles.** Per-session isolation in `crates/hx-browser/src/profile.rs`: a session's
+    directory, cookie hand-off file and browser storage are derived from its id under one pool
+    root, and the derivation is *asserted* injective (path escape, case-insensitive collision and
+    Windows device names refused by name) rather than assumed from a `format!` call.
+  - ◐ **The ladder.** A `Fetcher` trait the rungs are interchangeable behind, plus the escalation
+    decision: a refusal escalates, a success ends the climb without launching a dearer rung, a
+    transport error or a timeout stops it rather than spending a browser on a dead host, and a
+    target admission refused never escalates at all. Admission itself is structural — `TargetUrl`
+    is the only thing a rung can be pointed at, and it refuses `file://`, loopback, link-local and
+    the metadata service by construction.
+  - ◐ **The pool.** `BrowserPool` composes the two: a session's profile outlives a fetch, so a login
+    or a cleared challenge earned during one fetch is still there for the session's next one, and
+    admission runs *before* anything is created or launched, so a refused target leaves no profile
+    directory behind and reaches no rung. The session map is a `Mutex` held across one
+    `create_dir_all`, because minting the directory outside the lock would let two concurrent
+    callers for one session get two handles to the same path.
+  - ◐ **Human-in-the-loop.** The escalation surface a browser pane plugs into, with the contract
+    written down: what it receives (a redacted URL, the *session's own* profile directory, the
+    rung's reason, a budget), what it returns, and what happens on timeout. The rung enforces the
+    budget itself, and an unattached pane fails closed with a reported gap rather than waiting.
+  - ◐ **The rungs.** The cheap rung is a real `reqwest` client; the stealth rung launches a
+    configured tool and speaks a documented pipe protocol. Both are **hand-rolled rather than the
+    `crw`/`camoufox` named above**, and the difference is stated rather than implied: `crw`'s
+    Firecrawl-compatible extraction belongs to the search item's extraction ladder, and camoufox is
+    whatever command the operator configures. The HTTP rung's load-bearing detail is the redirect —
+    the client is built with `Policy::none()` and the rung admits **every hop before anything
+    connects to it**, so a page cannot redirect the fetcher into the local network or at the
+    metadata service. The stealth rung puts the URL and the session's cookies on **stdin, never in
+    argv**, which every other process on the machine can read.
 - Search: SearXNG, DDG, Mojeek, Marginalia, Brave, Google PSE, Wikipedia, plus the
   extraction ladder and URL/ETag caching
 
