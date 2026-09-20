@@ -229,7 +229,10 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
 
 - **Approval is a queue a client polls.** A run that needs a human waits, and any client can read the
   question and answer it over HTTP (`GET /v1/approvals`, `POST /v1/approvals/{id}`; `hx approvals` and
-  `hx approve` are the terminal one). Silence is a denial on a timer, the answer is recorded as an
+  `hx approve` are the terminal one). An answer has to declare the answering surface's **ceiling** — the
+  strongest risk it may authorise — and the queue refuses an answer above it, at the moment the answer
+  arrives. There is no default: a client that declares no ceiling is refused rather than granted
+  everything. Silence is a denial on a timer, the answer is recorded as an
   event with its `by`, and the question itself — including what a deletion measures — is in the
   stored trail. What is *not* there yet: nothing pushes a question to a client, so a web UI polls.
   `hx policy` prints the ladder in force, so "why did it ask?" and "what did I allow?" are answered by

@@ -80,6 +80,23 @@ impl RiskClass {
             Self::Privileged => "elevates privileges or touches credentials",
         }
     }
+
+    /// Does a surface whose ceiling is `self` authorise an action of `risk`?
+    ///
+    /// The ordering *is* the policy: `Read < Mutate < External < Destructive < Privileged`, and a
+    /// ceiling authorises everything at or below it, so a chat bridge with ceiling `Mutate` may
+    /// approve a file write and may never approve `rm -rf`.
+    ///
+    /// This is deliberately the **only** implementation of that comparison. `hx-gateway`'s
+    /// `AnswerAuthority::may_answer` (which decides a connector's answer) and `hx-agent`'s
+    /// `ApprovalQueue::answer` (the point every answer is applied at, whatever transport carried it)
+    /// both call it, so the ceiling cannot come to mean one thing on the channel path and another on
+    /// the local one — which is exactly how "a phone tap can never authorise `rm -rf`" would rot.
+    ///
+    /// Fail closed at the call sites: a `false` here is a **no**, never a silent yes.
+    pub fn covers(self, risk: RiskClass) -> bool {
+        risk <= self
+    }
 }
 
 /// A classification with a human-readable justification.
@@ -2293,6 +2310,38 @@ mod tests {
 
     fn t0() -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+    }
+
+    // -- the ceiling comparison ----------------------------------------------
+
+    #[test]
+    fn a_ceiling_covers_everything_at_or_below_it_and_nothing_above() {
+        // The one implementation of the rule the whole approvals story rests on. `AnswerAuthority`
+        // (a channel's answer) and `ApprovalQueue::answer` (where every answer is applied) both call
+        // this, so it is pinned here rather than only through either caller.
+        for (ceiling, risk, expected) in [
+            (RiskClass::Read, RiskClass::Read, true),
+            (RiskClass::Read, RiskClass::Mutate, false),
+            (RiskClass::Mutate, RiskClass::Read, true),
+            (RiskClass::Mutate, RiskClass::Mutate, true),
+            (RiskClass::Mutate, RiskClass::External, false),
+            (RiskClass::Mutate, RiskClass::Destructive, false),
+            (RiskClass::External, RiskClass::External, true),
+            (RiskClass::External, RiskClass::Destructive, false),
+            (RiskClass::Destructive, RiskClass::Destructive, true),
+            (RiskClass::Destructive, RiskClass::Privileged, false),
+            (RiskClass::Privileged, RiskClass::Privileged, true),
+            (RiskClass::Privileged, RiskClass::Read, true),
+        ] {
+            assert_eq!(ceiling.covers(risk), expected, "{ceiling:?} vs {risk:?}");
+        }
+
+        // And the ladder itself, so a reordering of the enum is a failing test rather than a silent
+        // widening of what a chat bridge may authorise.
+        assert!(RiskClass::Read < RiskClass::Mutate);
+        assert!(RiskClass::Mutate < RiskClass::External);
+        assert!(RiskClass::External < RiskClass::Destructive);
+        assert!(RiskClass::Destructive < RiskClass::Privileged);
     }
 
     // -- classification ------------------------------------------------------

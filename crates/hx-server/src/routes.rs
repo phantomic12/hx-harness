@@ -21,6 +21,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use hx_agent::AnswerResult;
+use hx_core::approval::RiskClass;
 use hx_core::config::SandboxProfile;
 use hx_core::error::HxError;
 use hx_core::ids::SessionId;
@@ -653,6 +655,23 @@ async fn list_approvals(
 struct ApprovalAnswer {
     /// `once`, `chat`, `always` or `deny`.
     option: String,
+    /// The strongest risk the surface that is answering may authorise — `read`, `mutate`, `external`,
+    /// `destructive` or `privileged`.
+    ///
+    /// **Required, with no default**, and that is the point: the ceiling is what stops a phone from
+    /// authorising `rm -rf`, and a field that could be omitted would be a field that silently means
+    /// "unbounded". `RiskClass` has no `Default` either, so there is no constructor, no deserializer
+    /// and no omission that yields a permissive ceiling — a body without this is a rejection, not a
+    /// grant. The queue re-judges it against the risk of the question it is holding, at the moment the
+    /// answer arrives, so this is the *declaration* and not the enforcement.
+    ///
+    /// Why the caller declares it rather than the daemon deriving it: this API has no authentication,
+    /// so it cannot tell one local client from another, and per-channel ceilings are not configured yet
+    /// (`approval.ask_via` is still a roadmap line). A **channel** does not answer through this route at
+    /// all — it answers through `hx-gateway`'s `ApprovalBridge`, whose ceiling comes from the
+    /// deployment rather than from the channel. The clients that do use this route are the owner's own
+    /// machine-local ones (the `hx` CLI, the embedded web UI), and they declare the terminal's ladder.
+    ceiling: RiskClass,
     /// Who answered — a user name, a surface. Recorded, because a tap on a phone and a keystroke in a
     /// terminal should not look alike afterwards.
     #[serde(default)]
@@ -678,16 +697,28 @@ async fn answer_approval(
     };
 
     let by = body.by.unwrap_or_else(|| "http".to_string());
-    if !state.approvals.answer(&id, option, &by) {
+    match state.approvals.answer(&id, option, &by, body.ceiling) {
+        AnswerResult::Answered => Ok(Json(serde_json::json!({ "answered": id, "by": by }))),
         // Nothing waiting under this id: it was answered already, or it timed out and the run was
         // refused. A 404 says so rather than pretending an answer landed.
-        return Err(ApiError::new(
+        AnswerResult::Unknown => Err(ApiError::new(
             StatusCode::NOT_FOUND,
             format!("no approval is waiting under '{id}' — it was answered already, or it expired"),
-        ));
+        )),
+        // The question is real and still waiting, and this answer is one the answering surface was
+        // never allowed to give. 403 and not 404, because the difference matters to whoever tried: a
+        // 404 says "wrong id", and this says "not yours to answer" — and the question stays open, so
+        // the run still ends in its own timeout denial rather than in this yes.
+        AnswerResult::AboveCeiling { risk, ceiling } => Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            format!(
+                "a {} action cannot be answered with ceiling {}; the answer was refused and the \
+                 question is still waiting",
+                risk.label(),
+                ceiling.label()
+            ),
+        )),
     }
-
-    Ok(Json(serde_json::json!({ "answered": id, "by": by })))
 }
 
 /// Every event of a session, in order: what a client that just attached renders.

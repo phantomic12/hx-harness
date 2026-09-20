@@ -279,7 +279,12 @@ impl TelegramConnector {
     /// `Display` includes the URL it failed on, which means interpolating the raw error would carry
     /// the token into a log line — and, since a failed `ask` now denies a run with the reason
     /// attached, into the transcript and the audit trail. `without_url` is reqwest's own answer to
-    /// exactly this case, and it is why the call sites below do not simply write `{err}`.
+    /// exactly this case, and it is why the send failures below do not write a bare `{err}`.
+    ///
+    /// The three sites that report a response whose *body* could not be read format through
+    /// `without_url()` as well. That is **defence in depth rather than a fix**: a body-read failure
+    /// from the pinned `reqwest` reads `error decoding response body` and carries no URL, which
+    /// `a_body_that_cannot_be_read_is_reported_without_the_url_either` pins as a dependency contract.
     fn unreachable(&self, err: reqwest::Error) -> HxError {
         HxError::Connector {
             connector: self.id.to_string(),
@@ -305,7 +310,7 @@ impl TelegramConnector {
         let text = response
             .text()
             .await
-            .unwrap_or_else(|err| format!("<unreadable body: {err}>"));
+            .unwrap_or_else(|err| format!("<unreadable body: {}>", err.without_url()));
         if !status.is_success() {
             return Err(HxError::Connector {
                 connector: self.id.to_string(),
@@ -415,7 +420,7 @@ impl Connector for TelegramConnector {
         let text = response
             .text()
             .await
-            .unwrap_or_else(|err| format!("<unreadable body: {err}>"));
+            .unwrap_or_else(|err| format!("<unreadable body: {}>", err.without_url()));
         if !status.is_success() {
             // Fail closed: a failed send is an error, not a silent drop.
             return Err(HxError::Connector {
@@ -449,7 +454,7 @@ impl Connector for TelegramConnector {
         let text = response
             .text()
             .await
-            .unwrap_or_else(|err| format!("<unreadable body: {err}>"));
+            .unwrap_or_else(|err| format!("<unreadable body: {}>", err.without_url()));
         if !status.is_success() {
             return Err(HxError::Connector {
                 connector: self.id.to_string(),

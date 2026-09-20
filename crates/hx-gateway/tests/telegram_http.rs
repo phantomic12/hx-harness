@@ -477,6 +477,89 @@ async fn a_token_never_reaches_an_error_message_not_even_the_url() {
     );
 }
 
+/// A stub that answers with a status but **promises more body than it sends**, then closes.
+///
+/// The send succeeds and the *body* read fails, which is the other `reqwest::Error` on this path. A
+/// non-success status is what makes it observable: that is the branch which interpolates the body
+/// straight into the message.
+async fn truncated_stub(status: u16) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a free port");
+    let addr = listener.local_addr().expect("a bound address");
+
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("a connection");
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = socket.read(&mut chunk).await.expect("a readable socket");
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if find(&buffer, b"\r\n\r\n").is_some() {
+                break;
+            }
+        }
+
+        let head = format!(
+            "HTTP/1.1 {status} {}\r\ncontent-type: application/json\r\ncontent-length: 4096\r\n\
+             connection: close\r\n\r\n",
+            reason(status)
+        );
+        socket
+            .write_all(head.as_bytes())
+            .await
+            .expect("the headers");
+        // A few bytes of a body that claimed to be 4096 long, and then the socket goes away.
+        socket
+            .write_all(b"{\"ok\": true")
+            .await
+            .expect("a partial body");
+        socket.flush().await.ok();
+    });
+
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn a_body_that_cannot_be_read_is_reported_without_the_url_either() {
+    // The other `reqwest::Error` on this path: the request succeeds and the *body* fails. On a failure
+    // status the body is interpolated straight into the message, and for `ask` that message is the
+    // reason a run denies with — so it must not carry the URL the credential lives in.
+    //
+    // **This test cannot fail against the pinned `reqwest`, and saying so is the point.** The error it
+    // produces is `error decoding response body`, which carries no URL: reverting the `without_url()`
+    // call on this path and re-running still passes. So it is kept as a guard on a *dependency*
+    // contract — `reqwest` upgrades are routine here, and if a version ever attaches the request URL to
+    // a body error, this is the test that says so — and not as evidence that a leak was fixed, because
+    // on this path there was none.
+    let base = truncated_stub(500).await;
+    let con = connector(&base);
+
+    let err = con
+        .deliver(
+            &token(),
+            &Target::Conversation(Conversation::telegram("1", "")),
+            "hello",
+        )
+        .await
+        .expect_err("the body never arrives");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("<unreadable body"),
+        "the failure must be reported as an unreadable body: {message}"
+    );
+    assert!(
+        !message.contains(token().expose()),
+        "the bot token must never appear in an error: {message}"
+    );
+    assert!(
+        !message.contains(&base),
+        "not the URL either, because the URL is where the token lives: {message}"
+    );
+}
+
 #[tokio::test]
 async fn a_receive_with_a_missing_ok_flag_fails_closed() {
     // A body that is not signed `ok: true` is not "no messages" — it is an error, so a malformed

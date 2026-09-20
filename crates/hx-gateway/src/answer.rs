@@ -44,8 +44,12 @@ pub struct AnswerAuthority;
 
 impl AnswerAuthority {
     /// May a channel whose ceiling is `ceiling` answer a request whose risk is `risk`?
+    ///
+    /// The comparison itself lives on [`RiskClass::covers`], so this and
+    /// [`ApprovalQueue::answer`](hx_agent::ApprovalQueue::answer) — the point every answer is applied
+    /// at — cannot come to disagree about what a ceiling means.
     pub fn may_answer(ceiling: RiskClass, risk: RiskClass) -> bool {
-        risk <= ceiling
+        ceiling.covers(risk)
     }
 
     /// Turn a raw platform answer into the option's label, *only if* that answer is within the ceiling.

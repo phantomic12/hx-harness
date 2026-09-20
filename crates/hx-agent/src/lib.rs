@@ -37,4 +37,4 @@ pub use approver::{
 pub use compact::{compact_at, Compacted};
 pub use context::{ContextBuilder, ContextFacts};
 pub use model::{DirectProvider, ModelCall, RouterModel};
-pub use queue::{ApprovalQueue, RefusingApprover, SessionScopedQueue};
+pub use queue::{AnswerResult, ApprovalQueue, RefusingApprover, SessionScopedQueue};

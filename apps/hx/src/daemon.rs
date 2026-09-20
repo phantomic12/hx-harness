@@ -206,6 +206,12 @@ pub async fn approvals(
 ///
 /// `by` travels into the audit trail, which is why it is a parameter rather than a constant here: an
 /// answer typed in a terminal and a tap on a phone must not look alike afterwards.
+///
+/// The **ceiling** is sent explicitly because the route requires it and has no default. This command
+/// *is* the terminal, so its ceiling is the full ladder ([`RiskClass::Privileged`]) — the same
+/// authority a keypress at a prompt has always had, which is why the value is here and not a flag: a
+/// surface that is not the terminal declares its own, and a client that declares nothing is refused
+/// rather than quietly granted everything.
 pub async fn approve(
     client: &reqwest::Client,
     base: &str,
@@ -216,7 +222,11 @@ pub async fn approve(
     let (_, reply) = send(
         client
             .post(format!("{base}/v1/approvals/{id}"))
-            .json(&serde_json::json!({ "option": option, "by": by })),
+            .json(&serde_json::json!({
+                "option": option,
+                "ceiling": hx_core::approval::RiskClass::Privileged.label(),
+                "by": by,
+            })),
         base,
         "answering an approval",
     )

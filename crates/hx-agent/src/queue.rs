@@ -9,12 +9,23 @@
 //!
 //! This lives in `hx-agent` rather than in the HTTP layer on purpose: a Telegram button, a TUI
 //! dialog and a `POST /v1/approvals/{id}` are the same decision, and the queue is the thing they
-//! share. The transport only decides how the question is *rendered* and who is allowed to answer.
+//! share. The transport only decides how the question is *rendered*.
+//!
+//! ## The ceiling is enforced here, not by the transport
+//!
+//! Because the queue is what every transport applies an answer *through*, it is also the one place a
+//! **ceiling** can be enforced without a transport being able to forget. [`ApprovalQueue::answer`]
+//! takes the answering surface's [`RiskClass`] ceiling as a required argument — there is no default
+//! and `RiskClass` has none — and judges it against the risk of the request the queue is *holding*, at
+//! the moment the answer arrives. A `Destructive` request answered from a surface whose ceiling is
+//! `Mutate` is refused and the question **stays open**, so the run's own timeout still denies it: a
+//! refusal is never converted into a yes. The comparison is [`RiskClass::covers`], the same one
+//! `hx-gateway`'s `AnswerAuthority` uses, so the channel path and the local path cannot disagree.
 
 use crate::approver::{ApprovalDecision, Approver};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use hx_core::approval::{ActionRequest, ApprovalOption, ApprovalRequest};
+use hx_core::approval::{ActionRequest, ApprovalOption, ApprovalRequest, RiskClass};
 #[cfg(test)]
 use hx_core::approval::{ApprovalPolicy, ApprovalSession, Verdict};
 use hx_core::ids::ApprovalId;
@@ -40,6 +51,24 @@ struct Waiting {
     /// The session and call this belongs to, for a client that filters by them.
     session: Option<String>,
     reply: Option<oneshot::Sender<(ApprovalOption, String)>>,
+}
+
+/// What came of an attempt to answer a waiting question.
+///
+/// Three outcomes rather than a `bool` because a caller has to be able to tell "there was nothing to
+/// answer" from "you are not allowed to answer that", and the two need different things said about
+/// them: the first is a 404 and a client's own bug, the second is a **refusal** that must be visible
+/// to whoever tried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnswerResult {
+    /// The answer reached the run that was waiting on it.
+    Answered,
+    /// Nothing was waiting under that id — a second answer to the same question, or an answer that
+    /// raced the timeout.
+    Unknown,
+    /// The answer was above the ceiling of the surface that gave it. The question **stays open**, so
+    /// the run's own timeout still denies it: a refusal here is never converted into a yes.
+    AboveCeiling { risk: RiskClass, ceiling: RiskClass },
 }
 
 impl ApprovalQueue {
@@ -75,22 +104,50 @@ impl ApprovalQueue {
         self.pending.lock().expect("approval queue").len()
     }
 
-    /// Answer one waiting request. `false` means nothing was waiting under that id — a second answer
-    /// to the same question, or an answer that raced the timeout.
+    /// Answer one waiting request, judged against the answering surface's **ceiling**.
+    ///
+    /// `ceiling` is the strongest risk the surface that is answering may authorise, and it is a
+    /// required argument with no default — the one way to make "an answer nobody was allowed to give"
+    /// impossible to arrive by omission. The check is against the risk of the request the queue is
+    /// *holding* (the queue's own record of what was asked, not anything the caller supplied), and it
+    /// is made **now**, when the answer arrives, because a surface's ceiling can be lowered while a
+    /// question is up.
+    ///
+    /// An answer above the ceiling is [`AnswerResult::AboveCeiling`] and the question **stays open**:
+    /// the run keeps waiting and its own timeout denies it. A refusal here is never converted into a
+    /// yes, and never into a silent no that looks like nobody replied.
     ///
     /// `by` is who answered, and it travels into the audit trail: "the agent did it" is not an answer
     /// anyone can act on later, and a tap on a phone is a weaker signal than a keystroke in a
     /// terminal, so the two must not look alike afterwards.
-    pub fn answer(&self, id: &str, option: ApprovalOption, by: &str) -> bool {
+    pub fn answer(
+        &self,
+        id: &str,
+        option: ApprovalOption,
+        by: &str,
+        ceiling: RiskClass,
+    ) -> AnswerResult {
         let mut pending = self.pending.lock().expect("approval queue");
+        let Some(risk) = pending.get(id).map(|waiting| waiting.request.risk) else {
+            return AnswerResult::Unknown;
+        };
+        if !ceiling.covers(risk) {
+            // Left in the queue on purpose: the run is still waiting, and its timeout is what ends
+            // this — with a denial that says nobody answered, which is the truth.
+            return AnswerResult::AboveCeiling { risk, ceiling };
+        }
+
         let Some(waiting) = pending.remove(id) else {
-            return false;
+            return AnswerResult::Unknown;
         };
         match waiting.reply {
             // The run may have timed out between the removal and the send; that is not an error, it
             // is a race the timeout is allowed to win.
-            Some(reply) => reply.send((option, by.to_string())).is_ok(),
-            None => false,
+            Some(reply) => match reply.send((option, by.to_string())) {
+                Ok(()) => AnswerResult::Answered,
+                Err(_) => AnswerResult::Unknown,
+            },
+            None => AnswerResult::Unknown,
         }
     }
 }
@@ -274,7 +331,18 @@ mod tests {
         }
         let id = seen.expect("the request is visible while the run waits");
         assert_eq!(queue.len(), 1);
-        assert!(queue.answer(id.as_str(), ApprovalOption::AllowForChat, "phone"));
+        assert_eq!(
+            queue.answer(
+                id.as_str(),
+                ApprovalOption::AllowForChat,
+                "phone",
+                // `git push` is `External`, so the ceiling has to reach that far for this test to be
+                // about the answer arriving rather than about the ceiling. The ceiling itself is the
+                // subject of `an_answer_above_the_ceiling_is_refused_and_the_question_stays_open`.
+                RiskClass::Privileged
+            ),
+            AnswerResult::Answered
+        );
 
         let decision = asking.await.expect("the run resumes");
         assert_eq!(decision.option, ApprovalOption::AllowForChat);
@@ -313,9 +381,138 @@ mod tests {
     async fn answering_twice_is_not_a_second_decision() {
         let queue = queue();
         let request = request_for("ls");
-        assert!(!queue.answer("nope", ApprovalOption::AllowOnce, "someone"));
-        assert!(!queue.answer(request.id.as_str(), ApprovalOption::AllowOnce, "someone"));
-        assert!(!queue.answer(request.id.as_str(), ApprovalOption::AllowOnce, "someone"));
+        // A terminal: the full ladder, so the ceiling is not what is being tested here.
+        let terminal = RiskClass::Privileged;
+        assert_eq!(
+            queue.answer("nope", ApprovalOption::AllowOnce, "someone", terminal),
+            AnswerResult::Unknown
+        );
+        assert_eq!(
+            queue.answer(
+                request.id.as_str(),
+                ApprovalOption::AllowOnce,
+                "someone",
+                terminal
+            ),
+            AnswerResult::Unknown,
+            "nothing was waiting, so nothing was answered"
+        );
+        assert_eq!(
+            queue.answer(
+                request.id.as_str(),
+                ApprovalOption::AllowOnce,
+                "someone",
+                terminal
+            ),
+            AnswerResult::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_above_the_ceiling_is_refused_and_the_question_stays_open() {
+        // The rule the docs make ("a chat bridge can never authorise a destructive action") has to be
+        // true of the path an answer is actually applied through, not only of a pure function. The
+        // queue is that path: every transport — a Telegram tap, the HTTP route — answers here.
+        let queue = ApprovalQueue::new(Duration::from_millis(150));
+        let request = request_for("rm -rf ./build");
+        assert_eq!(
+            request.risk,
+            RiskClass::Destructive,
+            "the fixture has to be the risk the test is about"
+        );
+        let action = ActionRequest::shell("rm -rf ./build");
+
+        let asking = {
+            let queue = Arc::clone(&queue);
+            let request = request.clone();
+            let action = action.clone();
+            tokio::spawn(async move { queue.decide(&request, &action).await })
+        };
+
+        let mut id = None;
+        for _ in 0..50 {
+            if let Some(first) = queue.outstanding(None).first() {
+                id = Some(first.id.clone());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let id = id.expect("the question is visible while the run waits");
+
+        // A chat bridge's ceiling: `Mutate`. The tap is refused, and the refusal names both numbers so
+        // a reader can see *why*.
+        assert_eq!(
+            queue.answer(
+                id.as_str(),
+                ApprovalOption::AllowOnce,
+                "telegram:4242 via main-tg",
+                RiskClass::Mutate
+            ),
+            AnswerResult::AboveCeiling {
+                risk: RiskClass::Destructive,
+                ceiling: RiskClass::Mutate,
+            }
+        );
+
+        // Crucially, the question is still open — the refusal did not become a decision. Silence then
+        // ends it the way silence always does, with a denial.
+        assert_eq!(
+            queue.len(),
+            1,
+            "the refused answer did not consume the question"
+        );
+        let decision = asking.await.expect("the run finishes");
+        assert_eq!(decision.option, ApprovalOption::Deny);
+        assert!(
+            decision.by.contains("nobody answered"),
+            "a refused answer must not be recorded as a decision: {}",
+            decision.by
+        );
+        assert!(
+            !decision.by.contains("telegram"),
+            "the phone's refusal is not an attribution: {}",
+            decision.by
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_at_the_ceiling_is_accepted() {
+        // The other half, so the check cannot pass by refusing everything: a `Mutate` question from a
+        // `Mutate` ceiling is exactly the case the chat bridge exists for.
+        let queue = queue();
+        let request = request_for("git add -A");
+        assert_eq!(request.risk, RiskClass::Mutate, "the fixture");
+        let action = ActionRequest::shell("git add -A");
+
+        let asking = {
+            let queue = Arc::clone(&queue);
+            let request = request.clone();
+            let action = action.clone();
+            tokio::spawn(async move { queue.decide(&request, &action).await })
+        };
+        let mut id = None;
+        for _ in 0..50 {
+            if let Some(first) = queue.outstanding(None).first() {
+                id = Some(first.id.clone());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let id = id.expect("the question is visible");
+
+        assert_eq!(
+            queue.answer(
+                id.as_str(),
+                ApprovalOption::AllowOnce,
+                "telegram:4242 via main-tg",
+                RiskClass::Mutate
+            ),
+            AnswerResult::Answered
+        );
+        assert_eq!(
+            asking.await.expect("the run resumes").option,
+            ApprovalOption::AllowOnce
+        );
     }
 
     #[tokio::test]
@@ -346,7 +543,16 @@ mod tests {
             "another session must not see it"
         );
 
-        queue.answer(id.as_str(), ApprovalOption::AllowOnce, "tui");
+        // `git push` is `External`, so the terminal's ladder is what answers it.
+        assert_eq!(
+            queue.answer(
+                id.as_str(),
+                ApprovalOption::AllowOnce,
+                "tui",
+                RiskClass::Privileged
+            ),
+            AnswerResult::Answered
+        );
         assert!(asking.await.expect("resumes").option == ApprovalOption::AllowOnce);
     }
 }

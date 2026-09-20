@@ -4,16 +4,17 @@ Status: 2026-09-16. Companion to `ROADMAP.md` (which tracks features); this file
 
 ```console
 $ cargo test --workspace
-904 tests, 0 failed                       # includes 20 chat API tests and 4 database reopen tests
-47 ignored                               # live: Docker, SSH, search, a real model
+992 tests, 0 failed                       # includes 24 chat API tests and 4 database reopen tests
+52 ignored                                # live: Docker, SSH, pty, WinRM, search, a real model
 
-# The 24 that need a real server, run by `.github/workflows/integration.yml`
-# and `.github/workflows/canary.yml`:
+# The `#[ignore]`d suites, split by whether CI runs them. `.github/workflows/integration.yml` runs
+# docker_live, chat_live, ssh_live, pty_live and terminal_remote_live; `canary.yml` runs search_live
+# — 32 of the 52. The rest are recorded manual runs, not something CI repeats:
 $ cargo test -p hx-sandbox --test docker_live -- --ignored --test-threads=1
 9 passed; 0 failed                       # a real Docker daemon, with gVisor installed
 $ HX_OPENAI_TEST_BASE_URL=… HX_OPENAI_TEST_MODEL=… HX_OPENAI_TEST_KEY=… \
   cargo test -p hx-provider --test openai_live -- --ignored --test-threads=1
-4 passed; 0 failed                       # a real model, through a real gateway
+4 passed; 0 failed                       # a real model, through a real gateway — manual, not CI
 $ cargo test -p hx-remote --test ssh_live -- --ignored --test-threads=1
 5 passed; 0 failed                       # a real sshd, real key auth
 $ cargo test -p hx-server --test chat_live -- --ignored --test-threads=1
@@ -24,9 +25,17 @@ $ HX_SEARXNG_URL=http://127.0.0.1:8888 HX_SEARCH_EXPECT_RESULTS=searxng \
 ```
 
 The counts matter in both directions. A green `cargo test` alone still means **the logic is right**;
-those 24 ignored tests are the ones that have reached another process, and the only ones here that
-could catch a protocol mistake. They now run in CI, which is the difference between "verified once"
-and "stays verified".
+the `#[ignore]`d tests are the ones that have reached another process, and the only ones here that could
+catch a protocol mistake.
+
+**A caveat on the live numbers above, stated rather than glossed.** Those pass counts are *recorded
+observations* from an earlier revision on a host that had Docker, an sshd and a SearXNG. This
+environment has none of them, so the `cargo test --workspace` line is the only figure in this block that
+one machine can reproduce. Two of the recorded counts no longer line up with the files: `docker_live`
+now carries 12 `#[ignore]`d tests and `ssh_live` 7, against the 9 and 5 recorded here — and
+`openai_live` is run by no workflow, despite the sentence that used to sit in this spot saying all of
+them ran in CI. Re-running those suites is what would make them trustworthy again; until then they are
+the weakest claims in this file.
 
 ## The audit chain (hermetic + verified on a real database)
 
@@ -107,6 +116,101 @@ neither was:
    `TelegramConnector::unreachable` now formats the error through `reqwest`'s own `without_url()`, and
    `a_token_never_reaches_an_error_message_not_even_the_url` asserts the message carries neither the
    token nor the URL. Not even the URL, because the URL is where the token lives.
+
+   **One caveat, measured rather than assumed.** The *send* path is the one that leaked, and it is the
+   one the test above exercises. The three sites that report a response whose **body** could not be read
+   are now formatted through `without_url()` too, and
+   `a_body_that_cannot_be_read_is_reported_without_the_url_either` pins them — but that test **cannot
+   fail against the pinned `reqwest`**: reverting the call and re-running still passes, because the
+   error it produces is `error decoding response body` and carries no URL. It is a guard on a
+   dependency contract (`reqwest` upgrades are routine here), not evidence of a fixed leak. The honest
+   summary is: the send path leaked and is fixed; the body path was never broken.
+
+## The approval loop-back (M5)
+
+The gap the milestone was actually missing: a tap was parsed and judged and then dropped, so pressing
+"Approve" on a phone did nothing. `crates/hx-gateway/src/bridge.rs` is the join, and
+`crates/hx-gateway/tests/approval_loopback.rs` is the evidence. **Everything in that file is the real
+object**: a real `AgentLoop` gated by the real `ApprovalQueue`, the real `TelegramConnector` over a real
+TCP socket, the real bridge. The only scripted piece is the model, which has nothing to do with the
+question being asked.
+
+| Test | The property |
+|---|---|
+| `a_tap_on_the_posted_button_resumes_the_run_and_is_attributed_to_its_channel` | The prompt goes out with one button per option, each carrying the request id; the tap comes back through `receive`; the run resumes with the decision a terminal would have produced, `by: telegram:4242 via main-tg` |
+| `the_running_agents_audit_trail_names_the_channel_the_answer_came_from` | The same, through a real run: `AgentEvent::ApprovalResolved { by: "telegram:4242 via main-tg", approved: false }`, and the refusal the model is told about names the channel too |
+| `a_destructive_tap_is_refused_on_the_running_path` | A `Destructive` question answered "allow once" from a `Mutate` channel is refused at the moment of the answer; the run keeps waiting and ends in the timeout denial, not in the phone's yes |
+| `a_stale_or_replayed_tap_does_not_answer_a_different_question` | Two questions pending in one chat: the replay is refused, a forged id is refused, an unoffered answer is refused, a tap from another chat is refused, and the other question is untouched throughout |
+| `a_permanent_grant_is_not_made_from_a_phone` | `always allow this` is refused from a channel; `allow for this chat` is honoured |
+| `a_channel_that_cannot_be_reached_denies_the_run_instead_of_leaving_it_waiting` | The run is denied immediately with the reason, nothing is parked in the queue, and the bot token appears in no decision |
+
+The stub is what makes the tap honest, and it is worth being explicit about: it does not hand the
+connector a callback the test invented. It **reads the button the connector actually posted** and presses
+that, so what is exercised is the wire round trip (`callback_data` out, `callback_query` back). A tap
+whose id did not survive that trip could not answer anything, and the test would fail.
+
+Unit tests in `bridge.rs` cover the parts that touch no platform: the attribution string (including the
+thread, because one chat with two threads is two conversations), that a chat message is not an answer,
+that an answer through an unconfigured channel is refused, that a question above the channel's ceiling is
+never *posted* (the connector panics if asked, so reaching the platform would be a failure rather than a
+silent pass), and that a question cannot be asked through a channel that does not exist.
+
+**Design decision, and its cost.** `hx-gateway` now depends on `hx-agent`. The bridge applies an answer
+to the queue a run is parked on, and the queue is the loop's; the dependency never runs the other way,
+and the alternatives (a newtype in `hxd`, a new crate for one `impl`) would move the channel-policy check
+away from `AnswerAuthority`, where it is tested. The cost is that building `hx-gateway` alone now builds
+the tool and remote stack with it. Recorded in `ARCHITECTURE.md` §1 next to the crate graph.
+
+**What this does not cover**, so the claim stays the size of the evidence: no live Telegram server (there
+is still no `#[ignore]`d live suite, so the connector's contract is asserted against a stub rather than
+against Telegram itself), no daemon-side receive loop (nothing in `hxd` drives `Connector::receive` yet),
+and no `approval.ask_via` config key — a channel's ceiling and conversation are constructed in code
+today. None of those is a property of the loop-back; they are the plumbing that will call it.
+
+## The ceiling, on the path an answer is actually applied through
+
+The loop-back above shipped with a ceiling that a reviewer could read as satisfied and that was not.
+`AnswerAuthority::judge` had **no caller outside its own unit tests on `main`**, and
+`Inbound::ApprovalAnswer` had none at all: the rule "a chat bridge can never authorise a `Destructive`
+action" was true of a pure function nothing on the running system called. The one live answer path —
+`POST /v1/approvals/{id}` → `ApprovalQueue::answer(id, option, by)` — had **no risk check and no ceiling
+of any kind**, and its `by` field is documented as the place a phone tap's attribution lands. The bridge
+enforced the ceiling; nothing that existed on `main` did.
+
+The fix puts the ceiling where every transport meets: `ApprovalQueue::answer` now takes the answering
+surface's ceiling as a **required** argument and judges it against the risk of the request the queue is
+*holding*, at the moment the answer arrives. The comparison is `RiskClass::covers` — one implementation,
+shared with `AnswerAuthority::may_answer` — and `RiskClass` has no `Default`, so there is no constructor,
+no deserializer and no omitted argument that yields a permissive ceiling. An answer above the ceiling
+leaves the question **open**, so the run still ends in its own timeout denial: a refusal is never
+converted into a yes.
+
+| Test | The property |
+|---|---|
+| `an_answer_above_the_ceiling_is_refused_and_the_question_stays_open` (`hx-agent`, unit) | A `Destructive` request answered with a `Mutate` ceiling is `AboveCeiling { risk, ceiling }`; the question is still in the queue; the run ends with `nobody answered`, and the phone's attribution is in no decision |
+| `an_answer_at_the_ceiling_is_accepted` (`hx-agent`, unit) | The other half, so the check cannot pass by refusing everything: a `Mutate` question from a `Mutate` ceiling is answered |
+| `a_destructive_answer_from_a_chat_channel_is_refused_over_http` (`hx-server/tests/api.rs`) | A **real run**, parked on a real question, answered over the real route with a chat channel's ceiling: **403**, the question is still listed, and the run records a refusal rather than running the `rm -rf` |
+| `an_answer_that_declares_no_ceiling_is_refused_rather_than_granted_everything` (`hx-server/tests/api.rs`) | A body with no `ceiling` is a client error and answers nothing — omission is a rejection, not an unbounded grant |
+| `a_ceiling_covers_everything_at_or_below_it_and_nothing_above` (`hx-core`, unit) | The ladder itself (`Read < Mutate < External < Destructive < Privileged`), so a reordering of the enum is a failing test rather than a silent widening of what a phone may authorise |
+
+**Every check below was run against the broken code first.** With the ceiling check disabled in
+`ApprovalQueue::answer`, the queue test fails `Answered` vs `AboveCeiling { Destructive, Mutate }` and the
+HTTP test fails `200` vs `403` — the route's own body in the failure output is
+`{"answered":"apr_…","by":"telegram:4242 via main-tg"}`, which is the defect stated as a passing response.
+With the ceiling field made optional (`#[serde(default = …)]` returning `Privileged`) the no-ceiling test
+fails on `200 OK`. Both breaks were reverted; the restored tree is the one the counts above describe.
+
+**The design decision, and it is written down rather than picked silently.** The route requires the
+*client* to declare its ceiling. That is deliberate and its limits are real: this API has **no
+authentication**, so the daemon cannot tell one local client from another, and per-channel ceilings are
+not configured yet (`approval.ask_via` is still a roadmap line). Given "declare it" or "have no check",
+declaring it is what makes the check present, explicit and testable. The two clients that use this route
+are the owner's own machine-local ones — the `hx` CLI (`by: "terminal"`) and the daemon's embedded web
+page (`by: "web"`) — and both declare the terminal's full ladder, which is the authority a keypress at
+the prompt has always had. A **channel** does not answer through this route at all: it answers through
+`ApprovalBridge`, whose ceiling comes from the deployment rather than from the channel. The residual hole
+is honest and named: with `--bind 0.0.0.0` and no auth on the API, a declared ceiling is not a defence
+against a remote caller, because the API's own authentication is the missing control, not the ceiling.
 
 ## The four tiers
 
@@ -689,13 +793,15 @@ all until `AgentConfig::default()` was fixed.
 ## Running the suite
 
 ```bash
-cargo test --workspace          # 695 tests, 0 failed, 24 ignored live tests
-cargo test -p hx-store          # 42 — migrations, the transcript, and 4 that reopen the file
-cargo test -p hx-agent          # 42 — the loop's gate, the routed model call, the transcript sink
-cargo test -p hx-tools          # 91 — requirements, bounded output, the two-phase registry, workspace resolution, the trash
-cargo test -p hx-server         # 30 — routes, and the loop end to end over HTTP
-cargo test -p hx-sandbox        # 62 — includes the ladder and the rollback invariants
-cargo test -p hx-remote         # 90 — includes known_hosts parsing and the host key policy
+cargo test --workspace          # 992 tests, 0 failed, 52 ignored live tests
+cargo test -p hx-store          # 58 — migrations, the transcript, and 4 that reopen the file
+cargo test -p hx-agent          # 60 — the loop's gate, the routed model call, the transcript sink
+cargo test -p hx-tools          # 102 — requirements, bounded output, the two-phase registry, workspace resolution, the trash
+cargo test -p hx-server         # 114 — routes, and the loop end to end over HTTP
+cargo test -p hx-sandbox        # 88 — includes the ladder and the rollback invariants
+cargo test -p hx-remote         # 132 — includes known_hosts parsing and the host key policy
+cargo test -p hx-gateway        # 44 — the connector trait, the Telegram wire, and the approval loop-back
+cargo test -p hx-core           # 120 — classification, the policy ladder, and the ceiling comparison
 cargo build --workspace         # clean: 0 warnings, 0 deprecations
 cargo clippy --workspace        # clean
 
