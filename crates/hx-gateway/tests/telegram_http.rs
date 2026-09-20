@@ -339,11 +339,14 @@ async fn an_approval_is_posted_with_one_button_per_option() {
     let keyboard = &captured.body["reply_markup"]["inline_keyboard"];
     assert_eq!(keyboard.as_array().unwrap().len(), 2, "one row per option");
     assert_eq!(keyboard[0][0]["text"], "allow once");
-    assert_eq!(keyboard[0][0]["callback_data"], "allow once");
+    // The button carries the id of the question it answers, not just the label: a tap that arrives
+    // after the run has moved on must be refusable, and only the id makes that possible.
+    assert_eq!(keyboard[0][0]["callback_data"], "apr_1:allow once");
     assert_eq!(keyboard[1][0]["text"], "deny");
+    assert_eq!(keyboard[1][0]["callback_data"], "apr_1:deny");
 
-    // The prompt was posted; the connector itself never claims an answer (the wiring of the human's tap
-    // back into a running agent is a separate step, see ROADMAP.md).
+    // The prompt was posted; the connector itself never claims an answer (the tap arrives later
+    // through `receive` and is joined to the waiting run by `hx_gateway::bridge`).
     assert_eq!(verdict, AnswerVerdict::NoAnswer);
 }
 
@@ -420,6 +423,141 @@ async fn a_409_conflict_is_a_hard_failure() {
         .await
         .expect_err("409 is a failure");
     assert!(err.to_string().contains("409"), "{err}");
+}
+
+#[tokio::test]
+async fn a_token_never_reaches_an_error_message_not_even_the_url() {
+    // Telegram authenticates with `/bot<token>/` in the *path*, so a URL in an error message is the
+    // bot token in an error message — and `reqwest::Error`'s own `Display` includes the URL it
+    // failed on. A failed `ask` now denies a run with this reason attached, which means the token
+    // would land in the transcript and the audit trail. The error must describe the failure without
+    // the URL that names the credential.
+    let con = connector("http://127.0.0.1:1");
+    let request = hx_core::approval::ApprovalRequest {
+        id: hx_core::ids::ApprovalId::from_raw("apr_1"),
+        tool: "shell".into(),
+        summary: "git push".into(),
+        risk: hx_core::approval::RiskClass::External,
+        reason: "t".into(),
+        key: "k".into(),
+        options: vec![
+            hx_core::approval::ApprovalOption::AllowOnce,
+            hx_core::approval::ApprovalOption::Deny,
+        ],
+        targets: vec![],
+        reversible: false,
+        undo: None,
+        confined: Default::default(),
+        default_on_timeout: hx_core::approval::ApprovalOption::Deny,
+        timeout_secs: None,
+    };
+    let task = hx_gateway::types::ApprovalTask {
+        request,
+        ceiling: hx_core::approval::RiskClass::Mutate,
+    };
+
+    let err = con
+        .ask(
+            &token(),
+            &Target::Conversation(Conversation::telegram("1", "")),
+            &task,
+        )
+        .await
+        .expect_err("nothing is listening");
+
+    let message = err.to_string();
+    assert!(message.contains("could not reach"), "{message}");
+    assert!(
+        !message.contains(token().expose()),
+        "the bot token must never appear in an error: {message}"
+    );
+    assert!(
+        !message.contains("127.0.0.1:1"),
+        "not even the URL, because the URL is where the token lives: {message}"
+    );
+}
+
+/// A stub that answers with a status but **promises more body than it sends**, then closes.
+///
+/// The send succeeds and the *body* read fails, which is the other `reqwest::Error` on this path. A
+/// non-success status is what makes it observable: that is the branch which interpolates the body
+/// straight into the message.
+async fn truncated_stub(status: u16) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a free port");
+    let addr = listener.local_addr().expect("a bound address");
+
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("a connection");
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = socket.read(&mut chunk).await.expect("a readable socket");
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if find(&buffer, b"\r\n\r\n").is_some() {
+                break;
+            }
+        }
+
+        let head = format!(
+            "HTTP/1.1 {status} {}\r\ncontent-type: application/json\r\ncontent-length: 4096\r\n\
+             connection: close\r\n\r\n",
+            reason(status)
+        );
+        socket
+            .write_all(head.as_bytes())
+            .await
+            .expect("the headers");
+        // A few bytes of a body that claimed to be 4096 long, and then the socket goes away.
+        socket
+            .write_all(b"{\"ok\": true")
+            .await
+            .expect("a partial body");
+        socket.flush().await.ok();
+    });
+
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn a_body_that_cannot_be_read_is_reported_without_the_url_either() {
+    // The other `reqwest::Error` on this path: the request succeeds and the *body* fails. On a failure
+    // status the body is interpolated straight into the message, and for `ask` that message is the
+    // reason a run denies with — so it must not carry the URL the credential lives in.
+    //
+    // **This test cannot fail against the pinned `reqwest`, and saying so is the point.** The error it
+    // produces is `error decoding response body`, which carries no URL: reverting the `without_url()`
+    // call on this path and re-running still passes. So it is kept as a guard on a *dependency*
+    // contract — `reqwest` upgrades are routine here, and if a version ever attaches the request URL to
+    // a body error, this is the test that says so — and not as evidence that a leak was fixed, because
+    // on this path there was none.
+    let base = truncated_stub(500).await;
+    let con = connector(&base);
+
+    let err = con
+        .deliver(
+            &token(),
+            &Target::Conversation(Conversation::telegram("1", "")),
+            "hello",
+        )
+        .await
+        .expect_err("the body never arrives");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("<unreadable body"),
+        "the failure must be reported as an unreadable body: {message}"
+    );
+    assert!(
+        !message.contains(token().expose()),
+        "the bot token must never appear in an error: {message}"
+    );
+    assert!(
+        !message.contains(&base),
+        "not the URL either, because the URL is where the token lives: {message}"
+    );
 }
 
 #[tokio::test]

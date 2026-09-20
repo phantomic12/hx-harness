@@ -629,12 +629,20 @@ function renderApproval(req) {
   return el;
 }
 
+// The ceiling this page answers with.
+//
+// The route requires one and has no default, so the client has to say what it is. This page is served
+// by the daemon itself and is the owner's own surface on the owner's own machine — the same authority
+// as a keystroke at the prompt — so it declares the full ladder. A surface that is not the terminal
+// (a chat bridge, say) must declare its own, and the queue refuses an answer above it.
+const CEILING = "privileged";
+
 async function answerApproval(id, option) {
   try {
     const res = await fetch(`${API}/v1/approvals/${encodeURIComponent(id)}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ option, by: "web" }),
+      body: JSON.stringify({ option, ceiling: CEILING, by: "web" }),
     });
     if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
     // Answered immediately rather than waiting for the next poll, so the card does not sit there

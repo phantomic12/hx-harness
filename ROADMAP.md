@@ -299,14 +299,41 @@ CIDR or raw IP — is still refused, with a reason naming the way out.*
 - ✅ **`Connector` trait + session router (`platform/chat/thread` → `SessionKey`)** — the trait a
   connector must actually do (receive, deliver, ask), the deterministic `SessionKey` fold, and the
   per-channel **answer authority** (a chat bridge ceiling can never authorise `Destructive`) plus the
-  delivery/home-channel policy. All in `crates/hx-gateway`.
+  delivery/home-channel policy. The policy lives in `crates/hx-gateway`; where it is *enforced* is the
+  ceiling bullet below.
 - ✅ **Telegram (long-poll) connector** — the first real connector, proving the trait over the actual Bot
   API with a hermetic HTTP stub (`tests/telegram_http.rs`). Long-poll with advancing offset, message
   and button-callback parsing, and the `Coalescer` primitive for streaming via coalesced `editMessageText`.
-  **Not landed here:** the webhook half, the full *streaming* loop (the coalescing primitive and the
-  `editMessageText` request shape are tested, but a live token-stream → edit driver is not), and wiring a
-  button answer back into a running agent's approval queue (the prompt is posted and the answer *authority*
-  enforced, but the end-to-end loop is a next step).
+  **Not landed here:** the webhook half and the full *streaming* loop (the coalescing primitive and the
+  `editMessageText` request shape are tested, but a live token-stream → edit driver is not).
+- ✅ **A button answer resumes the run** (`crates/hx-gateway/src/bridge.rs`) — the gap this milestone
+  was actually missing. A question posted to a channel is waited on under its conversation; a tap comes
+  back through the long-poll as `Inbound::ApprovalAnswer`, is matched to **the question its button
+  names** (never "whatever is pending"), judged against the channel's ceiling *at the moment of the
+  answer*, applied to the same `ApprovalQueue` a run is parked on, and attributed in the audit trail to
+  the channel it came from (`telegram:4242 via main-tg`, where a terminal keypress says `user`). Fail
+  closed twice over: a question that could not be posted is denied immediately instead of leaving a run
+  waiting for a prompt nobody can see, and silence still ends in the queue's timeout denial. Proven by
+  `tests/approval_loopback.rs`, which drives a real `AgentLoop` over the real connector and a real
+  socket. What is *not* here: the daemon-side receive loop that drives `Connector::receive` per channel,
+  and `approval.ask_via` as a config key — the bridge and its channel ceilings are constructed in code
+  today (see `docs/approvals.md` §8).
+- ✅ **The ceiling is enforced where the answer is applied** (`crates/hx-agent/src/queue.rs`) — closing a
+  hole that read as closed. `AnswerAuthority::judge` had **no caller outside its own unit tests**, and the
+  one live answer path (`POST /v1/approvals/{id}` → `ApprovalQueue::answer`) had no risk check at all, so
+  "a chat bridge can never authorise a `Destructive` action" was true of a pure function and false of the
+  running system. `ApprovalQueue::answer` now takes the answering surface's ceiling as a **required**
+  argument — no default, and `RiskClass` has none — and judges it against the risk of the request the
+  queue is holding, at the moment the answer arrives; the comparison is `RiskClass::covers`, one
+  implementation shared with `AnswerAuthority`. An answer above the ceiling leaves the question open, so
+  the run still ends in its own timeout denial. The HTTP route requires its callers to declare their
+  ceiling for the same reason, and a body that declares none is a rejection rather than a grant. Proven by
+  `a_destructive_answer_from_a_chat_channel_is_refused_over_http` and
+  `an_answer_that_declares_no_ceiling_is_refused_rather_than_granted_everything` (`hx-server/tests/api.rs`),
+  both of which were run against the broken code and went red first. **What this is not:** an
+  authentication story. The route has no auth, so a *declared* ceiling is only as trustworthy as the
+  caller, and with `--bind 0.0.0.0` it is no defence against a remote caller — that control is the API's
+  authentication, still absent (see `docs/approvals.md` §9).
 - **Discord** (twilight gateway, slash commands, threads, Message Content Intent) — **deferred by
   decision, no urgency**: Telegram proves the trait today, and a second platform shape is worth building
   when a need for it appears rather than speculatively.
@@ -314,8 +341,8 @@ CIDR or raw IP — is still refused, with a reason naming the way out.*
   background output goes to the pinned home channel; with no home channel it is **refused, not dropped**.
 - Then, **all deferred by decision**: Slack (Socket Mode) → Matrix → Email → WhatsApp Cloud → Signal →
   SMS. None is urgent, and the order is the intended sequence rather than a queue anyone is working.
-- **The next real step in this milestone is the two gaps named above** — wiring a button answer back into
-  a running agent's approval queue, and the live streaming driver — not another platform.
+- **The next real step in this milestone is the daemon wiring that turns
+  `approval.ask_via` into a running receive loop**, not another platform.
 
 - **Approvals out of band, as a configurable option** — a request can be answered from anywhere the
   user already is, not only from the surface that started the run: `approval.ask_via` naming one or

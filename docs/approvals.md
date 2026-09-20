@@ -286,3 +286,99 @@ Two bugs were found by the test that asserts a **run**, not a policy, refuses `r
    unit test that called the policy directly never saw it; the API test that ran a command did.
 2. `deployment_default()` set the flag but did not resolve it, so the one constructor an embedder calls
    without a config file promised a floor it did not carry.
+
+## 8. Answering from a phone
+
+§1–§7 are about what may be *asked*. This is the other end: an answer arriving from somewhere the user
+already is, rather than from the surface that started the run. `crates/hx-gateway/src/bridge.rs` is the
+whole of it — the loop-back that was missing until it existed, because a button tap was parsed, judged
+against the ceiling, and then dropped on the floor.
+
+The question a run asks and the answer a phone gives are joined by **the id the button carries**. The
+button's `callback_data` is `apr_<id>:<label>`, and an answer is looked up by that id *within the
+conversation it was asked in* — never "whatever is pending in this chat now". Everything else follows
+from that one rule:
+
+- **A stale tap is not an answer.** A button from a question that has been answered, timed out, or asked
+  by a different surface matches nothing and is refused.
+- **A replayed tap is not a second decision.** The queue is the atomic authority: the first answer wins,
+  and the second finds nothing to answer.
+- **A tap in the wrong chat is not an answer.** A question asked through a channel is waited on under its
+  conversation as the queue scope, so an answer arriving anywhere else has nothing to match — which is why
+  the scope matters and why a channel-asked question must be waited on this way rather than under a
+  session id.
+- **An answer the question never offered is not an instruction.** The label has to be one this request
+  rendered, checked against `ApprovalRequest::options` and not against the platform's word for it.
+
+**The ceiling is judged when the answer arrives**, not only when the question was posted. A channel's
+ceiling can be lowered while a question is up, and a queue can hold a question another surface asked, so
+"may this channel authorise this risk" is a question about the moment of the answer. A `Destructive`
+request answered "allow once" from a `Mutate` channel is refused, the run keeps waiting, and the wait ends
+in the timeout denial — never in the yes the phone offered.
+
+Two more rules belong to this layer rather than to the ceiling:
+
+- **A channel may answer for this instance or for this chat, never permanently.** `allow once` and
+  `allow for this chat` (chat-scoped, expiring) are honoured; `always allow this` is refused, because
+  that option writes a grant into the deployment's configuration and a phone tap must not be the thing
+  that writes it. The option list is the request's to offer — which surfaces may *exercise* a permanent
+  promotion is this layer's decision.
+- **A channel that is down fails closed, twice over.** A question that could not be posted is denied
+  immediately, with the reason, rather than left for a timeout that would look to the model like a human
+  who did not reply; and a question that was posted and never answered ends in the queue's timeout
+  denial. A channel failure is never converted into an answer, and a transport error is reported without
+  the URL it failed on — the URL is where the bot token lives.
+
+**Attribution.** The decision reaches the loop as `ApprovalDecision { by }` and the loop records it in
+`AgentEvent::ApprovalResolved.by`, so the trail says `telegram:4242 via main-tg` where a terminal
+keypress says `user`. This is security-relevant rather than cosmetic: "who approved this" is the question
+an incident review asks, and `user` does not answer it when the user was on a phone in another country.
+
+**What is deliberately not here.** No receive loop (the bridge turns *one* inbound event into an outcome;
+driving `Connector::receive` per channel is the daemon's job, one loop rather than one per waiting run),
+no delivery of a "denied" acknowledgement back to the chat, and no configuration surface yet:
+`approval.ask_via` is still a roadmap line rather than a key, so a channel's ceiling and conversation are
+constructed in code. The properties above do not depend on that plumbing, which is why it can be added
+without touching them.
+
+## 9. The ceiling belongs where the answer is applied, not where it is parsed
+
+§8 is the join. This is the part of it that was **wrong in a way that read as right**, and the reason the
+ceiling now lives in `ApprovalQueue` rather than only in the gateway.
+
+`AnswerAuthority::judge` is the rule — "a chat bridge may approve a `Mutate` and must never approve a
+`Destructive`" — and for a while it was true of a pure function that **nothing on the running system
+called**. The bridge called it. The only live answer path did not:
+`POST /v1/approvals/{id}` → `ApprovalQueue::answer(id, option, by)` applied whatever option arrived,
+against whatever question was waiting, with no risk and no ceiling anywhere in the call. A unit test of
+`judge` passed the whole time. That is the shape of bug this file exists to catch: a rule that is
+*correct* and *not wired*, where the test that proves it correct is the test that hides it.
+
+So the ceiling moved to the choke point. Every transport applies an answer through
+`ApprovalQueue::answer`, so that is where the check goes, and it takes the answering surface's ceiling as
+a **required** argument:
+
+- **Required, with no default, and `RiskClass` has no `Default`.** There is no constructor, no
+  deserializer and no omitted argument that yields a permissive ceiling. A route body that does not say
+  what it is gets a rejection, not everything — `an_answer_that_declares_no_ceiling_is_refused_rather_than_granted_everything`.
+- **Judged at answer time, against the queue's own record.** The risk compared is the one on the request
+  the queue is *holding*, not anything the caller supplied, and the comparison happens when the answer
+  arrives — so a ceiling lowered while a question is up is the one that applies.
+- **One implementation.** The comparison is `RiskClass::covers`; `AnswerAuthority::may_answer` delegates
+  to it. A channel's ceiling and the local path's ceiling cannot come to mean different things.
+- **A refusal is not a decision.** An answer above the ceiling leaves the question **open**. The run keeps
+  waiting and its own timeout denies it, so the outcome is "nobody answered" — never the phone's yes, and
+  never a silent no that looks like the operator said no.
+
+**Why the route asks the caller to declare a ceiling, and what that is worth.** This API has **no
+authentication**: the daemon cannot tell one local client from another, and per-channel ceilings are not
+configured yet (`approval.ask_via` is still a roadmap line). The honest choice was between "declare it"
+and "have no check", and declaring it is what makes the check present, explicit and testable. The clients
+that use this route are the owner's own machine-local ones — the `hx` CLI (`by: "terminal"`) and the
+daemon's embedded web page (`by: "web"`) — and both declare the terminal's full ladder, which is the
+authority a keypress at the prompt has always had. A **channel** does not answer through this route at
+all: it answers through `ApprovalBridge`, where the ceiling comes from the deployment rather than from the
+channel, which is the distinction that makes the channel's ceiling a control rather than a
+self-declaration. The residual hole is named rather than papered over: with `--bind 0.0.0.0` and no auth,
+a declared ceiling is not a defence against a remote caller. The missing control there is the API's
+authentication, not the ceiling.

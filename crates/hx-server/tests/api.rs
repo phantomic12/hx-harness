@@ -966,11 +966,13 @@ async fn a_run_that_needs_a_human_waits_and_runs_once_answered() {
     }
     let id = waiting.expect("the question must be visible over HTTP while the run waits");
 
-    // Answer it, attributed to the surface that answered.
+    // Answer it, attributed to the surface that answered. The ceiling is the terminal's, because this
+    // test client stands in for the owner's own machine-local surface — and the route has no default
+    // to fall back on, so a body that declares nothing is refused rather than granted everything.
     let (status, body) = post(
         Arc::clone(&h.state),
         &format!("/v1/approvals/{id}"),
-        serde_json::json!({ "option": "once", "by": "test-client" }),
+        serde_json::json!({ "option": "once", "ceiling": "privileged", "by": "test-client" }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -998,10 +1000,134 @@ async fn a_run_that_needs_a_human_waits_and_runs_once_answered() {
     let (status, body) = post(
         Arc::clone(&h.state),
         &format!("/v1/approvals/{id}"),
-        serde_json::json!({ "option": "once" }),
+        serde_json::json!({ "option": "once", "ceiling": "privileged" }),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+#[tokio::test]
+async fn a_destructive_answer_from_a_chat_channel_is_refused_over_http() {
+    // "A chat bridge can never authorise a destructive action" was true of a pure function that
+    // nothing on the running path called. This is the running path: a real run parked on a real
+    // question, answered over the real route, with a chat channel's ceiling — and the answer is
+    // refused, the question stays open, and the run ends in its own timeout denial rather than in the
+    // phone's yes.
+    let h = harness(vec![]).await;
+    h.model.push(Ok(calls(vec![(
+        "c1",
+        "shell",
+        serde_json::json!({ "cmd": "rm -rf ./build" }),
+    )])));
+    h.model.push(Ok(answer("understood")));
+
+    let state = Arc::clone(&h.state);
+    let body = h.body("clean the build directory");
+    let running = tokio::spawn(async move { chat(&state, body).await });
+
+    let mut waiting = None;
+    for _ in 0..200 {
+        let (status, list) = get(Arc::clone(&h.state), "/v1/approvals").await;
+        assert_eq!(status, StatusCode::OK);
+        if let Some(first) = list.as_array().and_then(|list| list.first()) {
+            assert_eq!(
+                first["risk"], "destructive",
+                "the fixture has to be the risk the test is about: {first}"
+            );
+            waiting = Some(first["id"].as_str().expect("an id").to_string());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let id = waiting.expect("the question must be visible over HTTP while the run waits");
+
+    // A chat bridge's ceiling. 403 and not 404 — the question is real, the answer is not the
+    // answering surface's to give — and not the 200 that used to mean "authorised".
+    let (status, body) = post(
+        Arc::clone(&h.state),
+        &format!("/v1/approvals/{id}"),
+        serde_json::json!({
+            "option": "once",
+            "ceiling": "mutate",
+            "by": "telegram:4242 via main-tg",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cannot be answered"),
+        "the refusal must say what it refused: {body}"
+    );
+
+    // The question is still open: the refused answer did not consume it.
+    let (_, list) = get(Arc::clone(&h.state), "/v1/approvals").await;
+    assert_eq!(
+        list.as_array().map(Vec::len),
+        Some(1),
+        "a refused answer leaves the question waiting: {list}"
+    );
+
+    let (status, reply) = running.await.expect("the run task finishes");
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(
+        reply["refusals"], 1,
+        "the destructive call was refused, not run: {reply}"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_that_declares_no_ceiling_is_refused_rather_than_granted_everything() {
+    // There is no permissive default anywhere in the chain: not on `RiskClass`, not on the body, not
+    // in a constructor. A client that says nothing about what it is does not get everything — it gets
+    // a rejection, and the question it tried to answer is untouched.
+    let h = harness(vec![]).await;
+    h.model.push(Ok(calls(vec![(
+        "c1",
+        "shell",
+        serde_json::json!({ "cmd": "git push" }),
+    )])));
+    h.model.push(Ok(answer("understood")));
+
+    let state = Arc::clone(&h.state);
+    let body = h.body("push my work");
+    let running = tokio::spawn(async move { chat(&state, body).await });
+
+    let mut waiting = None;
+    for _ in 0..200 {
+        let (status, list) = get(Arc::clone(&h.state), "/v1/approvals").await;
+        assert_eq!(status, StatusCode::OK);
+        if let Some(first) = list.as_array().and_then(|list| list.first()) {
+            waiting = Some(first["id"].as_str().expect("an id").to_string());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let id = waiting.expect("the question is visible while the run waits");
+
+    let (status, body) = post(
+        Arc::clone(&h.state),
+        &format!("/v1/approvals/{id}"),
+        serde_json::json!({ "option": "once", "by": "someone" }),
+    )
+    .await;
+    assert!(
+        status.is_client_error(),
+        "a body that declares no ceiling is a rejection, not an unbounded grant: {status} {body}"
+    );
+
+    let (_, list) = get(Arc::clone(&h.state), "/v1/approvals").await;
+    assert_eq!(
+        list.as_array().map(Vec::len),
+        Some(1),
+        "the rejected body answered nothing: {list}"
+    );
+
+    // Let the run reach its own timeout denial so the task does not outlive the test.
+    let (_, reply) = running.await.expect("the run task finishes");
+    assert_eq!(reply["refusals"], 1, "silence is still a denial: {reply}");
 }
 
 #[tokio::test]
