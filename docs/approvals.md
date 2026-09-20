@@ -16,16 +16,25 @@ Prior art worth copying, and what each teaches:
 
 ## 1. The ladder
 
-`RiskClass` already orders these (`Read < Mutate < External < Destructive < Privileged`). Here is what
-each tier should mean to an allowlist, least risky first:
+`RiskClass` already orders these (`Read < Mutate < External < ThirdParty < Destructive < Privileged`).
+Here is what each tier should mean to an allowlist, least risky first:
 
 | # | Tier | Examples | Default | May a "don't ask again" outlive the chat? |
 |---|---|---|---|---|
 | 0 | **Observe** — `Read` | `ls`, `cat`, `rg`, `git status/log/diff/show`, `wc`, `file`, `du`, `docker ps`, web search, reading any file the token covers | **allowed** at every level above `paranoid`, no prompt | N/A — nothing to remember |
 | 1 | **Local, reversible** — `Mutate` | `write_file`/`patch` **inside the workspace**, `mkdir`, `touch`, `cp` within the workspace, `git add/commit`, formatters, `npm install` into the project | **allowed** at `balanced` and above | Yes, but by **command signature** — `git add` covers `git add -A`, `git commit` never covers `git commit --amend` on pushed history |
 | 2 | **Leaves the machine** — `External` | `curl`, `ssh`, `scp`, `git push`, `npm publish`, any fetch whose destination is not local | **asks** at `balanced`; allowed at `trusting` | **No.** Chat-scoped at most: `git push origin main` is not `git push origin main --tags` |
-| 3 | **Cannot be undone** — `Destructive` | `rm -rf`, `truncate`, `dd`, `git reset --hard`, `git clean -f`, `git branch -D`, force-push, `DROP TABLE`, `curl … \| sh` | **asks** at every level including `trusting`; allowed at `yolo` only as a *once* answer | **Never.** A once-answer, and the request must name its targets (see §3) |
-| 4 | **Privilege or credentials** — `Privileged` | `sudo …` (escalates whatever it wraps), `mount`, `chmod -R` on system paths, `systemctl`, `gpg`/`op`/`bw`, reading a vault file | **asks** at every level; `ceiling: destructive` (recommended default) means even `yolo` asks | **Never**, under any policy |
+| 3 | **Runs code the operator did not write** — `ThirdParty` | a stdio MCP server's tools (`npx -y @modelcontextprotocol/server-filesystem …`), `uvx`, a downloaded installer, any binary fetched from a registry | **asks** at `balanced`; allowed at `trusting` | **No.** Chat-scoped at most: approving one tool of one server is not approving the next `npx` package the config gains |
+| 4 | **Cannot be undone** — `Destructive` | `rm -rf`, `truncate`, `dd`, `git reset --hard`, `git clean -f`, `git branch -D`, force-push, `DROP TABLE`, `curl … \| sh` | **asks** at every level including `trusting`; allowed at `yolo` only as a *once* answer | **Never.** A once-answer, and the request must name its targets (see §3) |
+| 5 | **Privilege or credentials** — `Privileged` | `sudo …` (escalates whatever it wraps), `mount`, `chmod -R` on system paths, `systemctl`, `gpg`/`op`/`bw`, reading a vault file | **asks** at every level; `ceiling: destructive` (recommended default) means even `yolo` asks | **Never**, under any policy |
+
+Why tier 3 is its own rung and not part of tier 1: `npm install` *writes* files whose contents the
+registry chose, but it does not run them; an MCP server's `tools/call` runs the program, and its blast
+radius is whatever that program decides it is. It sits **above** `External` rather than directly above
+`Mutate` because `balanced`'s threshold *is* `External` — a rung between 1 and 2 would be auto-allowed
+by the default level, which is the gap this tier was added to close. It is not a *refusal* class: MCP
+is the feature it exists for, so a deployment that wants it silent raises the level to `trusting` or
+writes an `allow` rule, and both are visible decisions.
 
 Two absolutes fall out of the table, and they are the ones worth defending:
 

@@ -78,11 +78,16 @@ pub fn render_policy(
     // What the level does with each risk class, in the order the classifier escalates. The ceiling is
     // folded in here rather than listed separately, because what a person needs to know is not that a
     // ceiling exists but *which calls still get asked about* because of it.
+    //
+    // `third_party` is in the list because it is a class a call can be given — a stdio MCP server's
+    // tools, most concretely — and a report that omitted it would be answering the question for five
+    // of the six things that can happen to a call.
     let threshold = policy.level.threshold();
     for risk in [
         RiskClass::Read,
         RiskClass::Mutate,
         RiskClass::External,
+        RiskClass::ThirdParty,
         RiskClass::Destructive,
         RiskClass::Privileged,
     ] {
@@ -890,6 +895,11 @@ hosts:
         assert!(rendered.contains("read         runs free"), "{rendered}");
         assert!(rendered.contains("mutate       runs free"), "{rendered}");
         assert!(rendered.contains("external     asks"), "{rendered}");
+        assert!(
+            rendered.contains("third_party  asks"),
+            "a stdio MCP call is `third_party`, and the report has to say `balanced` asks about it \
+             — the gap this class was added to close: {rendered}"
+        );
         assert!(rendered.contains("destructive  asks"), "{rendered}");
         assert!(rendered.contains("privileged   asks"), "{rendered}");
     }
@@ -1081,7 +1091,14 @@ agent:
             rendered.contains("no refusal — a delete of a pattern or a variable"),
             "the absent floor is the important part: {rendered}"
         );
-        for risk in ["read", "mutate", "external", "destructive", "privileged"] {
+        for risk in [
+            "read",
+            "mutate",
+            "external",
+            "third_party",
+            "destructive",
+            "privileged",
+        ] {
             assert!(
                 rendered.contains(&format!("{risk:<12} runs free")),
                 "`yolo` with no ceiling asks about nothing, and the report has to say so for every \

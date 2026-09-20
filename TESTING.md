@@ -197,7 +197,7 @@ converted into a yes.
 | `an_answer_at_the_ceiling_is_accepted` (`hx-agent`, unit) | The other half, so the check cannot pass by refusing everything: a `Mutate` question from a `Mutate` ceiling is answered |
 | `a_destructive_answer_from_a_chat_channel_is_refused_over_http` (`hx-server/tests/api.rs`) | A **real run**, parked on a real question, answered over the real route with a chat channel's ceiling: **403**, the question is still listed, and the run records a refusal rather than running the `rm -rf` |
 | `an_answer_that_declares_no_ceiling_is_refused_rather_than_granted_everything` (`hx-server/tests/api.rs`) | A body with no `ceiling` is a client error and answers nothing — omission is a rejection, not an unbounded grant |
-| `a_ceiling_covers_everything_at_or_below_it_and_nothing_above` (`hx-core`, unit) | The ladder itself (`Read < Mutate < External < Destructive < Privileged`), so a reordering of the enum is a failing test rather than a silent widening of what a phone may authorise |
+| `a_ceiling_covers_everything_at_or_below_it_and_nothing_above` (`hx-core`, unit) | The ladder itself (`Read < Mutate < External < ThirdParty < Destructive < Privileged`), so a reordering of the enum is a failing test rather than a silent widening of what a phone may authorise — with `ThirdParty`'s two neighbours asserted by name, because "after `Mutate`, before `Destructive`" is satisfied by two slots and only one of them makes `balanced` ask |
 
 **Every check below was run against the broken code first.** With the ceiling check disabled in
 `ApprovalQueue::answer`, the queue test fails `Answered` vs `AboveCeiling { Destructive, Mutate }` and the
@@ -217,6 +217,43 @@ the prompt has always had. A **channel** does not answer through this route at a
 `ApprovalBridge`, whose ceiling comes from the deployment rather than from the channel. The residual hole
 is honest and named: with `--bind 0.0.0.0` and no auth on the API, a declared ceiling is not a defence
 against a remote caller, because the API's own authentication is the missing control, not the ceiling.
+
+## The third-party class (M6)
+
+A stdio MCP call used to be `Resource::Process` → `risk_of` → `Mutate`, which the default `balanced`
+level **auto-allows** — so an operator who expected a prompt for a stdio server's tools never got one.
+The fix is a new `RiskClass::ThirdParty` ("runs a program the operator did not write") plus a fact the
+requirement carries: `hx-mcp`'s `requirement_for` still reports `Resource::Process` + `Action::Execute`
+(a child process is exactly what that capability means, and a new resource variant would have been a new
+*grant* to hold — an approval preference smuggled in as an authority change) and additionally sets
+`Requirement::third_party`, which `hx-agent`'s table is the single place to turn into a class.
+
+The class is ordered **above `External`**, not merely above `Mutate`: `balanced`'s threshold *is*
+`External`, so a rung between `Mutate` and `External` would have been auto-allowed by the very level the
+class exists to make prompt. "After `Mutate`, before `Destructive`" is satisfied by both slots, and only
+one of them works — which is why the ordering is asserted against `External` by name.
+
+The property is held across three crates and no single one can see the others, so it is pinned where
+each fact lives and the composition is stated in each test:
+
+| Test | The property |
+|---|---|
+| `a_stdio_server_is_reported_as_running_a_program_the_operator_did_not_write` (`hx-mcp`, unit) | `requirement_for` sets `third_party` for a stdio server and **not** for a streamable-HTTP endpoint, while the resource stays `Process` — the capability check is unchanged |
+| `the_table_puts_a_third_party_process_above_the_default_level` (`hx-agent`, unit) | `risk_of` maps `Process` + the flag to `ThirdParty`, and the *same* requirement without the flag stays `Mutate` — the control, because a table that called every process third-party would prompt on `ls` |
+| `a_third_party_process_is_asked_about_at_the_default_level` (`hx-agent`, unit) | Through the real `ApprovalSession`: `balanced` asks, `trusting` allows — the class is a prompt, not a refusal |
+| `every_other_resource_keeps_the_class_it_had` (`hx-agent`, unit) | The guard sits in front of a match that predates it, so the regression it catches is a reordering or a widened guard changing the answer for eight unrelated resources |
+| `the_default_level_asks_about_a_third_party_binary_and_a_higher_one_does_not` (`hx-core`, unit) | The level question itself, via `AutonomyLevel::auto_allows` and the session |
+| `the_level_threshold_and_the_session_agree_on_every_level_and_class` (`hx-core`, unit) | `auto_allows` is compared against `decide` over the **whole** cross-product (5 levels × 6 classes) rather than spot-checked — two implementations of one rule is how a table ends up describing a policy the session does not have |
+| `the_shipped_floor_neither_swallows_a_third_party_call_nor_waves_it_through` (`hx-core`, unit) | Adding a class changed neither half of the floor: `rm -rf /` and `rm -rf $BUILD_DIR` are still refused, `rm -rf /tmp/hx-build` is still answerable, and a `ThirdParty` call under the deployment policy is **asked** about |
+| `the_policy_report_says_what_this_level_does_with_each_risk_class` (`hx`, unit) | The `hx policy` renderer lists all six classes, so `third_party  asks` is visible at `balanced` — a report that answered for five of six would be decoration |
+
+**The honest limit.** The flag is set for *every* stdio MCP server, including one whose `command:`
+names a script the operator wrote themselves. `hx` reads a config and sees a command; it cannot tell
+`npx -y @scope/pkg` from `./my-server`, and the fail-closed answer is to ask once rather than to guess.
+The narrower fix — a per-server opt-out meaning "I wrote this" — is named in `ROADMAP.md` and
+deliberately **not** added: it would be a config flag whose only effect is to silence a prompt, which
+is the shape a safety switch should not have. An operator who wants one server silent writes
+`allow`/`ask` rules against its tool namespace, which is per-tool and visible.
 
 ## The browser pool (M6)
 
@@ -653,7 +690,6 @@ the failure is silent:
 | `hxd` reaper loop, `axum::serve` under load | Manual only | Low |
 | **`hx-mcp` against a real third-party MCP server** | No real server can be assumed on a build machine, so the live canary (`tests/mcp_live.rs`) is `#[ignore]`d and reads its target from `HX_MCP_LIVE_COMMAND`/`HX_MCP_LIVE_URL`. It has **never been run**. Everything the suite verifies about the wire is verified against a double this crate also wrote — real JSON-RPC over a real pipe, but our reading of the protocol at both ends. The one test in that file that needs no environment (`a_live_target_that_is_not_there_is_a_readable_failure_and_not_a_hang`) *does* run, and covers the commonest real state: a misconfigured server | Medium — a `rmcp` behaviour we have misread would pass every test here and fail on first contact. `rmcp` is the mitigation, and it is not under test |
 | **`hx-mcp` children inherit the daemon's environment** | Deliberate, and therefore never exercised as a failure. `env:` in a server's config *adds* variables; it does not replace the inherited set, because `npx` resolves Node through `PATH` and servers read `HOME` for caches. A secret exported into the daemon's shell therefore reaches every child it spawns. See `src/stdio.rs`'s module doc | Medium — the exposure is real but bounded: `hx`'s own credentials come from the vault, resolved per call, and are never placed in an environment |
-| **A stdio MCP call is auto-allowed at the default autonomy level** | Not a bug in `hx-mcp`: `requirement_for` reports `Resource::Process` + `Action::Execute` for a stdio server, which is what a child process *is*, and `hx-agent`'s risk table maps `Process` to `RiskClass::Mutate`, which the default `balanced` level allows without asking. Changing it in `hx-mcp` would mean reporting a resource that means something else | Medium — an operator who expects a prompt for a stdio server's tools does not get one. The workaround is an `ask` rule on the tool name, which the approval engine already supports (see ROADMAP) |
 
 ### Tier D — absent
 

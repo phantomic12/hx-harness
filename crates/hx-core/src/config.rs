@@ -1585,7 +1585,7 @@ mcp_servers:
             "names the fix: {message}"
         );
 
-        let mut http = McpServerConfig::streamable_http("ftp://mcp.example.com");
+        let http = McpServerConfig::streamable_http("ftp://mcp.example.com");
         let message = http.validate("gh").unwrap_err().to_string();
         assert!(message.contains("absolute http(s) URL"), "{message}");
     }
