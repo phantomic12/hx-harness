@@ -260,6 +260,17 @@ runners cannot reach, so there is deliberately **no** integration.yml job for it
 skips would add noise without evidence. An operator runs it by hand against a reachable host, as above.
 No container or workspace is left on the host when it finishes.
 
+**The same SSH transport against Darwin** (`macos-ssh` job in `integration.yml`)
+
+The table above is a Linux sshd. A GitHub-hosted `macos-latest` runner is a real Apple-signed macOS
+VM, so the same `ssh_live` suite points at it — a real `sshd` started on the runner's loopback
+with `systemsetup -setremotelogin on`, the runner's own key authorized, `HX_SSH_TEST_OS=macos`
+so the capability probe must report `Darwin` → `RemoteOs::MacOs` (see `expected_os` in `ssh_live.rs`).
+Since macOS ships an SFTP server, `has_sftp` is measured `Some(true)` and the file round-trips and
+rename go through the subsystem, not the shelled-out fallback. The run records `sw_vers` and `uname -a`
+in the job summary and uploads the live log as the `ssh-live-darwin` artifact, so the evidence is
+readable without re-running.
+
 **Search, against a real SearXNG and the real internet** (`crates/hx-search/tests/search_live.rs`)
 
 A SearXNG in Docker, JSON output enabled, the canary pointed at it: **10 fused results for one

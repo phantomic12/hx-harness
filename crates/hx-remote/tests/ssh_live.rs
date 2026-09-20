@@ -30,6 +30,26 @@ struct Target {
     key: Secret,
 }
 
+/// The OS the operator declares the far end to be, from the environment.
+///
+/// `SshHost` probes `uname -s` over the wire and reports what it measures
+/// (`RemoteOs::MacOs` for `Darwin`, `RemoteOs::Linux` for `Linux`, …). A test that pins one of
+/// those values to a fixed answer can only run against one platform, so the live suite declares the
+/// expected OS the same way it declares the host and the key. The default is `Linux`, so the
+/// existing Linux runs keep working unchanged; a macOS job sets `HX_SSH_TEST_OS=macos` and the
+/// probe is then required to report a Darwin host. That is still a measurement asserted against a
+/// declaration — the environment cannot change what the far side's `uname` says — not a test that
+/// agrees with itself.
+fn expected_os() -> RemoteOs {
+    match std::env::var("HX_SSH_TEST_OS").ok().as_deref() {
+        Some("macos") | Some("darwin") => RemoteOs::MacOs,
+        Some("linux") => RemoteOs::Linux,
+        // Anything unset or unrecognised keeps the historical behaviour: the original live suite was
+        // written against a Linux host.
+        _ => RemoteOs::Linux,
+    }
+}
+
 /// The machine to test against, or `None` when the environment does not name one.
 fn target() -> Option<Target> {
     let host = std::env::var("HX_SSH_TEST_HOST").ok()?;
@@ -99,8 +119,10 @@ async fn connects_probes_the_far_end_and_records_its_key() {
     .expect("connect to the test host");
 
     // Capabilities come from probing the far end over the connection that was just made, so this
-    // is evidence the exec path works, not evidence of a `uname` we ran locally.
-    assert_eq!(host.caps().os, RemoteOs::Linux, "{:?}", host.caps());
+    // is evidence the exec path works, not evidence of a `uname` we ran locally. The OS is
+    // compared against `HX_SSH_TEST_OS` (see `expected_os`): the probe must report the
+    // platform the operator declared the host to be, whether that is Linux or Darwin.
+    assert_eq!(host.caps().os, expected_os(), "{:?}", host.caps());
     assert!(host.caps().home_dir.is_some(), "{:?}", host.caps());
     assert!(host.describe().starts_with("ssh "), "{}", host.describe());
 

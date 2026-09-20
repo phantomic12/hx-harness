@@ -190,3 +190,104 @@ jobs:
         # The end-to-end one: HTTP create, policy gate, SSH, the pty, the pump, the broadcast and the
         # WebSocket, with every layer real. It found a deadlock the unit tests could not see.
         run: cargo test -p hx-server --test terminal_remote_live --locked -- --ignored --test-threads=1 --nocapture
+
+  # The same SSH transport, but against a real Apple-signed macOS VM. The `ssh` job above runs on an
+  # Ubuntu host; that proves `SshHost` against Linux. A GitHub-hosted `macos-latest` runner *is* a
+  # Darwin machine, so it is the cheapest way to prove the transport against macOS without Apple hardware
+  # (the `dockur/macos` I had needed a 10-30 minute interactive GUI install before sshd even
+  # exists; a runner boots in about a minute). The job runs its own SSH server on loopback and points
+  # the live suite at it — no third-party service, nothing exposed to the internet.
+  #
+  # This is deliberately ONE job, kept short: macOS runner minutes cost 10x Linux minutes on some plans,
+  # so nothing else in this file is extended to macOS.
+  macos-ssh:
+    name: ssh transport against Darwin (real macOS runner)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Record the target so the evidence names it
+        # A reviewer has to be able to tell this drove a real Mac from the log alone. `sw_vers`
+        # prints the exact macOS release; `uname -a` the kernel. Both go into the job summary so
+        # they survive without re-running the job.
+        run: |
+          {
+            echo "### Target: a real macOS runner"
+            echo ""
+            echo "\`\`\`"
+            sw_vers
+            uname -a
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          sw_vers
+          uname -a
+
+      - name: Enable Remote Login, authorize a key, and confirm the server listens
+        # The runner has sudo, and its own user is the one we SSH back into, so the whole setup is
+        # loopback on the runner. `systemsetup -setremotelogin on` starts `sshd` on port 22 and
+        # lets the current user authenticate with a public key once it is in `authorized_keys`.
+        run: |
+          set -euxo pipefail
+          sudo systemsetup -setremotelogin on
+          ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"
+          cat "$HOME/.ssh/id_ed25519.pub" >> "$HOME/.ssh/authorized_keys"
+          chmod 700 "$HOME/.ssh"
+          chmod 600 "$HOME/.ssh/authorized_keys"
+          # Assert readiness here instead of inside a test: "connection refused" from a test looks like
+          # a transport bug, when it is really a server that never came up.
+          for attempt in $(seq 1 20); do
+            if (exec 3<>/dev/tcp/127.0.0.1/22) 2>/dev/null; then
+              echo "sshd is listening on 22"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::sshd did not answer on 22"
+          exit 1
+
+      - name: Configure the test target
+        # The runner's own user, discovered rather than assumed: a hardcoded name breaks the moment the
+        # runner image changes, and the failure would look like an authentication bug. `HX_SSH_TEST_OS`
+        # tells the live suite the probe must report Darwin rather than Linux (see `expected_os` in ssh_live.rs).
+        run: |
+          {
+            echo "HX_SSH_TEST_HOST=127.0.0.1"
+            echo "HX_SSH_TEST_PORT=22"
+            echo "HX_SSH_TEST_USER=$(id -un)"
+            echo "HX_SSH_TEST_KEY=$HOME/.ssh/id_ed25519"
+            echo "HX_SSH_TEST_OS=macos"
+          } >> "$GITHUB_ENV"
+
+      - name: The transport against Darwin
+        # `set -o pipefail` so a failing test fails the job even though we tee the output to a log.
+        # The log is what gets uploaded, so the full live output is readable after the run.
+        run: |
+          set -o pipefail
+          cargo test -p hx-remote --test ssh_live --locked -- --ignored --test-threads=1 --nocapture 2>&1 | tee /tmp/ssh-live-darwin.log
+
+      - name: Summarize the evidence
+        if: always()
+        run: |
+          {
+            echo "### SSH + SFTP against Darwin: result"
+            echo ""
+            echo "- macOS: \`$(sw_vers -productVersion)\`"
+            echo "- kernel: \`$(uname -r)\`"
+            echo "- suite: \`cargo test -p hx-remote --test ssh_live -- --ignored --test-threads=1 --nocapture\` against \`127.0.0.1:22\`"
+            echo "- full live output is in the **ssh-live-darwin** artifact"
+            echo ""
+            echo "Test pass/fail lines from the run:"
+            echo ""
+            echo "\`\`\`"
+            grep -E '^(test result|running|test tests::|test [a-z_]+ \.\.\.)' /tmp/ssh-live-darwin.log || true
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the live output so it can be read without re-running
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssh-live-darwin
+          path: /tmp/ssh-live-darwin.log
