@@ -674,6 +674,15 @@ HX_SSH_TEST_HOST=<host> HX_SSH_TEST_USER=<user> HX_SSH_TEST_KEY=~/.ssh/id_ed2551
 
 ## Summary
 
+- **`hx-gateway` is no longer a placeholder.** It carries the `Connector` trait, the deterministic
+  session router, and the Telegram connector, proven by **30 tests** (21 unit + 9 over a hermetic HTTP
+  stub): the same thread always maps to one `SessionKey` and two threads on one platform do not collide;
+  a chat bridge's answer ceiling never authorises `Destructive`; background output with no home channel is
+  refused not dropped; and the Telegram connector's real `getUpdates`/`sendMessage` URLs, in-path token,
+  advancing offset, message/button parsing and fail-closed error paths are exercised over a real TCP stub — no
+  bot token (a generated fixture), no network. What is *not* covered: a live Telegram server (no `#[ignore]`d
+  live suite yet) and the full streaming loop (only the `Coalescer` primitive and the `editMessageText`
+  shape).
 - **11 crates with logic**: unit-tested at the level of pure functions and in-process lifecycles.
 - **3 crates**: empty. The green suite does not cover them.
 - **The store's resume path is tested across a real process boundary, in the only way a test can**:
