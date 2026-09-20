@@ -286,10 +286,22 @@ near host. Closing that is what the last item needs.*
 - ✅ **Telegram (long-poll) connector** — the first real connector, proving the trait over the actual Bot
   API with a hermetic HTTP stub (`tests/telegram_http.rs`). Long-poll with advancing offset, message
   and button-callback parsing, and the `Coalescer` primitive for streaming via coalesced `editMessageText`.
-  **Not landed here:** the webhook half, the full *streaming* loop (the coalescing primitive and the
-  `editMessageText` request shape are tested, but a live token-stream → edit driver is not), and wiring a
-  button answer back into a running agent's approval queue (the prompt is posted and the answer *authority*
-  enforced, but the end-to-end loop is a next step).
+- ✅ **Telegram streaming via coalesced `editMessageText`** — the driver that wires a model's token
+  stream to those calls (`crates/hx-gateway/src/telegram_stream.rs`): the first chunk writes immediately
+  (an empty screen while a model thinks is the worst of both worlds), later writes wait for a unit of new
+  characters, and **at most one write is ever in flight and the token loop never awaits it** — a flush
+  arriving during a write is *skipped*, not queued, because the newer text is carried by the next write.
+  The Bot API's real edge cases are handled rather than hoped about: `429`/`retry_after` is honoured
+  inside the write's own task (capped, and bounded in attempts, so a throttled channel cannot wedge a
+  run), `message is not modified` is a benign no-op that does **not** spend the retry budget, and the
+  final write always lands — an edit if the message is still there, otherwise a fresh `sendMessage` — so
+  a failure mid-answer cannot leave the user with nothing. **The honest trade-off:** coalescing bounds
+  the *number* of writes (`characters / unit + 1`), not their *rate*, which follows generation speed; a
+  very fast model can still outrun Telegram's per-chat edit rate (community-observed at roughly one per
+  second; the Bot API documents no number). When it does, the `429` path keeps the run correct and the
+  display lags while generation does not.
+  **Not landed here:** the webhook half, and wiring a button answer back into a running agent's approval
+  queue (the prompt is posted and the answer *authority* enforced, but the end-to-end loop is a next step).
 - **Discord** (twilight gateway, slash commands, threads, Message Content Intent) — **deferred by
   decision, no urgency**: Telegram proves the trait today, and a second platform shape is worth building
   when a need for it appears rather than speculatively.
@@ -297,8 +309,8 @@ near host. Closing that is what the last item needs.*
   background output goes to the pinned home channel; with no home channel it is **refused, not dropped**.
 - Then, **all deferred by decision**: Slack (Socket Mode) → Matrix → Email → WhatsApp Cloud → Signal →
   SMS. None is urgent, and the order is the intended sequence rather than a queue anyone is working.
-- **The next real step in this milestone is the two gaps named above** — wiring a button answer back into
-  a running agent's approval queue, and the live streaming driver — not another platform.
+- **The next real step in this milestone is the gap named above** — wiring a button answer back into
+  a running agent's approval queue — not another platform.
 
 - **Approvals out of band, as a configurable option** — a request can be answered from anywhere the
   user already is, not only from the surface that started the run: `approval.ask_via` naming one or

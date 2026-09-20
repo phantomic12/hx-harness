@@ -15,6 +15,9 @@
 //! - [`answer`] — the security half: per-channel answer ceilings (a chat bridge can never authorise a
 //!   `Destructive` action) and the delivery policy that keeps cron output from interleaving with chat.
 //! - [`telegram`] — the first real connector, proving the trait against the actual Telegram Bot API.
+//! - [`telegram_stream`] — the live streaming driver: a model's token stream driving coalesced
+//!   `editMessageText` updates, with the Bot API's real edge cases (`429`/`retry_after`, an identical
+//!   edit, a failure mid-answer, a final write that always lands) handled rather than hoped about.
 //!
 //! [`Conversation`]: crate::types::Conversation
 //! [`Target`]: crate::types::Target
@@ -25,6 +28,7 @@ pub mod answer;
 pub mod connector;
 pub mod router;
 pub mod telegram;
+pub mod telegram_stream;
 pub mod types;
 
 pub use connector::Connector;

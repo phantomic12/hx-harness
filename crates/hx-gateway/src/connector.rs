@@ -12,7 +12,9 @@
 //!   server. The gateway owns the loop, not the connector, so the ownership of "how do we keep
 //!   listening" is in one place.
 //! - [`Connector::deliver`] — a reply to a conversation. The building block of every *outbound*
-//!   path; streaming via coalesced edits is layered on top (Telegram's is `crate::telegram::Coalescer`).
+//!   path; streaming via coalesced edits is layered on top (Telegram's is `crate::telegram_stream`,
+//!   built on `crate::telegram::Coalescer`), and it is deliberately an inherent method rather than a
+//!   fourth verb here: a platform with no edit primitive has nothing to stream into.
 //! - [`Connector::ask`] — post the *whole* [`ApprovalRequest`] with buttons and return a handle the
 //!   gateway can match an [`Inbound::ApprovalAnswer`] to. A phone and a terminal must render the same
 //!   question; the connector carries the same [`ApprovalTask`] either one would.

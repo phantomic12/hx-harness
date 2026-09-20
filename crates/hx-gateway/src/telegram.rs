@@ -22,8 +22,10 @@
 //! The roadmap names streaming via coalesced `editMessageText`: instead of one `sendMessage` per token,
 //! the first chunk sends a message and each later chunk edits it in place. [`Coalescer`] is the pure
 //! accumulator that decides *which* chunks even need an API call — a long-running stream collapses into one
-//! send plus a few edits. Whether a full streaming loop is wired is stated in `ROADMAP.md`; this
-//! connector implements the coalescing primitive and its send/edit request shapes.
+//! send plus a few edits. The live driver that wires a model's token stream to those calls is
+//! [`crate::telegram_stream`]: it owns the one-write-in-flight rule, the Bot API's `429`/`retry_after` and
+//! `message is not modified` cases, and the final write that always lands. What lives here is the
+//! coalescing decision and the request shapes, which the driver composes.
 //!
 //! ## Untrusted input
 //!
@@ -245,13 +247,23 @@ impl TelegramConnector {
         }
     }
 
-    fn api_url(&self, method: &str, key: &Secret) -> String {
+    /// The Bot API URL for `method`, with the token in the path — Telegram's own authentication scheme.
+    ///
+    /// The result therefore **contains the credential**, which is why nothing derived from it may reach
+    /// an error message or a log: see the `without_url` handling on the call sites, and
+    /// [`crate::telegram_stream`]'s.
+    pub(crate) fn api_url(&self, method: &str, key: &Secret) -> String {
         format!(
             "{}/bot{}/{}",
             self.base_url.trim_end_matches('/'),
             key.expose(),
             method
         )
+    }
+
+    /// The HTTP client, for the streaming driver in [`crate::telegram_stream`].
+    pub(crate) fn http(&self) -> &reqwest::Client {
+        &self.client
     }
 
     async fn poll(&self, key: &Secret) -> Result<Vec<Inbound>> {
