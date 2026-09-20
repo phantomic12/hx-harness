@@ -77,8 +77,9 @@ Not yet exercised against a live remote daemon; that is the remaining M4 step.
 
 ## The browser pool (M6)
 
-The escalation ladder and the pool are built; the rungs above the cheap one are not exercised
-against a real browser in this environment, and nothing below claims otherwise.
+The escalation ladder, the pool and the two cheap rungs are built. **No browser is driven anywhere
+below**: `camoufox`, Chromium and CDP are not exercised in this environment, and nothing here claims
+otherwise. The stealth rung launches a configured tool, and no such tool is present here.
 
 **Per-session profile isolation** (`crates/hx-browser/src/profile.rs`, 10 tests). The property is
 that two sessions never share a directory, a cookie jar or a storage area, and it is asserted on a
@@ -100,6 +101,32 @@ rung stops it; an unavailable rung (no camoufox installed) is reported and the c
 attempt is recorded in order with its own reason; and the attempt ceiling stops the climb even when
 the site keeps refusing. Reports are asserted never to carry a token from the query string, and a
 fetched body is asserted never to render in `Debug`.
+
+**The rungs** (`src/rungs/http.rs`, `src/rungs/stealth.rs`, 88 lib tests + 10 integration tests). The
+two rungs are real implementations rather than scripted doubles, and the interesting one is the
+redirect guard.
+
+`HttpRung` is a real `reqwest` client built with `Policy::none()` — deliberately *not* following
+redirects itself, because a client that does has already opened the socket by the time any check could
+run. The rung follows redirects itself and admits **every hop before anything connects to it**. The
+test is built so it can fail: the redirect target is a *real listener*, so a guard that ran after
+connecting would move its connection counter. It is `0`. A redirect to `169.254.169.254` is refused
+with a report naming the page that sent us there — `BlockReason::Redirected`, not a bare "private
+host", because only one of those means the page's author chose the destination — a relative `Location`
+resolves against the hop that sent it, a redirect loop is bounded at 5 hops, a body over 4 MiB is
+refused rather than buffered, a non-text body is refused on the site's own declared type, and a failed
+fetch carries no URL (so no token) in its error.
+
+`StealthRung` launches a configured subprocess and speaks a documented protocol: the URL, the session's
+profile directory, the cookie jar and the budget on **stdin** (never in argv, which every process on the
+machine can read), and the exit code as the verdict — `0` a body, `3` a wall, any other non-zero a
+transport failure. The tool's stderr is deliberately not quoted into an error: it is unbounded, written
+by something this crate does not control, and can contain the URL it was handed.
+
+**What is not exercised: the tool itself.** No stealth browser exists here, so the protocol is verified
+against `/bin/sh` scripts that speak it — real processes over a real pipe, but our reading of the
+protocol at both ends. The browser rung is defined by the `Fetcher` trait and deliberately not wired;
+the interactive rung is a pane a person drives, not a subprocess.
 
 **Target admission** (`src/target.rs`, 13 tests). `file://`, `data:`, `gopher://` and `chrome://` are
 refused by scheme; loopback, RFC 1918, link-local (`169.254.169.254`, the metadata service), CGNAT,

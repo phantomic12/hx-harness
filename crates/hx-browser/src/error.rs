@@ -73,6 +73,19 @@ pub enum FetchError {
         content_type: String,
     },
 
+    /// The site answered with a body larger than the rung will hold.
+    ///
+    /// A hostile page can stream an unbounded body, and a per-attempt timeout bounds *how long* that
+    /// takes rather than *how much* arrives — so the cap is on bytes, not on seconds. It does not
+    /// escalate: a dearer rung would meet the same cap, and a browser that got far enough to render
+    /// the page has already spent more than the cap getting there.
+    #[error("the {rung} rung got a body over its cap: {bytes} bytes, limit {limit}")]
+    TooLarge {
+        rung: RungKind,
+        bytes: usize,
+        limit: usize,
+    },
+
     /// The rung could not run at all: no browser binary, no human pane attached.
     #[error("the {rung} rung is unavailable: {reason}")]
     Unavailable { rung: RungKind, reason: String },
@@ -116,6 +129,10 @@ impl FetchError {
             // The site spoke and said "not this". A browser would get the same 404.
             FetchError::Http { .. } | FetchError::NotText { .. } => Disposition::Stop,
 
+            // The site spoke, and it is sending more than this rung will hold. Classified here
+            // rather than defaulted, like every other variant.
+            FetchError::TooLarge { .. } => Disposition::Stop,
+
             // A person already looked. Asking again is a loop, and the interactive rung is the last
             // one anyway.
             FetchError::Interactive { .. } => Disposition::Stop,
@@ -134,7 +151,8 @@ impl FetchError {
             | FetchError::Transport { rung, .. }
             | FetchError::Http { rung, .. }
             | FetchError::NotText { rung, .. }
-            | FetchError::Unavailable { rung, .. } => Some(*rung),
+            | FetchError::Unavailable { rung, .. }
+            | FetchError::TooLarge { rung, .. } => Some(*rung),
             FetchError::Interactive { .. } | FetchError::Blocked(_) => None,
         }
     }

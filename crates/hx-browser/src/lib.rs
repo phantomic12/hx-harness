@@ -63,6 +63,7 @@ pub mod ladder;
 pub mod pool;
 pub mod profile;
 pub mod rung;
+pub mod rungs;
 pub mod target;
 
 pub use error::{Disposition, FetchError, RefusalReason};
@@ -74,4 +75,5 @@ pub use ladder::{Attempt, FetchReport, Ladder, DEFAULT_RUNG_TIMEOUT};
 pub use pool::BrowserPool;
 pub use profile::{PoolRoot, ProfileError, SessionProfile, COOKIE_FILE};
 pub use rung::{FetchRequest, Fetcher, RungKind, UntrustedPage};
+pub use rungs::{HttpRung, StealthRung};
 pub use target::{Admission, BlockReason, TargetRefusal, TargetUrl};

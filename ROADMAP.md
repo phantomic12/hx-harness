@@ -329,6 +329,15 @@ command with a button, receive a cron digest in a separate pinned thread.
     written down: what it receives (a redacted URL, the *session's own* profile directory, the
     rung's reason, a budget), what it returns, and what happens on timeout. The rung enforces the
     budget itself, and an unattached pane fails closed with a reported gap rather than waiting.
+  - ◐ **The rungs.** The cheap rung is a real `reqwest` client; the stealth rung launches a
+    configured tool and speaks a documented pipe protocol. Both are **hand-rolled rather than the
+    `crw`/`camoufox` named above**, and the difference is stated rather than implied: `crw`'s
+    Firecrawl-compatible extraction belongs to the search item's extraction ladder, and camoufox is
+    whatever command the operator configures. The HTTP rung's load-bearing detail is the redirect —
+    the client is built with `Policy::none()` and the rung admits **every hop before anything
+    connects to it**, so a page cannot redirect the fetcher into the local network or at the
+    metadata service. The stealth rung puts the URL and the session's cookies on **stdin, never in
+    argv**, which every other process on the machine can read.
 - Search: SearXNG, DDG, Mojeek, Marginalia, Brave, Google PSE, Wikipedia, plus the
   extraction ladder and URL/ETag caching
 
