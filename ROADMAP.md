@@ -633,40 +633,49 @@ from the lock screen and the agent continues.
 
 ## M8 — Subagent pooling (more than one model)
 
-Today a subagent's model is a **process-global**: a single `delegation.model` key, read when the child
-is spawned. That is a real ceiling, and it was measured rather than assumed:
+**A correction first, because a reader would otherwise believe the premise.** This milestone used to open with
+*today a subagent's model is a process-global, a single `delegation.model` key* — and there is **no
+subagent system in this repo to be global about**. Measured: there is no `ChildSpec`, no `Orchestrator`,
+no `spawn_child`/`delegate` anywhere in `crates/` or `apps/`; the only `Child` in the tree is a
+process guard in `apps/hxd/tests/startup.rs`; `hx-core`'s config has `providers:` and `pools:`
+but no `delegation` key; and `hx-store`'s `UsageRecord` already carries `provider`, `credential`,
+`model` and `cost_usd`. So the harness that draws children does not exist yet, and per-child `model`/`cost`
+auditing is already possible per turn.
 
-- **Lanes cannot differ.** A fan-out whose lanes want different models — a cheap one for mechanical
-  work, a strong one for the lane that has to reason about a security property — cannot express it.
-  Changing the key mid-run silently changes the model of every *subsequent* child and none of the
-  running ones, so a fan-out ends up split across models by accident of timing rather than by choice.
-- **One model's parameter set is not another's.** A reasoning effort one model accepts is a hard
-  `HTTP 400` for another — which turned every lane of a fan-out into a half-second failure whose
-  message named the parameter but not the fan-out. A pool has to know each member's accepted
-  parameters and clamp to them.
-- **One upstream can take down every lane at once.** All children share the model, so the model's
-  outage *is* the fan-out's outage, and a retry storm is indistinguishable from slow work. The lanes
-  look alive for ten minutes per call and produce nothing.
+What that means is that the hard part — the **routing rules** — can and should land before the spawner, as a
+pure, self-contained module a future spawner will draw from. That is what has landed here:
 
-- A **model pool** the harness draws children from, where each member carries its own endpoint,
-  credential, accepted parameters and health state
-- **Per-child model selection** — the model is part of the child's spec, chosen at spawn and recorded
-  with the child, not read from a global at the moment of use
-- **Health-aware draw**: a member that fails its first call is marked down and the next child is drawn
-  from a healthy one, and a lane that dies at spawn is retried on a *different* member rather than the
-  same one — so a bad member degrades throughput instead of stalling it
-- **Capability clamping**: a parameter a member does not accept is clamped to the nearest accepted
-  value and the clamp is recorded, never sent and hoped for
-- **Per-child model and cost in the audit chain**, so "which model did this work" and "did this lane
-  spend money" are answerable after the fact — the same standard the search path already holds itself
-  to with *zero paid API calls*
-- **Deterministic assignment under test**: a scripted pool that fails, clamps and recovers, so the
-  routing rules are asserted rather than observed
+- ✅ **A model pool the harness draws children from** (`crates/hx-core/src/pool.rs`) — `PoolMember` (id,
+  base URL, a credential **reference**, the parameters it accepts, a health state) and `ModelPool` (ordered
+  members + the draw policy). Members are configuration: deserializable from the `hx-core` config under
+  `model_pools:` via `Config::model_pool`, additive and `Default`, so existing config files keep parsing.
+  **Nothing draws from this pool yet** — the module doc says so plainly, because that gap is the honest shape
+  of the deliverable.
+- ✅ **Health-aware draw** — a member that fails its first call is marked down with a **reason and a
+  timestamp**; the next draw comes from a healthy member; a down member is never drawn while a healthy one
+  exists; when all are down the draw returns a distinguishable error naming each member and its reason, rather
+  than silently returning the first member. A recovered member (`mark_up`) is drawn again.
+- ✅ **Capability clamping** — a parameter a member does not accept is clamped to its **nearest** accepted
+  value (by that kind's ordering) and the clamp is **recorded** (`ParamClamp`), never sent and hoped
+  for; an accepted parameter produces no clamp; a parameter kind a member does not support at all is dropped
+  with `sent: None` rather than sent. The real case this exists for: one model rejects `reasoning_effort`
+  with `HTTP 400` while another accepts it. Asserted over a **scripted pool** — no network, members fail,
+  clamp and recover on command — with each routing invariant proven by a mutation that turns its test red.
+- ⬜ **Still to come** — per-child model selection (the model as part of the child's spec, recorded with the
+  child), the child spawner that draws from this pool, re-route on member death across *running* lanes, and
+  per-child model + cost in the audit chain (that last one is already possible per turn via `UsageRecord`, but
+  nothing consumes this pool yet to record against).
 
-**Exit criteria:** a fan-out of N lanes runs across N members of a pool, each lane's model recorded in
-the audit chain; killing one member's upstream mid-run re-routes new lanes to a healthy member with no
-operator action and no lane stalled by retry backoff; a lane whose model rejects a configured parameter
-is clamped and runs instead of failing at spawn.
+The routing reasoning this milestone is about, restated for what remains: lanes could not differ because a fan-out
+has no per-child model to differ; one model's parameter set is not another's because a 400 for `reasoning_effort`
+is a 400; one upstream can take down every lane because all children share the model. The pool here removes the
+second ceiling (clamping) and the shared-model property (members carry their own endpoint, credential, parameters and
+health); the first and third need the spawner that does not exist yet.
+
+**Exit criteria** (still open — they describe the spawner): a fan-out of N lanes runs across N members of a
+pool, each lane's model recorded in the audit chain; killing one member's upstream mid-run re-routes new lanes
+to a healthy member with no operator action and no lane stalled by retry backoff; a lane whose model rejects a
+configured parameter is clamped and runs instead of failing at spawn.
 
 ---
 
