@@ -17,6 +17,7 @@
 
 pub mod chat;
 pub mod hosts;
+pub mod remote_sandbox;
 pub mod routes;
 pub mod sandbox;
 pub mod state;

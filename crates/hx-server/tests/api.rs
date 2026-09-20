@@ -320,6 +320,51 @@ async fn a_chat_sandbox_start_failure_leaves_no_session_and_never_calls_the_mode
     assert_eq!(h.state.store.count().unwrap(), 0);
 }
 
+#[tokio::test]
+async fn a_profile_naming_an_unknown_host_is_refused_by_name() {
+    // The honest failure for a sandbox profile whose `host:` names a machine that does not exist: it is
+    // refused with the name in the message, rather than silently falling back to the local daemon (which
+    // would make `host:` a suggestion) or failing with a generic error the operator cannot act on. The
+    // harness has no `hosts:` at all, so any id is unknown.
+    let h = harness(vec![Ok(answer("must not run"))]).await;
+
+    let err = match h.state.sandbox_manager_for(Some("ghost")).await {
+        Ok(_) => panic!("an unknown host must be refused"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(message.contains("ghost"), "names the host: {message}");
+    assert!(
+        message.contains("no host") || message.contains("not configured"),
+        "says it is not configured, not merely that a route choked: {message}"
+    );
+}
+
+#[tokio::test]
+async fn a_profile_with_no_host_resolves_to_the_local_manager() {
+    // The control that keeps this feature honest: without it, a blanket "always route every profile to a
+    // remote manager" would pass. A profile without a `host` key must keep today's behaviour — the local
+    // daemon's `SandboxManager`, the exact `Arc` the state holds. If this test fails, the local path has
+    // been disturbed.
+    let mut h = harness(vec![Ok(answer("must not run"))]).await;
+    let local = Arc::new(SandboxManager::new(
+        Arc::new(ChatSandboxRuntime::default()),
+        4,
+    ));
+    let local_arc = Arc::clone(&local);
+    Arc::get_mut(&mut h.state).unwrap().sandboxes = Some(local);
+
+    let manager = h
+        .state
+        .sandbox_manager_for(None)
+        .await
+        .expect("no host means the local manager");
+    assert!(
+        Arc::ptr_eq(&manager, &local_arc),
+        "a no-host profile returns the local manager, not a fresh remote one"
+    );
+}
+
 // -- the harness ---------------------------------------------------------------------------------
 
 const CONFIG: &str = r#"

@@ -82,6 +82,10 @@ pub struct AppState {
     pub event_bus: broadcast::Sender<LiveEvent>,
     /// `None` when no container engine was reachable at startup.
     pub sandboxes: Option<Arc<SandboxManager>>,
+    /// One remote `SandboxManager` per named host, built lazily. Sharing one per host is what keeps
+    /// two requests for the same host from creating two managers (and thus two invisible container sets
+    /// the reaper cannot see): see [`AppState::sandbox_manager_for`].
+    pub remote_sandbox_managers: AsyncMutex<std::collections::HashMap<String, Arc<SandboxManager>>>,
     /// Reuse one shell boundary per profile and checkout across chat requests.
     pub chat_sandboxes: crate::sandbox::SandboxCache,
     pub started_at: DateTime<Utc>,
@@ -217,6 +221,7 @@ impl AppState {
             // normal live client must not lose events it was awake for.
             event_bus: broadcast::channel(2048).0,
             sandboxes: parts.sandboxes,
+            remote_sandbox_managers: AsyncMutex::new(HashMap::new()),
             chat_sandboxes: crate::sandbox::SandboxCache::new(),
             started_at: parts.started_at,
             sandbox_unavailable_reason: parts.sandbox_unavailable_reason,
@@ -325,6 +330,68 @@ impl AppState {
         Ok(Arc::new(
             LocalHost::detect(HostId::from_raw("local")).await?,
         ))
+    }
+
+    /// The [`SandboxManager`] a sandbox profile resolves to: the local one for `None`, or a remote
+    /// one for a named host.
+    ///
+    /// `None` (a profile without a `host` key) means the local daemon — today's behaviour unchanged —
+    /// and returns [`AppState::sandboxes`], so a profile with no host stays on the local engine and a
+    /// profile that names one goes remote. `Some(id)` resolves the host through [`AppState::resolve_host`]
+    /// — the one sanctioned way anything obtains a remote handle — wraps it in a
+    /// [`HostCommandRunner`](crate::remote_sandbox::HostCommandRunner) and a
+    /// [`RemoteSandboxRuntime`], and hands the [`SandboxManager`] that results to the existing
+    /// [`SandboxCache`](crate::sandbox::SandboxCache).
+    ///
+    /// ## Concurrency: one manager per host
+    ///
+    /// Managers are cached per host id. Two concurrent requests for the same host must not each build (and
+    /// then use) their own manager: each [`SandboxManager`] owns a `live` set the TTL reaper never
+    /// sees, so an uncached manager created per request would be a container set with no reaper. The
+    /// pattern is *resolve outside the lock, install once*: look up the cache; on a miss, drop the
+    /// lock, resolve and build, then re-check and insert only if the host still has none. A second
+    /// request racing the first may build a temporarily-extra manager, but only the installed one is ever
+    /// handed out and the loser is dropped unused (its `live` set is empty), so no container ever lands
+    /// in an unreaped manager.
+    pub async fn sandbox_manager_for(&self, host: Option<&str>) -> Result<Arc<SandboxManager>> {
+        match host {
+            None | Some("local") => self.sandboxes.as_ref().cloned().ok_or_else(|| {
+                HxError::Sandbox(
+                    self.sandbox_unavailable_reason
+                        .clone()
+                        .unwrap_or_else(|| "sandboxes are unavailable".into()),
+                )
+            }),
+            Some(id) => {
+                {
+                    let cache = self.remote_sandbox_managers.lock().await;
+                    if let Some(manager) = cache.get(id) {
+                        return Ok(Arc::clone(manager));
+                    }
+                }
+                let manager = self.build_remote_manager(id).await?;
+                let mut cache = self.remote_sandbox_managers.lock().await;
+                Ok(Arc::clone(cache.entry(id.to_string()).or_insert(manager)))
+            }
+        }
+    }
+
+    /// Build a fresh remote [`SandboxManager`] for `id`, without touching the per-host cache.
+    ///
+    /// Resolving and connecting is async and must not happen while holding the cache lock (it can run for
+    /// a credential read and an SSH handshake); only the install is serialised. See
+    /// [`AppState::sandbox_manager_for`] for how a raced build is dropped unused.
+    async fn build_remote_manager(&self, id: &str) -> Result<Arc<SandboxManager>> {
+        let host = self
+            .resolve_host(id)
+            .await
+            .map_err(|err| HxError::Sandbox(format!("cannot run sandbox on host {id:?}: {err}")))?;
+        let runner = Arc::new(crate::remote_sandbox::HostCommandRunner::new(host));
+        let runtime = Arc::new(hx_sandbox::RemoteSandboxRuntime::new(runner));
+        Ok(Arc::new(hx_sandbox::SandboxManager::new(
+            runtime,
+            self.config.agent.max_concurrent_subagents as usize,
+        )))
     }
 
     /// Resolve a host id to something that can be driven.

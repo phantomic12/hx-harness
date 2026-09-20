@@ -210,9 +210,14 @@ attempted capability escalation shows up as a denial event, not a hang.
   proxy sidecar placed on the *near* host, which a far daemon cannot host, so a remote sandbox
   whose spec asks for a non-empty egress allowlist is refused at `create` time (before anything
   reaches the far host) with a reason naming the way out, rather than half-enforced. An isolated
-  remote sandbox — empty allowlist and the network off — needs no proxy and **works**. Still to do
-  before the item is ✅: place the proxy sidecar on the far host so remote egress can be enforced,
-  wire the runtime into `hx-server`, and exercise it against a live remote daemon.
+  remote sandbox — empty allowlist and the network off — needs no proxy and **works**. It is now wired
+  into `hx-server`: a `SandboxProfile` can carry a `host:` key naming a machine from `hosts:`, and
+  the daemon resolves it (`AppState::sandbox_manager_for` → `resolve_host`) into one `SandboxManager`
+  per host wrapping a `HostCommandRunner` (the field-for-field `Host`→`RemoteCommandRunner` adapter)
+  behind a `RemoteSandboxRuntime`; a profile without a `host` stays on the local daemon unchanged, and a
+  `host:` naming an unknown machine is refused by name. Still to do before the item is ✅: place the proxy
+  sidecar on the far host so remote egress can be enforced, and exercise the wired path against a live
+  remote daemon.
 - ✅ **Remote terminal (a PTY straight to a remote host)** — `POST /v1/terminals` takes an optional
   `host`, and the daemon adopts the session as a terminal like any other, so the terminal pane and
   the WebSocket contract are unchanged: a client attaches to a remote shell the same way it attaches
@@ -227,9 +232,10 @@ key ever enters the model context or a sandbox.
 
 *Status: five of the seven items are done, and with the remote terminal in place the browser drives a
 remote box for real — browse, run, and an interactive shell — rather than only the first two. The exit
-criteria is still not met: remote sandboxes exist only as a unit-tested runtime (not yet wired into a
-route or verified against a live remote daemon), and Unix-only CI means the Windows transport
-is exercised by unit tests rather than against a live host.*
+criteria is still not met: remote sandboxes are now wired into `hx-server` (a `host:` profile key
+resolves to a per-host `RemoteSandboxRuntime` manager) but are not yet verified against a live remote
+daemon, and Unix-only CI means the Windows transport is exercised by unit tests rather than against a live
+host.*
 
 ---
 

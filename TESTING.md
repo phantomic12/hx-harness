@@ -60,6 +60,21 @@ This is hermetic evidence, not a live container run. Docker is not installed on 
 the new chat path has not yet been exercised against a real engine. The historical live results below
 remain evidence for their named suites, not for this new wiring.
 
+## Remote sandbox wiring (M4)
+
+The `Host`→`RemoteCommandRunner` adapter and the per-host manager routing are unit-tested in-process:
+
+- `hx-server` lib `remote_sandbox` tests drive `HostCommandRunner` with `hx_tools::testing::FakeHost`
+  (a real in-memory `Host`), asserting the field-for-field copy across the seam including that a non-zero
+  and an unknown (`None`) exit pass through **unchanged** — a non-zero is a successful *transport*
+  result, and only the remote runtime decides what it means.
+- `hx-server` `api` tests build the full `AppState`: `a_profile_naming_an_unknown_host_is_refused_by_name`
+  (a profile whose `host:` names no configured machine is refused with the name, not silently local), and
+  `a_profile_with_no_host_resolves_to_the_local_manager` (the control: a profile without a `host` key
+  returns the exact local daemon's `SandboxManager` `Arc`).
+
+Not yet exercised against a live remote daemon; that is the remaining M4 step.
+
 ## The four tiers
 
 Every claim in the repo falls into one of these. The gap that bites is B→C.

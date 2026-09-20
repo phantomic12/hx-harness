@@ -458,6 +458,12 @@ pub struct SandboxProfile {
     pub network: bool,
     #[serde(default = "default_true")]
     pub readonly_rootfs: bool,
+    /// The remote host this sandbox runs on. `None` (or absent) means the local daemon — today's
+    /// behaviour, unchanged. `Some(id)` names a host from `hosts:`; the daemon resolves it through
+    /// its `Host` and creates the sandbox there via [`RemoteSandboxRuntime`]. `#[serde(default)]`
+    /// keeps every existing profile (which never had the key) parsing unchanged.
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 impl Default for SandboxProfile {
@@ -473,6 +479,7 @@ impl Default for SandboxProfile {
             egress: Vec::new(),
             network: false,
             readonly_rootfs: true,
+            host: None,
         }
     }
 }
@@ -779,6 +786,31 @@ roles:
         assert!(!p.network, "network must default off");
         assert!(p.readonly_rootfs);
         assert_eq!(p.ttl_secs, 1800);
+    }
+
+    #[test]
+    fn a_sandbox_profile_without_a_host_key_parses_as_local_and_one_with_it_goes_remote() {
+        // The `host` field is additive and optional: every existing profile that never had the key must
+        // keep parsing (now as `None`, the local daemon), and a profile that adds it must round-trip to
+        // `Some(id)`. Without the `#[serde(default)]`, adding the field would have broken every existing
+        // config, which is exactly what this test guards.
+        let yaml = r#"
+sandbox_profiles:
+  local_dev:
+    isolation: l2
+  remote_build:
+    host: buildbox
+"#;
+        let c = Config::from_yaml(yaml).unwrap();
+        assert_eq!(
+            c.sandbox_profiles["local_dev"].host, None,
+            "a profile without `host` stays local"
+        );
+        assert_eq!(
+            c.sandbox_profiles["remote_build"].host.as_deref(),
+            Some("buildbox"),
+            "a profile with `host` names the machine"
+        );
     }
 
     #[test]

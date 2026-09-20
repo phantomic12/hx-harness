@@ -217,14 +217,9 @@ pub async fn run_chat(
             .sandbox_profiles
             .get(name)
             .ok_or_else(|| HxError::Config(format!("no sandbox profile named '{name}'")))?;
-        let manager = state.sandboxes.as_ref().ok_or_else(|| {
-            HxError::Sandbox(
-                state
-                    .sandbox_unavailable_reason
-                    .clone()
-                    .unwrap_or_else(|| "sandboxes are unavailable".into()),
-            )
-        })?;
+        // `profile.host` names the machine the sandbox runs on: `None` stays on the local daemon
+        // (today's behaviour), `Some(id)` goes remote through `AppState::sandbox_manager_for`.
+        let manager = state.sandbox_manager_for(profile.host.as_deref()).await?;
         let mut spec = hx_sandbox::SandboxSpec::from_profile(name, profile);
         spec.workspace_host_path = workspace.clone();
         spec.adopt_workspace_owner()
@@ -232,7 +227,7 @@ pub async fn run_chat(
         Some(
             state
                 .chat_sandboxes
-                .get(manager, &spec, std::time::Duration::from_secs(900))
+                .get(&manager, &spec, std::time::Duration::from_secs(900))
                 .await?,
         )
     } else {
