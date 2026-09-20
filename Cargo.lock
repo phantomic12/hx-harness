@@ -1381,6 +1381,7 @@ dependencies = [
  "futures",
  "hx-agent",
  "hx-core",
+ "hx-remote",
  "hx-secrets",
  "hx-tools",
  "indexmap",
