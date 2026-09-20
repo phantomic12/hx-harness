@@ -43,4 +43,4 @@ http-body-util = "0.1"
 # handshake cannot be exercised through `tower::oneshot`. That ply is already in the workspace's lock
 # (pulled in by the MCP/rmcp stack), so adding it as a dev-dependency for the tests costs nothing
 # that is not already compiled.
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
