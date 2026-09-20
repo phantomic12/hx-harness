@@ -246,6 +246,12 @@ attempted capability escalation shows up as a denial event, not a hang.
 **Exit criteria:** drive a Linux box, a Mac, and a Windows host from the browser; no private
 key ever enters the model context or a sandbox.
 
+The second clause is **tested** now rather than asserted: `SshAuth`'s `Debug` renders `"<redacted>"`
+and four tests pin that the material never reaches a debug line, a connected host's rendered surface,
+the vault→`SshAuth` seam, or a sandbox spec — each with a sentinel that must genuinely be present
+first, so the test cannot degrade into a no-op. The negative control was run: leaking the key through
+`Debug` makes the tripwire fail. See `TESTING.md`.
+
 *Status: seven of the eight items are done. The remote terminal is in place, so the browser drives a
 remote box for real — browse, run, and an interactive shell — rather than only the first two, and the
 Mac leg is proven: the same SSH transport runs against a real Apple-signed macOS VM in CI (the

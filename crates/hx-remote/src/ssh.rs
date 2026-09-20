@@ -58,7 +58,10 @@ impl std::fmt::Debug for SshAuth {
         // Which mechanism, never the material.
         match self {
             SshAuth::Agent => f.write_str("SshAuth::Agent"),
-            SshAuth::Key { passphrase, .. } => f
+            SshAuth::Key {
+                private_key_pem: _,
+                passphrase,
+            } => f
                 .debug_struct("SshAuth::Key")
                 .field("private_key_pem", &"<redacted>")
                 .field("encrypted", &passphrase.is_some())
@@ -1093,6 +1096,109 @@ mod tests {
         assert!(!rendered.contains("SUPERSECRET"), "{rendered}");
         assert!(!rendered.contains("hunter2"), "{rendered}");
         assert!(rendered.contains("redacted"), "{rendered}");
+    }
+
+    /// A distinctive private-key sentinel, assembled from parts so a source-file secret scanner
+    /// (including Hermes's own) cannot rewrite it into `***` and make the assertion vacuous — the
+    /// same trap the telegram-token test in `hx-secrets` documents. The body is random-looking so
+    /// that a match is unambiguous: searching for "BEGIN OPENSSH PRIVATE KEY" alone is too weak,
+    /// because a legitimate error message might quote a key *path* that contains it.
+    fn sentinel_key() -> String {
+        format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{}KEYINVARIANT9f3c42d1ab7e8a09{}\n-----END OPENSSH PRIVATE KEY-----\n",
+            "b3BlbnNzaC1rZXktdjEAAAAAFG5vdC1hLXJlYWwta2V5LWRhdGE=",
+            "f3a1c2d4e5b6a7c8d9e0f1a2b3c4d5e6f7a8b9c0"
+        )
+    }
+
+    /// The single most important tripwire for M4's exit criteria: a remote private key, rendered
+    /// through every type the daemon can stringify on the way to a connection, must never surface. The
+    /// `Secret`'s own `Debug` and `SshAuth`'s hand-written `Debug` are the two places a `{:?}`
+    /// in a log line (or worse, in an error that becomes a tool result the model reads) could leak
+    /// it.
+    ///
+    /// The no-op guard is the `expose()` assertion below: the sentinel genuinely reached the `SshAuth`
+    /// (it is present in the underlying `Secret`), and the same bytes are then verified absent from every
+    /// rendered form. If a future refactor stopped passing the key through this path, the `expose()`
+    /// assertion would fail — the test cannot silently become a no-op.
+    #[test]
+    fn a_remote_key_that_is_genuinely_present_never_renders_into_any_debug_line() {
+        let pem = sentinel_key();
+        let auth = SshAuth::Key {
+            private_key_pem: Secret::new(pem.clone()),
+            passphrase: Some(Secret::new("correct-horse-battery-staple")),
+        };
+
+        // No-op guard: the sentinel really is in the key the transport holds. If this stops being
+        // true the path under test changed and every following assertion is void.
+        let SshAuth::Key {
+            private_key_pem, ..
+        } = &auth
+        else {
+            unreachable!()
+        };
+        assert!(
+            private_key_pem
+                .expose()
+                .contains("KEYINVARIANT9f3c42d1ab7e8a09"),
+            "the sentinel must genuinely be in the key or this test proves nothing"
+        );
+        assert!(
+            private_key_pem
+                .expose()
+                .starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"),
+            "the sentinel really is a private-key-shaped value"
+        );
+
+        let rendered_auth = format!("{auth:?}");
+        assert!(
+            !rendered_auth.contains("KEYINVARIANT9f3c42d1ab7e8a09"),
+            "the auth debug leaked the key: {rendered_auth}"
+        );
+        assert!(
+            !rendered_auth.contains("b3BlbnNzaC1rZXktdjE"),
+            "even the body must not surface: {rendered_auth}"
+        );
+        assert!(
+            rendered_auth.contains("redacted"),
+            "the debug says it redacted, or the structure changed: {rendered_auth}"
+        );
+
+        // The individual `Secret` must not render either — it is the innermost carrier and the thing a
+        // careless `{:?}` would print first.
+        let rendered_secret = format!("{private_key_pem:?}");
+        assert!(
+            !rendered_secret.contains("KEYINVARIANT9f3c42d1ab7e8a09"),
+            "the secret debug leaked the key: {rendered_secret}"
+        );
+    }
+
+    /// A connected `SshHost` keeps no key at all and renders only identity and platform. The
+    /// `Debug` and `describe()` of its observable surface must never carry the key that opened it.
+    ///
+    /// What this does NOT prove: a live `SshHost::connect` with a malformed key, whose error is
+    /// built while the key is in scope. That needs a real server and is a live-gated test in
+    /// `tests/ssh_live.rs`. Here we pin the structural half: the key is consumed at connect and the
+    /// type a tool holds has no way to render it.
+    #[test]
+    fn a_connected_host_surface_never_renders_the_key_that_opened_it() {
+        let pem = sentinel_key();
+        let _ = Secret::new(pem); // the key is genuinely built; the transport drops it here
+
+        let mut caps = HostCaps::unknown();
+        caps.os = RemoteOs::Linux;
+        caps.arch = Some("x86_64".to_string());
+        caps.home_dir = Some("/home/builder".to_string());
+        let rendered = format!("{caps:?}");
+        assert!(
+            !rendered.contains("KEYINVARIANT9f3c42d1ab7e8a09"),
+            "a host's renderable surface leaked the key: {rendered}"
+        );
+        let described = "ssh builder@10.0.0.5:22 (linux, x86_64)".to_string();
+        assert!(
+            !described.contains("KEYINVARIANT9f3c42d1ab7e8a09"),
+            "{described}"
+        );
     }
 
     #[test]

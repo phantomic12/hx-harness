@@ -351,6 +351,61 @@ async fn executes_writes_reads_and_lists_over_the_connection() {
     assert!(cleaned.success(), "cleanup failed: {cleaned:?}");
 }
 
+#[ignore = "requires a real SSH host (HX_SSH_TEST_HOST, HX_SSH_TEST_USER, HX_SSH_TEST_KEY)"]
+#[tokio::test]
+async fn a_connect_failure_with_a_distinctive_key_present_never_renders_the_key() {
+    // The highest-value tripwire for "no private key ever enters the model context": a *failed*
+    // connection is the likeliest leak, because it is where an error message is built while the key
+    // is in scope. The sentinel is a deliberately malformed key (a real private-key block around a
+    // random body), so with `HostKeyPolicy::Insecure` the transport reaches the
+    // `decode_secret_key` step — the one place the PEM is interpolated into an `HxError::Remote`
+    // string ("could not parse the private key ...: {e}") — and fails there. The assertion is that
+    // the sentinel bytes never surface in that error, because the error becomes a `ToolOutcome::failed`
+    // the model reads and an audit `ToolCallFinished` summary.
+    //
+    // What this does NOT prove: a key that *successfully* authenticates is never rendered. It is never
+    // rendered because `SshAuth`/`Secret` redact their `Debug` (pinned in `src/ssh.rs`), and
+    // the key is dropped once the session is authenticated. This test's job is the failure half, where the
+    // key is still on the stack.
+    let target = skip_without_a_host!();
+
+    // Assembled from parts, not written as a literal, so a source secret scanner cannot redact it and
+    // turn the assertion into a no-op.
+    let sentinel = format!(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n{}KEYINVARIANT0badc0ffee{}\n-----END OPENSSH PRIVATE KEY-----\n",
+        "bm90LWEtcmVhbC1wcml2YXRlLWtleS1ib2R5LWZvci10ZXN0aW5nLXRvby1sb25nLXRvLWJlLXJlYWw=",
+        "fab0d1e2c3b4a5968778a9b0c1d2e3f4a5b6c7d8"
+    );
+
+    let err = SshHost::connect(
+        HostId::from("hst_leak"),
+        &target.host,
+        target.port,
+        &target.user,
+        &SshAuth::Key {
+            private_key_pem: Secret::new(sentinel.clone()),
+            passphrase: None,
+        },
+        // Insecure so the host-key check cannot refuse first (which would skip the key-parse step this
+        // test exists to exercise).
+        &HostKeyPolicy::Insecure,
+    )
+    .await
+    .expect_err("a malformed key must fail to connect");
+
+    let message = err.to_string();
+    eprintln!("malformed-key connect error: {message}");
+    assert!(
+        message.contains("could not parse the private key"),
+        "the error must be the key-parse failure, so this test exercised the path where the key is in \
+         scope: {message}"
+    );
+    assert!(
+        !message.contains("KEYINVARIANT0badc0ffee"),
+        "the connect error leaked the key the model would read: {message}"
+    );
+}
+
 /// A host that answers the `sftp` subsystem is measured, and its files move over SFTP.
 #[ignore = "requires a real SSH host (HX_SSH_TEST_HOST, HX_SSH_TEST_USER, HX_SSH_TEST_KEY)"]
 #[tokio::test]
