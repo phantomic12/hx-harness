@@ -379,15 +379,39 @@ a **required** argument:
   waiting and its own timeout denies it, so the outcome is "nobody answered" — never the phone's yes, and
   never a silent no that looks like the operator said no.
 
-**Why the route asks the caller to declare a ceiling, and what that is worth.** This API has **no
-authentication**: the daemon cannot tell one local client from another, and per-channel ceilings are not
-configured yet (`approval.ask_via` is still a roadmap line). The honest choice was between "declare it"
-and "have no check", and declaring it is what makes the check present, explicit and testable. The clients
-that use this route are the owner's own machine-local ones — the `hx` CLI (`by: "terminal"`) and the
-daemon's embedded web page (`by: "web"`) — and both declare the terminal's full ladder, which is the
-authority a keypress at the prompt has always had. A **channel** does not answer through this route at
-all: it answers through `ApprovalBridge`, where the ceiling comes from the deployment rather than from the
-channel, which is the distinction that makes the channel's ceiling a control rather than a
-self-declaration. The residual hole is named rather than papered over: with `--bind 0.0.0.0` and no auth,
-a declared ceiling is not a defence against a remote caller. The missing control there is the API's
-authentication, not the ceiling.
+**Why the route asks the caller to declare a ceiling, and what that is worth.** At the time the ceiling
+moved to the choke point, this API had **no authentication**: the daemon could not tell one local client
+from another, and per-channel ceilings are still not configured (`approval.ask_via` is still a roadmap
+line). The honest choice was between "declare it" and "have no check", and declaring it is what makes the
+check present, explicit and testable. The clients that use this route are the owner's own machine-local
+ones — the `hx` CLI (`by: "terminal"`) and the daemon's embedded web page (`by: "web"`) — and both declare
+the terminal's full ladder, which is the authority a keypress at the prompt has always had. A **channel**
+does not answer through this route at all: it answers through `ApprovalBridge`, where the ceiling comes
+from the deployment rather than from the channel, which is the distinction that makes the channel's
+ceiling a control rather than a self-declaration.
+
+**The API is authenticated now, and that is what the declared ceiling was missing.** The hole this section
+used to end on — "with `--bind 0.0.0.0` and no auth, a declared ceiling is not a defence against a remote
+caller" — is closed by a bearer token (`crates/hx-core/src/api_auth.rs`,
+`crates/hx-server/src/auth.rs`): `api.token` in the config (a literal, or a `store:name` reference
+resolved through `hx-secrets`) or `HX_API_TOKEN` in the environment, **required and refused at startup for
+a bind that is not loopback**, optional on loopback, compared in constant time, and answered with `401`
+and `WWW-Authenticate: Bearer` for a missing or wrong one. So a remote caller now has to present the token
+before it can declare anything, and the ceiling is no longer the only thing standing between a routable
+address and `POST /v1/approvals/{id}`.
+
+Two limits are worth stating rather than leaving to be discovered:
+
+- **A bearer token is not a session.** There is no rotation, no expiry, no per-client identity and no
+  revocation short of changing the token for everyone, so a token that leaks stays useful for as long as
+  it stands. `by:` is still a declaration by whoever holds the token, not a verified identity: the token
+  says *a* client was allowed in, not *which* one. Per-channel ceilings (`approval.ask_via`) are what
+  would make the answer's authority a property of the surface rather than of its declaration, and they
+  are still a roadmap line.
+- **The transport is plain HTTP.** Over a non-loopback interface the token travels in the clear unless
+  something in front of the daemon terminates TLS. `WWW-Authenticate: Bearer` is the challenge a client
+  should answer, not a claim that the channel is confidential.
+
+What is now true: the API cannot be reached at all without the token, and a daemon asked to serve a
+non-loopback address without one does not start. What is still not true: that the token tells the daemon
+which client is answering.

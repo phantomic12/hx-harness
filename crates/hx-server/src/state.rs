@@ -93,6 +93,16 @@ pub struct AppState {
     pub sandbox_unavailable_reason: Option<String>,
     /// Whether the secret vault was unlocked. Secrets are never loaded while locked.
     pub vault_unlocked: bool,
+    /// The bearer token every route but [`crate::auth::is_exempt`]'s two requires.
+    ///
+    /// Resolved **once**, in [`AppState::build`], from `api.token` or `HX_API_TOKEN` — not per
+    /// request, so a long-running daemon cannot be made to re-read an unlocked vault from a stray
+    /// request, and so the answer to "what is this daemon checking" cannot change under it.
+    ///
+    /// `None` means no token, which is a legitimate configuration on a loopback bind and a
+    /// configuration that never starts on any other. The check that makes that true is
+    /// [`hx_core::api_auth::require_token_for_bind`], called by `hxd` before it binds.
+    pub api_token: Option<hx_core::api_auth::ApiToken>,
 }
 
 /// Everything [`AppState::build`] assembles, so a test can assemble it differently.
@@ -109,6 +119,10 @@ pub struct AppStateParts {
     pub sandboxes: Option<Arc<SandboxManager>>,
     pub sandbox_unavailable_reason: Option<String>,
     pub started_at: DateTime<Utc>,
+    /// The API's bearer token, or `None` for an unauthenticated loopback deployment. A test that
+    /// wants the authenticated surface passes one here; a test that does not passes `None`, which
+    /// is the same thing a default-config daemon does.
+    pub api_token: Option<hx_core::api_auth::ApiToken>,
 }
 
 impl AppState {
@@ -138,6 +152,15 @@ impl AppState {
         // a stray request.
         let secrets = Arc::new(SecretStores::new().with(Arc::new(EnvSecrets)));
         let search = BackendRegistry::from_config(&config.search, client.clone(), &secrets)?;
+
+        // The API's bearer token, resolved once here rather than per request. A config that names a
+        // token it cannot resolve is a **startup failure**, not a daemon that quietly serves
+        // without one: `resolve_api_token` returning `Err` propagates out of `build`, and a
+        // `vault:` reference against a deployment with no vault is exactly the case where
+        // "degrade to no token" would leave a non-loopback daemon unprotected while its
+        // configuration says otherwise. Whether *having* no token is acceptable is a separate
+        // question, asked by `hxd` against the bind address.
+        let api_token = hx_secrets::resolve_api_token(&config, &secrets)?;
 
         // A *separate* client for providers, without the search timeout: a model call that takes
         // four minutes is a slow answer, not a failed one, and a 20-second cap here would turn every
@@ -203,6 +226,7 @@ impl AppState {
             sandboxes,
             sandbox_unavailable_reason,
             started_at: now,
+            api_token,
         }))
     }
 
@@ -231,6 +255,7 @@ impl AppState {
             started_at: parts.started_at,
             sandbox_unavailable_reason: parts.sandbox_unavailable_reason,
             vault_unlocked: false,
+            api_token: parts.api_token,
         })
     }
 

@@ -47,6 +47,59 @@ pub struct Config {
     pub agent: AgentConfig,
     #[serde(default)]
     pub terminal: TerminalConfig,
+    #[serde(default)]
+    pub api: ApiConfig,
+}
+
+/// The daemon's HTTP API.
+///
+/// ## The token is a reference by preference
+///
+/// `token` may be a literal value or a `store:name` reference (`env:HX_API_TOKEN`,
+/// `vault:api/token`). A reference is the form to prefer, for the reason every other credential in
+/// this file is a reference: a value written into a config file is a value in every copy, every
+/// backup and every paste of it. The literal form is accepted because a machine-local daemon
+/// needing one token should not have to grow a vault, and refusing it would push people towards
+/// `HX_API_TOKEN` — which is fine, and is the third form.
+///
+/// Resolution order, and it is deliberate that it is *not* "whichever is set": `api.token` wins
+/// when it is set, and `HX_API_TOKEN` is consulted only when the config names nothing. Two sources
+/// both honoured at once would make "which token is this daemon actually checking" unanswerable
+/// from the config alone.
+///
+/// ## Why the `Debug` is hand-written
+///
+/// `Config` derives `Debug`, and `hx` prints configurations. A derived `Debug` here would put a
+/// literal token into every dump of the config — including the ones a person pastes into a bug
+/// report. The rendering names whether a token is configured and never what it is.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiConfig {
+    /// A bearer token, as a literal or as a `store:name` reference resolved through `hx-secrets`.
+    ///
+    /// Absent means the daemon falls back to `HX_API_TOKEN`; absent *and* no environment variable
+    /// means no token, which is legal only on a loopback bind. See
+    /// [`crate::api_auth::require_token_for_bind`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+impl std::fmt::Debug for ApiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The *presence* of a token is configuration; the token is not. A reference is safe to
+        // print and a literal is not, and this cannot tell them apart without resolving — so it
+        // prints neither.
+        f.debug_struct("ApiConfig")
+            .field(
+                "token",
+                &match self.token.as_deref() {
+                    None => "None",
+                    Some(value) if value.trim().is_empty() => "Some(<empty>)",
+                    Some(_) => "Some(<redacted>)",
+                },
+            )
+            .finish()
+    }
 }
 
 /// The server-side terminal: what a client's `POST /v1/terminals` runs when it does not say.
@@ -1708,5 +1761,77 @@ mcp_servers:
         let mut server = McpServerConfig::stdio("", Vec::<String>::new());
         server.enabled = false;
         server.validate("fs").expect("disabled servers are inert");
+    }
+
+    // -- the API token -------------------------------------------------------
+
+    /// A config that says nothing about the API gets no token, which is what makes the existing
+    /// suite green: every test binds loopback and passes none, and the rule that keeps them green
+    /// is "optional on loopback", not "these tests happen to be special".
+    #[test]
+    fn a_config_with_no_api_block_has_no_token() {
+        let config = Config::from_yaml("roles: {}\n").expect("must parse");
+        assert_eq!(config.api.token, None);
+        assert_eq!(config.api, ApiConfig::default());
+    }
+
+    /// A token may be a `store:name` reference or a literal, and the parser does not choose between
+    /// them — resolving is the caller's job and the reason the field is a `String` rather than a
+    /// `SecretRef`. A field typed as a reference would have made the literal form unwritable, which
+    /// is a decision this config deliberately does not make.
+    #[test]
+    fn an_api_token_may_be_a_reference_or_a_literal() {
+        let referenced =
+            Config::from_yaml("api:\n  token: \"env:HX_API_TOKEN\"\n").expect("must parse");
+        assert_eq!(
+            referenced.api.token.as_deref(),
+            Some("env:HX_API_TOKEN"),
+            "a reference is stored verbatim; resolution happens where the secret stores are"
+        );
+
+        let literal =
+            Config::from_yaml("api:\n  token: \"a-machine-local-token\"\n").expect("must parse");
+        assert_eq!(literal.api.token.as_deref(), Some("a-machine-local-token"));
+    }
+
+    #[test]
+    fn a_misspelled_key_in_the_api_block_is_refused_rather_than_ignored() {
+        // `deny_unknown_fields` is the reason a typo'd `api.tokens` is a startup error instead of a
+        // daemon that looks configured and has no token.
+        let err = Config::from_yaml("api:\n  tokens: \"nope\"\n").unwrap_err();
+        assert!(err.to_string().contains("tokens"), "{err}");
+    }
+
+    /// The value must not reach a `Debug` dump. `Config` derives `Debug` and `hx` prints
+    /// configurations, so a derived `Debug` on `ApiConfig` would be a token in every bug report.
+    #[test]
+    fn a_literal_token_never_appears_in_a_config_debug_rendering() {
+        // Not key-shaped, so the read-side redaction that masks key-shaped literals in a file
+        // display cannot hide it from the assertion below and make the test pass for the wrong
+        // reason.
+        const SENTINEL: &str = "hx-api-token-literal-9c3f7e";
+
+        let config =
+            Config::from_yaml(&format!("api:\n  token: \"{SENTINEL}\"\n")).expect("must parse");
+        let printed = format!("{config:?}");
+        assert!(
+            !printed.contains(SENTINEL),
+            "a `Debug` dump of the config carried the token"
+        );
+        assert!(
+            printed.contains("<redacted>"),
+            "and it says a token is configured, which is configuration: {printed}"
+        );
+
+        // The control: an absent token and an empty one are distinguishable, so a dump answers
+        // "is this daemon authenticating" rather than always saying the same thing.
+        assert!(format!("{:?}", ApiConfig::default()).contains("None"));
+        assert!(format!(
+            "{:?}",
+            ApiConfig {
+                token: Some("  ".into())
+            }
+        )
+        .contains("<empty>"));
     }
 }

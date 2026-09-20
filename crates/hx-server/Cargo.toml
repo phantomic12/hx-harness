@@ -39,6 +39,10 @@ rusqlite.workspace = true
 async-trait.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# The auth tests capture what the tracing subscriber is *handed* and search it for the token. A
+# `Debug` assertion cannot cover a log line, and a log line is one of the three places a credential
+# leaks. Already in the workspace lock (the binaries use it), so this costs no download.
+tracing-subscriber.workspace = true
 # The WebSocket integration tests drive a real axum server over a real socket, because the upgrade
 # handshake cannot be exercised through `tower::oneshot`. That ply is already in the workspace's lock
 # (pulled in by the MCP/rmcp stack), so adding it as a dev-dependency for the tests costs nothing

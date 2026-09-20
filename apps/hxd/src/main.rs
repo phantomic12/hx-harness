@@ -76,10 +76,19 @@ async fn main() -> Result<()> {
 
     // Building the state validates the routing table: every role must resolve to a real pool,
     // every pool member to a real provider and model. A misconfigured harness fails here rather
-    // than at 3am on the first request.
+    // than at 3am on the first request. It also resolves the API's bearer token, so a `api.token`
+    // reference that cannot be resolved fails here rather than leaving the API unprotected.
     let state = AppState::build(config, Utc::now())
         .await
         .context("could not build the daemon state")?;
+
+    // **Fail closed, before anything is bound.** A bind that is not loopback and a token that was
+    // not configured is a refusal to start, not a warning: starting anyway would serve an
+    // unauthenticated API — file reads, commands on every configured host, and the approval
+    // questions a run is waiting on — to anything that can route to the address. `--check` is
+    // behind this on purpose, so validating a deployment that would not be allowed to run says so.
+    hx_core::api_auth::require_token_for_bind(&args.bind, state.api_token.is_some())
+        .context("the HTTP API would be reachable without authentication")?;
 
     if args.check {
         let report = state.status(Utc::now()).await;

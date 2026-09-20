@@ -542,6 +542,36 @@ pub fn static_checks(config: &Config) -> Vec<DoctorCheck> {
         }
     }
 
+    // The API's token. Reported because its *absence* is a refusal to start on any bind that is not
+    // loopback, and `hx doctor` is what an operator runs before starting the daemon — a check that
+    // stayed silent about the one setting that can stop the daemon from coming up would be
+    // answering a different question. Which source is configured is named; the value is not, and is
+    // not read here at all.
+    let token_source = if config
+        .api
+        .token
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
+        Some("api.token in this config")
+    } else if hx_secrets::EnvSecrets::has(hx_core::api_auth::API_TOKEN_ENV) {
+        Some(hx_core::api_auth::API_TOKEN_ENV)
+    } else {
+        None
+    };
+    checks.push(DoctorCheck::pass(
+        "api token",
+        match token_source {
+            Some(source) => format!("configured from {source}; the value is never read here"),
+            None => format!(
+                "none configured — legal on the loopback default, and a refusal to start on any \
+                 other --bind. Set `api.token`, or {} in the environment.",
+                hx_core::api_auth::API_TOKEN_ENV
+            ),
+        },
+    ));
+
     checks
 }
 

@@ -8,10 +8,26 @@
 //! Every failure here says which of two things went wrong: the daemon is not there (an actionable
 //! "start it with …"), or the daemon answered with an error of its own (which is quoted, not
 //! paraphrased — the daemon's message is usually better than one this layer could invent).
+//!
+//! ## Authentication
+//!
+//! A daemon that requires a bearer token answers `401` to everything else, so every command here
+//! goes through [`connect`], which resolves the token exactly the way the daemon does
+//! ([`hx_secrets::resolve_api_token`]: `api.token`, else `HX_API_TOKEN`) and puts it on the client's
+//! default headers. Resolving it once per process rather than per request keeps one answer to "what
+//! token is this client using", and `HeaderValue::set_sensitive` keeps it out of a `Debug` rendering
+//! of the request.
+//!
+//! One honest limit: this client has no vault, so a config whose `api.token` is a `vault:`
+//! reference cannot be resolved here. That is reported rather than silently ignored — the operator
+//! is told to put the token in the environment for the CLI, which is the form a script or a
+//! container would use anyway.
 
 use anyhow::{bail, Context};
+use hx_core::api_auth::API_TOKEN_ENV;
 use hx_core::config::Config;
 use serde_json::Value;
+use std::sync::Arc;
 
 /// Where to reach the daemon: `--daemon`, else the config, else the documented default.
 ///
@@ -28,6 +44,44 @@ pub fn base_url(config: &Config, explicit: Option<&str>) -> String {
     } else {
         format!("http://{}", raw.trim_end_matches('/'))
     }
+}
+
+/// Everything a daemon-facing command needs: where the daemon is, and a client that can
+/// authenticate to it.
+///
+/// The token is resolved with the same rule the daemon uses, so a deployment cannot end up with a
+/// daemon checking one token and its own CLI sending another.
+pub fn connect(
+    config: &Config,
+    explicit: Option<&str>,
+) -> anyhow::Result<(reqwest::Client, String)> {
+    let base = base_url(config, explicit);
+
+    // The same store set `AppState::build` has: the environment. A vault-backed reference cannot be
+    // resolved from here and is reported rather than ignored.
+    let secrets = hx_secrets::SecretStores::new().with(Arc::new(hx_secrets::EnvSecrets));
+    let token = hx_secrets::resolve_api_token(config, &secrets).context(
+        "could not work out the daemon's API token from this config (put it in the environment as \
+         HX_API_TOKEN if it lives in the vault, which this command cannot open)",
+    )?;
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = token {
+        let mut value =
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.expose()))
+                .context("the API token is not a valid header value")?;
+        // Marked sensitive so a `Debug` of the header map renders `Sensitive` rather than the
+        // token: the same reason `Secret`'s own `Debug` is redacted.
+        value.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+    }
+
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .context("could not build the HTTP client")?;
+
+    Ok((client, base))
 }
 
 async fn send(
@@ -57,6 +111,16 @@ async fn send(
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or(text);
+        // A 401 is the one status whose fix is not in the message the daemon sends — deliberately,
+        // because the body must not distinguish "no token" from "wrong token". So the *client* says
+        // which two settings to look at, and says nothing about the token itself.
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            bail!(
+                "{what} failed: 401 — {message}. This daemon requires a bearer token: set \
+                 `api.token` in the config, or {API_TOKEN_ENV} in the environment, to the token the \
+                 daemon was started with."
+            );
+        }
         bail!("{what} failed: {} — {message}", status.as_u16());
     }
 
@@ -299,5 +363,111 @@ mod tests {
             base_url(&config_with("127.0.0.1:8799"), None),
             "http://127.0.0.1:8799"
         );
+    }
+    /// A one-shot HTTP stub that records the request head it received and answers with `status`.
+    ///
+    /// Hand-rolled over a real socket rather than mocked: the property under test is "this request
+    /// carried this header on the wire", and `reqwest::Client`'s default headers have no getter to
+    /// assert on — a test that inspected the builder would be agreeing with itself.
+    async fn recording_stub(status: &'static str) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let recorded: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let sink = Arc::clone(&recorded);
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let read = stream.read(&mut buf).await.unwrap_or(0);
+                sink.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..read]).to_string());
+
+                let body = r#"{"error":"authentication required"}"#;
+                let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        (addr.to_string(), recorded)
+    }
+
+    #[tokio::test]
+    async fn a_configured_token_is_sent_as_a_bearer_credential_on_the_wire() {
+        let (addr, recorded) = recording_stub("200 OK").await;
+        let config = hx_core::config::Config::from_yaml("api:\n  token: \"cli-sentinel-2a9f\"\n")
+            .expect("config parses");
+
+        let (client, base) = connect(&config, Some(&addr)).expect("client builds");
+        client
+            .get(format!("{base}/v1/status"))
+            .send()
+            .await
+            .expect("a response");
+
+        let heads = recorded.lock().unwrap().clone();
+        assert_eq!(heads.len(), 1, "one request was made");
+        assert!(
+            heads[0].contains("authorization: Bearer cli-sentinel-2a9f")
+                || heads[0].contains("Authorization: Bearer cli-sentinel-2a9f"),
+            "the request carried no bearer token:\n{}",
+            heads[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn no_configured_token_means_no_authorization_header_at_all() {
+        // The loopback-optional rule from the client's side: a daemon that requires nothing must not
+        // receive a header, or "no token" would be indistinguishable from "a token" on the wire.
+        //
+        // The variable is cleared rather than left to the ambient environment: a machine with
+        // `HX_API_TOKEN` exported would otherwise make this test pass or fail depending on where it ran.
+        std::env::remove_var(hx_core::api_auth::API_TOKEN_ENV);
+
+        let (addr, recorded) = recording_stub("200 OK").await;
+        let config = hx_core::config::Config::from_yaml("roles: {}\n").expect("config parses");
+
+        let (client, base) = connect(&config, Some(&addr)).expect("client builds");
+        client
+            .get(format!("{base}/v1/status"))
+            .send()
+            .await
+            .expect("a response");
+
+        let heads = recorded.lock().unwrap().clone();
+        assert_eq!(heads.len(), 1);
+        assert!(
+            !heads[0].to_lowercase().contains("authorization"),
+            "an unconfigured client sent a credential:\n{}",
+            heads[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_401_tells_the_operator_which_setting_to_look_at_without_quoting_the_token() {
+        // The daemon's own 401 body deliberately does not distinguish "no token" from "wrong token", so
+        // the *client* is where the actionable sentence lives. It must name the settings and never the
+        // value.
+        let (addr, _) = recording_stub("401 Unauthorized").await;
+        let config = hx_core::config::Config::from_yaml("api:\n  token: \"cli-sentinel-2a9f\"\n")
+            .expect("config parses");
+
+        let (client, base) = connect(&config, Some(&addr)).expect("client builds");
+        let err = audit(&client, &base, "ses_1")
+            .await
+            .expect_err("a 401 is an error")
+            .to_string();
+
+        assert!(err.contains("401"), "{err}");
+        assert!(err.contains("api.token"), "{err}");
+        assert!(err.contains(hx_core::api_auth::API_TOKEN_ENV), "{err}");
+        assert!(!err.contains("cli-sentinel-2a9f"), "{err}");
     }
 }

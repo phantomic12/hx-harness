@@ -353,10 +353,36 @@ CIDR or raw IP — is still refused, with a reason naming the way out.*
   ceiling for the same reason, and a body that declares none is a rejection rather than a grant. Proven by
   `a_destructive_answer_from_a_chat_channel_is_refused_over_http` and
   `an_answer_that_declares_no_ceiling_is_refused_rather_than_granted_everything` (`hx-server/tests/api.rs`),
-  both of which were run against the broken code and went red first. **What this is not:** an
-  authentication story. The route has no auth, so a *declared* ceiling is only as trustworthy as the
-  caller, and with `--bind 0.0.0.0` it is no defence against a remote caller — that control is the API's
-  authentication, still absent (see `docs/approvals.md` §9).
+  both of which were run against the broken code and went red first. **What this is not, on its own:** an
+  authentication story. The route has no auth *of its own*, so a *declared* ceiling is only as trustworthy
+  as the caller, and with `--bind 0.0.0.0` it was no defence against a remote caller — that control is the
+  API's authentication, which had not landed yet (see `docs/approvals.md` §9). It has landed since: the
+  next item.
+- ✅ **The API's bearer token** (`crates/hx-core/src/api_auth.rs`, `crates/hx-server/src/auth.rs`,
+  `crates/hx-secrets/src/source.rs`) — the control §9 named as missing, and the reason a declared ceiling
+  is now a defence against a remote caller at all. `api.token` in the config (a literal, or a `store:name`
+  reference resolved through `hx-secrets`) or `HX_API_TOKEN` in the environment; **required and refused at
+  startup for a non-loopback bind**, optional on loopback so the existing loopback fixtures stay legal; the
+  refusal names both settings and happens before the listener binds, so `hxd --check` refuses too. The
+  comparison is constant time and hand-rolled (no new dependency): every byte of the longer input is
+  visited and the length difference is folded in as a bit, so a correct prefix costs the same as a wrong
+  first byte. A request with no token, a wrong token, a bare token or another scheme is `401` with
+  `WWW-Authenticate: Bearer`, and a missing token and a wrong one are **byte-identical** in the body. `GET
+  /healthz` and `GET /` (the embedded page — a browser navigation cannot carry a header) are exempt; the
+  WebSocket routes accept the token from `?token=` **only** on an upgrade request, the one request shape a
+  browser cannot authenticate by header, and the same query string on a plain GET is worth nothing. Both
+  clients are wired: `hx` puts the token on its client's default headers and its 401 message names the
+  settings, and the page sends it on every `fetch` and on its socket URLs. Proven by
+  `crates/hx-server/tests/api_auth.rs` (11 tests: a no-token `PUT` that must not reach the handler *with*
+  its write control, every prefix of the token refused, a bare token and another scheme refused, the two
+  refusals compared byte for byte, an unresolvable `api.token` failing the build, and a capture of the
+  tracing output on both refusal paths asserting the sentinel is in no log line and no `Debug` dump),
+  `ws_api.rs` (a real socket: refused without a credential, opened by `?token=` and by the header),
+  `web_client_api.rs` (the page loads while the API behind it does not), and `hx`'s own `daemon.rs` tests
+  (a stub recording the request head, so "the header was sent" is asserted on the wire). **What this is
+  not:** a session. A bearer token has no rotation, no expiry, no per-client identity and no replay
+  protection, and the transport is plain HTTP, so over a non-loopback interface it is in the clear without
+  TLS in front. The limit is written into the module doc and into `docs/approvals.md` §9 as well as here.
 - **Discord** (twilight gateway, slash commands, threads, Message Content Intent) — **deferred by
   decision, no urgency**: Telegram proves the trait today, and a second platform shape is worth building
   when a need for it appears rather than speculatively.

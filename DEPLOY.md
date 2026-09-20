@@ -132,9 +132,25 @@ There's a working [`docker-compose.yml`](docker-compose.yml) in the repo root.
 mount `/var/run/docker.sock`. Without it the daemon still starts and serves the HTTP API —
 it just reports the sandbox backend as unavailable. Compose already has the mount.
 
-**No authentication.** `hxd` has no auth of its own. Anything that can reach port 7717 can
-drive your model spend and your sandboxes. The Compose file binds to `127.0.0.1` on purpose.
-Put it behind a reverse proxy or an SSH tunnel rather than exposing it:
+**Authentication is a bearer token, and it is required off loopback.** The API can read files, run
+commands on every configured host, and answer the approval questions an agent run is waiting on, so
+`hxd` refuses to start when `--bind` is not a loopback address and no token is configured — a
+warning would be a line in a log nobody reads while the port is open. Set `api.token` in the config
+(a literal, or a `store:name` reference resolved through `hx-secrets` such as
+`"env:HX_API_TOKEN"`), or set `HX_API_TOKEN` in the environment, which is the form a container uses.
+On a loopback bind a token is optional but honoured if set. The Compose file binds to `127.0.0.1` on
+purpose; for anything else, give it a token:
+
+```console
+$ export HX_API_TOKEN=$(head -c 32 /dev/urandom | base64)
+$ hxd --config hx.yaml --bind 0.0.0.0:7717        # starts, because a token is configured
+$ hxd --config hx.yaml --bind 0.0.0.0:7717        # without HX_API_TOKEN and without api.token:
+                                                  # refuses to start, naming both settings
+```
+
+`hx` and the embedded web page send the token automatically when it is configured, so nothing else
+changes for a client. A tunnel is still the better answer where you have the choice, because the
+transport is plain HTTP and the token is a bearer credential with no rotation or expiry:
 
 ```console
 $ ssh -N -L 7717:127.0.0.1:7717 user@your-host
@@ -211,6 +227,11 @@ $ hxd --config hx.yaml --bind 127.0.0.1:7717
 | `--bind` | `HX_BIND` | `127.0.0.1:7717` |
 | `--check` | — | validate config, print a JSON status report, exit |
 
+`--bind` is not only an address. A value that is not loopback (`127.0.0.1`, `localhost`, `::1`)
+requires an API token, and the daemon **refuses to start** without one — `--check` included, so a
+config that would not be allowed to run says so before anything binds. See
+[Authentication](#authentication-is-a-bearer-token-and-it-is-required-off-loopback).
+
 Unknown config keys are rejected, so a typo fails loudly at startup instead of being
 silently ignored.
 
@@ -235,18 +256,29 @@ key or reweight a pool without touching agent definitions. `SecretRef` is parsed
 validated at startup.
 
 **These references are not yet resolved to real values.** The encrypted vault exists in
-`hx-secrets` and is unit-tested, but nothing in the daemon holds a secret, and there is no
-env var that supplies one. Treat credential plumbing as unbuilt rather than as
-misconfigured.
+`hx-secrets` and is unit-tested, but nothing in the daemon holds a provider credential, and there
+is no env var that supplies one. Treat credential plumbing as unbuilt rather than as
+misconfigured. **The one secret the daemon does hold is the API's own bearer token**
+(`api.token`, or `HX_API_TOKEN` — the same resolution path, so `api.token: "env:HX_API_TOKEN"` and
+`HX_API_TOKEN` are the same thing by two routes). It is the exception that proves the rule: the
+daemon needs it to admit a caller at all, so it cannot be fetched on demand.
 
 ---
 
 ## Health and status
 
 ```console
-$ curl -s localhost:7717/healthz
-$ curl -s localhost:7717/v1/status | jq .pools
+$ curl -s localhost:7717/healthz                        # exempt from the token, by design
+$ curl -s localhost:7717/v1/status | jq .pools          # 401 without the token
+$ curl -s -H "Authorization: Bearer $HX_API_TOKEN" localhost:7717/v1/status | jq .pools
 ```
+
+`/healthz` and `GET /` (the embedded page) are the only two routes that answer without a token.
+`/healthz` is exempt because a supervisor — Docker's `HEALTHCHECK`, systemd, a load balancer —
+has to be able to ask whether the process is alive without being handed the credential, and it
+answers nothing about the daemon's state or data. `/` is exempt because a browser navigation
+cannot attach a header, so the page would be unreachable otherwise; it serves a static file, and
+every call the page then makes goes to a token-protected route.
 
 The container image has a `HEALTHCHECK` against `/healthz`. `hxd --check` is the
 validate-and-exit equivalent for CI, and prints a JSON status report.

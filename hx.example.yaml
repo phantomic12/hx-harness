@@ -177,6 +177,42 @@ sandbox_profiles:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# The HTTP API's authentication.
+#
+# The daemon's API can read files, run commands on every configured host, and answer the approval
+# questions an agent run is waiting on. So it is authenticated with a bearer token, and the rule is
+# **fail-closed**: `hxd --bind 0.0.0.0:8787` with no token configured **refuses to start** rather
+# than starting unprotected with a warning. A warning is a line in a log nobody reads, and the
+# daemon would then be serving an unauthenticated API on a routable address.
+#
+# On a loopback bind (`127.0.0.1`, `localhost`, `::1` — the default) a token is optional but
+# honoured if set, so a local setup can still require one.
+#
+# The token may be written three ways, in this order of preference:
+#
+#   1. `token: "env:HX_API_TOKEN"` — a reference, resolved through `hx-secrets` at startup. This is
+#      the form to prefer: a value in a config file is a value in every copy and every paste of it.
+#   2. `token: "vault:api/token"` — the same, from an unlocked vault.
+#   3. `token: "a-literal-token"` — accepted, because a machine-local daemon needing one token
+#      should not have to grow a vault. A literal containing a `:` is read as a reference; put such
+#      a value in the environment or the vault instead.
+#
+# `api.token` wins when it is set; `HX_API_TOKEN` in the environment is the fallback and is the form
+# a container or a CI job uses. An *empty* variable counts as absent, not as an empty token.
+#
+# Clients: `hx` and the embedded web page both send `Authorization: Bearer <token>` when one is
+# configured. A request without it — or with a wrong one — is a `401` with `WWW-Authenticate:
+# Bearer`, and the two are indistinguishable in the body. `GET /healthz` and the web page at `GET /`
+# are exempt; see `crates/hx-server/src/auth.rs` for why, and for what a bearer token does *not* buy
+# you (no rotation, no expiry, no replay protection — it is not a session).
+#
+# Uncomment to require a token locally, or set it in so many words to serve a routable address:
+#
+# api:
+#   token: "env:HX_API_TOKEN"
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Search: SearXNG is the force multiplier — one JSON API in front of ~70 engines.
 # The keyless scrapers are fallbacks for when no SearXNG is running.
 # ---------------------------------------------------------------------------

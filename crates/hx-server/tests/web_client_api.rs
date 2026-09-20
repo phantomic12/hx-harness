@@ -67,6 +67,15 @@ struct Server {
 }
 
 async fn harness() -> Server {
+    harness_with_token(None).await
+}
+
+/// The same daemon, optionally requiring a bearer token.
+///
+/// The token is passed in rather than read from the environment so the test states its own
+/// configuration: a test whose credential came from the ambient environment would pass or fail
+/// depending on the machine it ran on.
+async fn harness_with_token(token: Option<&str>) -> Server {
     let mut config = hx_core::config::Config::from_yaml(CONFIG).expect("config parses");
     let dir = tempfile::tempdir().expect("temp dir");
     config.daemon.data_dir = dir.path().join("data").display().to_string();
@@ -96,6 +105,10 @@ async fn harness() -> Server {
         sandboxes: None,
         sandbox_unavailable_reason: Some("no container engine in a test".to_string()),
         started_at: now,
+        // No token by default: these tests bind loopback, which is exactly the deployment where a
+        // token is optional. A test that needed one here would mean the rule, not the test, was
+        // wrong.
+        api_token: token.map(hx_core::api_auth::ApiToken::new),
     });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -152,5 +165,73 @@ async fn the_root_serves_the_web_client_as_html() {
     assert!(
         body.contains("/v1/hosts") && body.contains("No hosts are configured."),
         "the page must render the hosts pane from the real /v1/hosts route"
+    );
+}
+
+#[tokio::test]
+async fn the_page_is_served_without_a_token_because_a_browser_cannot_send_one() {
+    // The exemption, tested as a pair: the page loads *and* the API behind it does not. Serving
+    // `GET /` to a browser is not a hole — it is a static file embedded in the binary, and a
+    // navigation cannot carry an `Authorization` header, so requiring one would make the page
+    // unreachable exactly when a token is configured.
+    let server = harness_with_token(Some("sentinel-token-for-the-web-client-test")).await;
+    let client = reqwest::Client::new();
+
+    let page = client
+        .get(format!("http://{}/", server.addr))
+        .send()
+        .await
+        .expect("a response");
+    assert_eq!(page.status(), reqwest::StatusCode::OK, "the page loads");
+
+    let api = client
+        .get(format!("http://{}/v1/status", server.addr))
+        .send()
+        .await
+        .expect("a response");
+    assert_eq!(
+        api.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "and the API behind it does not answer without the token"
+    );
+}
+
+#[tokio::test]
+async fn the_page_carries_the_bearer_token_on_every_call_it_makes() {
+    // A page that renders but sends no token is unusable against a daemon that requires one, so
+    // the wiring is part of what "the web client is served" has to mean. These assertions are about
+    // the served text, which is the only thing this test can see — the behaviour is the daemon's
+    // 401 and the panel is a browser's.
+    let server = harness().await;
+    let body = reqwest::Client::new()
+        .get(format!("http://{}/", server.addr))
+        .send()
+        .await
+        .expect("a response")
+        .text()
+        .await
+        .expect("a body");
+
+    assert!(
+        body.contains("Bearer ${token}"),
+        "the page must send the token as a bearer credential"
+    );
+    assert!(
+        body.contains("hx.api.token"),
+        "and keep it somewhere a reload does not lose it"
+    );
+    assert!(
+        body.contains("id=\"token-input\""),
+        "and give the operator somewhere to put it"
+    );
+    assert!(
+        body.contains("?token=") || body.contains("token=${encodeURIComponent"),
+        "and carry it on the WebSocket URLs, which cannot take a header"
+    );
+    // The property that keeps this true as routes are added: every call goes through the one
+    // helper, so a new pane cannot forget the header.
+    assert!(
+        !body.contains("await fetch(`${API}"),
+        "a call site bypasses apiFetch, and would be sent without the token"
     );
 }

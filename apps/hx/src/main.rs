@@ -223,7 +223,7 @@ async fn main() -> Result<()> {
             json,
             stream,
         } => {
-            let base = daemon::base_url(&config, cli.daemon.as_deref());
+            let (client, base) = daemon::connect(&config, cli.daemon.as_deref())?;
             let mut body = serde_json::json!({ "prompt": prompt, "max_turns": max_turns });
             // Only the fields the caller actually set: the daemon's defaults are its own to decide,
             // and sending `null`s would make this command's defaults look like the daemon's.
@@ -243,7 +243,6 @@ async fn main() -> Result<()> {
                 body["autonomy"] = serde_json::json!(autonomy);
             }
 
-            let client = reqwest::Client::new();
             let reply = if stream {
                 // Progress goes to stderr, the reply to stdout: piping `hx chat` through something
                 // else must not drag "turn 3" lines into the parsed output.
@@ -283,8 +282,8 @@ async fn main() -> Result<()> {
         }
 
         Command::Audit { id, json } => {
-            let base = daemon::base_url(&config, cli.daemon.as_deref());
-            let report = daemon::audit(&reqwest::Client::new(), &base, &id).await?;
+            let (client, base) = daemon::connect(&config, cli.daemon.as_deref())?;
+            let report = daemon::audit(&client, &base, &id).await?;
             print!("{}", commands::render_audit(&report, json));
 
             // A broken chain is not a success. Exit 2 the way an incomplete run does, so `hx audit`
@@ -295,14 +294,13 @@ async fn main() -> Result<()> {
         }
 
         Command::Sessions { limit } => {
-            let base = daemon::base_url(&config, cli.daemon.as_deref());
-            let list = daemon::sessions(&reqwest::Client::new(), &base, limit).await?;
+            let (client, base) = daemon::connect(&config, cli.daemon.as_deref())?;
+            let list = daemon::sessions(&client, &base, limit).await?;
             print!("{}", commands::render_sessions(&list));
         }
 
         Command::Session { id, export } => {
-            let base = daemon::base_url(&config, cli.daemon.as_deref());
-            let client = reqwest::Client::new();
+            let (client, base) = daemon::connect(&config, cli.daemon.as_deref())?;
 
             match export.as_str() {
                 "none" => {
@@ -351,15 +349,14 @@ async fn main() -> Result<()> {
         }
 
         Command::Approvals { session, json } => {
-            let base = daemon::base_url(&config, cli.daemon.as_deref());
-            let list =
-                daemon::approvals(&reqwest::Client::new(), &base, session.as_deref()).await?;
+            let (client, base) = daemon::connect(&config, cli.daemon.as_deref())?;
+            let list = daemon::approvals(&client, &base, session.as_deref()).await?;
             print!("{}", commands::render_approvals(&list, json));
         }
 
         Command::Approve { id, option, by } => {
-            let base = daemon::base_url(&config, cli.daemon.as_deref());
-            let reply = daemon::approve(&reqwest::Client::new(), &base, &id, &option, &by).await?;
+            let (client, base) = daemon::connect(&config, cli.daemon.as_deref())?;
+            let reply = daemon::approve(&client, &base, &id, &option, &by).await?;
             // Echoed, not assumed: the daemon is the one that knows whether a question was still
             // waiting, and an answer that arrived after the run gave up is not an answer.
             println!("{}", serde_json::to_string(&reply).unwrap_or_default());

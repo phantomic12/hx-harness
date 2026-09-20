@@ -188,6 +188,9 @@ hosts:
         sandboxes: None,
         sandbox_unavailable_reason: Some("no container engine in a test".to_string()),
         started_at: now,
+        // No token: these tests bind loopback, which is exactly the deployment where a token is
+        // optional. A test that needed one here would mean the rule, not the test, was wrong.
+        api_token: None,
     });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
