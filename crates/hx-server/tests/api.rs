@@ -484,7 +484,12 @@ async fn harness_with(config_yaml: &str, replies: Vec<Result<ChatResponse>>) -> 
     let secrets = SecretStores::new().with(Arc::new(EnvSecrets));
     let store = Store::from_config(&config).expect("store opens");
     let client = reqwest::Client::new();
-    let search = BackendRegistry::from_config(&config.search, client.clone()).expect("search");
+    let search = BackendRegistry::from_config(
+        &config.search,
+        client.clone(),
+        &hx_secrets::SecretStores::new(),
+    )
+    .expect("search");
 
     let model = ScriptedModel::new(replies);
     let state = AppState::from_parts(AppStateParts {

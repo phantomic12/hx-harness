@@ -589,7 +589,11 @@ pub async fn run_search(
         .user_agent(hx_search::backends::USER_AGENT)
         .timeout(std::time::Duration::from_secs(20))
         .build()?;
-    let registry = hx_search::BackendRegistry::from_config(&config.search, client)?;
+    // `hx search` resolves `env:` credential references only, the same as the daemon before its
+    // vault is unlocked. A `vault:` reference therefore fails loudly with the reference named rather
+    // than sending an unauthenticated request.
+    let secrets = hx_secrets::SecretStores::new().with(std::sync::Arc::new(hx_secrets::EnvSecrets));
+    let registry = hx_search::BackendRegistry::from_config(&config.search, client, &secrets)?;
     Ok(registry
         .search(&hx_search::SearchQuery::new(query).with_limit(limit))
         .await)

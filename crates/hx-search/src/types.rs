@@ -203,6 +203,46 @@ pub fn canonicalize_url(raw: &str) -> String {
     url.to_string()
 }
 
+/// Whether a result URL is on `site`, or on a subdomain of it.
+///
+/// This exists for the backends whose query language has **no** `site:` operator — Marginalia
+/// and Wikipedia. For those, folding `site:docs.rs` into the search terms does not filter
+/// anything: MediaWiki would search for the literal token `site:docs.rs` and return nothing at
+/// all, which is worse than not filtering. Applying the filter to the returned URLs instead can
+/// only ever *remove* results that violate it, so it cannot manufacture a wrong answer — it can
+/// only narrow a right one.
+///
+/// A subdomain counts as a match, because `site:docs.rs` is conventionally read as "the docs.rs
+/// site" and `doc.rust-lang.org`-style hosts are the exception rather than the rule. The
+/// comparison is case-insensitive and ignores a leading `www.`, a scheme and a path, so
+/// `site:https://www.docs.rs/en` works the way a person would expect it to.
+pub fn host_matches(url: &str, site: &str) -> bool {
+    let Some(host) = Url::parse(url.trim())
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+    else {
+        return false;
+    };
+
+    // Accept a bare host, or anything URL-shaped: take the host out of it and drop `www.`.
+    let site = site.trim();
+    let site = Url::parse(site)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| site.to_string());
+    let site = site
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let site = site.strip_prefix("www.").unwrap_or(&site);
+
+    if site.is_empty() {
+        return false;
+    }
+
+    host == site || host.ends_with(&format!(".{site}"))
+}
+
 /// Merge per-backend rankings into one ranking using Reciprocal Rank Fusion.
 ///
 /// `lists` pairs each backend id with its results in rank order. Ties are broken
@@ -327,6 +367,40 @@ mod tests {
     #[test]
     fn unparseable_urls_still_deduplicate() {
         assert_eq!(canonicalize_url("not a url"), canonicalize_url("NOT A URL"));
+    }
+
+    // ---- site filtering by host ----
+
+    #[test]
+    fn a_host_filter_matches_the_host_and_its_subdomains() {
+        assert!(host_matches("https://docs.rs/serde", "docs.rs"));
+        assert!(host_matches("https://serde.rs/", "serde.rs"));
+        assert!(
+            host_matches("https://doc.rust-lang.org/std/", "rust-lang.org"),
+            "a subdomain is the same site"
+        );
+    }
+
+    #[test]
+    fn a_host_filter_rejects_a_different_site_that_merely_ends_the_same_way() {
+        // The bug a naive `ends_with` has: "notdocs.rs" ends with "docs.rs".
+        assert!(!host_matches("https://notdocs.rs/", "docs.rs"));
+        assert!(!host_matches("https://example.com/docs.rs", "docs.rs"));
+        assert!(!host_matches("https://docs.rs.evil.test/", "docs.rs"));
+    }
+
+    #[test]
+    fn a_host_filter_accepts_a_url_shaped_site_and_ignores_www_and_case() {
+        assert!(host_matches("https://docs.rs/x", "https://www.docs.rs/en"));
+        assert!(host_matches("https://WWW.docs.rs/x", "docs.rs"));
+        assert!(host_matches("https://docs.rs/x", "DOCS.RS"));
+    }
+
+    #[test]
+    fn a_host_filter_against_an_unparseable_url_is_false_not_true() {
+        // Fail closed: an unreadable URL must not slip past a filter the caller asked for.
+        assert!(!host_matches("not a url", "docs.rs"));
+        assert!(!host_matches("https://docs.rs/", ""));
     }
 
     // ---- fusion ----

@@ -204,7 +204,12 @@ async fn harness() -> Option<(Arc<AppState>, std::path::PathBuf, tempfile::TempD
     let secrets = SecretStores::new().with(Arc::new(EnvSecrets));
     let store = Store::from_config(&config).expect("store opens");
     let client = reqwest::Client::new();
-    let search = BackendRegistry::from_config(&config.search, client.clone()).expect("search");
+    let search = BackendRegistry::from_config(
+        &config.search,
+        client.clone(),
+        &hx_secrets::SecretStores::new(),
+    )
+    .expect("search");
 
     let model = ScriptedModel::new(vec![
         Ok(shell_call(

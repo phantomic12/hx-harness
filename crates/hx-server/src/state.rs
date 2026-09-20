@@ -127,7 +127,17 @@ impl AppState {
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .map_err(|e| HxError::Config(format!("could not build the HTTP client: {e}")))?;
-        let search = BackendRegistry::from_config(&config.search, client.clone())?;
+
+        // Until the vault is unlocked this resolves `env:` references only. That is stated rather
+        // than implied: `hx status` reports which stores are configured, so a `vault:` reference
+        // that cannot resolve yet is visible before a run tries to use it.
+        //
+        // Built *before* the search registry, because the registry resolves the credential
+        // references in `search.credentials` once, at construction — a long-running daemon that
+        // touched the vault per query would be one that can be made to read an unlocked vault from
+        // a stray request.
+        let secrets = Arc::new(SecretStores::new().with(Arc::new(EnvSecrets)));
+        let search = BackendRegistry::from_config(&config.search, client.clone(), &secrets)?;
 
         // A *separate* client for providers, without the search timeout: a model call that takes
         // four minutes is a slow answer, not a failed one, and a 20-second cap here would turn every
@@ -150,11 +160,6 @@ impl AppState {
             );
         }
         let store = Arc::new(Store::from_config_with_key(&config, chain_key)?);
-
-        // Until the vault is unlocked this resolves `env:` references only. That is stated rather
-        // than implied: `hx status` reports which stores are configured, so a `vault:` reference
-        // that cannot resolve yet is visible before a run tries to use it.
-        let secrets = Arc::new(SecretStores::new().with(Arc::new(EnvSecrets)));
 
         let search = Arc::new(search);
         let tools = Arc::new(crate::chat::default_tools(search.all(), client.clone()));

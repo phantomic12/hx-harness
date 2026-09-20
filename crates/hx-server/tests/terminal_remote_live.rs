@@ -167,7 +167,12 @@ hosts:
     let client = reqwest::Client::new();
     let providers =
         ProviderRegistry::from_config(&config, client.clone()).expect("providers build");
-    let search = BackendRegistry::from_config(&config.search, client.clone()).expect("search");
+    let search = BackendRegistry::from_config(
+        &config.search,
+        client.clone(),
+        &hx_secrets::SecretStores::new(),
+    )
+    .expect("search");
     let store = Store::from_config(&config).expect("store opens");
 
     let state = AppState::from_parts(AppStateParts {

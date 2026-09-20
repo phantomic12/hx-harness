@@ -441,6 +441,55 @@ command with a button, receive a cron digest in a separate pinned thread.
 **Exit criteria:** a research task runs 6 free backends in parallel, dedupes, RRF-ranks,
 extracts the top 8, and cites them — with zero paid API calls.
 
+**What has landed so far (search).** The backend set is now one file per engine, and four more
+keyless engines are wired into the registry: **Mojeek** (its own crawler, so its results are
+independent evidence rather than a second view of another engine's index), **Marginalia** (the
+non-commercial web — the most *diverse* backend in the fan-out, and the one whose top ten share
+least with DuckDuckGo's), **Wikipedia** (the only member that is a documented API rather than a
+scrape) and **Hacker News via the Algolia index** (a *filtered* corpus rather than a web index,
+which is what makes its agreement with the general engines meaningful). Each parser is tested
+against a captured response: Wikipedia against a real live JSON capture, Marginalia against a real
+HTML capture, Hacker News against two real live Algolia captures, and Mojeek against a
+**transcription** of its markup because its live path is bot-walled from here (`curl` UA → 403,
+browser UA → 200 with `<title>Captcha</title>`) — that path has **not** been exercised, and both
+the module doc and `TESTING.md` say so rather than implying otherwise. `&` in a Wikipedia article
+URL is escaped as `%26` and `+` is left alone, pinned on the final URL string.
+
+The milestone's "6 free backends" is now a number the code holds, not one a document asserts:
+`KEYLESS_BACKENDS` lists them and `every_keyless_backend_is_counted` compares that list against what
+the registry actually builds. SearXNG is on it but is deliberately **not** a default — it cannot be
+constructed without `searxng_url`, so a deployment that wants it names it explicitly.
+
+**Brave and Google PSE are wired as opt-in keyed backends.** Neither is keyless, neither is a
+default, and a test asserts the registry built from a default config contains no keyed backend at
+all — so "zero paid API calls" stays a property of the shipped configuration rather than a promise
+about how it is used. The credential is a **reference** through `hx-secrets`:
+`search.credentials.brave: "vault:brave/search"` or `env:BRAVE_SEARCH_KEY`, resolved once at
+registry construction. The field this replaces was `brave_key: Option<String>` — a literal key in a
+config file that nothing read — and it is gone, so the old spelling is now a parse error rather than
+a key sitting in a file a status command would print.
+
+Two things about Google PSE are worth naming, because they are security properties rather than
+features. First, its API takes the key as a **query parameter**, so the request URL carries a
+credential — which means `reqwest::Error`'s `Display` (it prints the URL) would have put a live key
+into an error the model reads. Every failure in that backend converts through a redacting helper
+instead, and the test for it builds a **real** `reqwest::Error` containing a sentinel key, asserts
+the raw error genuinely contains it, and only then asserts the converted one does not: without the
+first half the test would pass on a redaction that never had anything to hide. Second, `cx` is
+deliberately *not* a credential — it names a search engine and appears in every result URL, so it is
+a plain config value and hiding it would obscure something that is not hidden.
+
+Both keyed parsers are tested against the **documented** response shape rather than a capture: a live
+call needs a paid key this build does not have. That is weaker evidence than the live captures the
+keyless backends are tested against, and the module docs and `TESTING.md` say so rather than
+implying a call was made.
+
+`default_backends()` was also wrong and is fixed: it named `searxng`, which cannot be constructed
+without `searxng_url`, and the registry treats a named-but-unconfigured backend as a loud error — so
+the **default configuration could not build a registry at all**. The defaults are now the keyless
+set only, which is what makes "zero paid API calls" a property of the shipped config rather than a
+promise about how it is used.
+
 ---
 
 ## M7 — Native apps
