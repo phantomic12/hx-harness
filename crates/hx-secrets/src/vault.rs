@@ -5,6 +5,17 @@
 //! existing vaults — a vault that can't be migrated is a vault people stop using.
 //!
 //! The plaintext inside the envelope is a JSON map of `name -> value`.
+//!
+//! [`Vault::create`] and [`Vault::open`] work on that envelope as a *string*. [`Vault::create_at`],
+//! [`Vault::open_at`] and [`Vault::save_to`] are the same operations against a file, and that is
+//! where the cross-process behaviour lives: two processes can only disagree about a vault through a
+//! file, so the properties that matter — never create one over a vault that is already there, never
+//! replace one non-atomically, never read a missing vault as an empty one — are *file* properties.
+//! They are held by the filesystem (`create_new`, `rename`) rather than by this type, because a
+//! check written here is a check another process can run between two of its own lines.
+//!
+//! What the file layer deliberately does **not** do is coordinate writers: see [`Vault::save_to`]
+//! for why a last-writer-wins replace is the whole design and not an oversight.
 
 use base64::Engine as _;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -12,6 +23,9 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fs;
+use std::io::{self, Write as _};
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -38,6 +52,21 @@ pub enum VaultError {
     Kdf(String),
     #[error("unsupported vault version {0}")]
     UnsupportedVersion(u32),
+    /// A vault is already at this path. Named because a path is not a secret and "which file"
+    /// is the only thing the operator needs in order to act on it.
+    #[error(
+        "a vault already exists at {}; refusing to overwrite it — open it, or move it aside first",
+        .0.display()
+    )]
+    AlreadyExists(PathBuf),
+    /// There is no vault at this path — deliberately distinct from "a vault with nothing in it".
+    #[error(
+        "no vault at {} — there is a difference between \"no vault\" and \"an empty vault\"",
+        .0.display()
+    )]
+    NoVault(PathBuf),
+    #[error(transparent)]
+    Io(#[from] io::Error),
     #[error("randomness source unavailable: {0}")]
     Rng(String),
     #[error(transparent)]
@@ -166,6 +195,39 @@ impl Vault {
         })
     }
 
+    /// Create a new, empty vault **as a file**, refusing to touch one that is already there.
+    ///
+    /// The refusal is the point. [`Vault::create`] knows nothing about a path, so a second process
+    /// that "creates a vault" where one already lives has only two moves available: truncate the
+    /// file (`create(true)`), or check `exists()` first and lose the race anyway. Both destroy a
+    /// vault holding the operator's keys, and neither is visible until something needs a secret.
+    /// `create_new` makes the filesystem do the check and the create as one step, which is the only
+    /// version of this that a second process cannot slip between.
+    pub fn create_at(
+        path: impl AsRef<Path>,
+        passphrase: &str,
+        kdf: KdfParams,
+    ) -> Result<Self, VaultError> {
+        let path = path.as_ref();
+        let vault = Self::create(passphrase, kdf)?;
+        let sealed = vault.seal()?;
+
+        let mut file = match open_for_write(path, true) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(VaultError::AlreadyExists(path.to_path_buf()))
+            }
+            Err(e) => return Err(VaultError::Io(e)),
+        };
+        if let Err(e) = write_and_sync(&mut file, sealed.as_bytes()) {
+            // Do not leave the reservation behind: a zero-length file would make every later
+            // attempt fail with "already exists" for a vault that was never written.
+            let _ = fs::remove_file(path);
+            return Err(VaultError::Io(e));
+        }
+        Ok(vault)
+    }
+
     /// Unlock an existing vault from its serialized envelope.
     pub fn open(passphrase: &str, envelope_json: &str) -> Result<Self, VaultError> {
         let env: Envelope = serde_json::from_str(envelope_json)?;
@@ -233,6 +295,31 @@ impl Vault {
         })
     }
 
+    /// Unlock the vault stored at `path`.
+    ///
+    /// A missing file is an error, not a new empty vault. "There is no vault here" and "the vault
+    /// is empty" are different answers, and collapsing them turns a mistyped path into a vault
+    /// whose every secret has apparently gone missing — while the caller carries on with no
+    /// credentials at all. A zero-length file gets its own message for the same reason: it is a
+    /// creation that died, and saying so beats a JSON parser's line and column.
+    pub fn open_at(path: impl AsRef<Path>, passphrase: &str) -> Result<Self, VaultError> {
+        let path = path.as_ref();
+        let sealed = match fs::read_to_string(path) {
+            Ok(sealed) => sealed,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(VaultError::NoVault(path.to_path_buf()))
+            }
+            Err(e) => return Err(VaultError::Io(e)),
+        };
+        if sealed.trim().is_empty() {
+            return Err(VaultError::Malformed(format!(
+                "{} is empty — a vault whose creation never finished, or a file that was truncated",
+                path.display()
+            )));
+        }
+        Self::open(passphrase, &sealed)
+    }
+
     /// Serialize to an encrypted envelope, ready to write to disk.
     pub fn seal(&self) -> Result<String, VaultError> {
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -273,6 +360,53 @@ impl Vault {
         Ok(serde_json::to_string_pretty(&env)?)
     }
 
+    /// Write this vault to `path`, replacing what is there in one step.
+    ///
+    /// Seal to a temporary file in the target's own directory, flush it to the device, then
+    /// `rename` it over the target. A `rename` within a directory is atomic on POSIX, so a second
+    /// process opening the vault sees the whole previous envelope or the whole new one — never a
+    /// half-written file, which would fail to parse and read to an operator as "the vault is
+    /// corrupt". The temp file must be in that same directory because `rename` does not cross a
+    /// filesystem, and a scratch file in `/tmp` would quietly turn the replace into a copy.
+    ///
+    /// **Deliberately not a lock, and deliberately not a merge.** Two processes that both open,
+    /// edit and save the same vault end with the last writer's version and the earlier update is
+    /// gone — silently, because nothing here reads the file it is replacing. That is what an atomic
+    /// replace without locking *is*, and it is written down rather than implied: a vault is edited
+    /// by a person through a CLI, not by a fleet, and the alternative (an advisory lock plus a
+    /// re-read) buys a merge nobody asked for at the cost of a stale-lock failure mode. A test
+    /// asserting that both updates survive would be asserting a property this design does not have.
+    pub fn save_to(&self, path: impl AsRef<Path>) -> Result<(), VaultError> {
+        let path = path.as_ref();
+        let directory = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let sealed = self.seal()?;
+
+        // A distinct scratch name per call: two processes saving at once must not share one, or
+        // they interleave into it and rename the mixture into place.
+        let mut suffix = [0u8; 8];
+        fill_random(&mut suffix)?;
+        let temp = directory.join(format!(
+            ".{}.{}.tmp",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("vault"),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(suffix)
+        ));
+
+        let written = open_for_write(&temp, false)
+            .and_then(|mut file| write_and_sync(&mut file, sealed.as_bytes()));
+        if let Err(e) = written {
+            let _ = fs::remove_file(&temp);
+            return Err(VaultError::Io(e));
+        }
+        if let Err(e) = fs::rename(&temp, path) {
+            let _ = fs::remove_file(&temp);
+            return Err(VaultError::Io(e));
+        }
+        Ok(())
+    }
+
     pub fn put(&mut self, name: impl Into<String>, value: impl Into<Secret>) {
         self.entries.insert(name.into(), value.into());
     }
@@ -311,6 +445,41 @@ impl fmt::Debug for Vault {
             .field("entries", &format_args!("{} secret(s)", self.entries.len()))
             .finish_non_exhaustive()
     }
+}
+
+/// Write bytes and get them onto the device before returning.
+///
+/// The flush is not decoration: a `rename` that lands before the bytes do leaves a durable file
+/// with no content, which is exactly the crash the atomic replace exists to survive.
+fn write_and_sync(file: &mut fs::File, bytes: &[u8]) -> io::Result<()> {
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Open a file for writing, optionally insisting that it did not already exist.
+///
+/// One function with a `#[cfg(unix)]` block rather than two cfg-split functions: the permission
+/// bits are the only platform difference, and a split would need a second arm kept in step for
+/// every other argument — the trap that leaves the non-Unix arm uncompiled and broken.
+///
+/// On Unix the file is created `0600`. The content is encrypted, so this is not about the
+/// ciphertext leaking; it is about not handing an offline attacker a passphrase file, and about the
+/// ordinary case where the vault sits in a shared home directory or a backup that ignores modes.
+/// Windows inherits the directory's ACL, which is the closest equivalent it has.
+fn open_for_write(path: &Path, create_new: bool) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true);
+    if create_new {
+        options.create_new(true);
+    } else {
+        options.create(true).truncate(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 fn derive_key(passphrase: &str, salt: &[u8], kdf: &KdfParams) -> Result<[u8; KEY_LEN], VaultError> {
@@ -474,5 +643,86 @@ mod tests {
         let reopened = Vault::open("pw", &v.seal().unwrap()).unwrap();
         assert!(!reopened.contains("a"));
         assert!(reopened.contains("b"));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The file layer. These are the in-process half; the cross-process half is
+    // `tests/vault_process.rs`, which is the only place these properties can actually be seen.
+    // ---------------------------------------------------------------------------------------
+
+    fn temp_dir() -> tempfile::TempDir {
+        tempfile::TempDir::new().expect("a temp dir")
+    }
+
+    #[test]
+    fn creating_a_vault_over_an_existing_one_is_refused_rather_than_truncating_it() {
+        // The destructive version of this is one word of `OpenOptions` away, and it looks like it
+        // worked: the file exists, the vault opens, and every secret that was in it is gone.
+        let dir = temp_dir();
+        let path = dir.path().join("vault.json");
+        let mut original = Vault::create_at(&path, "pw", fast()).unwrap();
+        original.put("anthropic/main", "the-value-that-must-survive");
+        original.save_to(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let err = Vault::create_at(&path, "a-different-passphrase", fast()).unwrap_err();
+        assert!(matches!(err, VaultError::AlreadyExists(_)), "got {err:?}");
+        assert!(err.to_string().contains("refusing to overwrite"));
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "the file was touched"
+        );
+        let reopened = Vault::open_at(&path, "pw").unwrap();
+        assert_eq!(
+            reopened.get("anthropic/main").unwrap().expose(),
+            "the-value-that-must-survive"
+        );
+    }
+
+    #[test]
+    fn opening_a_vault_that_is_not_there_is_an_error_rather_than_a_new_empty_vault() {
+        // A typo in a path must not read as "this vault has no secrets": that answer is
+        // indistinguishable from a vault that was wiped, and the caller carries on unauthenticated.
+        let dir = temp_dir();
+        let path = dir.path().join("typo.json");
+
+        let err = Vault::open_at(&path, "pw").unwrap_err();
+        assert!(matches!(err, VaultError::NoVault(_)), "got {err:?}");
+        assert!(err.to_string().contains("no vault at"));
+        assert!(!path.exists(), "opening must not have created the file");
+    }
+
+    #[test]
+    fn a_zero_length_vault_file_is_named_rather_than_parsed() {
+        // The state a `create` that died half-way leaves behind. A JSON parser's line-and-column
+        // tells the operator nothing about how it got there.
+        let dir = temp_dir();
+        let path = dir.path().join("half-created.json");
+        std::fs::write(&path, "").unwrap();
+
+        let err = Vault::open_at(&path, "pw").unwrap_err();
+        assert!(matches!(err, VaultError::Malformed(_)), "got {err:?}");
+        assert!(err.to_string().contains("never finished"), "{err}");
+    }
+
+    #[test]
+    fn saving_a_vault_leaves_no_scratch_file_behind() {
+        // The temp file is in the vault's own directory, so a leak is visible to the operator and
+        // grows without bound on every edit.
+        let dir = temp_dir();
+        let path = dir.path().join("vault.json");
+        let mut vault = Vault::create_at(&path, "pw", fast()).unwrap();
+        for round in 0..3 {
+            vault.put("k", format!("v{round}"));
+            vault.save_to(&path).unwrap();
+        }
+
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["vault.json".to_string()], "{entries:?}");
     }
 }

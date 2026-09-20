@@ -361,6 +361,35 @@ a dead container engine as `FAIL` rather than crashing, and `/v1/search` against
 reported SearXNG's `connection refused` and DuckDuckGo's bot check as **failures** rather than
 returning an empty list.
 
+**The vault, opened by a second process** (`crates/hx-secrets/tests/vault_process.rs`)
+
+Hermetic — no network, no daemon, and it runs in the ordinary `cargo test --workspace` on all three
+CI platforms, so this is the one tier C item that closes without needing a machine CI cannot host.
+The second process is `crates/hx-secrets/src/bin/vault_probe.rs`, named through
+`env!("CARGO_BIN_EXE_hx-vault-probe")` so the test drives the artefact the same `cargo test` just
+built. Every observation below is made by *running* that binary, including the reads that verify a
+write — nothing is confirmed by the process that performed it.
+
+| What ran | Observed |
+|---|---|
+| A second process reads the sentinel with the right passphrase | exit 0, `FIXTURE-VALUE-NOT-A-REAL-KEY-4c1f` on stdout — the positive control, run first, because a probe that reads nothing at all would otherwise satisfy every refusal below |
+| Empty passphrase, wrong passphrase, and **no** passphrase variable at all | non-zero exit, **empty stdout** (the failure mode is a quiet empty value a caller reads as "no secret"), the sentinel absent from stderr, and stderr non-empty so the refusal carries a reason. An absent variable is refused rather than guessed as empty |
+| A second process told to create a vault where one already lives | Refused naming `already exists`; the file's bytes are **identical** to the snapshot taken before, and a third process still reads the original secret back. The second process was given a different passphrase, so a create that quietly succeeded could not hide behind the first still working |
+| Four writers saving at once, with a reader opening the vault 3000 times throughout | All four reported success; the reader completed all 3000 opens and never saw fewer than the pre-existing entry; every readable name carries exactly the value its writer wrote; `len()` equals what a reader can actually find; the pre-existing entry survives and at least one writer's update does. Last-writer-wins is the design (`save_to` says so), so the assertion is "not every update gone", not a merge nobody implemented |
+| A save while a reader holds the file open | The path names a new vault a third process can open, and the held handle still reads the **old** vault entire. A truncate-and-rewrite of the target fails this deterministically |
+| The shipped KDF cost (64 MiB / 3 passes / 4 lanes) | A second process creates and opens a vault at the real parameters — the one slow test in the file, isolated there rather than weakening the product's KDF to speed the suite |
+
+**The negative controls were run, because a test that cannot fail is not evidence.** Truncating in
+`create_at` instead of using `create_new` fails the overwrite test. Replacing `save_to`'s
+temp-file-and-`rename` with a truncate-and-rewrite fails the held-handle test — and *does not* fail
+the concurrency test, which is recorded in that test's doc comment: the torn window is microseconds
+wide and a reader has to land in it, which is exactly why the deterministic test exists next to it.
+Making `Vault::open` fail open (return an empty vault on a decryption failure) fails the
+refusal-reason test and leaves the unlocking test green — no assertion about a value can tell
+"refused" from "empty", so those two tests are the property only as a pair, and both doc comments
+say so. Both `#[cfg]` arms of the held-handle test were compiled and run, by swapping the cfg on
+this host.
+
 ### Tier B — unit-tested (in CI)
 
 | Crate | Tests | LOC | What the tests actually prove |
@@ -370,7 +399,7 @@ returning an empty list.
 | `hx-remote` | 130 | 7162 | Platform caps parsing (`uname`/`ver`), path translation, shell quoting incl. injection attempts, risky-command classification, mid-truncation, approval round-trip against the local host, **`known_hosts`**: hashed host fields (HMAC-SHA1), globs, negation, `@revoked` beating trust regardless of line order, a different key type reading as first use rather than substitution, plus the policy's fail-closed behaviour and the wording of every refusal — and the **SFTP v3 client** (`src/sftp.rs`): packet framing, a byte buffer that reassembles a packet split across channel chunks, STATUS/NAME/VERSION reply parsing, a directory NAME packet's entries with their sizes and dir-bit, and the three-way availability collapsing to the capability field |
 | `hx-sandbox` | 81 | 2066 | Isolation ladder ordering and monotonicity, spec↔YAML round-trip, `SandboxSpec`→`HostConfig` mapping field by field, **no engine-rejected security option** (`userns=`, `seccomp=default`), an egress allowlist that cannot be enforced, registry/TTL bookkeeping, the concurrency cap, and rollback on a failed start — plus the **remote runtime**: its docker CLI command lines carry every security setting as a flag (`--read-only`, `--cap-drop=ALL`, user-namespace remap, `--runtime=runsc` for L3), spec values are shell-quoted so they cannot become far-host commands, **remote egress is fail-closed**: a non-empty egress allowlist refuses at `create` (before anything reaches the far host, with a reason naming the way out) while an empty-egress isolated sandbox is allowed and its command is sent, and `name`/`available`/`create`/`start`/`stop`/`remove`/`exec` run against a recording transport that fails loudly when it runs out of script |
 | `hx-search` | 45 | 1740 | RRF rank fusion, HTML extraction, entity decoding, per-backend failure isolation (with **fake** backends) |
-| `hx-secrets` | 36 | 1302 | Argon2id+XChaCha20 round-trip, tamper detection, redaction patterns, and **credential resolution**: a `store:name` reference resolved through `vault:`/`env:`/a fixed map, an empty environment variable refused like an absent one, an unknown store listing the stores that *are* configured, and every error message asserted **not** to contain a value |
+| `hx-secrets` | 40 unit + 6 integration | 1679 src + 591 tests | Argon2id+XChaCha20 round-trip, tamper detection, redaction patterns, and **credential resolution**: a `store:name` reference resolved through `vault:`/`env:`/a fixed map, an empty environment variable refused like an absent one, an unknown store listing the stores that *are* configured, and every error message asserted **not** to contain a value. Plus the **file layer** and its cross-process half (`tests/vault_process.rs`, tier A above): creating over an existing vault refused rather than truncating it, a missing vault an error rather than a new empty one, a zero-length file named rather than parsed, a save leaving no scratch file behind |
 | `hx-agent` | 45 | 1407 | The loop's gate, in one file of integration tests: the target of a destructive call is **measured after the capability check and before the prompt** (and the event that reaches the store carries it, so the trail proves what the approver was shown), a **capability denial is a result the model reads and cannot be approved away** (an approver willing to say yes is never asked), an approval denial is reported and the command never reaches the host, `allow for chat` stops the second prompt while a remembered denial is not re-asked, a tool declaring no external effect is never prompted about, a refused call does not stop its sibling, unknown tools and unusable arguments return as results, a non-zero exit is still a call that *ran*, `max_turns` and the deadline stop the run, and the exact event sequence a client renders. Plus the **routed model call** over a real `ModelRouter` and a real `ProviderRegistry`, with only the adapter faked: the route decides the model, the key follows the credential the pool granted, a refused credential is benched and its *sibling* is tried before another provider, a missing key and a 502 both give the reservation back (asserted with `concurrent: 1`, since a leaked lease looks exactly like a rate limit), and a day's budget that covers one pessimistic reservation still allows three calls |
 | `hx-store` | 42 | 2059 | Migrations applied once and never re-run, **a database from a newer build refused with both versions named** (and left untouched), `STRICT` rejecting a type mistake at insert, the transcript written by `seq` the caller does not track, a batch written whole or not at all, a cascade that only happens because `Store` sets `foreign_keys`, every part type round-tripping while an unknown one is reported rather than dropped, events and usage surviving a reopen — plus 4 in `tests/resume.rs` that drop the store and open a **new connection** to the same file, which is the closest a test gets to killing the daemon |
 | `hx-tools` | 94 | 3826 | Requirements per tool, bounded output, the two-phase registry, **confinement** (a run with a boundary runs the command there and touches no host; a boundary that cannot be entered is reported as a failure instead of falling back to the machine — the failure mode that would silently unconfine every run whose engine hiccuped), and **a misnamed argument refused rather than ignored** — `cwd` instead of `workdir` used to drop silently and run the command in the daemon's own directory. `delete` is the largest entry: the XDG trash round-trip on a real in-memory host, a directory walked rather than counted at the top level, the filesystem root refused, an unreadable path refused **before** anything is touched, an existing trash name never overwritten, a *pattern* read as one literal filename and told so, a transport failure that says nothing was deleted, and a `delete` that still requires the `Delete` capability on the resolved path |
@@ -395,8 +424,12 @@ the failure is silent:
 |---|---|---|
 | **Egress filtering** | Not implemented: no proxy, no firewall rule. Now *refused* rather than ignored (`SpecError::EgressNotEnforced`), so it cannot silently mean "open internet" | Medium — a networked sandbox is unrestricted |
 | DuckDuckGo keyless scraping — the *success* path | Every attempt from a plain HTTP client is answered with an `anomaly` challenge: a TLS-fingerprint wall, not a markup change. The failure path is verified live; the success path needs a browser-fingerprint client (M6) | Medium — search silently loses a source, but `SearchReport` names it |
-| Vault written to disk and reopened in a **new process** | Untested | Medium — in-process round-trip only |
 | `hxd` reaper loop, `axum::serve` under load | Manual only | Low |
+
+*The vault written to disk and reopened in a new process* was the fourth row here. It is now in
+tier A above: `crates/hx-secrets/tests/vault_process.rs`, six tests, hermetic, in CI on all three
+platforms. The reason it sat here was not that it needed hardware — a second process is cheap — but
+that the crate had no integration tests at all and no way to name a binary from one.
 
 ### Tier D — absent
 
@@ -699,5 +732,6 @@ HX_SSH_TEST_HOST=<host> HX_SSH_TEST_USER=<user> HX_SSH_TEST_KEY=~/.ssh/id_ed2551
 - **The ladder is now verified end to end**, L3 included: the sandbox on a VM-backed runtime sees a
   guest kernel, not the host's.
 - **What is still tier C**: egress filtering (not implemented, and refused rather than pretended),
-  keyless scraping that survives a TLS-fingerprint bot wall (browser-pool work), the vault opened in
-  a new process, and provider calls to a real model API.
+  keyless scraping that survives a TLS-fingerprint bot wall (browser-pool work), and provider calls
+  to a real model API. The vault opened in a new process used to be on this list; it is now six
+  hermetic tests in `crates/hx-secrets/tests/vault_process.rs`, run in ordinary CI.
