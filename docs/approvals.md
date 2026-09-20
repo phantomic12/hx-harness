@@ -36,6 +36,19 @@ by the default level, which is the gap this tier was added to close. It is not a
 is the feature it exists for, so a deployment that wants it silent raises the level to `trusting` or
 writes an `allow` rule, and both are visible decisions.
 
+**The unstated consequence for chat bridges.** Placing `ThirdParty` above `External` means that on a
+deployment with a chat bridge (e.g. Telegram), the prompt raised by a stdio MCP call **cannot be answered
+from that channel**. The bridge ceiling is `Mutate` (`crates/hx-gateway/src/answer.rs:40`, `telegram.rs:604`),
+`covers(ThirdParty)` is false, and §9 specifies that an answer exceeding the answering surface's ceiling
+leaves the question open until it denies itself by timeout (`default_on_timeout: Deny`). Nothing is
+newly *denied* by the policy decision — an over-ceiling attempt is `Ask`, never `Deny` — but the prompt
+cannot be resolved from the bridge. Furthermore, the remedy of writing an `allow` rule against the tool
+namespace does not help on a bridge-only deployment, because §2 enforces that `ask` and `allow` are both
+subject to the ceiling: a rule cannot allow what the ceiling forbids. For an operator running a bridge-only
+setup, the actual options are either to raise the bridge ceiling (accepting that bridge approvals can permit
+third-party code execution) or to answer the prompt locally through a terminal client (`hx`) or the local
+web UI where the full ladder is available.
+
 Two absolutes fall out of the table, and they are the ones worth defending:
 
 - **A deny rule and the ceiling sit above the dial.** A per-request `--autonomy yolo` can lower the
