@@ -22,7 +22,7 @@ exist before anything can hide behind an integration test.
   TTL reaping, rollback on a failed start
 - `hx-server` + `hxd` — axum route surface and the daemon binary
 
-**Status: 690 tests green, clippy clean (0 warnings).** M0 closed at 324 of them: core 83, provider
+**Status: 978 tests green, clippy clean (0 warnings).** M0 closed at 324 of them: core 83, provider
 61, sandbox 53, search 45, remote 33, secrets 27, server 11, cli 11 — `hx-tools`, `hx-agent` and
 `hx-store` came after M0 and are covered in the M1/M2 sections.
 
@@ -33,7 +33,7 @@ ceiling, unattended budget and expiry; buckets refuse when exhausted and recover
 fail over and bench unhealthy credentials; RRF dedupes `?utm_source=` variants of one URL; a
 failed sandbox create rolls back rather than leaking a container.
 
-**Not landed yet** (typed stubs only): `hx-browser`, `hx-mcp`, `hx-gateway`.
+**Not landed yet** (typed stubs only): `hx-browser`, `hx-mcp`. `hx-gateway` is no longer one — see M5.
 
 **Deliberately unverified at M0:** the concrete HTTP adapters (`OpenAiCompatible`,
 `AnthropicMessages`) and the fetch/parse halves of the search backends. Their *pure* halves —
@@ -130,7 +130,10 @@ killed an idle daemon while looking like a pass).
   It is a client in the strict sense: the terminal is created once under a fixed id and reattached,
   so a refresh rejoins the running shell; the session socket resumes with `since_seq` so a reconnect
   renders the gap rather than the whole history.
-- Frontend, still to come: a workspace file tree, a diff/review pane, and the approval queue
+- Frontend, still to come: a diff/review pane, and the remaining unattended budget on the approval
+  pane. The tree and the queue themselves are built — the host directory browser with a file
+  viewer/editor and a command runner, and a pane that polls `GET /v1/approvals` and renders each
+  question's risk class, reason and undo line
 - **Two clients on one session simultaneously** (TUI + browser) — this is the real test that
   the daemon/client split is honest and not cosmetic
 
@@ -139,8 +142,10 @@ the TUI; then send an agent prompt from the browser and see it stream in both. *
 proven at the protocol level.** The events half: two WebSocket clients on one session, and a browser
 SSE run plus a WebSocket client, seeing the same stream (`tests/ws_api.rs`). The terminal half: two
 clients on one shell receiving the same bytes, a late client sent the scrollback, and a detached
-client leaving the shell running (`tests/terminal_api.rs` for the socket, `tests/terminal.rs` for the
-PTY, and `scripts/check_web_client.py` against a live daemon, which drives the exact frames the page
+client leaving the shell running (`tests/terminal_api.rs` for the socket,
+`crates/hx-remote/tests/pty_live.rs` for the PTY — 4 tests — and
+`crates/hx-server/tests/terminal_remote_live.rs` — 3 tests — for the whole remote path, and
+`scripts/check_web_client.py` against a live daemon, which drives the exact frames the page
 sends). What is *not* yet exercised is a real TUI and a real browser against one session at the same
 moment: the browser stack was unavailable, so the page's protocol was driven directly rather than
 through a rendered page.
@@ -164,8 +169,9 @@ through a rendered page.
   count of rows written before the chain existed, which is never folded into `intact`. Verified live
   against a daemon: 8 chained events report intact, one row rewritten with raw SQL reports TRAIL
   ALTERED at that row.
-- Web UI: container pane, and an approval queue showing the risk class, the reason, and the
-  remaining unattended budget
+- ◐ Web UI: the sandbox/container status strip and an approval queue showing the risk class, the
+  reason and the undo line are built (`crates/hx-server/static/index.html`). The one part still
+  open is the **remaining unattended budget** — the page has no `unattended`/`budget` anywhere
 
 **Exit criteria:** an agent asked to "build this untrusted code and run it" does so in L2 with
 no network, is killed at TTL, and its workspace survives while the sandbox doesn't. An
@@ -260,7 +266,7 @@ the vault→`SshAuth` seam, or a sandbox spec — each with a sentinel that must
 first, so the test cannot degrade into a no-op. The negative control was run: leaking the key through
 `Debug` makes the tripwire fail. See `TESTING.md`.
 
-*Status: seven of the eight items are done. The remote terminal is in place, so the browser drives a
+*Status: all eight items are done. The remote terminal is in place, so the browser drives a
 remote box for real — browse, run, and an interactive shell — rather than only the first two, and the
 Mac leg is proven: the same SSH transport runs against a real Apple-signed macOS VM in CI (the
 `macos-ssh` integration job — a `macos-latest` runner boots in about a minute, whereas the

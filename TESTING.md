@@ -1,21 +1,23 @@
 # Testing roadmap — what is verified, and what only looks verified
 
-Status: 2026-09-16. Companion to `ROADMAP.md` (which tracks features); this file tracks **evidence**.
+Status: 2026-09-20. Companion to `ROADMAP.md` (which tracks features); this file tracks **evidence**.
 
 ```console
-$ cargo test --workspace
-904 tests, 0 failed                       # includes 20 chat API tests and 4 database reopen tests
-47 ignored                               # live: Docker, SSH, search, a real model
+$ cargo test --workspace --locked
+978 tests, 0 failed                      # includes 22 chat API tests and 4 database reopen tests
+52 ignored                               # live: Docker, SSH, WinRM, search, a real model
 
-# The 24 that need a real server, run by `.github/workflows/integration.yml`
-# and `.github/workflows/canary.yml`:
+# The five live suites below — 29 tests — are `#[ignore]`d by default.
+# `.github/workflows/integration.yml` runs the Docker, SSH and chat ones and
+# `.github/workflows/canary.yml` runs the search canary. The model suites need a key,
+# which CI has none of, so they are run by hand.
 $ cargo test -p hx-sandbox --test docker_live -- --ignored --test-threads=1
-9 passed; 0 failed                       # a real Docker daemon, with gVisor installed
+12 passed; 0 failed                      # a real Docker daemon, with gVisor installed
 $ HX_OPENAI_TEST_BASE_URL=… HX_OPENAI_TEST_MODEL=… HX_OPENAI_TEST_KEY=… \
   cargo test -p hx-provider --test openai_live -- --ignored --test-threads=1
 4 passed; 0 failed                       # a real model, through a real gateway
 $ cargo test -p hx-remote --test ssh_live -- --ignored --test-threads=1
-5 passed; 0 failed                       # a real sshd, real key auth
+7 passed; 0 failed                       # a real sshd, real key auth
 $ cargo test -p hx-server --test chat_live -- --ignored --test-threads=1
 2 passed; 0 failed                       # a real container, through POST /v1/chat
 $ HX_SEARXNG_URL=http://127.0.0.1:8888 HX_SEARCH_EXPECT_RESULTS=searxng \
@@ -24,9 +26,10 @@ $ HX_SEARXNG_URL=http://127.0.0.1:8888 HX_SEARCH_EXPECT_RESULTS=searxng \
 ```
 
 The counts matter in both directions. A green `cargo test` alone still means **the logic is right**;
-those 24 ignored tests are the ones that have reached another process, and the only ones here that
-could catch a protocol mistake. They now run in CI, which is the difference between "verified once"
-and "stays verified".
+the 52 `#[ignore]`d tests are the ones that have reached another process — the 29 in the five suites
+above, plus the WinRM, remote-sandbox, PTY/remote-terminal and Anthropic suites documented further
+down. The ones CI can host run there, which is the difference between "verified once" and "stays
+verified".
 
 ## The audit chain (hermetic + verified on a real database)
 
@@ -56,9 +59,11 @@ call or session on startup rejection, exact command source without a host-side `
 `/workspace`, and no host marker. A shell test covers an explicit relative workdir separately from
 command source. CLI help exposes `--sandbox-profile`.
 
-This is hermetic evidence, not a live container run. Docker is not installed on this development host;
-the new chat path has not yet been exercised against a real engine. The historical live results below
-remain evidence for their named suites, not for this new wiring.
+The tests above are hermetic in-process evidence for this wiring. The live half of the same path is
+`crates/hx-server/tests/chat_live.rs` — two tests against a real Docker daemon, recorded in tier A
+below — and a container engine *is* installed on this development host (Docker 29.8.1), so the path is
+not blocked on one. The historical live results further down remain evidence for their named suites
+rather than for this wiring.
 
 ## Remote sandbox wiring (M4)
 
@@ -73,7 +78,10 @@ The `Host`→`RemoteCommandRunner` adapter and the per-host manager routing are 
   `a_profile_with_no_host_resolves_to_the_local_manager` (the control: a profile without a `host` key
   returns the exact local daemon's `SandboxManager` `Arc`).
 
-Not yet exercised against a live remote daemon; that is the remaining M4 step.
+That is the in-process half. The live half has since run: `crates/hx-sandbox/tests/remote_live.rs`
+(three tests, `#[ignore]`d) drives a real `SshHost` against a real remote Docker daemon and reads the
+security properties back from `docker inspect` **on the far host** — see *The remote sandbox runtime,
+against a real remote Docker daemon* below.
 
 ## The four tiers
 
@@ -90,7 +98,7 @@ Every claim in the repo falls into one of these. The gap that bites is B→C.
 
 **The isolation ladder, against a real Docker daemon** (`crates/hx-sandbox/tests/docker_live.rs`)
 
-Nine tests against Docker 29 on Ubuntu 24.04 with cgroup v2 and gVisor registered. This suite exists because the ladder
+Twelve tests against Docker 29 on Ubuntu 24.04 with cgroup v2 and gVisor registered. This suite exists because the ladder
 was a *mapping* — `SandboxSpec` → `HostConfig`, asserted field by field — and a mapping proves
 intent, not that the engine accepts it.
 
@@ -129,11 +137,15 @@ intent, not that the engine accepts it.
 
 All four are fixed and expressed through mechanisms that exist (`HostConfig.UsernsMode`, and
 nothing at all for the engine's default seccomp), with a unit test that fails if either string comes
-back. The third is now *refused* — `SpecError::EgressNotEnforced`, which says what to do instead —
-rather than accepted and ignored, and the example config no longer claims a constraint it cannot
-keep. The first failing run also happened to demonstrate the rollback invariant against a real
-engine: seven spawns failed at *start* after a successful create, and every one reported
-`it has been removed`.
+back. The third is now *enforced* rather than accepted and ignored: an allowlist puts the sandbox on
+an internal Docker network with no gateway, and the only route out is a proxy sidecar that admits a
+`CONNECT` target only when the allowlist matches — so a profile that names four hostnames reaches
+those four and nothing else (`crates/hx-sandbox/src/egress.rs`, and the live pair in tier A). What is
+still *refused* — `SpecError::EgressNotEnforced`, which says what to do instead — is an entry the
+proxy cannot decide, a CIDR or a raw IP, rather than accepted and ignored. The example config no
+longer claims a constraint it cannot keep. The first failing run also happened to demonstrate the
+rollback invariant against a real engine: seven spawns failed at *start* after a successful create,
+and every one reported `it has been removed`.
 
 **The chat path, against a real container engine** (`crates/hx-server/tests/chat_live.rs`)
 
@@ -322,7 +334,7 @@ rename go through the subsystem, not the shelled-out fallback. The run records `
 in the job summary and uploads the live log as the `ssh-live-darwin` artifact, so the evidence is
 readable without re-running.
 
-**The key invariant: no private key reaches the model, the trail, or a sandbox** (hermetic, five tests)
+**The key invariant: no private key reaches the model, the trail, or a sandbox** (four hermetic tests, plus a live fifth)
 
 M4's exit criteria ends with a security claim — *"no private key ever enters the model context or a
 sandbox"* — that was asserted in prose and never tested. These tests make it a tripwire:
@@ -366,19 +378,24 @@ returning an empty list.
 
 ### Tier B — unit-tested (in CI)
 
-| Crate | Tests | LOC | What the tests actually prove |
+| Crate | Tests (all targets) | LOC (`src/`) | What the tests actually prove |
 |---|---|---|---|
-| `hx-core` | 108 | 5385 | ID monotonicity, error taxonomy (**a rejected credential is an auth failure, and a 500 is not**, so a pool retries one and benches the other), **capability path grants** (incl. the empty-grant-means-root regression), approval policy incl. unattended budgets and **the shipped catastrophe set in both directions** (the unrecoverable paths refused, `/tmp` and `/home` left answerable) and the refusal of a delete whose target is a pattern, message/event round-trips, target descriptions a person can price, and config parsing incl. rejection of unknown keys and **`hx.example.yaml` itself parsing** |
-| `hx-provider` | 111 | 4091 | Token-bucket timing, **budget fail-closed on a zero estimate**, credential pool round-robin, shared-limiter identity across pools, routing and fallthrough, a granted ticket carrying the credential's `secret_ref`, a role's reservation estimated from the **dearest** route, the provider factory refusing a kind it has no adapter for, and **streaming**: SSE events reassembled across split chunks before being parsed, text deltas emitted in order, and the batch of unmerged tool-call fragments a proxy hands over merged by `index` into one call. The **Anthropic** stream as well: named events reassembled across split reads and CRLF terminators, text deltas in order, `input_json_delta` fragments accumulated and parsed only at `content_block_stop` (a per-fragment parse fails on nearly every real call), an empty-argument call treated as `{}` while genuinely truncated JSON is an error naming the call, two tool calls in one turn kept apart by index, usage taken from the last cumulative `message_delta` rather than summed, `ping` and unknown event types ignored rather than fatal, and a mid-stream `error` event raised rather than returned as a short answer — plus two tests over real HTTP asserting `stream: true` is the only difference from the non-streaming body |
-| `hx-remote` | 130 | 7162 | Platform caps parsing (`uname`/`ver`), path translation, shell quoting incl. injection attempts, risky-command classification, mid-truncation, approval round-trip against the local host, **`known_hosts`**: hashed host fields (HMAC-SHA1), globs, negation, `@revoked` beating trust regardless of line order, a different key type reading as first use rather than substitution, plus the policy's fail-closed behaviour and the wording of every refusal — and the **SFTP v3 client** (`src/sftp.rs`): packet framing, a byte buffer that reassembles a packet split across channel chunks, STATUS/NAME/VERSION reply parsing, a directory NAME packet's entries with their sizes and dir-bit, and the three-way availability collapsing to the capability field |
-| `hx-sandbox` | 90 | 2066 | Isolation ladder ordering and monotonicity, spec↔YAML round-trip, `SandboxSpec`→`HostConfig` mapping field by field, **no engine-rejected security option** (`userns=`, `seccomp=default`), the entries of an egress allowlist the proxy cannot match, registry/TTL bookkeeping, the concurrency cap, and rollback on a failed start — plus the **remote runtime**: its docker CLI command lines carry every security setting as a flag (`--read-only`, `--cap-drop=ALL`, user-namespace remap, `--runtime=runsc` for L3), spec values are shell-quoted so they cannot become far-host commands, **remote egress is enforced on the far host**: an enforceable allowlist renders the internal network, the `hx-egress-proxy` sidecar created with **no** `--network` (Docker refuses a second network once the mode is fixed) and the `HTTP_PROXY`/`HTTPS_PROXY` that make the sidecar the only route — a sidecar nothing talks to would enforce nothing, invisibly — asserted token-for-token through setup → create → start → remove → teardown against a recording transport that fails loudly when it runs out of script, while a CIDR/raw-IP entry, and a spec with no far-host proxy binary configured, are still refused with a reason naming the way out |
+| `hx-core` | 119 | 6065 | ID monotonicity, error taxonomy (**a rejected credential is an auth failure, and a 500 is not**, so a pool retries one and benches the other), **capability path grants** (incl. the empty-grant-means-root regression), approval policy incl. unattended budgets and **the shipped catastrophe set in both directions** (the unrecoverable paths refused, `/tmp` and `/home` left answerable) and the refusal of a delete whose target is a pattern, message/event round-trips, target descriptions a person can price, and config parsing incl. rejection of unknown keys and **`hx.example.yaml` itself parsing** |
+| `hx-provider` | 149 | 6200 | Token-bucket timing, **budget fail-closed on a zero estimate**, credential pool round-robin, shared-limiter identity across pools, routing and fallthrough, a granted ticket carrying the credential's `secret_ref`, a role's reservation estimated from the **dearest** route, the provider factory refusing a kind it has no adapter for, and **streaming**: SSE events reassembled across split chunks before being parsed, text deltas emitted in order, and the batch of unmerged tool-call fragments a proxy hands over merged by `index` into one call. The **Anthropic** stream as well: named events reassembled across split reads and CRLF terminators, text deltas in order, `input_json_delta` fragments accumulated and parsed only at `content_block_stop` (a per-fragment parse fails on nearly every real call), an empty-argument call treated as `{}` while genuinely truncated JSON is an error naming the call, two tool calls in one turn kept apart by index, usage taken from the last cumulative `message_delta` rather than summed, `ping` and unknown event types ignored rather than fatal, and a mid-stream `error` event raised rather than returned as a short answer — plus two tests over real HTTP asserting `stream: true` is the only difference from the non-streaming body |
+| `hx-remote` | 132 | 7276 | Platform caps parsing (`uname`/`ver`), path translation, shell quoting incl. injection attempts, risky-command classification, mid-truncation, approval round-trip against the local host, **`known_hosts`**: hashed host fields (HMAC-SHA1), globs, negation, `@revoked` beating trust regardless of line order, a different key type reading as first use rather than substitution, plus the policy's fail-closed behaviour and the wording of every refusal — and the **SFTP v3 client** (`src/sftp.rs`): packet framing, a byte buffer that reassembles a packet split across channel chunks, STATUS/NAME/VERSION reply parsing, a directory NAME packet's entries with their sizes and dir-bit, and the three-way availability collapsing to the capability field |
+| `hx-sandbox` | 94 | 4190 | Isolation ladder ordering and monotonicity, spec↔YAML round-trip, `SandboxSpec`→`HostConfig` mapping field by field, **no engine-rejected security option** (`userns=`, `seccomp=default`), the entries of an egress allowlist the proxy cannot match, registry/TTL bookkeeping, the concurrency cap, and rollback on a failed start — plus the **remote runtime**: its docker CLI command lines carry every security setting as a flag (`--read-only`, `--cap-drop=ALL`, user-namespace remap, `--runtime=runsc` for L3), spec values are shell-quoted so they cannot become far-host commands, **remote egress is enforced on the far host**: an enforceable allowlist renders the internal network, the `hx-egress-proxy` sidecar created with **no** `--network` (Docker refuses a second network once the mode is fixed) and the `HTTP_PROXY`/`HTTPS_PROXY` that make the sidecar the only route — a sidecar nothing talks to would enforce nothing, invisibly — asserted token-for-token through setup → create → start → remove → teardown against a recording transport that fails loudly when it runs out of script, while a CIDR/raw-IP entry, and a spec with no far-host proxy binary configured, are still refused with a reason naming the way out |
 | `hx-search` | 45 | 1740 | RRF rank fusion, HTML extraction, entity decoding, per-backend failure isolation (with **fake** backends) |
 | `hx-secrets` | 36 | 1302 | Argon2id+XChaCha20 round-trip, tamper detection, redaction patterns, and **credential resolution**: a `store:name` reference resolved through `vault:`/`env:`/a fixed map, an empty environment variable refused like an absent one, an unknown store listing the stores that *are* configured, and every error message asserted **not** to contain a value |
-| `hx-agent` | 45 | 1407 | The loop's gate, in one file of integration tests: the target of a destructive call is **measured after the capability check and before the prompt** (and the event that reaches the store carries it, so the trail proves what the approver was shown), a **capability denial is a result the model reads and cannot be approved away** (an approver willing to say yes is never asked), an approval denial is reported and the command never reaches the host, `allow for chat` stops the second prompt while a remembered denial is not re-asked, a tool declaring no external effect is never prompted about, a refused call does not stop its sibling, unknown tools and unusable arguments return as results, a non-zero exit is still a call that *ran*, `max_turns` and the deadline stop the run, and the exact event sequence a client renders. Plus the **routed model call** over a real `ModelRouter` and a real `ProviderRegistry`, with only the adapter faked: the route decides the model, the key follows the credential the pool granted, a refused credential is benched and its *sibling* is tried before another provider, a missing key and a 502 both give the reservation back (asserted with `concurrent: 1`, since a leaked lease looks exactly like a rate limit), and a day's budget that covers one pessimistic reservation still allows three calls |
-| `hx-store` | 42 | 2059 | Migrations applied once and never re-run, **a database from a newer build refused with both versions named** (and left untouched), `STRICT` rejecting a type mistake at insert, the transcript written by `seq` the caller does not track, a batch written whole or not at all, a cascade that only happens because `Store` sets `foreign_keys`, every part type round-tripping while an unknown one is reported rather than dropped, events and usage surviving a reopen — plus 4 in `tests/resume.rs` that drop the store and open a **new connection** to the same file, which is the closest a test gets to killing the daemon |
-| `hx-tools` | 94 | 3826 | Requirements per tool, bounded output, the two-phase registry, **confinement** (a run with a boundary runs the command there and touches no host; a boundary that cannot be entered is reported as a failure instead of falling back to the machine — the failure mode that would silently unconfine every run whose engine hiccuped), and **a misnamed argument refused rather than ignored** — `cwd` instead of `workdir` used to drop silently and run the command in the daemon's own directory. `delete` is the largest entry: the XDG trash round-trip on a real in-memory host, a directory walked rather than counted at the top level, the filesystem root refused, an unreadable path refused **before** anything is touched, an existing trash name never overwritten, a *pattern* read as one literal filename and told so, a transport failure that says nothing was deleted, and a `delete` that still requires the `Delete` capability on the resolved path |
-| `hx-server` | 46 | 2545 | Route dispatch via `oneshot`, `HxError`→HTTP status mapping, and twelve tests that run the **real loop over the real HTTP surface** with only the model scripted: an answer comes back with its session, its cost and its events; a tool call runs and its result reaches the model; a write outside the workspace is denied and never happens; a shell command that needs a human is refused **with the reason**, and the same command runs under `yolo`; a second request on a session continues the transcript; unknown autonomy and unknown roles are 400s that name what is accepted; and a request that cannot run leaves no session behind. Two of them are the floor a `yolo` run cannot lift: `rm -rf /etc` is **refused** (with the shipped rule's reason, so the model can read why) while `rm -rf /tmp/…` still runs, which is the pair that shows the refusal is a list of named paths and not a blanket stop. Plus the sandbox adapter: a command runs in the boundary with its workdir translated host→mount, a path outside the mount is refused **without running anything**, a sandbox path is left alone (the model may have copied one), one container per checkout and none shared across checkouts, a reaped sandbox is replaced rather than returned, a command that outlives its deadline is reported as still-running rather than as success, and dropping the boundary destroys it. Plus **SSE**: three tests that POST `/v1/chat/stream` through the real router and parse the response the way a spec-compliant client would — a run streams its events and ends with a named `done` carrying the reply, a run that cannot start arrives as a named `error` event rather than a status (the response is already `text/event-stream` by then, so there is no status left to change), and two runs on one shared bus do not see each other's events |
-| `hx` | 39 | 1884 | Renderers for pools/hosts/sandbox-spec/**policy**/sessions/runs/approvals, CLI parsing, and the daemon client's URL rules (an explicit `--daemon` wins, a bare `host:port` from the config gets a scheme, a URL that already has one is left alone). The policy renderer is asserted on the *order* of the rules rather than their presence — printing them in the struct's order would describe a policy the session does not have — and the approvals renderer is asserted to show a target list, the way back, and the command that answers the question, because a terminal that showed less than the daemon asked would be a weaker interface to one decision. Plus the **SSE reader** for `hx chat --stream`: a frame needs a blank line to complete, a CRLF stream still terminates frames (a proxy that sent those would otherwise buffer every event forever with no error), a run event carries its session, `done` and `error` frames are told apart, a keepalive comment is not a frame, a multi-line payload needs several `data:` lines and joins with newlines, a long argument is truncated to one line, and the `done` frame is asserted to unwrap to the same shape `/v1/chat` returns — the mistake that printed `session ?` and `0 turn(s)` for a run that had done real work |
+| `hx-agent` | 58 | 2047 | The loop's gate, in one file of integration tests: the target of a destructive call is **measured after the capability check and before the prompt** (and the event that reaches the store carries it, so the trail proves what the approver was shown), a **capability denial is a result the model reads and cannot be approved away** (an approver willing to say yes is never asked), an approval denial is reported and the command never reaches the host, `allow for chat` stops the second prompt while a remembered denial is not re-asked, a tool declaring no external effect is never prompted about, a refused call does not stop its sibling, unknown tools and unusable arguments return as results, a non-zero exit is still a call that *ran*, `max_turns` and the deadline stop the run, and the exact event sequence a client renders. Plus the **routed model call** over a real `ModelRouter` and a real `ProviderRegistry`, with only the adapter faked: the route decides the model, the key follows the credential the pool granted, a refused credential is benched and its *sibling* is tried before another provider, a missing key and a 502 both give the reservation back (asserted with `concurrent: 1`, since a leaked lease looks exactly like a rate limit), and a day's budget that covers one pessimistic reservation still allows three calls |
+| `hx-store` | 58 | 2920 | Migrations applied once and never re-run, **a database from a newer build refused with both versions named** (and left untouched), `STRICT` rejecting a type mistake at insert, the transcript written by `seq` the caller does not track, a batch written whole or not at all, a cascade that only happens because `Store` sets `foreign_keys`, every part type round-tripping while an unknown one is reported rather than dropped, events and usage surviving a reopen — plus 4 in `tests/resume.rs` that drop the store and open a **new connection** to the same file, which is the closest a test gets to killing the daemon |
+| `hx-tools` | 102 | 4125 | Requirements per tool, bounded output, the two-phase registry, **confinement** (a run with a boundary runs the command there and touches no host; a boundary that cannot be entered is reported as a failure instead of falling back to the machine — the failure mode that would silently unconfine every run whose engine hiccuped), and **a misnamed argument refused rather than ignored** — `cwd` instead of `workdir` used to drop silently and run the command in the daemon's own directory. `delete` is the largest entry: the XDG trash round-trip on a real in-memory host, a directory walked rather than counted at the top level, the filesystem root refused, an unreadable path refused **before** anything is touched, an existing trash name never overwritten, a *pattern* read as one literal filename and told so, a transport failure that says nothing was deleted, and a `delete` that still requires the `Delete` capability on the resolved path |
+| `hx-server` | 112 | 6242 | Route dispatch via `oneshot`, `HxError`→HTTP status mapping, and twenty-one of the twenty-two tests in `tests/api.rs` driving the **real loop over the real HTTP surface** with only the model scripted: an answer comes back with its session, its cost and its events; a tool call runs and its result reaches the model; a write outside the workspace is denied and never happens; a shell command that needs a human is refused **with the reason**, and the same command runs under `yolo`; a second request on a session continues the transcript; unknown autonomy and unknown roles are 400s that name what is accepted; and a request that cannot run leaves no session behind. Two of them are the floor a `yolo` run cannot lift: `rm -rf /etc` is **refused** (with the shipped rule's reason, so the model can read why) while `rm -rf /tmp/…` still runs, which is the pair that shows the refusal is a list of named paths and not a blanket stop. Plus the sandbox adapter: a command runs in the boundary with its workdir translated host→mount, a path outside the mount is refused **without running anything**, a sandbox path is left alone (the model may have copied one), one container per checkout and none shared across checkouts, a reaped sandbox is replaced rather than returned, a command that outlives its deadline is reported as still-running rather than as success, and dropping the boundary destroys it. Plus **SSE**: three tests that POST `/v1/chat/stream` through the real router and parse the response the way a spec-compliant client would — a run streams its events and ends with a named `done` carrying the reply, a run that cannot start arrives as a named `error` event rather than a status (the response is already `text/event-stream` by then, so there is no status left to change), and two runs on one shared bus do not see each other's events |
+| `hx` | 43 | 2619 | Renderers for pools/hosts/sandbox-spec/**policy**/sessions/runs/approvals, CLI parsing, and the daemon client's URL rules (an explicit `--daemon` wins, a bare `host:port` from the config gets a scheme, a URL that already has one is left alone). The policy renderer is asserted on the *order* of the rules rather than their presence — printing them in the struct's order would describe a policy the session does not have — and the approvals renderer is asserted to show a target list, the way back, and the command that answers the question, because a terminal that showed less than the daemon asked would be a weaker interface to one decision. Plus the **SSE reader** for `hx chat --stream`: a frame needs a blank line to complete, a CRLF stream still terminates frames (a proxy that sent those would otherwise buffer every event forever with no error), a run event carries its session, `done` and `error` frames are told apart, a keepalive comment is not a frame, a multi-line payload needs several `data:` lines and joins with newlines, a long argument is truncated to one line, and the `done` frame is asserted to unwrap to the same shape `/v1/chat` returns — the mistake that printed `session ?` and `0 turn(s)` for a run that had done real work |
+
+**Tests** is every target of `cargo test -p <crate> --locked` (unit, integration and bin targets);
+the `#[ignore]`d live suites are excluded here and counted in tier A. **LOC** is
+`find crates/<crate>/src -name '*.rs' | xargs wc -l` — the crate's own source, not its tests. Both
+columns are reproducible with those two commands.
 
 Two families in that table are worth naming, because in both the obvious implementation is wrong and
 the failure is silent:
@@ -396,21 +413,20 @@ the failure is silent:
 
 | Call site | Why it has never run | Risk if wrong |
 |---|---|---|
-| **Egress filtering** | Not implemented: no proxy, no firewall rule. Now *refused* rather than ignored (`SpecError::EgressNotEnforced`), so it cannot silently mean "open internet" | Medium — a networked sandbox is unrestricted |
 | DuckDuckGo keyless scraping — the *success* path | Every attempt from a plain HTTP client is answered with an `anomaly` challenge: a TLS-fingerprint wall, not a markup change. The failure path is verified live; the success path needs a browser-fingerprint client (M6) | Medium — search silently loses a source, but `SearchReport` names it |
 | Vault written to disk and reopened in a **new process** | Untested | Medium — in-process round-trip only |
 | `hxd` reaper loop, `axum::serve` under load | Manual only | Low |
 
 ### Tier D — absent
 
-Three crates are one line each — placeholder `lib.rs` with a doc comment and nothing else:
+Two crates are one line each — placeholder `lib.rs` with a doc comment and nothing else:
 
-`hx-browser` · `hx-gateway` · `hx-mcp`
+`hx-browser` · `hx-mcp`
 
 They are declared as workspace members, so `cargo test` reports nothing for them and the build is
-green. **A green suite says nothing about them.** Also absent: the web UI, the Tauri desktop/mobile
-apps, host certificates, `ssh-agent` auth, `WinRMHost`, SSH file transfer to a Windows host (the
-POSIX-only paths refuse via a capability check), and the egress proxy.
+green. **A green suite says nothing about them.** Also absent: the Tauri desktop/mobile apps, host
+certificates, `ssh-agent` auth, and SSH file transfer to a Windows host (the POSIX-only paths refuse
+via a capability check).
 
 ## The defect this audit found in the suite itself
 
@@ -472,22 +488,22 @@ with the recorded key and the line number in the message; TOFU records *before* 
 that cannot be pinned is not accepted; a certificate is refused, because the authority behind it is
 not verified.
 
-**2 — A real Docker integration test. ✅ Done.** `crates/hx-sandbox/tests/docker_live.rs`, eight
+**2 — A real Docker integration test. ✅ Done.** `crates/hx-sandbox/tests/docker_live.rs`, twelve
 tests, run in CI on `ubuntu-latest`. The ladder is no longer a mapping function: the daemon's own
 view of the container is asserted, `network=none` is probed from inside, the pid ceiling is read from
 the cgroup and then attacked, and the reaper is checked against `docker inspect` rather than against
 its own bookkeeping.
 
-**3 — A real SSH integration test. ✅ Done, and scheduled.** Five tests against a throwaway `sshd` in
+**3 — A real SSH integration test. ✅ Done, and scheduled.** Seven tests against a throwaway `sshd` in
 CI, on a non-default port so the bracketed `known_hosts` form is exercised. It is not a second
 machine and not a Windows host — that is item 7.
 
 **4 — Mark the untested paths so the suite cannot lie. ✅ Done for both live surfaces.**
-`cargo test --workspace` reports `18 ignored` instead of implying full coverage, and
+`cargo test --workspace` reports `52 ignored` instead of implying full coverage, and
 `.github/workflows/integration.yml` runs them where CI can host them. The remaining tier C paths —
-L3, the egress proxy, real search backends — should get the same treatment as they gain tests; the
-suite's real weakness was never low coverage but that **nothing distinguished "verified" from
-"compiles"**, so a green run read as more assurance than it was.
+real search backends, the vault opened in a new process — should get the same treatment as they gain
+tests; the suite's real weakness was never low coverage but that **nothing distinguished "verified"
+from "compiles"**, so a green run read as more assurance than it was.
 
 **5 — Live search canary. ✅ Done.** `crates/hx-search/tests/search_live.rs`, four tests, run nightly
 by `.github/workflows/canary.yml` — which starts a SearXNG of its own, because that is the one
@@ -499,10 +515,12 @@ found DuckDuckGo serving an `anomaly` challenge on every request — reported co
 recorded in README as the reason a browser-fingerprint client is M6 work rather than a parsing bug.
 
 **6 — End-to-end agent test.** ◐ Unblocked, not done. The loop exists now (`crates/hx-agent`), and
-its 21 tests exercise the gate end to end — but against a *scripted* model and an in-memory host,
-which is still only our own assumptions. The test that counts drives a real model through the loop
-with a real tool against a real host or sandbox, and it cannot be written before the loop is wired
-into something that owns a credential and a host (`hx-store` and `hxd`, next in M1).
+its 31 tests exercise the gate end to end — but against a *scripted* model and an in-memory host,
+which is still only our own assumptions. The loop is wired into something that owns a credential and
+a host (`hx-store` and `hxd`), and a real model has been driven through it by hand (see *Tier C — a
+real model through the daemon* below), but that run is still manual: what is missing is a **test**
+that drives a real model through the loop with a real tool against a real host or sandbox, which
+needs a key CI does not have.
 
 **7 — L3, and a non-Linux remote.**
 
@@ -512,9 +530,9 @@ the host reports `7.0.0-30-generic`, keeps a read-only root, runs non-root, and 
 bind mount. `HX_DOCKER_REQUIRE_L3=1` makes a missing gVisor a failure, so the capability cannot
 quietly stop being tested.
 
-◐ **A Windows remote is still unverified** — its shell wrapping and the POSIX-only file-transfer
-guards have never met a real server. It needs a Windows box with an SSH server and a key, which is
-environment work rather than code work.
+✅ **A Windows remote is verified — over WinRM.** What that does *not* cover is a Windows **SSH**
+server: the POSIX-only file-transfer guards and the shell wrapping have never met one. That needs a
+Windows box running `sshd`, which is environment work rather than code work.
 
 ✅ **WinRM against a real Windows host.** `hx-remote` carries a hand-rolled NTLMv2 implementation
 (`src/ntlm.rs`) and a WinRM transport (`src/winrm.rs`), and `tests/winrm_live.rs` exercises both
@@ -685,15 +703,15 @@ all until `AgentConfig::default()` was fixed.
 ## Running the suite
 
 ```bash
-cargo test --workspace          # 695 tests, 0 failed, 24 ignored live tests
-cargo test -p hx-store          # 42 — migrations, the transcript, and 4 that reopen the file
-cargo test -p hx-agent          # 42 — the loop's gate, the routed model call, the transcript sink
-cargo test -p hx-tools          # 91 — requirements, bounded output, the two-phase registry, workspace resolution, the trash
-cargo test -p hx-server         # 30 — routes, and the loop end to end over HTTP
-cargo test -p hx-sandbox        # 62 — includes the ladder and the rollback invariants
-cargo test -p hx-remote         # 90 — includes known_hosts parsing and the host key policy
+cargo test --workspace --locked   # 978 tests, 0 failed, 52 ignored live tests
+cargo test -p hx-store          # 58 — migrations, the transcript, and 4 that reopen the file
+cargo test -p hx-agent          # 58 — the loop's gate, the routed model call, the transcript sink
+cargo test -p hx-tools          # 102 — requirements, bounded output, the two-phase registry, workspace resolution, the trash
+cargo test -p hx-server         # 112 — routes, and the loop end to end over HTTP
+cargo test -p hx-sandbox        # 94 — includes the ladder and the rollback invariants
+cargo test -p hx-remote         # 132 — includes known_hosts parsing and the host key policy
 cargo build --workspace         # clean: 0 warnings, 0 deprecations
-cargo clippy --workspace        # clean
+cargo clippy --workspace --all-targets --locked -- -D warnings   # clean (this is what CI runs)
 
 # the ones that need a real service (this is the shape CI runs them in)
 cargo test -p hx-sandbox --test docker_live -- --ignored --test-threads=1
@@ -713,20 +731,21 @@ HX_SSH_TEST_HOST=<host> HX_SSH_TEST_USER=<user> HX_SSH_TEST_KEY=~/.ssh/id_ed2551
   live suite yet) and the full streaming loop (only the `Coalescer` primitive and the `editMessageText`
   shape).
 - **11 crates with logic**: unit-tested at the level of pure functions and in-process lifecycles.
-- **3 crates**: empty. The green suite does not cover them.
+- **2 crates**: empty (`hx-browser`, `hx-mcp`). The green suite does not cover them.
 - **The store's resume path is tested across a real process boundary, in the only way a test can**:
   four tests in `crates/hx-store/tests/resume.rs` drop the `Store` and open a *new connection* to
   the same file, then continue the conversation. One of them is the case M1's exit criterion turns
   on — a run that died between a tool call and its result — where the transcript is repaired with a
   result that says the call did not run, rather than being sent to a provider that would reject it
   with an error that does not mention the cause.
-- **The agent loop's gate is tested where it can be**: 21 integration tests with no network and no
+- **The agent loop's gate is tested where it can be**: 31 integration tests with no network and no
   model — a capability denial that an approval cannot widen, an approval denial that never reaches the
   host, a refusal that does not stop the next call, and the event sequence a client will render. What
   none of them reaches is a real model: a scripted one is a model we wrote.
-- **22 live tests**, all `#[ignore]`d by default: a real Docker daemon with gVisor installed, a real
-  `sshd` and a real SearXNG are run in CI; the four against a real model are run deliberately, since
-  they need a key and CI has none.
+- **52 live tests**, all `#[ignore]`d by default: a real Docker daemon with gVisor installed, a real
+  `sshd` and a real SearXNG are run in CI; the ones against a real model are run deliberately, since
+  they need a key and CI has none. The rest — WinRM against a Windows guest, the remote-sandbox
+  runtime, the remote PTY — need hosts on a private network, so they are run by hand too.
 - **The SSH transport and the sandbox lifecycle are tier A, and regress loudly**: host key refusals
   observed against a real server, and a container whose egress, pid ceiling, read-only root, bind
   mount and reaper were each verified against the daemon rather than against our own bookkeeping.
@@ -739,4 +758,4 @@ HX_SSH_TEST_HOST=<host> HX_SSH_TEST_USER=<user> HX_SSH_TEST_KEY=~/.ssh/id_ed2551
 - **What is still tier C**: egress filtering by CIDR or raw IP — a hostname allowlist is now enforced
   on both the near and the far host, but the proxy matches hostnames, so those entries are refused
   rather than pretended — plus keyless scraping that survives a TLS-fingerprint bot wall (browser-pool
-  work), the vault opened in a new process, and provider calls to a real model API.
+  work), the vault opened in a new process, and the `hxd` reaper loop and `axum::serve` under load.

@@ -41,7 +41,9 @@ profile untrusted  (isolation L2)
   userns mode       private (requested)
   runtime           (engine default)
   tmpfs             /tmp rw,noexec,nosuid,size=1g
-  workspace         /home/you/proj -> /workspace
+  tmpfs             /var/tmp rw,noexec,nosuid,size=512m
+  tmpfs             /run rw,noexec,nosuid,size=64m
+  workspace         /workspace-src -> /workspace
 ```
 
 ```console
@@ -64,11 +66,11 @@ $ curl -s localhost:7717/v1/status | jq .pools
 | A terminal on a remote host | **Built** — `Host::open_pty` returns a `PtySession` (a stream, not a request) and `SshHost` implements it over a real pty channel, so `POST /v1/terminals` with a `host` gives a client an interactive shell on another machine through the same WebSocket it already uses (`crates/hx-remote/tests/pty_live.rs`, `crates/hx-server/tests/terminal_remote_live.rs`). `LocalHost` and `WinRmHost` refuse with reasons rather than handing back a session that never speaks |
 | Sandboxes: L1/L2/L3 isolation ladder, Docker lifecycle, TTL reaper | **Built** — created, confined and reaped against a real daemon (`crates/hx-sandbox/tests/docker_live.rs`), running as the workspace's owner so the bind mount is writable; L3 verified inside gVisor, where the sandbox sees `4.19.0-gvisor` and not the host kernel |
 | Daemon (`hxd`) + HTTP API + CLI (`hx`) | **Done**, runnable |
-| Tools (`hx-tools`) + the agent loop (`hx-agent`) | **Built** — seven tools, and a loop that classifies every call against the capability token and then the approval policy; 26 tests pin the gate down against a scripted model (`crates/hx-agent/tests/loop.rs`). `delete` moves a named path to the XDG trash rather than unlinking it, and a destructive prompt carries what will be gone — the resolved path, its entry count, its bytes — because the tool measures the target before anyone is asked |
+| Tools (`hx-tools`) + the agent loop (`hx-agent`) | **Built** — seven tools, and a loop that classifies every call against the capability token and then the approval policy; 31 tests pin the gate down against a scripted model (`crates/hx-agent/tests/loop.rs`). `delete` moves a named path to the XDG trash rather than unlinking it, and a destructive prompt carries what will be gone — the resolved path, its entry count, its bytes — because the tool measures the target before anyone is asked |
 | Sessions (`hx-store`) | **Built** — SQLite: create, resume, list, rename, delete, export (JSON/Markdown), events, usage totals. A transcript that ended mid-call is *repaired*, not sent to a provider that would reject it |
-| Web UI, Tauri desktop/mobile, chat connectors | **Partly built** — the daemon serves a browser client at `/` (terminal + session stream, no build step), the per-session WebSocket event stream is built and tested, and the server-side terminal is built and tested. The file tree, the diff pane, the approval queue, Tauri, and the connectors are not built |
+| Web UI, Tauri desktop/mobile, chat connectors | **Partly built** — the daemon serves a browser client at `/` (terminal + session stream + an approval queue that polls `GET /v1/approvals` + a per-host directory browser, file viewer/editor and command runner, no build step), the per-session WebSocket event stream is built and tested, and the server-side terminal is built and tested. The diff/review pane, Tauri, and a full connector set are not built (the `Connector` trait, the session router and the Telegram connector are) |
 | MCP client, browser-automation pool | **Not started** |
-| The loop wired into `hxd` and `hx`: `POST /v1/chat`, `hx chat`, session routes over `hx-store` | **Built** — one request runs the loop against a session: the prompt is stored before the model is called, the role decides the model, credentials come from a `store:name` reference, events are written as they happen, and a transcript that ended mid-call is repaired before it is sent. Twenty tests drive the **real loop over the real HTTP surface**; model replies are scripted and sandbox engine calls use a recording runtime. `hx chat --sandbox-profile dev` selects a configured shell boundary; missing or failed boundaries never fall back to host execution |
+| The loop wired into `hxd` and `hx`: `POST /v1/chat`, `hx chat`, session routes over `hx-store` | **Built** — one request runs the loop against a session: the prompt is stored before the model is called, the role decides the model, credentials come from a `store:name` reference, events are written as they happen, and a transcript that ended mid-call is repaired before it is sent. Twenty-two tests in `crates/hx-server/tests/api.rs`, twenty-one of which drive the **real loop over the real HTTP surface**; model replies are scripted and sandbox engine calls use a recording runtime. `hx chat --sandbox-profile dev` selects a configured shell boundary; missing or failed boundaries never fall back to host execution |
 
 ---
 
@@ -93,7 +95,7 @@ sent as its own frame — a stream that simply stops is indistinguishable from a
 That single decision is what makes the web-UI requirement achievable rather than a promise that
 decays. CLI, browser, Tauri desktop, Tauri mobile and chat connectors all render the same
 `AgentEvent` stream and call the same HTTP API, so a feature cannot exist on one surface only.
-It is why `hx status` and the daemon cannot disagree about what is running.
+It is why `hx sessions` and the daemon cannot disagree about what is running.
 
 ## The four design decisions worth reviewing
 
@@ -137,8 +139,9 @@ apps/
   hx             the CLI
 ```
 
-Empty placeholder crates (`hx-browser`, `hx-gateway`, `hx-mcp`) are reserved for the milestones that
-need them.
+Empty placeholder crates (`hx-browser`, `hx-mcp`) are reserved for the milestones that need them.
+`hx-gateway` is no longer one: it carries the `Connector` trait, the deterministic session router and
+the Telegram connector.
 
 ## Installing
 
@@ -180,7 +183,10 @@ approval policy from hx.yaml
   destructive  asks
   privileged   asks
   ceiling  none — a `yolo` chat can auto-approve anything, including a deleted database
+  budget   none — a run may keep going without a check-in
+  expires  never
   deletes  a pattern or a variable in a delete is refused outright (`rm -rf build*`, `rm -rf $DIR`), …
+  grants   none — this checkout has no `.hx/allow.toml`
 ```
 
 A call that needs a human does not fail, it waits — and any client can answer it. From a second
@@ -210,7 +216,7 @@ $ ./target/release/hxd --bind 127.0.0.1:7717
 ```
 
 ```console
-$ cargo test --workspace         # 904 tests, 0 failed, 47 ignored live tests
+$ cargo test --workspace         # 978 tests, 0 failed, 52 ignored live tests
 $ cargo test -p hx-sandbox --test docker_live -- --ignored   # needs a container engine
 $ cargo test -p hx-remote --test ssh_live -- --ignored       # needs an SSH server
 $ HX_SEARXNG_URL=... HX_SEARCH_EXPECT_RESULTS=searxng \
@@ -234,10 +240,14 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
   stored trail. What is *not* there yet: nothing pushes a question to a client, so a web UI polls.
   `hx policy` prints the ladder in force, so "why did it ask?" and "what did I allow?" are answered by
   the same output rather than by reading the source.
-- **Project-scoped allowlists are not persisted.** "Always allow this" is remembered in memory for the
-  rest of the run, and `docs/approvals.md` §5's reviewable `.hx/allow.toml` — the file in the
-  repository a team can diff — is not written yet. Until it is, a remembered approval outlives
-  nothing. The `confined` axis (§4), chat profile selection, and `hx policy` (§6) are built.
+- **Project-scoped allowlists are shipped.** `docs/approvals.md` §5's reviewable `.hx/allow.toml` —
+  the file in the repository a team can diff — is loaded per run from the run's own resolved
+  workspace (`crates/hx-core/src/allowlist.rs`, folded into the policy by `crates/hx-server/src/chat.rs`),
+  so a grant written in one worktree applies to that checkout and not to another. A malformed file is a
+  hard error rather than a silent skip, and the file can only *allow*: a deny is never read from it,
+  because a file anyone can edit must not be able to set the lock. `hx policy --workspace <dir>` prints
+  the grants in force and reports a broken file. "Always allow this" is also remembered in memory for
+  the rest of the run. The `confined` axis (§4), chat profile selection, and `hx policy` (§6) are built.
   Shell confinement does not confine file tools or make the writable workspace mount disposable.
 - **Streaming.** **Built** for the OpenAI-compatible provider: a turn is sent with `stream: true`
   and deltas are emitted as they arrive, with tool-call fragments merged by the same rule the
@@ -257,7 +267,7 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
 - **Nothing in `ci.yml` reaches another machine.** That file is in-process unit tests; the tests
   that open a socket — a real Docker daemon, a real `sshd` — live in
   `.github/workflows/integration.yml` and are `#[ignore]`d by default, so a local `cargo test` stays
-  green on a laptop without Docker while still reporting `18 ignored` rather than implying coverage.
+  green on a laptop without Docker while still reporting `52 ignored` rather than implying coverage.
   L3 is verified where gVisor is installed — the CI job installs it, and `HX_DOCKER_REQUIRE_L3`
   turns a skip into a failure so the strongest claim in the ladder cannot quietly stop being
   tested.
@@ -280,8 +290,16 @@ Rust 1.89+ (edition 2021). Verified on 1.98.1.
   verified, and accepting an unverified chain would claim a check that did not happen. The same
   applies to `ssh-agent` auth, which returns an explicit error rather than pretending.
 - **Host key policy from config.** The policy is an argument to `SshHost::connect`
-  (`Strict` / `Tofu` / `Insecure`) with `~/.ssh/known_hosts` as the default store. Reading it out
-  of `hx.yaml` belongs to the host registry in M4, along with `WinRMHost` and a Windows remote,
-  where the shell wrapping and the POSIX-only file-transfer guards have never met a real server.
-- **Web UI, desktop/mobile apps, chat connectors, MCP, browser pool.** Designed in
-  `ARCHITECTURE.md`, not built.
+  (`Strict` / `Tofu` / `Insecure`) with `~/.ssh/known_hosts` as the default store. The host registry
+  has landed (`hosts:` in the config, credentials resolved from the vault at connect time,
+  `AppState::resolve_host` as the one way to obtain a remote handle), but the daemon still
+  **hardcodes** `HostKeyPolicy::Strict` against its own `<data_dir>/known_hosts`
+  (`crates/hx-server/src/hosts.rs`), so which policy applies is not yet readable from `hx.yaml`.
+  `WinRMHost` and a Windows remote are no longer a gap: the live suite is **9 of 9** against a real
+  Windows 10 guest (connect and self-report, a command's output and exit code, a byte-for-byte file
+  round-trip, a directory listing, `rename` refusing to overwrite, shell reuse, an unreachable host,
+  and bad credentials refused without echoing the password).
+- **Web UI, desktop/mobile apps, chat connectors, MCP, browser pool.** The browser client is built
+  (see the status table above). The Tauri desktop/mobile shells, the diff/review pane, a full
+  connector set (the `Connector` trait, the session router and Telegram are in), the MCP client and
+  the browser pool are designed in `ARCHITECTURE.md`, not built.

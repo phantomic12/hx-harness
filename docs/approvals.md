@@ -37,8 +37,9 @@ Two absolutes fall out of the table, and they are the ones worth defending:
 
 ## 2. The three outcomes, in one order
 
-`ApprovalPolicy` today has `allow` and `deny`; the level threshold supplies the implicit *ask*. That
-loses one thing the prior art has: the ability to force a prompt for something that is *below* the
+`ApprovalPolicy` has `allow`, `ask` and `deny` rule lists; the level threshold supplies the implicit
+*ask* for anything no rule matches. The explicit `ask` list is what adds the one thing the prior art
+has and a threshold alone cannot: the ability to force a prompt for something that is *below* the
 threshold — a project that wants to look at every `write_file` even at `trusting`, or an operator who
 wants a prompt for `shell` regardless of its class because the classifier might be wrong about a
 command it has never seen.
@@ -151,7 +152,8 @@ the host and declare that fact to the approval layer. The workspace remains a wr
 The shell sends command source and workdir separately. Embedding `cd /host/checkout` in the command
 would defeat mount translation even though the engine received `/workspace` as its working directory.
 HTTP tests assert the exact engine command and translated directory, not merely that `exec` was called.
-Live Docker verification of this chat path remains outstanding; these tests use a recording runtime.
+The live Docker verification of this chat path is `crates/hx-server/tests/chat_live.rs` — two tests
+against a real daemon, recorded in `TESTING.md`'s tier A. The HTTP tests above use a recording runtime.
 
 ## 5. Where "remember" lives, and for how long
 
@@ -270,7 +272,7 @@ The looser the setting, the more the floor mattered, which is the worst possible
 The floor is therefore **not a list that can be replaced by omission**. `inherit_denials` is a field on
 `ApprovalPolicy` whose serde default is `true` and whose type default is `None`, because those are two
 different questions: a policy that came from a *file* is a deployment and inherits the floor, while
-`ApprovalPolicy::default()` is a library caller and must not acquire fourteen rules it never wrote.
+`ApprovalPolicy::default()` is a library caller and must not acquire thirty-two rules it never wrote.
 `with_floor()` folds the shipped rules in (the file's own rules first, so *its* note is the one that
 explains a refusal), and `Config::from_yaml` — the boundary between a file and a policy — is where it runs.
 Dropping the floor now takes the words `inherit_denials: false`, and `hx policy` reports that as
