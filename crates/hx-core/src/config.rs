@@ -1541,6 +1541,18 @@ hosts:
             "and the catastrophe set with it: {:?}",
             approval.deny
         );
+
+        // The example carries an M8 model pool, and it builds to a pool of healthy members whose
+        // credentials are references, never values.
+        assert!(!config.model_pools.is_empty());
+        let builder = config
+            .model_pool("builder")
+            .expect("example builder model pool builds");
+        assert_eq!(builder.members.len(), 2);
+        assert!(
+            builder.members[0].credential.starts_with("vault:"),
+            "a member credential is a reference, never a value"
+        );
     }
 
     // -- MCP servers ---------------------------------------------------------

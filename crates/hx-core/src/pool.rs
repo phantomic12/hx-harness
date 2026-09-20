@@ -622,16 +622,12 @@ model_pools:
         assert!(err.contains("nope"), "{err}");
     }
 
-    /// Backwards compatibility: a config with no `model_pools` section at all still loads.
+    /// Backwards compatibility: a config with no `model_pools` section at all still loads, and the
+    /// field is unset rather than defaulted to something.
     #[test]
     fn a_config_with_no_model_pool_section_still_loads() {
         let cfg = crate::config::Config::from_yaml("{}\n").expect("must parse");
         assert!(cfg.model_pools.is_empty());
-
-        // And the shipped example config — which predates this field — still parses.
-        let example = include_str!("../../../hx.example.yaml");
-        let cfg2 = crate::config::Config::from_yaml(example).expect("example must parse");
-        assert!(cfg2.model_pools.is_empty());
     }
 
     /// A member config is additive: every field except `id`/`base_url`/`credential` is defaulted.
