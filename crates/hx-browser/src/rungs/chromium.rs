@@ -23,8 +23,24 @@
 //! - If admitted, the request is continued with `Fetch.continueRequest`.
 //! - If refused, the request is failed immediately with `Fetch.failRequest` (`errorReason: AccessDenied`).
 //!
-//! The guard runs on the wire boundary, not on the response: zero connections are made to unadmitted
-//! addresses.
+//! ### The wire guarantee: request boundary vs. socket boundary
+//!
+//! **No HTTP request is delivered to a refused target.**
+//!
+//! The guarantee is enforced strictly at the *request* boundary, not the raw *socket* boundary:
+//! - For subresource requests (`fetch()`, `XMLHttpRequest`, images, stylesheets), Chromium initiates no
+//!   speculative preconnection. The interception pauses before socket creation, guaranteeing **zero TCP
+//!   connections** on the wire.
+//! - For top-level navigations (e.g. `window.location.href = ...`), Chromium's speculative preconnect
+//!   mechanism may open raw TCP connections to the target *below* the CDP interception layer before
+//!   `Fetch.requestPaused` fires to refuse the navigation. These sockets carry **zero request bytes**;
+//!   interception halts the request and issues `Fetch.failRequest`, so no HTTP request line, headers,
+//!   or body ever reach the wire.
+//!
+//! Disabling features via CLI flags (such as `--disable-features=Preconnect,SpeculativeServiceWorker,NavigationPredictor,NetworkPrediction`)
+//! was evaluated, but Chromium's navigation engine continues to open speculative preconnect sockets
+//! for top-level navigations. A reader or consumer of this rung must therefore understand that
+//! while subresources guarantee zero connections, top-level navigations guarantee zero HTTP requests.
 //!
 //! ## Reaping the browser on every path
 //!
@@ -511,12 +527,12 @@ fn drive_cdp(
                     break;
                 }
 
-                // Page load complete -> evaluate outerHTML
+                // Page load complete -> evaluate outerHTML (small delay to allow microtasks/scripts to settle)
                 if text.contains("\"method\":\"Page.loadEventFired\"") && eval_cmd_id.is_none() {
                     msg_id += 1;
                     eval_cmd_id = Some(msg_id);
                     let eval_cmd = format!(
-                        r#"{{"id":{},"sessionId":"{}","method":"Runtime.evaluate","params":{{"expression":"document.documentElement.outerHTML","returnByValue":true}}}}"#,
+                        r#"{{"id":{},"sessionId":"{}","method":"Runtime.evaluate","params":{{"expression":"new Promise(r => setTimeout(r, 50)).then(() => document.documentElement.outerHTML)","awaitPromise":true,"returnByValue":true}}}}"#,
                         msg_id, session_id
                     );
                     let _ = ws.send(Message::Text(eval_cmd.into()));

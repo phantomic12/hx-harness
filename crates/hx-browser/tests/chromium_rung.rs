@@ -25,6 +25,7 @@ struct Stub {
     addr: SocketAddr,
     task: JoinHandle<()>,
     connections: Arc<AtomicUsize>,
+    requests: Arc<AtomicUsize>,
 }
 
 impl Stub {
@@ -36,10 +37,11 @@ impl Stub {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
         let connections = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
         let conns_clone = connections.clone();
 
         let task = tokio::spawn(async move {
-            while let Ok((mut socket, peer)) = listener.accept().await {
+            while let Ok((socket, peer)) = listener.accept().await {
                 eprintln!("STUB ACCEPTED from peer: {peer}");
                 conns_clone.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(handler(socket));
@@ -50,17 +52,51 @@ impl Stub {
             addr,
             task,
             connections,
+            requests,
         }
     }
 
-    /// A listener that records connections and answers nothing.
+    /// A listener that records connections and request lines, and answers nothing.
     async fn silent() -> Self {
-        Self::new(|mut socket| async move {
-            let mut buf = [0u8; 1024];
-            let n = socket.read(&mut buf).await.unwrap_or(0);
-            eprintln!("TARGET RECEIVED: {}", String::from_utf8_lossy(&buf[..n]));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let reqs = requests.clone();
+        let mut stub = Self::new(move |mut socket| {
+            let reqs = reqs.clone();
+            async move {
+                let mut buf = [0u8; 1024];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let text = String::from_utf8_lossy(&buf[..n]);
+                eprintln!("TARGET RECEIVED: {text}");
+                if n > 0 && text.lines().any(|line| line.contains("HTTP/")) {
+                    reqs.fetch_add(1, Ordering::SeqCst);
+                }
+            }
         })
-        .await
+        .await;
+        stub.requests = requests;
+        stub
+    }
+
+    /// A listener that accepts connections, reads incoming bytes, and hangs forever without answering.
+    async fn hanging() -> Self {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let reqs = requests.clone();
+        let mut stub = Self::new(move |mut socket| {
+            let reqs = reqs.clone();
+            async move {
+                let mut buf = [0u8; 1024];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let text = String::from_utf8_lossy(&buf[..n]);
+                eprintln!("TARGET RECEIVED: {text}");
+                if n > 0 && text.lines().any(|line| line.contains("HTTP/")) {
+                    reqs.fetch_add(1, Ordering::SeqCst);
+                }
+                std::future::pending::<()>().await;
+            }
+        })
+        .await;
+        stub.requests = requests;
+        stub
     }
 
     fn url(&self, path: &str) -> String {
@@ -69,6 +105,10 @@ impl Stub {
 
     fn connections(&self) -> usize {
         self.connections.load(Ordering::SeqCst)
+    }
+
+    fn requests(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
     }
 }
 
@@ -159,7 +199,7 @@ fetch('http://{target_addr}/stolen')
 }
 
 #[tokio::test]
-async fn a_page_whose_script_navigates_to_a_private_address_is_blocked_and_the_listener_accepts_zero_connections(
+async fn a_page_whose_script_navigates_to_a_private_address_is_blocked_and_the_listener_receives_zero_requests(
 ) {
     let target = Stub::silent().await;
     let target_addr = target.addr;
@@ -202,10 +242,12 @@ window.location.href = 'http://{target_addr}/stolen';
         other => panic!("expected FetchError::Blocked, got {other:?}"),
     }
 
+    // Chromium's speculative preconnect opens raw TCP sockets below CDP request interception,
+    // so connections may be accepted on top-level navigation, but zero HTTP request bytes reach the wire.
     assert_eq!(
-        target.connections(),
+        target.requests(),
         0,
-        "the intercepted navigation reached the listener on the wire!"
+        "the intercepted navigation delivered a request to the listener on the wire!"
     );
 }
 
@@ -256,8 +298,8 @@ async fn the_browser_child_process_is_reaped_after_a_transport_failure() {
 
 #[tokio::test]
 async fn the_browser_child_process_is_reaped_when_the_fetch_times_out() {
-    // Stub accepts connection but never responds
-    let stub = Stub::silent().await;
+    // Stub accepts connection and hangs forever
+    let stub = Stub::hanging().await;
 
     let rung = ChromiumRung::with_admission(Admission::AllowLocal).expect("rung");
     let (_temp, session_profile) = profile("reap-timeout");
