@@ -260,6 +260,33 @@ runners cannot reach, so there is deliberately **no** integration.yml job for it
 skips would add noise without evidence. An operator runs it by hand against a reachable host, as above.
 No container or workspace is left on the host when it finishes.
 
+**The key invariant: no private key reaches the model, the trail, or a sandbox** (hermetic, five tests)
+
+M4's exit criteria ends with a security claim — *"no private key ever enters the model context or a
+sandbox"* — that was asserted in prose and never tested. These tests make it a tripwire:
+
+| Where the leak would surface | Test | Result |
+|---|---|---|
+| `SshAuth`'s `Debug` line | `a_remote_key_that_is_genuinely_present_never_renders_into_any_debug_line` | **passes** |
+| A connected host's rendered surface | `a_connected_host_surface_never_renders_the_key_that_opened_it` | **passes** |
+| The vault → `SshAuth` seam | `a_vault_key_that_is_genuinely_resolved_never_renders_in_its_ssh_auth` | **passes** |
+| The sandbox spec | `a_sandbox_spec_from_a_profile_never_mounts_the_vault_or_any_secret` | **passes** |
+
+**The invariant holds.** Key material cannot reach a tool result, an audit event, an error line or a
+sandbox spec on any path inspected.
+
+**These are tripwires, not restatements, and that was checked rather than assumed.** Each test uses a
+distinctive generated sentinel and asserts that the sentinel *is* genuinely present on the path
+before asserting it never renders — so a future refactor that stops passing the key turns the test
+into an explicit failure rather than a silent no-op. The negative control was then run for real:
+making `SshAuth::Key`'s `Debug` print the key (instead of `"<redacted>"`) made the first test **fail**
+at `ssh.rs:1154`, and reverting it made the test pass again. A test that cannot fail is not evidence.
+
+**What this does NOT prove**, and the doc comments say so: a sandbox with real network access could
+exfiltrate a secret by other means; that is scoped out. The live connect-error path (a *failed*
+connection is the likeliest place a key would render into an error the model reads) is gated as a live
+test in `ssh_live.rs` rather than faked, so it runs when a real host is named.
+
 **Search, against a real SearXNG and the real internet** (`crates/hx-search/tests/search_live.rs`)
 
 A SearXNG in Docker, JSON output enabled, the canary pointed at it: **10 fused results for one

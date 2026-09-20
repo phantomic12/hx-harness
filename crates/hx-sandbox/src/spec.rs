@@ -932,6 +932,65 @@ mod tests {
     }
 
     #[test]
+    fn a_sandbox_spec_from_a_profile_never_mounts_the_vault_or_any_secret() {
+        // M4's exit criterion, sandbox half: a sandbox the model can drive must not have the vault or
+        // a key file mounted or passed as environment. `SandboxSpec::from_profile` is the one place a
+        // profile becomes the thing the engine is asked to run, so this is the seam to pin.
+        //
+        // This asserts what is TRUE structurally: a profile carries no secret at all (its fields are
+        // image, limits, egress, workspace — there is no vault field), so the spec it produces has an
+        // empty `env`, a single workspace `binds`, and no vault-shaped string anywhere in its serialized
+        // form. The sentinel guards the negative: it is asserted present in the "host" (the profile's
+        // only mount source is the workspace, and that workspace path is given the sentinel) and verified
+        // absent from everything the engine sees except the (expected) workspace mount.
+        //
+        // What this does NOT prove: a sandbox with `network: true` could exfiltrate a key it never
+        // had mounted by other means (it is not a network-isolation guarantee). That is out of scope
+        // and named here so the test's coverage is not overread.
+        let profile = SandboxProfile::default();
+        // The workspace is the one host path a sandbox mounts; the sentinel naming it is the no-op
+        // guard — it must appear in the bind (it is the workspace) and nowhere else.
+        let workspace_host = "workspace-KEYINVARIANT0c0ffee";
+        let mut spec = SandboxSpec::from_profile("untrusted", &profile);
+        spec.workspace_host_path = workspace_host.to_string();
+        let settings = spec.host_settings();
+
+        assert!(
+            spec.env.is_empty(),
+            "a profile-derived spec must carry no environment variables, got {:?}",
+            spec.env
+        );
+        assert_eq!(
+            settings.binds.len(),
+            1,
+            "exactly one bind, the workspace: {:?}",
+            settings.binds
+        );
+        assert!(
+            settings.binds[0].starts_with(workspace_host)
+                && settings.binds[0].ends_with(":/workspace:rw"),
+            "the one bind IS the sentinel workspace, so the no-op guard is real: {:?}",
+            settings.binds
+        );
+
+        // Serialize the full spec the way it could reach a transcript or the engine, and confirm no
+        // vault-shaped path or secret marker lives anywhere in it.
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(
+            !json.contains(&format!("{}/.hx/vault", workspace_host)),
+            "a derived spec must not reference the vault: {json}"
+        );
+        assert!(
+            !json.contains("vault"),
+            "a derived spec must not reference the vault: {json}"
+        );
+        assert!(
+            !json.contains("BEGIN OPENSSH") && !json.contains("PRIVATE KEY"),
+            "a derived spec must not contain key material: {json}"
+        );
+    }
+
+    #[test]
     fn settings_serialise_for_status_output() {
         let settings = spec(IsolationLevel::L2).host_settings();
         let json = serde_json::to_string(&settings).unwrap();

@@ -247,6 +247,7 @@ fn read_secret(secrets: &SecretStores, reference: &str, host_id: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hx_secrets::FixedSecrets;
 
     fn config_with(yaml: &str) -> Config {
         Config::from_yaml(yaml).expect("config parses")
@@ -379,6 +380,51 @@ hosts:
         let message = format!("{err:?}");
         assert!(message.contains("buildbox"), "{message}");
         assert!(message.contains("store:name"), "{message}");
+    }
+
+    #[test]
+    fn a_vault_key_that_is_genuinely_resolved_never_renders_in_its_ssh_auth() {
+        // M4's exit criterion pinned at the seam where the vault value becomes a credential: the
+        // sentinel must genuinely resolve out of the store (so this is not a no-op), and the
+        // resulting `SshAuth` — the type a log line or a connect error could render — must not
+        // contain it. The key is assembled from parts so a source secret scanner cannot redact it and
+        // make the assertion vacuous.
+        let sentinel = format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{}KEYINVARIANTa1b2c3d4e5{}\n-----END OPENSSH PRIVATE KEY-----",
+            "c29tZS1wcml2YXRlLWtleS1ib2R5LWRhdGEtZm9yLXZhdWx0LXRyaXB3aXJl",
+            "09f8e7d6c5b4a39281706f5e4d3c2b1a0"
+        );
+        let secrets = SecretStores::new().with(Arc::new(
+            FixedSecrets::vault().set("ssh/buildbox", Secret::new(sentinel.clone())),
+        ));
+
+        let auth = ssh_auth(
+            &secrets,
+            "buildbox",
+            &AuthMethod::Key {
+                secret_ref: "vault:ssh/buildbox".to_string(),
+            },
+        )
+        .expect("the sentinel resolves");
+
+        // No-op guard: the key genuinely came out of the vault and reached the auth.
+        let SshAuth::Key {
+            private_key_pem, ..
+        } = &auth
+        else {
+            panic!("expected a key auth");
+        };
+        assert!(
+            private_key_pem.expose().contains("KEYINVARIANTa1b2c3d4e5"),
+            "the sentinel must genuinely be in the resolved key or this test proves nothing"
+        );
+
+        let rendered = format!("{auth:?}");
+        assert!(
+            !rendered.contains("KEYINVARIANTa1b2c3d4e5"),
+            "the ssh auth for a resolved vault key leaked it: {rendered}"
+        );
+        assert!(rendered.contains("redacted"), "{rendered}");
     }
 
     #[tokio::test]
