@@ -365,7 +365,7 @@ fn is_wall_status(status: StatusCode) -> bool {
 /// A missing `Content-Type` is treated as text: plenty of static servers omit it, and refusing the page
 /// on a header nobody sent would send the ladder to a browser for a working page. A declared binary type
 /// is believed, because reading a 4 MB image into a `String` helps nobody.
-fn is_text(content_type: &str) -> bool {
+pub(crate) fn is_text(content_type: &str) -> bool {
     let essence = content_type
         .split(';')
         .next()
@@ -394,7 +394,7 @@ fn is_text(content_type: &str) -> bool {
 ///
 /// The body is untrusted input and may be megabytes of an attacker's choosing; the return value is a
 /// fixed marker from [`CHALLENGE_MARKERS`], never a slice of the page. See [`RefusalReason::Challenge`].
-fn challenge_marker(body: &str) -> Option<&'static str> {
+pub(crate) fn challenge_marker(body: &str) -> Option<&'static str> {
     let lowered = body.to_ascii_lowercase();
     CHALLENGE_MARKERS
         .iter()

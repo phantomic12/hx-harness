@@ -527,6 +527,18 @@ command with a button, receive a cron digest in a separate pinned thread.
     argv**, which every other process on the machine can read, and clears the process environment
     before passing an **allowlist, fail-closed** so a third-party browser binary never inherits the
     daemon's credentials or API keys.
+  - ◐ **The interactive Chromium rung.** `crates/hx-browser/src/rungs/chromium.rs` is a real
+    headless Chromium driven over CDP, with `Fetch.enable` request interception on every request so a
+    loaded page cannot turn the browser into an internal scanner or an IAM exfiltration pipe. Its
+    security guarantee is stated at the **request** boundary, not the socket boundary, and verified
+    against real Chromium - the browser is installed on the developer host and not on the remote build
+    host, so the chromium tests always run locally rather than in the offload gate. A refused subresource guarantees **zero TCP connections**, while a
+    refused top-level navigation may open speculative preconnect sockets carrying **zero request bytes** —
+    the `--disable-features=Preconnect,SpeculativeServiceWorker,NavigationPredictor,NetworkPrediction`
+    flag was tried and is insufficient, so the guarantee is pinned at the request line, and the rung's
+    doc says why. The browser child is reaped on every exit path (success, transport failure, timeout,
+    future drop), with the timeout path asserted against a real `/proc` pid. **The pool still has no
+    production caller**: nothing in `hx-server` or `hx-search` launches a browser yet.
 - Search: SearXNG, DDG, Mojeek, Marginalia, Brave, Google PSE, Wikipedia, plus the
   extraction ladder and URL/ETag caching
   - ◐ **The extraction ladder.** `crates/hx-search/src/extract.rs` is a hand-rolled ladder — plain
