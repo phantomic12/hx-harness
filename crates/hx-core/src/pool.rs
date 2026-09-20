@@ -491,12 +491,17 @@ mod tests {
         );
     }
 
-    /// Nearest is the true nearest by ordinal: Medium→High/Low are both distance 1, and the tie resolves
-    /// deterministically; the important, non-tie assertions are Low→Low (accepted) and a request outside
-    /// the accepted range (Low when the member accepts Medium/High) clamping up to the nearest.
+    /// Nearest is the true nearest by ordinal — not "minimum accepted" and not "some accepted".
+    ///
+    /// Two assertions, each chosen so that the wrong implementation (`.min()`, or the first accepted)
+    /// differs from nearest:
+    /// - target Low (0), member accepts [Medium(1), High(2)]) → nearest is Medium; `.min()` would
+    ///   also give Medium, so this alone does not catch a `.min()` regression.
+    /// - target High (2), member accepts [Low(0), Medium(1)]) → nearest is Medium; `.min()` would give
+    ///   Low. This is the one that actually distinguishes nearest from minimum.
     #[test]
     fn clamping_picks_the_truly_nearest_accepted_value() {
-        // Member accepts only Medium and High.
+        // Case A: target Low, member accepts [Medium, High].
         let m = member(
             "m",
             &[
@@ -504,7 +509,6 @@ mod tests {
                 Param::reasoning_effort(ReasoningEffort::High),
             ],
         );
-        // Requested Low (0) is nearest Medium (1): distance 1 vs High (2): distance 2.
         let eff = m.clamp(&[Param::reasoning_effort(ReasoningEffort::Low)]);
         assert_eq!(
             eff.clamps,
@@ -515,6 +519,28 @@ mod tests {
         );
         assert_eq!(
             eff.params,
+            vec![Param::reasoning_effort(ReasoningEffort::Medium)]
+        );
+
+        // Case B: target High, member accepts [Low, Medium] → nearest is Medium, `.min()` would give Low.
+        let m2 = member(
+            "m2",
+            &[
+                Param::reasoning_effort(ReasoningEffort::Low),
+                Param::reasoning_effort(ReasoningEffort::Medium),
+            ],
+        );
+        let eff2 = m2.clamp(&[Param::reasoning_effort(ReasoningEffort::High)]);
+        assert_eq!(
+            eff2.clamps,
+            vec![ParamClamp {
+                requested: Param::reasoning_effort(ReasoningEffort::High),
+                sent: Some(Param::reasoning_effort(ReasoningEffort::Medium)),
+            }],
+            "High is nearest Medium (distance 1), not Low (distance 2)"
+        );
+        assert_eq!(
+            eff2.params,
             vec![Param::reasoning_effort(ReasoningEffort::Medium)]
         );
     }
