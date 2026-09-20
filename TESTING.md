@@ -113,6 +113,18 @@ literals being judged as *hostnames*: `Url::host_str` keeps the brackets, so `"[
 as an address and fell through to the name rules, where it was refused for the wrong reason. The
 check now uses `url.host()`, which cannot be fooled by spelling.
 
+**The human-in-the-loop contract** (`src/interactive.rs`, 10 tests). The pane's interface is real and
+its absence fails closed. With no pane attached the rung returns an unavailable error that the ladder
+reports and moves past — it does not wait, retry, or invent a result. A pane that never answers is
+abandoned on the rung's own budget, asserted by wrapping the call in a *longer* outer timeout and
+requiring the rung's error to come back first, so a hang fails the test. The challenge a pane is
+handed is asserted to carry the session's **own** profile directory (a pane that picked its own would
+break the isolation the pool is built on), a URL with the query string stripped (a challenge URL
+routinely carries a return-to token), the budget the rung will actually enforce, and a distinct id
+per challenge. A person who clears the wall ends the rung with a reason saying what to do next —
+re-run the ladder in that session — because reading the page needs a CDP driver this crate does not
+have yet, and saying so is better than returning an empty page.
+
 ## The four tiers
 
 Every claim in the repo falls into one of these. The gap that bites is B→C.

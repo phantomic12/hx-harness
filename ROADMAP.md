@@ -319,6 +319,10 @@ command with a button, receive a cron digest in a separate pinned thread.
     target admission refused never escalates at all. Admission itself is structural — `TargetUrl`
     is the only thing a rung can be pointed at, and it refuses `file://`, loopback, link-local and
     the metadata service by construction.
+  - ◐ **Human-in-the-loop.** The escalation surface a browser pane plugs into, with the contract
+    written down: what it receives (a redacted URL, the *session's own* profile directory, the
+    rung's reason, a budget), what it returns, and what happens on timeout. The rung enforces the
+    budget itself, and an unattached pane fails closed with a reported gap rather than waiting.
 - Search: SearXNG, DDG, Mojeek, Marginalia, Brave, Google PSE, Wikipedia, plus the
   extraction ladder and URL/ETag caching
 

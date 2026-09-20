@@ -58,12 +58,17 @@
 //! assert, and nothing here claims a real browser was driven.
 
 pub mod error;
+pub mod interactive;
 pub mod ladder;
 pub mod profile;
 pub mod rung;
 pub mod target;
 
 pub use error::{Disposition, FetchError, RefusalReason};
+pub use interactive::{
+    HumanChallenge, HumanOutcome, HumanPane, InteractiveFetcher, NoPane, PaneError,
+    DEFAULT_HUMAN_BUDGET,
+};
 pub use ladder::{Attempt, FetchReport, Ladder, DEFAULT_RUNG_TIMEOUT};
 pub use profile::{PoolRoot, ProfileError, SessionProfile, COOKIE_FILE};
 pub use rung::{FetchRequest, Fetcher, RungKind, UntrustedPage};
