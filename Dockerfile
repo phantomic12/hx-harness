@@ -79,6 +79,12 @@ COPY hx.example.yaml /etc/hx/hx.yaml
 
 # Defaults that make the container reachable and self-describing. Override HX_BIND if you
 # put something in front of it; 0.0.0.0 is required for the port to be visible outside.
+#
+# 0.0.0.0 also means the API's bearer token is **required**: `hxd` refuses to start when the bind
+# address is not loopback and no token is configured, rather than serving an unauthenticated API to
+# the network with a warning in the log. Set HX_API_TOKEN (or `api.token` in the config) or this
+# image will exit at startup — with a message naming both settings. There is deliberately no
+# default token here: a token baked into an image is a token every deployment shares.
 ENV HX_CONFIG=/etc/hx/hx.yaml \
     HX_BIND=0.0.0.0:7717 \
     RUST_LOG=info

@@ -357,5 +357,5 @@ These are failures documented in the code, `TESTING.md`, or CI config — not sp
 - **Windows: fewer tests than on Linux.** Expected — the PTY/terminal suites are `#[cfg(unix)]`
   and compile to zero tests on Windows, not silently-passing ones.
 
-For anything deployment-shaped (the Docker socket, the fact that `hxd` has no authentication of
-its own, version pinning, checksums), see **`DEPLOY.md`**.
+For anything deployment-shaped (the Docker socket, the API's bearer token and the fact that it is
+required off loopback, version pinning, checksums), see **`DEPLOY.md`**.

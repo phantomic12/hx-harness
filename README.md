@@ -156,8 +156,8 @@ Windows PowerShell: `iwr -useb https://raw.githubusercontent.com/phantomic12/hx-
 Container: `docker pull ghcr.io/phantomic12/hx-harness:latest`
 
 **[DEPLOY.md](DEPLOY.md)** covers all four paths, version pinning, checksum and attestation
-verification, and the two things that bite people — the Docker socket, and the fact that `hxd`
-has no authentication of its own.
+verification, and the two things that bite people — the Docker socket, and the API's
+authentication.
 
 ## Running it
 

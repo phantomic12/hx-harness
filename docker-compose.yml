@@ -16,9 +16,10 @@ services:
     restart: unless-stopped
 
     ports:
-      # Bound to loopback on the host on purpose. hxd has no authentication of its own —
-      # anything that can reach the port can drive your model spend and your sandboxes.
-      # Put it behind a reverse proxy or an SSH tunnel instead of exposing it.
+      # Bound to loopback on the host on purpose. The API takes a bearer token, and it *requires*
+      # one on any bind that is not loopback — so this line is the host half of that rule, and
+      # HX_API_TOKEN below is the other. Put it behind a reverse proxy or an SSH tunnel rather than
+      # exposing it: the transport is plain HTTP.
       - "127.0.0.1:7717:7717"
 
     volumes:
@@ -34,10 +35,14 @@ services:
 
     environment:
       RUST_LOG: info
-      # There is deliberately no credential env var here. hx.yaml's `vault:` references are
-      # parsed and validated at startup, but they are not yet resolved to real values —
-      # nothing in the daemon holds a secret (see "Credential handling" in DEPLOY.md).
-      # Running this image today requires no credentials at all.
+      # The API's bearer token. Not optional here: this container sets HX_BIND=0.0.0.0:7717, and
+      # hxd refuses to start on a non-loopback bind without a token. Compose's `:?` makes an unset
+      # variable a compose-level failure with this message, rather than a container that starts and
+      # immediately exits. Generate one with `head -c 32 /dev/urandom | base64` and export it.
+      HX_API_TOKEN: "${HX_API_TOKEN:?set HX_API_TOKEN in your environment, or put api.token in hx.yaml}"
+      # hx.yaml's `vault:` references are parsed and validated at startup but are not yet resolved
+      # to real values — the API token is the one secret the daemon actually holds (see
+      # "Credential handling" in DEPLOY.md).
 
     # A daemon that talks to the Docker socket wants to be able to see its own containers.
     # Nothing else here needs extra privileges.

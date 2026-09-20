@@ -168,13 +168,32 @@
     border-top: 1px solid var(--line); font-size: 12px; white-space: pre-wrap;
   }
   .dim { color: var(--dim); font-size: 11px; }
+  .token-button {
+    margin-left: auto; background: transparent; color: var(--dim);
+    border: 1px solid var(--line); border-radius: 4px; padding: 3px 9px; cursor: pointer;
+  }
+  .token-button:hover { color: var(--text); border-color: var(--accent); }
+  .token-panel {
+    display: flex; align-items: center; gap: 8px; padding: 6px 14px;
+    background: var(--panel); border-bottom: 1px solid var(--line); flex: none;
+  }
+  .token-panel input { flex: 1; max-width: 460px; }
 </style>
 </head>
 <body>
 <header>
   <h1>hx</h1>
   <div class="status"><span class="dot" id="dot"></span><span id="status-text">connecting…</span></div>
+  <!-- The token panel. Present always, not only when the daemon refuses: a person who has just been
+       handed a token needs somewhere to put it before the first request fails. -->
+  <button id="token-button" class="token-button" title="API bearer token">token</button>
 </header>
+<div id="token-panel" class="token-panel" hidden>
+  <input id="token-input" type="password" placeholder="bearer token" autocomplete="off" spellcheck="false">
+  <button id="token-save">save</button>
+  <button id="token-clear">clear</button>
+  <span id="token-status" class="dim"></span>
+</div>
 <main>
   <section class="pane">
     <h2>hosts<span id="host-count"></span></h2>
@@ -242,9 +261,46 @@
 // Same origin: the daemon serves this file and the API, so there is no host to configure and no
 // CORS to arrange.
 const API = "";
+
+// ---------------------------------------------------------------------------------------------
+// Authentication
+//
+// The daemon may require a bearer token, and this page is one of the two clients that has to send
+// it. A browser cannot attach a header to a WebSocket handshake, so the token is presented two
+// ways: `Authorization: Bearer …` on every fetch, and `?token=` on a WebSocket URL — which the
+// daemon accepts *only* on an upgrade request, because that is the one request shape with no
+// alternative. See `crates/hx-server/src/auth.rs`.
+//
+// It is kept in localStorage so a reload does not lose it, and it is asked for once when the daemon
+// answers 401 rather than being something a person has to know to look for first. Nothing else is
+// stored here: this page owns no state the daemon does not.
+const TOKEN_KEY = "hx.api.token";
+const apiToken = () => localStorage.getItem(TOKEN_KEY) || "";
+const setToken = (value) => {
+  if (value) localStorage.setItem(TOKEN_KEY, value);
+  else localStorage.removeItem(TOKEN_KEY);
+  $("token-status").textContent = value ? "token set" : "no token";
+};
+
+// Every request goes through this. A 401 is the daemon saying "a token is required" — the body
+// deliberately does not distinguish a missing token from a wrong one, so neither can this.
+async function apiFetch(path, init = {}) {
+  const headers = Object.assign({}, init.headers || {});
+  const token = apiToken();
+  if (token) headers["authorization"] = `Bearer ${token}`;
+  const res = await fetch(path, Object.assign({}, init, { headers }));
+  if (res.status === 401) {
+    showError("this daemon requires an API token — open the token panel and paste it");
+    $("token-panel").hidden = false;
+  }
+  return res;
+}
+
 const wsURL = (path) => {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${location.host}${path}`;
+  const token = apiToken();
+  const query = token ? `?token=${encodeURIComponent(token)}` : "";
+  return `${proto}//${location.host}${path}${query}`;
 };
 
 const $ = (id) => document.getElementById(id);
@@ -321,14 +377,14 @@ async function ensureTerminal() {
   // shell that is already running instead of starting a second one. A terminal that is gone (the
   // shell exited) is recreated, which the POST below does on a 409.
   terminalId = terminalId || "hx-term";
-  const res = await fetch(`${API}/v1/terminals`, {
+  const res = await apiFetch(`${API}/v1/terminals`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ id: terminalId, cols: term ? term.cols : 80, rows: term ? term.rows : 24 }),
   });
   // 200 = created; anything else may mean it already exists, which is fine — attach and find out.
   if (res.status !== 200) {
-    const list = await fetch(`${API}/v1/terminals`).then((r) => r.json()).catch(() => ({}));
+    const list = await apiFetch(`${API}/v1/terminals`).then((r) => r.json()).catch(() => ({}));
     if (!(list.terminals || []).includes(terminalId)) {
       const body = await res.text();
       throw new Error(`could not create a terminal: ${body}`);
@@ -412,7 +468,7 @@ function summarize(event) {
 }
 
 async function ensureSession() {
-  const res = await fetch(`${API}/v1/sessions`, { method: "POST" });
+  const res = await apiFetch(`${API}/v1/sessions`, { method: "POST" });
   if (res.status === 200 || res.status === 201) {
     const body = await res.json();
     sessionId = body.id || body.session;
@@ -420,7 +476,7 @@ async function ensureSession() {
   if (!sessionId) {
     // Not every daemon build may accept a bare POST; fall back to the most recent session so the
     // pane still shows something real rather than an empty box.
-    const list = await fetch(`${API}/v1/sessions`).then((r) => r.json()).catch(() => ({}));
+    const list = await apiFetch(`${API}/v1/sessions`).then((r) => r.json()).catch(() => ({}));
     const items = list.sessions || list || [];
     if (Array.isArray(items) && items.length) sessionId = items[0].id || items[0];
   }
@@ -467,7 +523,7 @@ async function sendPrompt() {
   $("send").disabled = true;
   showError("");
   try {
-    const res = await fetch(`${API}/v1/chat`, {
+    const res = await apiFetch(`${API}/v1/chat`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ session: sessionId, prompt, stream: false }),
@@ -505,7 +561,7 @@ async function pollSandboxes() {
     // the summary this strip renders — availability, slots, the reason — is part of the status
     // snapshot. Reading the list route would leave the strip permanently blank, which looks the
     // same as a daemon with no container engine.
-    const res = await fetch(`${API}/v1/status`);
+    const res = await apiFetch(`${API}/v1/status`);
     if (!res.ok) throw new Error(`${res.status}`);
     const s = (await res.json()).sandboxes || {};
     host.innerHTML = "";
@@ -529,7 +585,7 @@ async function pollSandboxes() {
 
 async function pollApprovals() {
   try {
-    const res = await fetch(`${API}/v1/approvals`);
+    const res = await apiFetch(`${API}/v1/approvals`);
     if (!res.ok) throw new Error(`${res.status}`);
     const items = await res.json();
     renderApprovals(Array.isArray(items) ? items : []);
@@ -639,7 +695,7 @@ const CEILING = "privileged";
 
 async function answerApproval(id, option) {
   try {
-    const res = await fetch(`${API}/v1/approvals/${encodeURIComponent(id)}`, {
+    const res = await apiFetch(`${API}/v1/approvals/${encodeURIComponent(id)}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ option, ceiling: CEILING, by: "web" }),
@@ -663,7 +719,7 @@ async function answerApproval(id, option) {
 async function pollHosts() {
   const host = $("hosts");
   try {
-    const res = await fetch(`${API}/v1/hosts`);
+    const res = await apiFetch(`${API}/v1/hosts`);
     if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
     const items = await res.json();
     if (!Array.isArray(items)) throw new Error("hosts is not a list");
@@ -781,7 +837,7 @@ async function openHost(id) {
 
   // Describe the machine too, so the dialog can say what it is talking to rather than only its name.
   try {
-    const res = await fetch(`${API}/v1/hosts/${encodeURIComponent(id)}`);
+    const res = await apiFetch(`${API}/v1/hosts/${encodeURIComponent(id)}`);
     const detail = await res.json();
     if (!res.ok) throw new Error(detail.error || `${res.status}`);
     const bits = [];
@@ -808,7 +864,7 @@ async function listDir(path) {
   hostError("");
   const query = path ? `?path=${encodeURIComponent(path)}` : "";
   try {
-    const res = await fetch(`${API}/v1/hosts/${encodeURIComponent(browseHost)}/files${query}`);
+    const res = await apiFetch(`${API}/v1/hosts/${encodeURIComponent(browseHost)}/files${query}`);
     const body = await res.json();
     if (!res.ok) throw new Error(body.error || `${res.status}`);
     // The daemon echoes where it actually listed, which matters when nothing was asked for.
@@ -880,7 +936,7 @@ async function openFile(path) {
   hostError("");
   $("host-file-status").textContent = "loading…";
   try {
-    const res = await fetch(
+    const res = await apiFetch(
       `${API}/v1/hosts/${encodeURIComponent(browseHost)}/file?path=${encodeURIComponent(path)}`
     );
     const body = await res.json();
@@ -914,7 +970,7 @@ async function saveFile() {
   hostError("");
   $("host-file-status").textContent = "saving…";
   try {
-    const res = await fetch(`${API}/v1/hosts/${encodeURIComponent(browseHost)}/file`, {
+    const res = await apiFetch(`${API}/v1/hosts/${encodeURIComponent(browseHost)}/file`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -940,7 +996,7 @@ async function runOnHost() {
   hostError("");
   $("host-out").textContent = "running…";
   try {
-    const res = await fetch(`${API}/v1/hosts/${encodeURIComponent(browseHost)}/exec`, {
+    const res = await apiFetch(`${API}/v1/hosts/${encodeURIComponent(browseHost)}/exec`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ command }),
@@ -960,12 +1016,34 @@ async function runOnHost() {
   }
 }
 
+// ---- token panel wiring -----------------------------------------------------------------------
+
+$("token-button").addEventListener("click", () => {
+  $("token-panel").hidden = !$("token-panel").hidden;
+  if (!$("token-panel").hidden) $("token-input").focus();
+});
+$("token-save").addEventListener("click", () => {
+  setToken($("token-input").value.trim());
+  $("token-input").value = "";
+  $("token-panel").hidden = true;
+  // A reload rather than a patch-up: the sockets already opened (or already refused) carry the
+  // previous credential, and every pane's first render depends on a request that has already
+  // happened. Reloading re-runs all of it against the new token, which is one code path instead of
+  // two that could disagree.
+  location.reload();
+});
+$("token-clear").addEventListener("click", () => {
+  setToken("");
+  location.reload();
+});
+$("token-status").textContent = apiToken() ? "token set" : "no token";
+
 // ---------------------------------------------------------------------------------------------
 // Boot
 
 (async function main() {
   try {
-    const health = await fetch(`${API}/healthz`).then((r) => r.text()).catch(() => null);
+    const health = await apiFetch(`${API}/healthz`).then((r) => r.text()).catch(() => null);
     setStatus(health ? "connected" : "daemon unreachable", !!health);
   } catch (_) {
     setStatus("daemon unreachable", false);
@@ -992,7 +1070,7 @@ $("new-term").addEventListener("click", async () => {
   // shell, and reusing the id would just reattach to the first.
   const id = `hx-term-${Date.now().toString(36)}`;
   try {
-    await fetch(`${API}/v1/terminals`, {
+    await apiFetch(`${API}/v1/terminals`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ id, cols: term.cols, rows: term.rows }),
