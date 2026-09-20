@@ -39,6 +39,10 @@
 //!
 //! ## What this rung deliberately does not do
 //!
+//! - **It does not inherit the daemon's environment.** Inheriting the parent environment is the
+//!   convenient default and what this rung initially did, but a third-party browser process
+//!   would then inherit every secret and API key exported in the daemon's shell. Instead,
+//!   `Command::env_clear()` is called and only an explicit allowlist is passed back.
 //! - **It does not quote the tool's stderr into an error.** The stderr of a third-party process is
 //!   unbounded, is written by something this crate does not control, and can contain the URL it was
 //!   handed — and therefore a token. The exit code is the protocol's report; a reason that quoted the
@@ -157,6 +161,84 @@ impl std::fmt::Debug for StealthRung {
     }
 }
 
+/// The variables a stealth browser child inherits from the daemon's environment, on every platform.
+///
+/// This is a mirror of `hx-mcp`'s allowlist discipline (`crates/hx-mcp/src/stdio.rs`). It is mirrored
+/// here rather than shared because `hx-browser` does not depend on `hx-mcp` (they are sibling crates
+/// with disjoint concerns), and factoring a shared allowlist into `hx-core` would widen that crate's
+/// scope for a two-site pattern. In addition to the base process environment (`PATH`, `HOME`, `USER`,
+/// `LOGNAME`, `SHELL`, `TMPDIR`, `LANG`, `LC_ALL`, `TERM`), a browser on Linux may need display and session
+/// sockets (`DISPLAY`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`).
+///
+/// What is deliberately absent is anything credential-shaped: `OPENAI_API_KEY`, cloud keys, tokens,
+/// and daemon settings. An allowlist fail-closed approach means unlisted names cannot leak.
+const INHERITED_ALWAYS: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XDG_RUNTIME_DIR",
+];
+
+/// The extra variables a Windows child needs to start at all.
+///
+/// Mirrored from `crates/hx-mcp/src/stdio.rs`. `SYSTEMROOT` is needed for loading DLLs, `TEMP`/`TMP`
+/// for staging, and `PATHEXT`/`COMSPEC` for executable resolution.
+#[cfg(windows)]
+const INHERITED_WINDOWS: &[&str] = &[
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "PATHEXT",
+    "COMSPEC",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMFILES",
+    "NUMBER_OF_PROCESSORS",
+];
+
+/// The counterpart on every other platform so the check is a single expression without `cfg` at each site.
+#[cfg(not(windows))]
+const INHERITED_WINDOWS: &[&str] = &[];
+
+/// Is this variable inherited on the allowlist?
+///
+/// Case-insensitive on Windows and exact on Unix, matching platform environment semantics.
+fn is_inherited(name: &str) -> bool {
+    let listed = |allowed: &str| -> bool {
+        #[cfg(windows)]
+        {
+            allowed.eq_ignore_ascii_case(name)
+        }
+        #[cfg(not(windows))]
+        {
+            allowed == name
+        }
+    };
+
+    INHERITED_ALWAYS
+        .iter()
+        .chain(INHERITED_WINDOWS)
+        .any(|allowed| listed(allowed))
+}
+
+/// The environment passed to the child process: the daemon's own environment filtered to the allowlist.
+///
+/// Paired with `Command::env_clear()`, this ensures fail-closed environment inheritance.
+fn child_environment() -> Vec<(String, String)> {
+    std::env::vars()
+        .filter(|(name, _)| is_inherited(name))
+        .collect()
+}
+
 #[async_trait]
 impl Fetcher for StealthRung {
     fn kind(&self) -> RungKind {
@@ -172,6 +254,8 @@ impl Fetcher for StealthRung {
 
         let mut child = tokio::process::Command::new(&self.command)
             .args(&self.args)
+            .env_clear()
+            .envs(child_environment())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -469,5 +553,45 @@ mod tests {
         );
         assert!(!bounded.is_refusal(), "{bounded}");
         assert!(format!("{bounded}").contains("did not answer"), "{bounded}");
+    }
+
+    #[test]
+    fn the_allowlist_covers_what_a_browser_needs_and_nothing_credential_shaped() {
+        for name in [
+            "PATH",
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "SHELL",
+            "TMPDIR",
+            "LANG",
+            "LC_ALL",
+            "TERM",
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XDG_RUNTIME_DIR",
+        ] {
+            assert!(is_inherited(name), "{name} must be inherited");
+        }
+
+        for name in [
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "GH_TOKEN",
+            "MY_COMPANY_DEPLOY_KEY",
+            "HX_API_TOKEN",
+        ] {
+            assert!(
+                !is_inherited(name),
+                "{name} must not be inherited by default"
+            );
+        }
+
+        #[cfg(not(windows))]
+        {
+            assert!(!is_inherited("path"), "Unix names are case-sensitive");
+        }
+        assert!(!is_inherited("PATHEXTRA"));
     }
 }

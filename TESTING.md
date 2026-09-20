@@ -359,7 +359,7 @@ attempt is recorded in order with its own reason; and the attempt ceiling stops 
 the site keeps refusing. Reports are asserted never to carry a token from the query string, and a
 fetched body is asserted never to render in `Debug`.
 
-**The rungs** (`src/rungs/http.rs`, `src/rungs/stealth.rs`, 88 lib tests + 10 integration tests). The
+**The rungs** (`src/rungs/http.rs`, `src/rungs/stealth.rs`, 89 lib tests + 11 integration tests). The
 two rungs are real implementations rather than scripted doubles, and the interesting one is the
 redirect guard.
 
@@ -379,6 +379,13 @@ profile directory, the cookie jar and the budget on **stdin** (never in argv, wh
 machine can read), and the exit code as the verdict — `0` a body, `3` a wall, any other non-zero a
 transport failure. The tool's stderr is deliberately not quoted into an error: it is unbounded, written
 by something this crate does not control, and can contain the URL it was handed.
+The child process inherits an **allowlist, fail-closed**, mirroring `hx-mcp`'s discipline:
+`Command::env_clear()` before spawning, followed only by what a browser process genuinely needs
+(`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `LANG`, `LC_ALL`, `TERM`, and on Linux
+`DISPLAY`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`; DLL and path helpers on Windows). Third-party browser
+binaries never receive exported credentials, API keys, or daemon settings. Pinned by
+`crates/hx-browser/tests/stealth_env.rs`, running `/usr/bin/env` as the rung command with a parent sentinel
+and ordinary variables asserted absent alongside positive controls for `PATH` and controlled `LOGNAME`.
 
 **What is not exercised: the tool itself.** No stealth browser exists here, so the protocol is verified
 against `/bin/sh` scripts that speak it — real processes over a real pipe, but our reading of the
