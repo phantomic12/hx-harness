@@ -1826,11 +1826,23 @@ search:
 
     #[tokio::test]
     async fn exec_runs_a_command_on_the_local_host() {
+        // The route's own `timeout_secs` is raised well above the 30s default for the *test's*
+        // request, and only for it. This test asserts that `exec` runs the command and returns the
+        // result as a 200 — the property under test. The 30s default is the production exec budget
+        // (a route pointable at any machine should not hold a request open indefinitely), and it is NOT
+        // what this test verifies. On a loaded CI runner, spawning the local shell can exceed 30s,
+        // so the default would make the test flake as `remote host error: command timed out after
+        // 30.0s` (a 502) even though exec was fine. Giving the request a longer deadline removes
+        // that coupling without weakening the assertion: if `exec` genuinely stops working, the
+        // `assert_eq!(status, OK)` still fails. The production timeout is deliberately untouched.
         let state = test_state().await;
         let (status, body) = post(
             state,
             "/v1/hosts/local/exec",
-            serde_json::json!({ "command": "printf host-pane-ok" }),
+            serde_json::json!({
+                "command": "printf host-pane-ok",
+                "timeout_secs": 120,
+            }),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -1842,11 +1854,17 @@ search:
     async fn exec_reports_a_failing_command_rather_than_making_it_a_transport_error() {
         // A non-zero exit is a *result*. Turning it into a 5xx would tell the client the daemon
         // broke, which is the wrong story and the wrong retry decision.
+        //
+        // As with `exec_runs_a_command_on_the_local_host`, the request's own `timeout_secs` is
+        // raised above the production default so a loaded CI runner cannot flake the test with a
+        // spurious `timed out after 30.0s` 502. The assertion is unchanged: if `exec` really
+        // stops returning exit codes, `assert_eq!(status, OK)` and `assert_eq!(exit_code, 3)`
+        // still fail. The production timeout is deliberately untouched.
         let state = test_state().await;
         let (status, body) = post(
             state,
             "/v1/hosts/local/exec",
-            serde_json::json!({ "command": "exit 3" }),
+            serde_json::json!({ "command": "exit 3", "timeout_secs": 120 }),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");

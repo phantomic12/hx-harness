@@ -568,9 +568,18 @@ async fn the_far_daemon_rejects_l2_userns_remapping_when_it_is_not_configured() 
         .expect_err("L2 must not create on a daemon without userns remapping configured");
     let message = err.to_string();
     eprintln!("userns finding: {message}");
+    // The runtime rewrites this one specific failure to name the cause and the way out (a remote
+    // daemon with no `userns-remap`), and keeps the engine's own text. Assert both so a future
+    // hardening — say, a live daemon gaining remap that would make `create` succeed — falls loudly
+    // rather than as a soft skip.
     assert!(
-        message.contains("invalid USER mode") || message.contains("userns"),
-        "the rejection must name the userns cause: {message}"
+        message.contains("invalid USER mode"),
+        "the engine's own message must surface: {message}"
+    );
+    assert!(
+        message.contains("no user-namespace remapping")
+            && message.contains("Configure userns-remap"),
+        "the rejection must name the cause and the way out: {message}"
     );
     assert!(
         !container_exists(&host, &name).await,
