@@ -290,11 +290,26 @@ CIDR or raw IP — is still refused, with a reason naming the way out.*
 
 ## M5 — Connectors
 
-- `Connector` trait + session router (`platform/chat/thread` → `SessionKey`)
-- **Telegram** (long-poll + webhook), streaming via coalesced `editMessageText`
-- **Discord** (twilight gateway, slash commands, threads, Message Content Intent)
-- Delivery targets, home-channel pinning, so cron output doesn't interleave with chat
-- Then: Slack (Socket Mode) → Matrix → Email → WhatsApp Cloud → Signal → SMS
+- ✅ **`Connector` trait + session router (`platform/chat/thread` → `SessionKey`)** — the trait a
+  connector must actually do (receive, deliver, ask), the deterministic `SessionKey` fold, and the
+  per-channel **answer authority** (a chat bridge ceiling can never authorise `Destructive`) plus the
+  delivery/home-channel policy. All in `crates/hx-gateway`.
+- ✅ **Telegram (long-poll) connector** — the first real connector, proving the trait over the actual Bot
+  API with a hermetic HTTP stub (`tests/telegram_http.rs`). Long-poll with advancing offset, message
+  and button-callback parsing, and the `Coalescer` primitive for streaming via coalesced `editMessageText`.
+  **Not landed here:** the webhook half, the full *streaming* loop (the coalescing primitive and the
+  `editMessageText` request shape are tested, but a live token-stream → edit driver is not), and wiring a
+  button answer back into a running agent's approval queue (the prompt is posted and the answer *authority*
+  enforced, but the end-to-end loop is a next step).
+- **Discord** (twilight gateway, slash commands, threads, Message Content Intent) — **deferred by
+  decision, no urgency**: Telegram proves the trait today, and a second platform shape is worth building
+  when a need for it appears rather than speculatively.
+- ✅ **Delivery targets, home-channel pinning** (`DeliveryPolicy`) — a reply goes to its conversation;
+  background output goes to the pinned home channel; with no home channel it is **refused, not dropped**.
+- Then, **all deferred by decision**: Slack (Socket Mode) → Matrix → Email → WhatsApp Cloud → Signal →
+  SMS. None is urgent, and the order is the intended sequence rather than a queue anyone is working.
+- **The next real step in this milestone is the two gaps named above** — wiring a button answer back into
+  a running agent's approval queue, and the live streaming driver — not another platform.
 
 - **Approvals out of band, as a configurable option** — a request can be answered from anywhere the
   user already is, not only from the surface that started the run: `approval.ask_via` naming one or
