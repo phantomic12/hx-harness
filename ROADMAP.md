@@ -486,11 +486,7 @@ command with a button, receive a cron digest in a separate pinned thread.
   drives a hand-rolled MCP client against the real binary over a real pipe and asserts that, including
   the control (the same call under a policy that allows it runs) and a refused `delete` whose file is
   still on disk. See TESTING.md's `hx-mcp` row.
-- ⬜ **Open, from this item:** there is no streamable-HTTP MCP **server** transport. `rmcp`'s is
-  already in this crate's dependency graph — `tests/http.rs` runs one on `axum` — so what is missing
-  is not a dependency but an **authentication story**: who the client is, what it may do, and how
-  that is proven. Until there is one, an endpoint that runs tools for whoever can reach the port
-  would be exactly the hole the stdio-only decision exists to not be.
+- ✅ **Closed, from this item:** streamable-HTTP MCP **server** transport (`crates/hx-mcp/src/server_http.rs` plus `hx-mcp-server --http`), gated by bearer-token auth (`hx-core::api_auth`). Fail-closed: refuses to start on a non-loopback bind when no token is configured (`require_token_for_bind`). Constant-time comparison (`ApiToken::matches`) with byte-identical 401 refusals for missing, wrong, or malformed credentials. Dispatches through the same `McpServer::call` gate: a call needing approval is refused immediately and leaves no approval request outstanding (`session.outstanding()` is `None`; the daemon's `ApprovalQueue` is never touched), and `Destructive` calls are refused. **The residual limit**: the token is a bearer credential with no per-client identity, so `by:` remains a declaration by whoever holds it, and plain HTTP has no transport encryption unless TLS is terminated in front. Tested end-to-end in `tests/server_http.rs` (9 tests), including out-of-process probe evidence that unauthenticated requests never reach the handler. See TESTING.md's `hx-mcp` row.
 - Browser pool: crw (Rust, Firecrawl-compat) → camoufox (stealth) → Chromium (interactive CDP),
   per-container profile isolation, challenge escalation to a human-in-the-loop browser pane
   - ◐ **Profiles.** Per-session isolation in `crates/hx-browser/src/profile.rs`: a session's

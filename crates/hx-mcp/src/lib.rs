@@ -55,21 +55,22 @@
 //!
 //! ## The other direction: [`server`] — `hx` as an MCP server
 //!
-//! This crate also runs the *other* role, and the whole of it is [`server::McpServer`]: `hx`'s own
-//! [`hx_tools::ToolRegistry`] offered to somebody else's MCP client over stdio. Three decisions are
-//! made there and stated here so they are not mistaken for omissions:
+//! This crate also runs the *other* role, offering `hx`'s own [`hx_tools::ToolRegistry`] to
+//! somebody else's MCP client over stdio ([`server::McpServer`]) or over streamable HTTP
+//! ([`server_http`]). Three decisions are made there and stated here so they are not mistaken for omissions:
 //!
-//! 1. **stdio only, and no listening socket.** A TCP transport would need an authentication story
-//!    (`hx` has a capability token for its own agents, and nothing that answers "which stranger on
-//!    the network is calling"), so the transport is a pipe the operator had to start deliberately.
-//!    `rmcp`'s HTTP *server* transport is already in this crate's graph — it runs in `tests/http.rs` —
-//!    so adding one later is a decision about authentication rather than a missing dependency.
-//! 2. **A call that needs approval is refused, not prompted for.** A stdio connection has no surface
+//! 1. **Authentication before network reach.** The stdio transport opens no socket. The HTTP
+//!    transport ([`server_http`]) serves `rmcp`'s streamable-HTTP protocol behind bearer-token
+//!    authentication ([`hx_core::api_auth::require_token_for_bind`], [`hx_core::api_auth::ApiToken::matches`]).
+//!    A non-loopback bind with no token configured refuses to start. Missing and wrong tokens are
+//!    indistinguishable 401s. The honest limit: the token is a bearer credential with no per-client
+//!    identity, and plain HTTP has no transport security unless terminated by a TLS proxy in front.
+//! 2. **A call that needs approval is refused, not prompted for.** Neither stdio nor HTTP has a surface
 //!    a person is looking at, so [`server::McpServer`] has no approver field and no code that
 //!    publishes an [`ApprovalRequest`] anywhere: the refusal happens immediately and says why, and
 //!    the reason names the two ways an operator can allow the call. Nothing a client can say changes
-//!    that, which is the property `tests/server_stdio.rs` drives a real client over a real pipe to
-//!    hold.
+//!    that, which is the property `tests/server_stdio.rs` and `tests/server_http.rs` drive real clients
+//!    to hold.
 //! 3. **The gate is the same gate.** Every call goes through the same `ToolRegistry::prepare`, the
 //!    same capability check and the same requirement → risk → approval decision a local call does —
 //!    `hx-agent`'s `risk_of` is the table, not a second one that agrees today and drifts later.
@@ -115,6 +116,7 @@
 pub mod host;
 pub mod names;
 pub mod server;
+pub mod server_http;
 pub mod tool;
 
 mod conn;
@@ -124,4 +126,5 @@ mod stdio;
 pub use host::{HealthState, McpHost, RestartBudget, ServerHealth};
 pub use names::{namespaced, sanitize, split, MAX_NAMESPACE_CHARS, MAX_NAME_CHARS, SEPARATOR};
 pub use server::{default_registry, CallOutcome, McpServer, ServerStats};
+pub use server_http::{bind_and_serve, router};
 pub use tool::{requirement_for, McpTool, RemoteTool, MAX_SCHEMA_CHARS};

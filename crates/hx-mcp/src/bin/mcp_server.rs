@@ -1,4 +1,4 @@
-//! `hx-mcp-server`: `hx`'s tools, served to somebody else's MCP client over stdio.
+//! `hx-mcp-server`: `hx`'s tools, served to somebody else's MCP client over stdio or HTTP.
 //!
 //! ## What this binary is, and what it deliberately is not
 //!
@@ -6,18 +6,16 @@
 //! [`hx_mcp::server::McpServer`], so the gate a client's call passes through is the same code a test
 //! drives without a pipe, and there is one file to read to know what a call may do.
 //!
-//! - **stdout is the wire.** Every byte written there is a JSON-RPC message. Nothing in this program
-//!   prints to it — not a banner, not a warning, not a help message (`--help` goes to stderr for
-//!   exactly this reason). A stray `println!` here would be a protocol error on every client's first
-//!   read, which is the failure mode this paragraph exists to prevent.
+//! - **stdout is the wire in stdio mode.** Every byte written there is a JSON-RPC message. Nothing in
+//!   this program prints to it — not a banner, not a warning, not a help message (`--help` goes to
+//!   stderr for exactly this reason). A stray `println!` here would be a protocol error on every
+//!   client's first read.
 //! - **stderr is not a log sink.** No `tracing` subscriber is installed, so nothing a tool does, a
 //!   client sends or a policy decides can reach it: the only lines this program writes are one
 //!   startup line and its own fatal errors, neither of which contains a tool's output or an argument.
-//!   `tests/server_stdio.rs` asserts that a sentinel which *did* travel through a tool call appears
-//!   in the client's result and in no line of stderr.
-//! - **There is no listening socket.** No port, no `--http`, no feature flag: see
-//!   [`hx_mcp::server`]'s module doc for why an unauthenticated HTTP endpoint that runs tools is not
-//!   a thing this program offers.
+//! - **stdio is the default.** When `--http` or `--bind` is passed, it serves over streamable HTTP
+//!   behind bearer-token authentication. A non-loopback bind without a token configured is refused
+//!   at startup.
 //! - **There is no approver.** A call the policy would put a question to is refused, immediately,
 //!   with a reason naming the two ways an operator can allow it.
 //!
@@ -25,7 +23,7 @@
 //!
 //! ```text
 //! hx-mcp-server [--workspace DIR] [--policy LEVEL] [--ask GLOB]... [--allow GLOB]...
-//!               [--report FILE]
+//!               [--report FILE] [--http [BIND]] [--bind ADDR] [--token TOKEN]
 //! ```
 //!
 //! | flag | meaning |
@@ -35,6 +33,9 @@
 //! | `--ask GLOB` | force a refusal for calls to a matching tool name; repeatable |
 //! | `--allow GLOB` | auto-allow a matching tool name, below the level's threshold; repeatable |
 //! | `--report FILE` | write the session's state as JSON when the connection ends |
+//! | `--http [BIND]` | serve over streamable HTTP instead of stdio (default bind: 127.0.0.1:8787) |
+//! | `--bind ADDR` | bind address for HTTP mode (default: 127.0.0.1:8787, or `HX_BIND`) |
+//! | `--token TOKEN` | bearer token for HTTP mode (or `HX_API_TOKEN` in environment) |
 //!
 //! `--report` exists for an operator who wants to know what a long-lived connection did, and for the
 //! test suite, which uses it to read the *server's own* approval state after a refused call: the
@@ -42,10 +43,11 @@
 //! process, and the report is how a client-side test can observe it rather than infer it.
 //!
 //! The policy defaults to [`ApprovalPolicy::deployment_default`] — `balanced` plus the shipped
-//! catastrophe denials — because a stdio MCP server is a *deployment*, not a library caller, and the
+//! catastrophe denials — because an MCP server is a *deployment*, not a library caller, and the
 //! floor is what an operator expects to still be there when they have configured nothing.
 
 use chrono::Utc;
+use hx_core::api_auth::{ApiToken, API_TOKEN_ENV};
 use hx_core::approval::{ApprovalPolicy, ApprovalSession, AutonomyLevel, Rule};
 use hx_core::capability::{Action, Capability, CapabilityToken, Resource};
 use hx_core::ids::{AgentId, HostId};
@@ -59,18 +61,21 @@ use std::sync::Arc;
 const USAGE_EXIT: i32 = 64;
 
 const USAGE: &str = "\
-hx-mcp-server: serve hx's tools to an MCP client over stdio
+hx-mcp-server: serve hx's tools to an MCP client over stdio or HTTP
 
 usage: hx-mcp-server [--workspace DIR] [--policy LEVEL] [--ask GLOB]... [--allow GLOB]...
-                     [--report FILE]
+                     [--report FILE] [--http [BIND]] [--bind ADDR] [--token TOKEN]
 
   --workspace DIR   the directory the tools act in (default: the current directory)
   --policy LEVEL    paranoid | cautious | balanced | trusting | yolo  (default: balanced)
   --ask GLOB        force a refusal for calls to a matching tool name; repeatable
   --allow GLOB      auto-allow a matching tool name below the level's threshold; repeatable
   --report FILE     write the session's approval state as JSON when the connection ends
+  --http [BIND]     serve over streamable HTTP instead of stdio (default bind: 127.0.0.1:8787)
+  --bind ADDR       bind address for HTTP mode (default: 127.0.0.1:8787, or HX_BIND)
+  --token TOKEN     bearer token for HTTP mode (or HX_API_TOKEN in environment)
 
-A call the approval policy would ask a person about is refused here: a stdio connection has no
+A call the approval policy would ask a person about is refused here: this connection has no
 surface to ask. Add an `allow` rule for a tool you want this connection to be able to call.";
 
 struct Args {
@@ -79,6 +84,9 @@ struct Args {
     ask: Vec<String>,
     allow: Vec<String>,
     report: Option<PathBuf>,
+    http: bool,
+    bind: Option<String>,
+    token: Option<String>,
 }
 
 impl Args {
@@ -88,6 +96,9 @@ impl Args {
         let mut ask = Vec::new();
         let mut allow = Vec::new();
         let mut report = None;
+        let mut http = false;
+        let mut bind = None;
+        let mut token = None;
 
         let mut iter = argv.into_iter();
         while let Some(flag) = iter.next() {
@@ -111,8 +122,23 @@ impl Args {
                 "--report" => {
                     report = Some(PathBuf::from(iter.next().ok_or("--report needs a value")?))
                 }
+                "--http" => {
+                    http = true;
+                    if let Some(peek) = iter.as_slice().first() {
+                        if !peek.starts_with("--") {
+                            bind = Some(iter.next().unwrap());
+                        }
+                    }
+                }
+                "--bind" => {
+                    http = true;
+                    bind = Some(iter.next().ok_or("--bind needs a value")?);
+                }
+                "--token" => {
+                    token = Some(iter.next().ok_or("--token needs a value")?);
+                }
                 "--help" | "-h" => {
-                    // To stderr, because stdout is the wire — see the module doc.
+                    // To stderr, because stdout may be the wire — see the module doc.
                     eprintln!("{USAGE}");
                     std::process::exit(0);
                 }
@@ -136,7 +162,30 @@ impl Args {
             ask,
             allow,
             report,
+            http,
+            bind,
+            token,
         })
+    }
+
+    fn http_bind(&self) -> Option<String> {
+        if self.http || self.bind.is_some() {
+            Some(
+                self.bind
+                    .clone()
+                    .or_else(|| std::env::var("HX_BIND").ok())
+                    .unwrap_or_else(|| "127.0.0.1:8787".to_string()),
+            )
+        } else {
+            None
+        }
+    }
+
+    fn resolved_token(&self) -> Option<String> {
+        self.token
+            .clone()
+            .or_else(|| std::env::var(API_TOKEN_ENV).ok())
+            .filter(|t| !t.is_empty())
     }
 
     /// The policy this server runs under.
@@ -201,12 +250,67 @@ fn main() {
     }
 }
 
+async fn serve(args: Args) -> Result<(), String> {
+    if let Some(bind) = args.http_bind() {
+        serve_http(args, bind).await
+    } else {
+        serve_stdio(args).await
+    }
+}
+
+/// Serve over streamable HTTP until terminated, then write the report.
+async fn serve_http(args: Args, bind: String) -> Result<(), String> {
+    let host = LocalHost::detect(HostId::from_raw("local"))
+        .await
+        .map_err(|err| format!("could not probe this machine: {err}"))?;
+    let ctx = ToolContext::new(Arc::new(host))
+        .in_workspace(args.workspace.to_string_lossy().into_owned());
+
+    let registry = Arc::new(default_registry());
+    let server = Arc::new(McpServer::new(
+        registry,
+        ctx,
+        args.capability(Utc::now()),
+        ApprovalSession::new(args.policy()),
+    ));
+
+    let token = args.resolved_token().map(ApiToken::new);
+    let (addr, task) = hx_mcp::server_http::bind_and_serve(
+        Arc::clone(&server),
+        &bind,
+        token,
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+
+    eprintln!(
+        "hx-mcp-server: {} tools over HTTP at http://{addr}/mcp, policy {}, workspace {}. A call that needs approval is refused: this connection has no surface to ask.",
+        server.tool_names().len(),
+        args.level.label(),
+        args.workspace.display()
+    );
+
+    tokio::select! {
+        res = task => {
+            if let Err(err) = res {
+                return Err(format!("the HTTP service task ended abnormally: {err}"));
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {}
+    }
+
+    if let Some(path) = &args.report {
+        write_report(path, &args, &server)?;
+    }
+    Ok(())
+}
+
 /// Serve one stdio connection to the end, then write the report.
 ///
 /// One connection per process, and the process is the transport: when the client closes the pipe,
 /// `rmcp` sees EOF, the service ends, and this returns. That is the whole lifecycle — there is no
 /// accept loop because there is nothing to accept.
-async fn serve(args: Args) -> Result<(), String> {
+async fn serve_stdio(args: Args) -> Result<(), String> {
     let host = LocalHost::detect(HostId::from_raw("local"))
         .await
         .map_err(|err| format!("could not probe this machine: {err}"))?;

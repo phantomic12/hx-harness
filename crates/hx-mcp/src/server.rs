@@ -10,19 +10,18 @@
 //! the only thing in this crate that runs a tool, and it is the same sequence `hx-agent`'s
 //! `handle_call` performs, with one deliberate difference described below.
 //!
-//! ## stdio only, and why there is no HTTP transport here
+//! ## Transports: stdio and streamable HTTP
 //!
-//! The transport is the client's stdin/stdout, and there is **no listening socket** — not as a
-//! configuration option, not behind a feature flag. A TCP transport would need an authentication
-//! story: who is this client, what may *they* do, and how is that identity proven? `hx` has a
-//! capability token for its own agents and a vault for its own credentials, and neither answers
-//! "which stranger on the network is calling". Shipping an unauthenticated HTTP endpoint that runs
-//! tools would be shipping the exact hole this module exists to not be, so the transport is a pipe
-//! that the operator had to start deliberately, and the *client* has to have been given it.
+//! Tools can be served over a pipe (the client's stdin/stdout) or over MCP's streamable-HTTP
+//! transport ([`crate::server_http`]). In both cases, the gate a call passes through is identical.
 //!
-//! `rmcp`'s streamable-HTTP **server** transport is already in this crate's dependency graph (the
-//! HTTP test suite runs a real one on `axum`), so adding it later is a decision about authentication
-//! rather than a missing dependency. It is recorded in `ROADMAP.md` as the open item it is.
+//! The HTTP transport requires bearer-token authentication (`hx_core::api_auth`). A listening
+//! socket is reachable by strangers, so the HTTP transport refuses to start on a non-loopback bind
+//! with no token configured ([`hx_core::api_auth::require_token_for_bind`]).
+//!
+//! **The honest limit**: the token is a bearer credential with no per-client identity, no rotation
+//! and no expiry. Whoever holds the token can call any tool allowed by the server's policy, and
+//! plain HTTP offers no encryption in transit unless terminated by a TLS reverse proxy in front.
 //!
 //! ## Refuse rather than prompt
 //!
