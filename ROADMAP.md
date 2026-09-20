@@ -380,7 +380,7 @@ CIDR or raw IP — is still refused, with a reason naming the way out.*
   browser cannot authenticate by header, and the same query string on a plain GET is worth nothing. Both
   clients are wired: `hx` puts the token on its client's default headers and its 401 message names the
   settings, and the page sends it on every `fetch` and on its socket URLs. Proven by
-  `crates/hx-server/tests/api_auth.rs` (11 tests: a no-token `PUT` that must not reach the handler *with*
+  `crates/hx-server/tests/api_auth.rs` (12 tests: a no-token `PUT` that must not reach the handler *with*
   its write control, every prefix of the token refused, a bare token and another scheme refused, the two
   refusals compared byte for byte, an unresolvable `api.token` failing the build, and a capture of the
   tracing output on both refusal paths asserting the sentinel is in no log line and no `Debug` dump),
@@ -641,30 +641,52 @@ promise about how it is used.
 
 ## M7 — Native apps
 
-- Tauri 2 shell reusing the exact web UI bundle; local or remote `hxd`
-- Desktop: system tray (toggle window / open approvals / quit), global hotkey (reported when the OS
-  refuses the binding), OS notifications for approval requests — **landed**; native file pickers not yet
-- The **phone-approval exit criterion is still unmet**: approving from a phone lock screen needs Mobile
-  (iOS/Android push), which is not reachable from this environment
-- Mobile (iOS + Android): chat, session browse, log view, approval queue, push notifications
-  via APNs/FCM; device token in Keychain/Keystore
-- Auto-update, code signing, CI matrix for all five targets
+  - ✅ **Tauri 2 desktop shell** reusing the exact web UI bundle (`apps/hx-desktop`): it references
+    `crates/hx-server/static/index.html` directly via Tauri's `frontendDist` rather than forking it, and
+    reuses `hx-secrets::resolve_api_token` so `api.token` literals, `store:name` references and
+    `HX_API_TOKEN` all work. Tested (25 tests) for the endpoint/token resolution pure function (local vs
+    remote, config-vs-env precedence, eager remote-missing-token failure), for bundle-path identity, and
+    for the desktop three's testable cores. It can target a local or remote `hxd`.
+  - ✅ **Desktop: system tray, global hotkey, OS notifications** — landed. The tray menu is a pure
+    `TRAY_MENU`/`action_for` pair so a renamed or dropped item fails a test; a refused hotkey binding
+    surfaces as `Refused` rather than being swallowed; the approval notification names the tool and the
+    session and redacts token-shaped values and paths outside the workspace. Each degrades to a working
+    window with a warning rather than failing to start. **Native file pickers are not landed**, and the
+    tray icon, a live hotkey binding and a raised notification are not exercised headlessly — each
+    module's doc says so.
+  - ⬜ **The phone-approval exit criterion is still unmet**: approving from a phone lock screen needs
+    Mobile (iOS/Android push), which is not reachable from this environment.
+  - ⬜ **Mobile (iOS + Android)** — explicitly deferred (needs the Android NDK/SDK and a macOS host for
+    iOS signing; neither is available).
+  - ⬜ **Auto-update, code signing, CI matrix for all five targets** — not landed.
 
 **Exit criteria:** an approval requested by a running agent pings your phone; you approve it
-from the lock screen and the agent continues.
+from the lock screen and the agent continues. **Unmet.** The desktop shell is a window that points at the
+daemon; it does not push an approval to a phone, and the phone/lock-screen approval path is not built. The
+`approval.ask_via` receive loop and a mobile client are the missing halves (see M5).
 
 ---
 
 ## M8 — Subagent pooling (more than one model)
 
-**A correction first, because a reader would otherwise believe the premise.** This milestone used to open with
-*today a subagent's model is a process-global, a single `delegation.model` key* — and there is **no
-subagent system in this repo to be global about**. Measured: there is no `ChildSpec`, no `Orchestrator`,
-no `spawn_child`/`delegate` anywhere in `crates/` or `apps/`; the only `Child` in the tree is a
-process guard in `apps/hxd/tests/startup.rs`; `hx-core`'s config has `providers:` and `pools:`
-but no `delegation` key; and `hx-store`'s `UsageRecord` already carries `provider`, `credential`,
-`model` and `cost_usd`. So the harness that draws children does not exist yet, and per-child `model`/`cost`
-auditing is already possible per turn.
+  *Status note (docs-truth-sweep): the roadmap item below was written on the assumption that a
+  subagent system already exists in this repo — a **process-global** `delegation.model` key read when a
+  child is spawned. That premise is **false on this tree**: there is no `delegation.model` key, no
+  `ChildSpec`, no `Orchestrator`, no `spawn_child`/`delegate` anywhere in `crates/` or `apps/`, and no
+  path that spawns a child model at all (the only `Child` in the tree is a process guard in
+  `apps/hxd/tests/startup.rs`). The concurrency-and-pool settings that exist
+  (`AgentConfig::max_concurrent_subagents`, `default_pool`) bound a **credential pool**, not a model pool
+  of subagents, and `hx-store`'s `UsageRecord` already carries `provider`, `credential`, `model` and
+  `cost_usd`, so per-turn model/cost auditing is already possible. So this milestone's framing describes a
+  system that does not exist yet: there is no fan-out to draw lanes from, no `delegation.model` to be
+  per-lane, and no spawn to record a model for. **The pool itself has now landed**
+  (`crates/hx-core/src/pool.rs`) — members with their own endpoint, credential *reference*, accepted
+  parameters and health; health-aware draw; and clamping that records what it clamped — with **no
+  spawner drawing from it**. The items below remain the target; they are goals for the harness yet to be
+  built, not done work. Where the code lags a claim, that is reported here rather than papered over.
+
+  Today a subagent's model is a **process-global**: a single `delegation.model` key, read when the child
+  is spawned. That is a real ceiling, and it was measured rather than assumed:
 
 What that means is that the hard part — the **routing rules** — can and should land before the spawner, as a
 pure, self-contained module a future spawner will draw from. That is what has landed here:
