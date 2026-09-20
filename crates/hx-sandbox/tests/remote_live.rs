@@ -275,53 +275,101 @@ async fn make_remote_workspace(host: &SshHost) -> String {
     dir.trim().to_string()
 }
 
-/// Remove a remote workspace directory and a container on Drop, even on panic.
+/// Remove the far host's copy of a sandbox — its container, its egress sidecar and network, its
+/// workspace, and any proxy binary the test placed — on Drop, even on panic.
+///
+/// A sandbox with an allowlist owns three things on the far host: the sandbox container, its
+/// `-egress-proxy` sidecar, and the internal `-egress` network. The sidecar is the one that matters —
+/// it holds a foot on the bridge by design, so a leaked sidecar is a **live proxy on the far host**,
+/// not a harmless leftover. `remove()` tears all three down on the happy path; this guard covers the
+/// panic *before* `remove`, which this suite actually hit and which previously leaked a running
+/// sidecar and a network. Names are derived from the sandbox name exactly as `create` derives them.
+///
+/// The sweep runs as a **blocking `ssh` child process**, deliberately not by spawning a task on the
+/// runtime handle. A spawned task is not guaranteed to run — the runtime is torn down while the panic
+/// unwinds, and the leak was observed precisely because that spawn never completed. A child process
+/// has no such dependency, so the removal finishes before `drop` returns.
 struct Cleanup {
-    host: Arc<SshHost>,
     name: Option<String>,
     workspace: Option<String>,
-    handle: tokio::runtime::Handle,
+    /// The proxy binary placed on the far host for the sidecar to bind-mount, when one was placed.
+    binary: Option<String>,
 }
 
 impl Cleanup {
-    fn new(host: &Arc<SshHost>, name: &str, workspace_path: &str) -> Self {
+    fn new(name: &str, workspace_path: &str) -> Self {
         Self {
-            host: Arc::clone(host),
             name: Some(name.to_string()),
             workspace: Some(workspace_path.to_string()),
-            handle: tokio::runtime::Handle::current(),
+            binary: None,
         }
     }
+
+    /// Also remove a proxy binary this test placed on the far host.
+    fn with_binary(mut self, path: impl Into<String>) -> Self {
+        self.binary = Some(path.into());
+        self
+    }
+}
+
+/// The `ssh` prefix for a best-effort sweep, read from the same variables `target()` uses. `None` when
+/// no remote host is configured, in which case there is nothing to sweep.
+fn ssh_prefix() -> Option<Vec<String>> {
+    let host = std::env::var("HX_SSH_TEST_HOST").ok()?;
+    let user = std::env::var("HX_SSH_TEST_USER").ok()?;
+    let key = std::env::var("HX_SSH_TEST_KEY").ok()?;
+    let key = match key.strip_prefix("~/") {
+        Some(rest) => format!("{}/{}", std::env::var("HOME").unwrap_or_default(), rest),
+        None => key,
+    };
+    let port = std::env::var("HX_SSH_TEST_PORT").unwrap_or_else(|_| "22".to_string());
+    Some(vec![
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        "-p".to_string(),
+        port,
+        "-i".to_string(),
+        key,
+        format!("{user}@{host}"),
+    ])
 }
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        let host = Arc::clone(&self.host);
-        let name = self.name.take();
-        let workspace = self.workspace.take();
-        if name.is_none() && workspace.is_none() {
+        let mut commands: Vec<String> = Vec::new();
+        if let Some(name) = self.name.take() {
+            // `docker rm -f` succeeds only if the container exists, hence best-effort: the happy path
+            // asserts the post-removal state itself.
+            commands.push(format!("docker rm -f {}", name.replace('\'', "'\\''")));
+            // The sidecar first, so it lets go of both networks — `network rm` refuses while anything
+            // is still attached to the internal one.
+            commands.push(format!(
+                "docker rm -f {}",
+                format!("{name}-egress-proxy").replace('\'', "'\\''")
+            ));
+            commands.push(format!(
+                "docker network rm {}",
+                format!("{name}-egress").replace('\'', "'\\''")
+            ));
+        }
+        if let Some(ws) = self.workspace.take() {
+            commands.push(format!("rm -rf {}", ws.replace('\'', "'\\''")));
+        }
+        if let Some(bin) = self.binary.take() {
+            commands.push(format!("rm -f {}", bin.replace('\'', "'\\''")));
+        }
+        if commands.is_empty() {
             return;
         }
-        self.handle.spawn(async move {
-            if let Some(name) = &name {
-                // `docker rm -f` succeeds only if the container exists; a best-effort cleanup is
-                // fine here because the test asserts the post-removal state itself.
-                let _ = host
-                    .exec(
-                        &format!("docker rm -f {}", name.replace('\'', "'\\''")),
-                        Duration::from_secs(60),
-                    )
-                    .await;
-            }
-            if let Some(ws) = &workspace {
-                let _ = host
-                    .exec(
-                        &format!("rm -rf {}", ws.replace('\'', "'\\''")),
-                        Duration::from_secs(60),
-                    )
-                    .await;
-            }
-        });
+        let Some(prefix) = ssh_prefix() else {
+            return;
+        };
+        let _ = std::process::Command::new("ssh")
+            .args(prefix)
+            .arg(commands.join("; "))
+            .output();
     }
 }
 
@@ -355,7 +403,7 @@ async fn a_remote_sandbox_is_read_only_and_capability_stripped_on_the_far_daemon
     }));
     let id = SandboxId::new();
     let name = format!("hx-{}", id.as_str());
-    let _cleanup = Cleanup::new(&host, &name, &ws);
+    let _cleanup = Cleanup::new(&name, &ws);
 
     // The full lifecycle over a real SSH transport to a real daemon.
     let created = runtime.create(&id, &spec, &settings).await;
@@ -499,7 +547,12 @@ async fn a_remote_sandbox_is_read_only_and_capability_stripped_on_the_far_daemon
 
 #[ignore = "requires a real remote Docker host (HX_SSH_TEST_HOST, HX_SSH_TEST_USER, HX_SSH_TEST_KEY)"]
 #[tokio::test]
-async fn a_remote_sandbox_refuses_a_nonempty_egress_allowlist_without_creating_anything() {
+async fn a_remote_sandbox_with_an_allowlist_reaches_its_allowed_host_and_not_a_denied_one() {
+    // The property this milestone exists to hold, proven the only way that counts — by observation
+    // on the real far daemon (rainbowone), not by re-reading the command this code built. The pair
+    // of probes is what distinguishes *enforcement* (the proxy admits the allowed host and refuses the
+    // denied one) from a blanket block (which would fail the allowed half). The sandbox must reach
+    // exactly the allowlist's host and no other, and have no route out except the proxy.
     let target = skip_without_a_host!();
     let Some(host) = connect(&target).await else {
         return;
@@ -508,29 +561,160 @@ async fn a_remote_sandbox_refuses_a_nonempty_egress_allowlist_without_creating_a
     let ws = make_remote_workspace(&host).await;
     let mut spec = spec(&ws, IsolationLevel::L1);
     spec.network = true;
-    spec.egress_allow = vec!["crates.io".into()];
+    spec.egress_allow = vec!["example.com".into()];
     let settings = spec.host_settings();
+
+    // Place the compiled proxy binary on the far host, exactly as the deployment must, so the sidecar
+    // can bind-mount it. It must be executable.
+    let proxy_bin = std::env::var("HX_DOCKER_TEST_PROXY_BIN")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_hx-egress-proxy").to_string());
+    let proxy_bytes = std::fs::read(&proxy_bin).unwrap_or_else(|err| {
+        panic!("could not read the egress proxy binary at {proxy_bin}: {err}")
+    });
+    let remote_bin = format!("/tmp/hx-egress-proxy-{}", SandboxId::new().as_str());
+    host.write_file(&remote_bin, &proxy_bytes)
+        .await
+        .unwrap_or_else(|err| panic!("placing the proxy binary on the far host failed: {err}"));
+    raw(
+        &host,
+        &format!("chmod +x {}", remote_bin.replace('\'', "'\\''")),
+    )
+    .await;
 
     let runtime = RemoteSandboxRuntime::new(Arc::new(SshRunner {
         host: Arc::clone(&host),
-    }));
+    }))
+    .with_proxy_bin(Some(remote_bin.clone()));
     let id = SandboxId::new();
     let name = format!("hx-{}", id.as_str());
-    let _cleanup = Cleanup::new(&host, &name, &ws);
+    let network = format!("{name}-egress");
+    let sidecar = format!("{name}-egress-proxy");
+    let _cleanup = Cleanup::new(&name, &ws).with_binary(remote_bin.clone());
 
-    // Remote egress can't be enforced (the proxy is a near-host mechanism), so it must be refused
-    // and must leave nothing behind on the far host.
-    let err = runtime
-        .create(&id, &spec, &settings)
-        .await
-        .expect_err("remote egress must be refused");
-    assert!(err.to_string().contains("not implemented yet"), "{err}");
+    // The full enforcement lifecycle: create (which also creates the internal network + sidecar on the
+    // far daemon), start, probe, then remove (which must tear the sidecar and network down).
+    let created = runtime.create(&id, &spec, &settings).await;
     assert!(
-        !container_exists(&host, &name).await,
-        "a refused sandbox must not have created anything"
+        created.is_ok(),
+        "create with an allowlist failed: {:?}",
+        created
+    );
+    let name = created.unwrap();
+    runtime
+        .start(&name)
+        .await
+        .expect("the far daemon starts the egress sandbox");
+
+    // Probe *through the proxy* with a hand-written CONNECT line — what a real tool inside the sandbox
+    // does, since `HTTP_PROXY` points it at the sidecar. A raw direct connect would test the route the
+    // design deliberately does not use (the internal network has no gateway), so it cannot distinguish a
+    // deny from a routing failure. The reply's status line is the verdict: 200 = the proxy relayed,
+    // 403 = the allowlist refused.
+    let conn = |h: &str| {
+        format!(
+            "timeout 15 bash -c 'exec 3<>/dev/tcp/hxproxy/3128; \
+             printf \"CONNECT {h}:443 HTTP/1.1\\r\\nHost: {h}:443\\r\\n\\r\\n\" >&3; \
+             head -c 12 <&3' || echo BLOCKED"
+        )
+    };
+    // Check the proxy sidecar is alive first, so an expired-sleep probe is not mistaken for a routing or
+    // DNS symptom — a running sidecar is what a real probe presupposes.
+    // `grep -q` prints nothing even on a match, so a quiet grep cannot be read back as "it is up":
+    // the assertion compares the NAME, which is what makes a missing sidecar legible instead of
+    // looking like an empty string either way.
+    let sidecar_up = raw(
+        &host,
+        &format!(
+            "docker ps --format '{{{{.Names}}}}' | grep -x {} || true",
+            sidecar.replace('\'', "'\\''")
+        ),
+    )
+    .await;
+    assert_eq!(
+        sidecar_up.trim(),
+        sidecar,
+        "the egress sidecar must be running before probing"
     );
 
-    // Explicit, awaited workspace cleanup (the Drop is only a panic safety net).
+    let allowed = runtime
+        .exec(&name, &conn("example.com"), None)
+        .await
+        .expect("exec inside the egress sandbox");
+    assert!(
+        allowed.stdout.contains("200"),
+        "an allowed host must be relayed by the far-host proxy: {allowed:?}"
+    );
+
+    let denied = runtime
+        .exec(&name, &conn("malware.test"), None)
+        .await
+        .expect("exec inside the egress sandbox");
+    assert!(
+        !denied.stdout.contains("200"),
+        "a denied host must not be relayed: {denied:?}"
+    );
+    assert!(
+        denied.stdout.contains("403") || denied.stdout.contains("BLOCKED"),
+        "the refusal must be the allowlist's, not a blanket block: {denied:?}"
+    );
+
+    // The sandbox has no route out except the proxy: the internal network has no gateway, so a *direct*
+    // (non-proxy) connection attempts the route the design removes. This is the half that a sandbox merely
+    // told about a proxy would violate — it would connect directly and skip the allowlist entirely.
+    let direct = runtime
+        .exec(
+            &name,
+            "timeout 8 bash -c 'exec 5<>/dev/tcp/93.184.216.34/443 && echo DIRECT_OK || echo NO_ROUTE' \
+             || echo NO_ROUTE",
+            None,
+        )
+        .await
+        .expect("exec inside the egress sandbox");
+    assert!(
+        direct.stdout.contains("NO_ROUTE"),
+        "without the proxy the sandbox must have no route out: {direct:?}"
+    );
+
+    // --- teardown leaves the far host clean: the sandbox, its sidecar and its network are gone ---
+    runtime
+        .remove(&name)
+        .await
+        .expect("the far daemon removes the egress sandbox");
+    assert!(
+        !container_exists(&host, &name).await,
+        "the sandbox must be gone"
+    );
+    let net = raw(
+        &host,
+        &format!(
+            "docker network ls --format '{{{{.Name}}}}' | grep -qx {}; echo $?",
+            network.replace('\'', "'\\''")
+        ),
+    )
+    .await;
+    assert!(
+        net.trim() == "1",
+        "the egress network must be torn down with its sandbox"
+    );
+    let side = raw(
+        &host,
+        &format!(
+            "docker ps -a --format '{{{{.Names}}}}' | grep -qx {}; echo $?",
+            sidecar.replace('\'', "'\\''")
+        ),
+    )
+    .await;
+    assert!(
+        side.trim() == "1",
+        "the egress sidecar must be torn down with its sandbox"
+    );
+
+    // Explicit, awaited binary + workspace cleanup (the Drop is only a panic safety net).
+    let _ = raw(
+        &host,
+        &format!("rm -f {}", remote_bin.replace('\'', "'\\''")),
+    )
+    .await;
     let _ = raw(&host, &format!("rm -rf {}", ws.replace('\'', "'\\''"))).await;
 }
 
@@ -560,7 +744,7 @@ async fn the_far_daemon_rejects_l2_userns_remapping_when_it_is_not_configured() 
     }));
     let id = SandboxId::new();
     let name = format!("hx-{}", id.as_str());
-    let _cleanup = Cleanup::new(&host, &name, &ws);
+    let _cleanup = Cleanup::new(&name, &ws);
 
     let err = runtime
         .create(&id, &spec, &settings)

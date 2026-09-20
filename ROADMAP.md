@@ -200,16 +200,18 @@ attempted capability escalation shows up as a denial event, not a hang.
   subsystem and completes the version handshake so `Some(true)` is now a measured fact, `Some(false)` a
   measured absence, and `None` is reserved for a probe the transport itself cut short. `WinRmHost` reports
   `Some(false)`, which it genuinely knows, since WinRM is not an SSH transport at all.
-- 🔶 **Remote sandboxes** — run the sandbox on a *remote* Docker/Podman host. The runtime now
+- ✅ **Remote sandboxes** — run the sandbox on a *remote* Docker/Podman host. The runtime now
   exists: `RemoteSandboxRuntime` in `crates/hx-sandbox/src/remote.rs` is a second
   `SandboxRuntime` that renders the same reviewed `HostConfig` as the local runtime's settings map
   to, but as docker CLI command lines handed to a tiny local `RemoteCommandRunner` trait (instead of
   to `bollard` against a local socket), so the safe defaults survive the trip to a far daemon. It
   meets `hx-sandbox`'s no-`hx-remote`-dependency rule: `Host` satisfies the runner later via
-  a thin adapter in `hx-server`. Remote egress is **fail-closed**: an allowlist is enforced by a
-  proxy sidecar placed on the *near* host, which a far daemon cannot host, so a remote sandbox
-  whose spec asks for a non-empty egress allowlist is refused at `create` time (before anything
-  reaches the far host) with a reason naming the way out, rather than half-enforced. An isolated
+  a thin adapter in `hx-server`. Remote egress is **enforced, not refused**: an allowlist is
+  held by the same internal-network + `hx-egress-proxy` sidecar as the local runtime, but placed
+  on the *far* host by a few docker CLI commands the far daemon already accepts; it needs only the
+  far-host path of the compiled binary. The only non-empty allowlist cases still refused are the honest
+  ones — a CIDR or raw IP the proxy cannot match, or a spec created without a far-host proxy binary
+  configured. An isolated
   remote sandbox — empty allowlist and the network off — needs no proxy and **works**. It is now wired
   into `hx-server`: a `SandboxProfile` can carry a `host:` key naming a machine from `hosts:`, and
   the daemon resolves it (`AppState::sandbox_manager_for` → `resolve_host`) into one `SandboxManager`
@@ -229,11 +231,17 @@ attempted capability escalation shows up as a denial event, not a hang.
   `docker: --userns: invalid USER mode` (exit 125). The module doc claimed the CLI flag was a no-op on
   such a daemon — it is not; the bollard API value is interpreted differently from the CLI flag. Pinned
   by `the_far_daemon_rejects_l2_userns_remapping_when_it_is_not_configured`, and it is why the lifecycle
-  test exercises L1 with a read-only root forced (L1 sends no `--userns`). Open still: place the proxy
-  sidecar on the far host so remote egress can be enforced, and decide how a profile should behave when
-  the far daemon has no userns remap (refuse L2/L3 up front, or degrade to L1 and say so). Wired and
-  live-verified, so the runtime half of this item is done; remote **egress** enforcement is not, which
-  is why the item stays 🔶.
+  test exercises L1 with a read-only root forced (L1 sends no `--userns`). **Remote egress is now
+  genuinely enforced, not refused**: the proxy sidecar and internal network are placed **on the far host** —
+  `RemoteSandboxRuntime` renders the same internal-network-with-no-gateway + `hx-egress-proxy` sidecar
+  as docker CLI commands, and needs only the far-host path of the compiled binary (`with_proxy_bin`, whose
+  absence alone still refuses, honestly — a sandbox with an unplaced binary is one that could not be enforced).
+  Live-proven by `a_remote_sandbox_with_an_allowlist_reaches_its_allowed_host_and_not_a_denied_one`
+  on rainbowone: the sandbox reaches the allowlisted `example.com` through the far-host proxy, refuses a denied
+  host, has no direct route, and `remove` tears the sidecar and network down with it. The earlier fail-closed
+  claim in this item has been rewritten above: a remote sandbox whose allowlist the proxy **can** match is no
+  longer refused; only an unenforceable shape (a CIDR/raw IP) or a missing far-host binary still is. The
+  item is fully done, so it is now ✅.
 - ✅ **Remote terminal (a PTY straight to a remote host)** — `POST /v1/terminals` takes an optional
   `host`, and the daemon adopts the session as a terminal like any other, so the terminal pane and
   the WebSocket contract are unchanged: a client attaches to a remote shell the same way it attaches
@@ -271,9 +279,12 @@ browser, file viewer/editor and command runner. Linux is live-tested in CI, a Ma
 against a real Apple-signed arm64 VM, and no private key reaches the model, the trail or a sandbox
 — that last clause is now pinned by tripwire tests rather than asserted. See `TESTING.md`.
 
-*What is still open is the remaining 🔶 below, not the criteria: **remote sandbox egress is
-fail-closed** — an allowlist is refused rather than enforced, because the proxy sidecar lives on the
-near host. Closing that is what the last item needs.*
+*M4's exit criteria are met, with no `🔶` left in this milestone: **remote sandbox egress is enforced,
+not merely fail-closed** — an allowlist is held by the same internal-network + `hx-egress-proxy` sidecar
+the local runtime uses, placed on the far host, and live-verified by observation rather than by reading
+back the command: an allowed host is relayed, a denied host is refused by the allowlist itself rather
+than by a blanket block, and the sandbox has no direct route out. Only what the proxy cannot match — a
+CIDR or raw IP — is still refused, with a reason naming the way out.*
 
 ---
 

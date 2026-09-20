@@ -25,8 +25,9 @@ pub mod spec;
 pub use docker::{logs, to_container_config, to_host_config, wait_for_engine, DockerRuntime};
 pub use egress::EgressProxy;
 pub use remote::{
-    create_command, exec_command, remove_command, start_command, stop_command, RemoteCommandOutput,
-    RemoteCommandRunner, RemoteSandboxRuntime,
+    create_command, egress_network_name, egress_setup_commands, egress_sidecar_name,
+    egress_teardown_commands, exec_command, remove_command, start_command, stop_command,
+    RemoteCommandOutput, RemoteCommandRunner, RemoteSandboxRuntime,
 };
 pub use runtime::{SandboxExecOutput, SandboxHandle, SandboxManager, SandboxRuntime, SandboxState};
 pub use spec::{
