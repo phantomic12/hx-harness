@@ -30,6 +30,21 @@
 //!
 //! A denied target answers `403 Forbidden` and closes. It does not time out and it does not
 //! accidentally get forwarded, because the forward happens *only* after the allowlist check passes.
+//!
+//! ## Defence in depth: the proxy will not dial an address either
+//!
+//! The validator (`SandboxSpec::validate`, in `crate::spec` of the library) refuses an allowlist
+//! entry that is address-shaped in the `inet_aton` grammar (`0x01010101`, `127.1`, `2130706433`,
+//! `0177.0.0.1`, …), but this file does not *rely* on that. It holds its own copy of the predicate —
+//! the same grammar, the same test table on both sides — and refuses to dial a destination that is
+//! address-shaped even when the entry matched the allowlist exactly.
+//!
+//! The copy is deliberate and was the decision of record: this binary depends on `std` alone, so a
+//! bad entry that reaches it (an older validator, a hand-written `HX_EGRESS_ALLOW`, a future caller
+//! that forgets to validate) cannot become a live connection. Measured before the guard existed: an
+//! allowlist of `0x01010101` answered `200 Connection established` and dialed 1.1.1.1 — a
+//! destination the operator never named. Two implementations with one shared test table is the
+//! accepted cost of keeping this binary's dependency list empty.
 
 use std::env;
 use std::io::{Read, Write};
@@ -129,6 +144,37 @@ fn allowed(host: &str, allow: &[String]) -> bool {
     })
 }
 
+/// Whether a `CONNECT` target is address-shaped in the `inet_aton` grammar rather than a name.
+///
+/// **A deliberate copy of `hx_sandbox::spec::is_address_shaped`.** This binary is compiled with
+/// `std` alone and must stay that way (see the module doc); the two implementations are kept in step
+/// by carrying the *same test table* on both sides, which is the accepted answer here rather than
+/// linking the library in. The reason it exists at all: `getaddrinfo` — and therefore
+/// `TcpStream::connect` — accepts `0x01010101`, `127.1`, `2130706433`, `0177.0.0.1` and the rest of
+/// the `inet_aton` family, so a destination that merely *looks* like a name can be dialed as an
+/// address. This proxy matches by name; it must not dial what is not one.
+fn is_address_shaped(host: &str) -> bool {
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return false;
+    }
+    parts.iter().all(|p| is_inet_aton_number(p))
+}
+
+/// One dot-separated part of a host: decimal, octal (`0`-prefixed) or hex (`0x`-prefixed).
+fn is_inet_aton_number(part: &str) -> bool {
+    if part.is_empty() {
+        return false;
+    }
+    if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+        !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit())
+    } else if part.len() > 1 && part.starts_with('0') {
+        part.chars().all(|c| ('0'..='7').contains(&c)) // octal
+    } else {
+        part.chars().all(|c| c.is_ascii_digit()) // decimal
+    }
+}
+
 fn handle(mut client: TcpStream, allow: &[String]) {
     let mut buf = [0u8; 4096];
     let read = match client.read(&mut buf) {
@@ -171,6 +217,18 @@ fn handle(mut client: TcpStream, allow: &[String]) {
         eprintln!("egress DENIED {host}:{port}");
         // A clear, immediate refusal: the sandbox must observe the failure as a *denial*, not a
         // hang, or a tool will retry into a black hole and the operator will never see why.
+        let _ = write_status(&mut client, 403, "Forbidden");
+        return;
+    }
+
+    // Defence in depth, and it is the difference between a refusal and a live connection. The
+    // validator refuses an address-shaped allowlist entry, but this proxy does not trust that: an
+    // entry that matched here (`0x01010101` matched `0x01010101` exactly) must still not be *dialed*,
+    // because the resolver would read it as 1.1.1.1. Measured before this guard existed: the proxy
+    // answered `200 Connection established` and opened a real connection to 1.1.1.1. The refusal is
+    // the same 403 the allowlist itself produces — the sandbox sees a denial, never a tunnel.
+    if is_address_shaped(host) {
+        eprintln!("egress DENIED {host}:{port} (address-shaped destination; not a name to dial)");
         let _ = write_status(&mut client, 403, "Forbidden");
         return;
     }
@@ -285,5 +343,133 @@ mod tests {
             "a CIDR entry must admit nothing"
         );
         assert!(!allowed("crates.io.evil.com", &allow));
+    }
+
+    // ---- the dial guard: real loopback sockets, no copy of the predicate ----
+
+    /// Run the proxy's own `handle` behind a real loopback listener and return its port.
+    ///
+    /// The tests below drive the proxy the way a sandbox does — a TCP connection carrying a
+    /// `CONNECT` line — rather than calling `handle` with a hand-made buffer, so both the refusal
+    /// and the dial are real. Nothing here needs the internet: the "upstream" is another loopback
+    /// listener this test owns.
+    fn proxy_on_a_loopback_port(allow: Vec<String>) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind the proxy's test port");
+        let port = listener
+            .local_addr()
+            .expect("the test listener has an address")
+            .port();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let allow = allow.clone();
+                thread::spawn(move || handle(stream, &allow));
+            }
+        });
+        port
+    }
+
+    /// Send `CONNECT <target>` to the proxy and return the status line it answers.
+    fn connect_through(proxy_port: u16, target: &str) -> String {
+        let mut client =
+            TcpStream::connect(("127.0.0.1", proxy_port)).expect("connect to the test proxy");
+        client
+            .write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+            .expect("write the CONNECT line");
+        let mut buf = [0u8; 256];
+        let read = client.read(&mut buf).unwrap_or(0);
+        String::from_utf8_lossy(&buf[..read]).to_string()
+    }
+
+    #[test]
+    fn the_proxy_dials_a_name_entry_and_answers_200() {
+        // The control for the refusal below, and the reason it is not a copy of the predicate: it
+        // proves the proxy really *does* dial when the entry is a name, so a guard that refused
+        // everything (or a proxy that never dialed at all) would fail here instead of passing as a
+        // false "the hole is closed". `localhost` resolves to the loopback upstream this test bound.
+        let upstream = TcpListener::bind("127.0.0.1:0").expect("bind a loopback upstream");
+        let upstream_port = upstream.local_addr().unwrap().port();
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = upstream.accept() {
+                let _ = stream.write_all(b"UPSTREAM\n");
+            }
+        });
+
+        let proxy = proxy_on_a_loopback_port(vec!["localhost".to_string()]);
+        let status = connect_through(proxy, &format!("localhost:{upstream_port}"));
+        assert!(
+            status.contains("200 Connection established"),
+            "a name entry must be dialed and relayed: {status:?}"
+        );
+    }
+
+    #[test]
+    fn the_proxy_refuses_to_dial_an_address_shaped_destination() {
+        // The end-to-end proof of the guard, against a real socket. Each of these entries matches
+        // the allowlist *exactly* (`allowed` returns true — that is what makes this a dial guard and
+        // not a second allowlist check), and each is address-shaped, so the resolver underneath
+        // `TcpStream::connect` would read it as an address: `0x01010101` is 1.1.1.1, `127.1` is
+        // 127.0.0.1. Before the guard existed the first of these answered
+        // `200 Connection established` and opened a real connection to 1.1.1.1.
+        for smuggled in [
+            "0x01010101",
+            "0x7f000001",
+            "127.1",
+            "2130706433",
+            "0177.0.0.1",
+        ] {
+            let allow = vec![smuggled.to_string()];
+            assert!(
+                allowed(smuggled, &allow),
+                "{smuggled} must match its own allowlist entry, or this test proves nothing"
+            );
+            let proxy = proxy_on_a_loopback_port(allow);
+            let status = connect_through(proxy, &format!("{smuggled}:443"));
+            assert!(
+                status.contains("403"),
+                "{smuggled} is an address, not a name to dial: {status:?}"
+            );
+            assert!(
+                !status.contains("200"),
+                "{smuggled} must never be tunneled: {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_proxys_address_grammar_matches_the_librarys_on_the_same_table() {
+        // The proxy keeps its own copy of the predicate rather than linking the library (see the
+        // module doc), so the two are kept honest by carrying the *same* test table. This is that
+        // table; `hx_sandbox::spec`'s `the_address_shape_predicate_matches_the_inet_aton_grammar_it_claims_to`
+        // is its twin. A change to one grammar that is not made to the other fails here.
+        for shaped in [
+            "0",
+            "0x0",
+            "0X0",
+            "00",
+            "017",
+            "1",
+            "1.2",
+            "1.2.3",
+            "1.2.3.4",
+            "0xffffffff",
+            "0177.0.0.1",
+            "0x7f.0.0.1",
+            "2130706433",
+        ] {
+            assert!(is_address_shaped(shaped), "{shaped} is address-shaped");
+        }
+        for not_shaped in [
+            "",
+            "example.com",
+            "123.example.com",
+            "localhost",
+            "09",
+            "1.2.3.4.5",
+            "0x",
+            "a.1",
+        ] {
+            assert!(!is_address_shaped(not_shaped), "{not_shaped} is not");
+        }
     }
 }

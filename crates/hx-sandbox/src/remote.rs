@@ -414,11 +414,17 @@ pub fn egress_sidecar_name(name: &str) -> String {
 
 /// Whether an egress allowlist entry can actually be enforced by the proxy sidecar.
 ///
-/// The proxy matches a `CONNECT` target by hostname (exact or `*.domain` suffix); a CIDR or a
-/// raw IP is not a hostname, so it cannot be decided and must be refused rather than half-enforced.
-/// This mirrors [`crate::spec`]'s `is_proxy_enforceable`. A bare IPv4 address *passes* a
-/// hostname-shape check (its labels are alphanumeric), so the explicit `IpAddr` parse is the
-/// guard, exactly as the local validator learned.
+/// The proxy matches a `CONNECT` target by hostname (exact or `*.domain` suffix); a CIDR, a raw IP
+/// or anything *address-shaped* is not a hostname, so it cannot be decided and must be refused
+/// rather than half-enforced. This mirrors [`crate::spec`]'s `is_proxy_enforceable`, and — unlike the
+/// version this replaces — it uses the *same* address grammar rather than an `IpAddr` parse.
+///
+/// The `IpAddr` parse was the hole: a bare IPv4 passes a hostname-shape check (its labels are
+/// alphanumeric), and so does the whole `inet_aton` family, which `IpAddr::from_str` does not
+/// recognise but the resolver really does — `0x01010101` is 1.1.1.1, `127.1` is 127.0.0.1,
+/// `2130706433` is 127.0.0.1. On the far host that produced `egress ALLOWED 0x01010101:443 → dialed
+/// 1.1.1.1`: an allowlist entry that read as a name and dialed an address. The grammar lives once,
+/// in [`crate::spec::is_address_shaped`], so the near and far validators cannot drift apart.
 fn is_egress_enforceable(entry: &str) -> bool {
     let entry = entry.trim().trim_end_matches('.');
     if entry.is_empty() {
@@ -428,7 +434,9 @@ fn is_egress_enforceable(entry: &str) -> bool {
     let looks_hostname = host
         .split('.')
         .all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
-    looks_hostname && host.parse::<std::net::IpAddr>().is_err()
+    looks_hostname
+        && !crate::spec::is_address_shaped(host)
+        && host.parse::<std::net::IpAddr>().is_err()
 }
 
 /// The docker commands that create the internal egress network and the proxy sidecar on the far daemon.
@@ -874,6 +882,33 @@ mod tests {
             message.contains("cannot be enforced") && message.contains("93.184.216.34"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn an_address_shaped_allowlist_entry_is_refused_on_the_far_path_too() {
+        // The same hole as `spec.rs`'s, reached through the remote path. `0x01010101` and the rest of
+        // the `inet_aton` family pass a hostname-shape check (their labels are alphanumerics) and are
+        // *really dialed as addresses* — on the far host the old guard produced
+        // `egress ALLOWED 0x01010101:443 → dialed 1.1.1.1`. `create_command` refuses the shape before
+        // building any command, so the far daemon is never handed a "hostname" that is an address.
+        for smuggled in [
+            "0x01010101",
+            "127.1",
+            "2130706433",
+            "0177.0.0.1",
+            "0x7f000001",
+        ] {
+            let mut s = spec(IsolationLevel::L1);
+            s.network = true;
+            s.egress_allow = vec![smuggled.into()];
+            let settings = s.host_settings();
+            let err = create_command("hx-sbx_x", &s, &settings).unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("cannot be enforced") && message.contains(smuggled),
+                "{message}"
+            );
+        }
     }
 
     #[test]
