@@ -550,8 +550,14 @@ command with a button, receive a cron digest in a separate pinned thread.
     residual collision is a miss rather than a wrong body). The module doc says plainly that this is
     **not** an HTTP cache implementation: `Vary`, `no-store`, `Age` and `stale-while-revalidate` are
     not implemented and not claimed.
+  - ◐ **The research task.** `crates/hx-search/src/research.rs`: wires the 6 keyless backends
+    (SearXNG, DDG, Mojeek, Marginalia, Wikipedia, Hacker News) in parallel via `fanout`, deduplicates
+    by canonical URL, fuses ranks with RRF, fetches the top 8 sources through `UrlCache` using an
+    in-crate `Fetcher` (with per-fetch timeout and body cap, avoiding any inverted dependency on
+    `hx-browser`), extracts with `Ladder::default_rungs()`, and produces citations with zero paid
+    API calls.
 
-**Exit criteria:** a research task runs 6 free backends in parallel, dedupes, RRF-ranks,
+**Exit criteria:** ✅ a research task runs 6 free backends in parallel, dedupes, RRF-ranks,
 extracts the top 8, and cites them — with zero paid API calls.
 
 **What has landed so far (search).** The backend set is now one file per engine, and four more

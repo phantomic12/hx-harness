@@ -68,6 +68,7 @@
 //! shows the shape the real one takes when it lands.
 
 use crate::backends::{clean_text, decode_entities};
+use serde::{Deserialize, Serialize};
 
 /// How much of a document's text a block must hold before it counts as the main block.
 pub const MAIN_SHARE: f64 = 0.6;
@@ -122,7 +123,8 @@ impl FetchedPage {
 }
 
 /// Which rung produced the text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Rung {
     Plain,
     Readability,
