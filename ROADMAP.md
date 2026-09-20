@@ -290,10 +290,15 @@ near host. Closing that is what the last item needs.*
   `editMessageText` request shape are tested, but a live token-stream → edit driver is not), and wiring a
   button answer back into a running agent's approval queue (the prompt is posted and the answer *authority*
   enforced, but the end-to-end loop is a next step).
-- **Discord** (twilight gateway, slash commands, threads, Message Content Intent)
+- **Discord** (twilight gateway, slash commands, threads, Message Content Intent) — **deferred by
+  decision, no urgency**: Telegram proves the trait today, and a second platform shape is worth building
+  when a need for it appears rather than speculatively.
 - ✅ **Delivery targets, home-channel pinning** (`DeliveryPolicy`) — a reply goes to its conversation;
   background output goes to the pinned home channel; with no home channel it is **refused, not dropped**.
-- Then: Slack (Socket Mode) → Matrix → Email → WhatsApp Cloud → Signal → SMS
+- Then, **all deferred by decision**: Slack (Socket Mode) → Matrix → Email → WhatsApp Cloud → Signal →
+  SMS. None is urgent, and the order is the intended sequence rather than a queue anyone is working.
+- **The next real step in this milestone is the two gaps named above** — wiring a button answer back into
+  a running agent's approval queue, and the live streaming driver — not another platform.
 
 - **Approvals out of band, as a configurable option** — a request can be answered from anywhere the
   user already is, not only from the surface that started the run: `approval.ask_via` naming one or
