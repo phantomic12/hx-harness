@@ -75,6 +75,39 @@ The `Host`→`RemoteCommandRunner` adapter and the per-host manager routing are 
 
 Not yet exercised against a live remote daemon; that is the remaining M4 step.
 
+## A button tap names its question, and a token never reaches an error
+
+Two things had to be true before an answer from a phone could be *joined* to the run that asked, and
+neither was:
+
+1. **The button carried only the label.** `callback_data` was `"allow once"`, and the connector handed
+   the tap up as an `Inbound::ApprovalAnswer` with `approval_id: ""`. An answer that names no question
+   can only be matched by guessing — "whatever is pending in this chat now" — which is how a tap that
+   arrives after a run moved on answers a different question. `callback_data` is now
+   `apr_<id>:<label>` and `split_callback_data` is the inverse; a payload that does not split (an
+   older build's button, a hand-sent string) arrives with an empty id, which no pending request can
+   match, and is refused rather than guessed at. Asserted by
+   `a_button_carries_the_question_it_answers_and_the_answer_round_trips`,
+   `a_payload_that_names_no_question_is_not_an_answer_to_one`, and over the wire in
+   `an_approval_is_posted_with_one_button_per_option`, which now asserts the exact `callback_data`
+   Telegram is sent.
+2. **A transport failure put the bot token in the error message.** Telegram authenticates with
+   `/bot<token>/` in the *path*, and `reqwest::Error`'s `Display` includes the URL it failed on, so
+   `could not reach Telegram: {err}` was a token in an error message — about to become a token in the
+   transcript and the audit trail, because a failed `ask` denies a run with its reason attached. The
+   test was written first and run against the unfixed code:
+
+   ```console
+   $ cargo test -p hx-gateway --test telegram_http a_token_never
+   thread '...' panicked at crates/hx-gateway/tests/telegram_http.rs:470:
+   the bot token must never appear in an error: connector main-tg failed: could not reach Telegram:
+   error sending request for url (http://127.0.0.1:1/bot0123456789:TESTBOT-…/sendMessage)
+   ```
+
+   `TelegramConnector::unreachable` now formats the error through `reqwest`'s own `without_url()`, and
+   `a_token_never_reaches_an_error_message_not_even_the_url` asserts the message carries neither the
+   token nor the URL. Not even the URL, because the URL is where the token lives.
+
 ## The four tiers
 
 Every claim in the repo falls into one of these. The gap that bites is B→C.

@@ -124,9 +124,10 @@ pub fn build_send_body(conversation: &Conversation, text: &str) -> Value {
 
 /// The body of a `sendMessage` that carries an approval with answer buttons.
 ///
-/// The buttons are the request's own options; the callback `data` is the option label, and the
-/// gateway maps it back through the same request. No decision about whether an answer is *legal* happens
-/// here — that is [`crate::answer::AnswerAuthority`]'s job, against the request's risk.
+/// The buttons are the request's own options; the callback `data` is the approval id plus the
+/// option label (see [`callback_data`]), and the gateway maps it back through the same request. No
+/// decision about whether an answer is *legal* happens here — that is
+/// [`crate::answer::AnswerAuthority`]'s job, against the request's risk.
 pub fn build_approval_body(conversation: &Conversation, task: &ApprovalTask) -> Value {
     let rows: Vec<Value> = task
         .request
@@ -135,7 +136,7 @@ pub fn build_approval_body(conversation: &Conversation, task: &ApprovalTask) -> 
         .map(|option| {
             json!([{
                 "text": option.label(),
-                "callback_data": option.label(),
+                "callback_data": callback_data(task.request.id.as_str(), option.label()),
             }])
         })
         .collect();
@@ -148,6 +149,33 @@ pub fn build_approval_body(conversation: &Conversation, task: &ApprovalTask) -> 
         body["message_thread_id"] = json!(conversation.thread.as_str());
     }
     body
+}
+
+/// The `callback_data` for one option: the approval id, then the option's label.
+///
+/// **The id is what makes a tap an answer to a particular question.** A button carrying only a
+/// label cannot be matched to a pending request at all, and "the question that is pending in this
+/// chat right now" is not an identity: a tap that arrives after the run moved on would answer
+/// whatever is pending *then*. So the id travels with the button and comes back with the tap, and
+/// the answer is matched to it or refused (`crate::bridge`).
+///
+/// `ApprovalId` is `apr_<32 hex>` and no option label contains a colon, so the first colon is the
+/// split. Telegram caps `callback_data` at 64 bytes; the longest pair here is 36 + 1 + 18.
+pub fn callback_data(approval_id: &str, label: &str) -> String {
+    format!("{approval_id}:{label}")
+}
+
+/// Split a tap's `callback_data` back into the question it answers and the answer given.
+///
+/// `None` for a payload that names no question — a button from a build older than this one, or a
+/// string someone sent by hand. The caller must refuse such a tap rather than guess which question
+/// was meant, because guessing is exactly how a tap answers the wrong one.
+pub fn split_callback_data(data: &str) -> Option<(String, String)> {
+    let (approval_id, label) = data.split_once(':')?;
+    if approval_id.is_empty() || label.is_empty() {
+        return None;
+    }
+    Some((approval_id.to_string(), label.to_string()))
 }
 
 /// The body of an `editMessageText` that replaces a previously sent message in place.
@@ -244,6 +272,21 @@ impl TelegramConnector {
         )
     }
 
+    /// A transport failure, described **without the URL**.
+    ///
+    /// The URL is where the credential is: Telegram authenticates with `/bot<token>/` in the path,
+    /// so a URL in an error message is the bot token in an error message. `reqwest::Error`'s own
+    /// `Display` includes the URL it failed on, which means interpolating the raw error would carry
+    /// the token into a log line — and, since a failed `ask` now denies a run with the reason
+    /// attached, into the transcript and the audit trail. `without_url` is reqwest's own answer to
+    /// exactly this case, and it is why the call sites below do not simply write `{err}`.
+    fn unreachable(&self, err: reqwest::Error) -> HxError {
+        HxError::Connector {
+            connector: self.id.to_string(),
+            reason: format!("could not reach Telegram: {}", err.without_url()),
+        }
+    }
+
     async fn poll(&self, key: &Secret) -> Result<Vec<Inbound>> {
         let offset = self.offset.load(Ordering::SeqCst);
         let url = format!(
@@ -257,10 +300,7 @@ impl TelegramConnector {
             .get(&url)
             .send()
             .await
-            .map_err(|err| HxError::Connector {
-                connector: self.id.to_string(),
-                reason: format!("could not reach Telegram: {err}"),
-            })?;
+            .map_err(|err| self.unreachable(err))?;
         let status = response.status();
         let text = response
             .text()
@@ -303,14 +343,20 @@ impl TelegramConnector {
                     });
                 } else if let Some(callback) = update.get("callback_query").and_then(parse_callback)
                 {
+                    // The tap names the question it answers, or it is not an answer. A payload that
+                    // does not split (an older button, a string typed by hand) arrives with an empty
+                    // id, which no pending request can match — the bridge refuses it and says why,
+                    // rather than matching it to whatever happens to be pending.
+                    let (approval_id, answer) = split_callback_data(&callback.data)
+                        .unwrap_or_else(|| (String::new(), callback.data.clone()));
                     inbound.push(Inbound::ApprovalAnswer {
                         conversation: Conversation {
                             platform: platform(),
                             chat: ChatId(callback.chat_id),
                             thread: ThreadId(String::new()),
                         },
-                        approval_id: String::new(),
-                        answer: callback.data,
+                        approval_id,
+                        answer,
                     });
                 }
             }
@@ -364,10 +410,7 @@ impl Connector for TelegramConnector {
             .json(&body)
             .send()
             .await
-            .map_err(|err| HxError::Connector {
-                connector: self.id.to_string(),
-                reason: format!("could not reach Telegram: {err}"),
-            })?;
+            .map_err(|err| self.unreachable(err))?;
         let status = response.status();
         let text = response
             .text()
@@ -401,10 +444,7 @@ impl Connector for TelegramConnector {
             .json(&body)
             .send()
             .await
-            .map_err(|err| HxError::Connector {
-                connector: self.id.to_string(),
-                reason: format!("could not reach Telegram: {err}"),
-            })?;
+            .map_err(|err| self.unreachable(err))?;
         let status = response.status();
         let text = response
             .text()
@@ -417,10 +457,12 @@ impl Connector for TelegramConnector {
             });
         }
 
-        // The prompt was posted. Whether and how the human's answer reaches a running agent is a
-        // separate wiring step (see ROADMAP.md); the connector has done its job: the question is on the
-        // screen with answer buttons. An answer, when it comes, arrives through `receive` as
-        // `Inbound::ApprovalAnswer` and is judged by `AnswerAuthority`.
+        // The prompt was posted, buttons and all — including the id of the question in each button,
+        // so a later tap can be matched to *this* request rather than to whatever is pending when it
+        // arrives. The answer itself does not come back through this call: it arrives later through
+        // `receive` as `Inbound::ApprovalAnswer` and is joined to the waiting run by
+        // `crate::bridge::ApprovalBridge`. Returning `NoAnswer` here is the honest report of what
+        // this call did — it asked, and nobody has answered yet.
         Ok(AnswerVerdict::NoAnswer)
     }
 }
@@ -459,7 +501,7 @@ mod tests {
     fn a_button_tap_is_parsed_as_a_callback_answer() {
         let wire = json!({
             "callback_query": {
-                "data": "allow once",
+                "data": "apr_1:allow once",
                 "message": { "chat": { "id": 12345 } }
             }
         });
@@ -468,7 +510,32 @@ mod tests {
             .and_then(parse_callback)
             .expect("a callback");
         assert_eq!(c.chat_id, "12345");
-        assert_eq!(c.data, "allow once");
+        assert_eq!(c.data, "apr_1:allow once");
+    }
+
+    #[test]
+    fn a_button_carries_the_question_it_answers_and_the_answer_round_trips() {
+        // The property the whole loop-back rests on: the tap names the request it answers. A button
+        // that carried only the label could not be matched to a question at all.
+        let data = callback_data("apr_0f1e2d", "allow for this chat");
+        assert_eq!(data, "apr_0f1e2d:allow for this chat");
+        assert_eq!(
+            split_callback_data(&data),
+            Some(("apr_0f1e2d".to_string(), "allow for this chat".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_payload_that_names_no_question_is_not_an_answer_to_one() {
+        // An older build's button (label only), a hand-sent string, an empty id or label: none of
+        // these names a question, so none of them may be matched to one.
+        for payload in ["allow once", ":allow once", "apr_1:", "", "deny"] {
+            assert_eq!(
+                split_callback_data(payload),
+                None,
+                "{payload:?} names no question"
+            );
+        }
     }
 
     #[test]
