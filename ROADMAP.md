@@ -620,6 +620,45 @@ from the lock screen and the agent continues.
 
 ---
 
+## M8 — Subagent pooling (more than one model)
+
+Today a subagent's model is a **process-global**: a single `delegation.model` key, read when the child
+is spawned. That is a real ceiling, and it was measured rather than assumed:
+
+- **Lanes cannot differ.** A fan-out whose lanes want different models — a cheap one for mechanical
+  work, a strong one for the lane that has to reason about a security property — cannot express it.
+  Changing the key mid-run silently changes the model of every *subsequent* child and none of the
+  running ones, so a fan-out ends up split across models by accident of timing rather than by choice.
+- **One model's parameter set is not another's.** A reasoning effort one model accepts is a hard
+  `HTTP 400` for another — which turned every lane of a fan-out into a half-second failure whose
+  message named the parameter but not the fan-out. A pool has to know each member's accepted
+  parameters and clamp to them.
+- **One upstream can take down every lane at once.** All children share the model, so the model's
+  outage *is* the fan-out's outage, and a retry storm is indistinguishable from slow work. The lanes
+  look alive for ten minutes per call and produce nothing.
+
+- A **model pool** the harness draws children from, where each member carries its own endpoint,
+  credential, accepted parameters and health state
+- **Per-child model selection** — the model is part of the child's spec, chosen at spawn and recorded
+  with the child, not read from a global at the moment of use
+- **Health-aware draw**: a member that fails its first call is marked down and the next child is drawn
+  from a healthy one, and a lane that dies at spawn is retried on a *different* member rather than the
+  same one — so a bad member degrades throughput instead of stalling it
+- **Capability clamping**: a parameter a member does not accept is clamped to the nearest accepted
+  value and the clamp is recorded, never sent and hoped for
+- **Per-child model and cost in the audit chain**, so "which model did this work" and "did this lane
+  spend money" are answerable after the fact — the same standard the search path already holds itself
+  to with *zero paid API calls*
+- **Deterministic assignment under test**: a scripted pool that fails, clamps and recovers, so the
+  routing rules are asserted rather than observed
+
+**Exit criteria:** a fan-out of N lanes runs across N members of a pool, each lane's model recorded in
+the audit chain; killing one member's upstream mid-run re-routes new lanes to a healthy member with no
+operator action and no lane stalled by retry backoff; a lane whose model rejects a configured parameter
+is clamped and runs instead of failing at spawn.
+
+---
+
 ## Open security items
 
 **A remote sandbox can reach the far host's own bridge address.** *(Open. Measured, pinned, not
