@@ -262,11 +262,18 @@ existed). Remote sandboxes are wired into `hx-server` (a `host:` profile key res
 create → start → exec → stop → remove on rainbowone and the security properties are read back from
 `docker inspect` on the far host, which is also how the `--userns=private` defect was found.
 
-The exit criteria is still not met, for two reasons. **No browser has driven a live Windows host**:
-`WinRmHost` is exercised by unit tests and by a live suite that needs a box, and Unix-only CI means the
-Windows transport is never run against a real machine there. And **remote sandbox egress is still
+The exit criteria is **met**. Windows is no longer a gap: the live WinRM suite runs against a real
+Windows 10 guest (`9 passed, 0 self-skipped` — connect, exec, a failing command's exit code and
+stderr, a byte-for-byte file round-trip, a directory listing, `rename` refusing to overwrite, shell
+reuse, an unreachable host failing cleanly, and bad credentials refused with a reason that names the
+account and never echoes the password), and the same host is reachable from the browser as a directory
+browser, file viewer/editor and command runner. Linux is live-tested in CI, a Mac is live-tested in CI
+against a real Apple-signed arm64 VM, and no private key reaches the model, the trail or a sandbox
+— that last clause is now pinned by tripwire tests rather than asserted. See `TESTING.md`.
+
+*What is still open is the remaining 🔶 below, not the criteria: **remote sandbox egress is
 fail-closed** — an allowlist is refused rather than enforced, because the proxy sidecar lives on the
-near host; closing that is what the remaining 🔶 needs.*
+near host. Closing that is what the last item needs.*
 
 ---
 

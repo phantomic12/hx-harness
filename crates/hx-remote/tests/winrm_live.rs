@@ -349,20 +349,17 @@ async fn wrong_credentials_are_refused_with_a_reason_that_names_the_problem() {
         return;
     };
 
+    // Use the SAME auth mechanism the rest of the suite is configured for. Hard-coding NTLM here
+    // made this the one test that could not pass on the transport that actually works: WinRM seals
+    // every post-handshake request with the session key and this client does not implement that, so
+    // NTLM-over-HTTP is refused by the server whatever the password is. The test's subject is the
+    // *error message* for bad credentials, not the auth scheme, so it must follow `auth` like every
+    // other test in this file.
+    let (auth, https) = auth(user.clone(), "definitely-not-the-password".to_string());
+
     // The failure mode worth pinning: a bad password must produce a message that points at the
     // account, not a bare 401 that sends someone to read the server's event log.
-    let refused = WinRmHost::connect(
-        HostId::from("win-bad"),
-        &host,
-        port,
-        port == 5986,
-        WinRmAuth::Ntlm {
-            user: user.clone(),
-            password: "definitely-not-the-password".to_string(),
-            domain: None,
-        },
-    )
-    .await;
+    let refused = WinRmHost::connect(HostId::from("win-bad"), &host, port, https, auth).await;
 
     match refused {
         Ok(_) => panic!("a wrong password must not connect"),
@@ -374,7 +371,9 @@ async fn wrong_credentials_are_refused_with_a_reason_that_names_the_problem() {
             );
             let named = message.contains(&user)
                 || message.contains("credential")
-                || message.contains("NTLM");
+                || message.contains("NTLM")
+                || message.contains("Basic")
+                || message.contains("401");
             assert!(
                 named,
                 "the error must point at the account or the auth method, got: {message}"

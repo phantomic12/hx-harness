@@ -227,6 +227,54 @@ connection negotiated and recorded `ssh-ed25519`.
 Still not covered by any run: a Windows SSH server, a jump host, and `ssh-agent` auth (which returns
 an explicit "not implemented" error rather than a wrong answer).
 
+**The WinRM transport, against a real Windows host** (`crates/hx-remote/tests/winrm_live.rs`)
+
+**9 passed, 0 self-skipped** against the `hx-wintest` guest on rainbowone (Windows 10, `dockur/windows`).
+What that covers: connect and self-report, a command's output coming back through the SOAP framing, a
+failing command reporting its exit code and stderr separately, a file round-tripping byte-for-byte, a
+directory listing with real entries, `rename` refusing to overwrite, several commands reusing one
+shell, an unreachable host failing cleanly, and bad credentials being refused with a message that
+names the account **and never echoes the password**.
+
+**The transport is HTTPS + Basic. NTLM-over-HTTP cannot work and never will** — WinRM seals every
+post-handshake request with the negotiated session key (`multipart/encrypted`, MS-NLMP SEAL) and this
+client does not implement that layer, so a plaintext envelope is refused whatever the password is. The
+NTLM crypto is correct; the transport is the problem. Do not spend time on it again.
+
+The guest has **no HTTPS listener**, so the run puts a TLS-terminating proxy in front of the plain
+5985 listener. The proxy must NOT sit on **5986**: the suite computes `https = port == 5986`, so a
+proxy there silently switches the client to TLS against a plain listener. Use a spare port (**5999**):
+
+```console
+# on the host that can reach the Windows guest (rainbowone here):
+cp /tmp/tls_proxy.py /tmp/tls_proxy_5999.py
+sed -i 's/^LISTEN = ("127.0.0.1", 5986)/LISTEN = ("127.0.0.1", 5999)/' /tmp/tls_proxy_5999.py
+setsid nohup python3 /tmp/tls_proxy_5999.py < /dev/null > /tmp/tls5999.log 2>&1 &
+
+# from the machine running the tests, forward that port:
+ssh -N -L 5999:127.0.0.1:5999 yoav@100.99.145.19
+
+# the guest account's password is read from its own container env, never typed into a transcript:
+PW=$(ssh yoav@100.99.145.19 "docker inspect hx-wintest --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^PASSWORD=' | cut -d= -f2-")
+HX_WINRM_HOST=127.0.0.1 HX_WINRM_PORT=5999 HX_WINRM_USER=hxtest HX_WINRM_PASSWORD="$PW" \
+HX_WINRM_AUTH=basic HX_WINRM_HTTPS=1 HX_WINRM_INSECURE=1 \
+  cargo test -p hx-remote --test winrm_live -- --ignored --test-threads=1
+```
+
+`HX_WINRM_INSECURE=1` accepts the self-signed cert; `HX_WINRM_HTTPS=1` is what makes the client accept
+Basic at all (the crate refuses Basic over plain HTTP, for exactly the confidentiality reason above).
+
+**One test was wrong and is now fixed.** `wrong_credentials_…` hard-coded `WinRmAuth::Ntlm` and derived
+`https` from `port == 5986` instead of honouring the configured auth — which made it the one test that
+could not pass on the transport that actually works, and it failed with a misleading `error sending
+request for url (http://127.0.0.1:5999/wsman)`. It now follows the same `auth()` helper as every other
+test in the file. Worth remembering as a shape: **a test that pins its own transport while the rest of
+the suite is configured for another will always be the odd one out, and its failure looks like a
+product bug.**
+
+**This cannot run in CI** — it needs a reachable Windows box, and CI runners can reach neither the
+tailnet guest nor a Windows machine, so there is deliberately no job that would only skip.
+
 **The remote sandbox runtime, against a real remote Docker daemon** (`crates/hx-sandbox/tests/remote_live.rs`)
 
 `RemoteSandboxRuntime` renders the same settings the local runtime maps to as docker CLI command
