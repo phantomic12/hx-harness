@@ -19,6 +19,7 @@ pub mod error;
 pub mod event;
 pub mod ids;
 pub mod message;
+pub mod pool;
 
 pub use api_auth::{bind_is_loopback, require_token_for_bind, ApiToken, API_TOKEN_ENV};
 pub use approval::{
@@ -37,3 +38,7 @@ pub use ids::{
     ProviderId, SandboxId, SessionId, ToolCallId, VolumeId,
 };
 pub use message::{Message, Part, Role};
+pub use pool::{
+    DrawError, EffectiveParams, MemberHealth, ModelPool, ModelPoolMemberConfig, Param, ParamClamp,
+    PoolMember, ReasoningEffort,
+};

@@ -67,6 +67,24 @@ pools:
     inherits: background
     limits: { concurrent: 2, daily_usd: 5.0 }
 
+# M8 model pools: per-child model members a future subagent spawner draws from.
+# The routing rules (health-aware draw, capability clamping) are built and tested in
+# hx-core; nothing draws from these yet. The credential is a *reference* — never a value.
+# `accepts` is the set of parameters this member accepts; anything else requested is clamped
+# to the nearest accepted value (or dropped) and the clamp is recorded, never sent raw.
+model_pools:
+  builder:
+    - id: builder-strong
+      base_url: https://api.anthropic.com
+      credential: "vault:anthropic/main"
+      accepts:
+        - { kind: reasoning_effort, value: high }
+    - id: builder-cheap
+      base_url: https://api.openai.com
+      credential: "env:OPENAI_API_KEY"
+      accepts:
+        - { kind: reasoning_effort, value: low }
+
 roles:
   builder: interactive
   reviewer: interactive
