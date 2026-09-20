@@ -80,6 +80,15 @@ channel-policy check further from `AnswerAuthority`, where it is tested. The cos
 paid: building `hx-gateway` alone now builds the tool and remote stack with it. See
 `crates/hx-gateway/src/bridge.rs`.
 
+Two more arrows were added with `hx-mcp`'s **server** half, and both exist so that a tool call made
+over MCP is judged by the same code a local call is: `hx-mcp` depends on `hx-agent` — `risk_of`
+classifies the call and an `ApprovalSession` decides it, and a second risk table is the one thing a
+remote surface must not have — and on `hx-remote`, because the `hx-mcp-server` binary's tools act on
+a `LocalHost`. The cost is stated where it is paid: building `hx-mcp` now builds the tool, remote and
+provider stack with it, as building `hx-gateway` already did. The alternative for the first edge is a
+copy of the risk table that agrees today and drifts later, which is exactly the drift an approval
+rule cannot survive. See `crates/hx-mcp/src/server.rs`.
+
 ---
 
 ## 2. Stack decisions
