@@ -64,6 +64,28 @@ fn default_update_interval() -> u64 {
     DEFAULT_UPDATE_INTERVAL_SECS
 }
 
+impl UpdateConfig {
+    /// Reject a configuration that would arm a zero-period ticker.
+    ///
+    /// `tokio::time::interval(Duration::from_secs(0))` panics, so `enabled: true` with
+    /// `interval_secs: 0` would crash the daemon one interval after startup — the worst kind of
+    /// misconfiguration, one that passes every check and then kills the process. A disabled
+    /// checker spawns no task and needs no interval, so zero is only refused when enabled.
+    /// `hxd` calls this at startup (fail closed, before binding); the spawned checker re-checks
+    /// defensively because this type is also constructed programmatically.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.enabled && self.interval_secs == 0 {
+            return Err(
+                "update.interval_secs must be greater than zero when update checking is enabled \
+                 (a zero interval would panic the check ticker; set a positive number of seconds \
+                 or disable the checker)"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Compare two dotted numeric versions, after stripping a leading `v` from either.
 ///
 /// `v0.1.2` and `0.1.2` compare equal; a missing trailing component counts as `0`, so
@@ -220,5 +242,34 @@ mod tests {
             None,
             "non-string tag_name"
         );
+    }
+
+    #[test]
+    fn an_enabled_checker_with_a_zero_interval_is_rejected() {
+        // `tokio::time::interval(0)` panics: enabled + zero must never reach the spawn path.
+        let cfg = UpdateConfig {
+            enabled: true,
+            url: DEFAULT_UPDATE_URL.to_string(),
+            interval_secs: 0,
+        };
+        let err = cfg.validate().expect_err("enabled + interval 0 must fail validation");
+        assert!(err.contains("interval_secs"), "{err}");
+    }
+
+    #[test]
+    fn a_disabled_checker_needs_no_interval_and_a_positive_one_passes() {
+        let off = UpdateConfig {
+            enabled: false,
+            url: DEFAULT_UPDATE_URL.to_string(),
+            interval_secs: 0,
+        };
+        assert!(off.validate().is_ok(), "disabled spawns no task, so zero is harmless");
+        let on = UpdateConfig {
+            enabled: true,
+            url: DEFAULT_UPDATE_URL.to_string(),
+            interval_secs: 60,
+        };
+        assert!(on.validate().is_ok());
+        assert!(UpdateConfig::default().validate().is_ok());
     }
 }

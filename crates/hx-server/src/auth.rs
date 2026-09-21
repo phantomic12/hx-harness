@@ -126,23 +126,39 @@ pub async fn require_bearer(
     request: Request,
     next: Next,
 ) -> Response {
+    let path = request.uri().path().to_string();
     let Some(expected) = state.api_token.as_ref() else {
         // No token configured: legal only because the daemon refused to start on a non-loopback
         // bind without one. The check that makes that true is at startup, not here, which is why
-        // this arm can be a pass-through rather than a second refusal.
+        // this arm can be a pass-through rather than a second refusal. The WebSocket Origin check
+        // below still runs: cross-origin protection does not depend on a token being set.
+        if is_websocket_route(&path) && is_websocket_upgrade(request.headers()) {
+            if !ws_origin_allowed(request.headers(), host_of(request.headers())) {
+                return forbidden_cross_origin();
+            }
+        }
         return next.run(request).await;
     };
 
-    if is_exempt(request.uri().path()) || is_webhook_route(request.uri().path()) {
+    if is_exempt(&path) || is_webhook_route(&path) {
         return next.run(request).await;
     }
 
     match presented_token(&request) {
-        Some(presented) if expected.matches(&presented) => next.run(request).await,
+        Some(presented) if expected.matches(&presented) => {}
         // A missing token and a wrong one produce byte-identical responses: the body must not be a
         // way to learn whether a guess was close, or whether a token is configured at all.
-        _ => unauthorized(),
+        _ => return unauthorized(),
     }
+
+    // Bearer auth passed, but a browser page from another site presenting a stolen token must
+    // still not be able to open a shell. See `ws_origin_allowed`.
+    if is_websocket_route(&path) && is_websocket_upgrade(request.headers()) {
+        if !ws_origin_allowed(request.headers(), host_of(request.headers())) {
+            return forbidden_cross_origin();
+        }
+    }
+    next.run(request).await
 }
 
 /// Routes that are answered without the *daemon's* token because they carry their own.
@@ -200,6 +216,103 @@ fn bearer_from_headers(headers: &HeaderMap) -> Option<&str> {
     } else {
         Some(token)
     }
+}
+
+/// Whether a WebSocket handshake's `Origin` header may proceed.
+///
+/// Bearer auth already keeps strangers without the token out; this keeps *other websites* out
+/// when the token is used from a browser. A malicious page cannot set `Origin` on a WebSocket it
+/// opens, but the browser always sends one — so a handshake arriving with a foreign `Origin`
+/// is a cross-site attempt to ride the operator's session, and it is refused with 403 even when
+/// the token is valid (a token that reached a query string or a log is exactly how a valid
+/// credential ends up in the wrong hands).
+///
+/// The rule, deliberately host-based rather than scheme-based so a Tauri/desktop webview
+/// (`tauri://localhost`) keeps working:
+/// - no `Origin` header (CLI, TUI, tests, non-browser clients) → allow;
+/// - `Origin` whose host equals the request's own `Host` (same-origin, any port) → allow;
+/// - `Origin` naming a loopback host (a local dev UI on another port) → allow;
+/// - anything else — including `Origin: null` and unparseable values → reject.
+///
+/// `host` is the request's `Host` header value; `None` when absent.
+pub fn ws_origin_allowed(headers: &HeaderMap, host: Option<&str>) -> bool {
+    let Some(raw) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return true;
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return true;
+    }
+    if raw.eq_ignore_ascii_case("null") {
+        return false;
+    }
+    let Some(origin_host) = origin_host_of(raw) else {
+        return false;
+    };
+    if is_loopback_host(origin_host) {
+        return true;
+    }
+    match host.map(strip_port) {
+        Some(own) => origin_host.eq_ignore_ascii_case(own),
+        None => false,
+    }
+}
+
+/// The request's own host (the `Host` header, port stripped), for same-origin comparison.
+fn host_of(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+}
+
+/// Extract the host from an `Origin` value (`scheme://authority[/...]`), port stripped.
+fn origin_host_of(origin: &str) -> Option<&str> {
+    let (_, rest) = origin.split_once("://")?;
+    if rest.is_empty() {
+        return None;
+    }
+    let authority = rest.split('/').next().unwrap_or(rest);
+    if authority.is_empty() {
+        return None;
+    }
+    Some(strip_port(authority))
+}
+
+/// Strip a `:port` suffix from an authority, leaving bare hosts (including IPv6) intact.
+fn strip_port(authority: &str) -> &str {
+    let authority = authority.trim();
+    if let Some(rest) = authority.strip_prefix('[') {
+        // `[::1]` or `[::1]:port`.
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    // A bare IPv6 literal has more than one colon and no port to strip; a single colon means
+    // `host:port`.
+    if authority.bytes().filter(|&b| b == b':').count() == 1 {
+        if let Some((host, _)) = authority.rsplit_once(':') {
+            return host;
+        }
+    }
+    authority
+}
+
+/// The loopback hosts a local UI may be served from. Mirrors the rmcp default allowlist plus
+/// the `localhost` name both stacks accept.
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host.eq_ignore_ascii_case("127.0.0.1")
+        || host.eq_ignore_ascii_case("::1")
+}
+
+/// The cross-origin refusal: 403, carrying no token information.
+fn forbidden_cross_origin() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        axum::Json(serde_json::json!({ "error": "cross-origin websocket rejected" })),
+    )
+        .into_response()
 }
 
 /// Is this a WebSocket handshake?
@@ -433,6 +546,105 @@ mod tests {
                 .get(header::WWW_AUTHENTICATE)
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer")
+        );
+    }
+
+    fn origin_headers(origin: Option<&str>, host: Option<&str>) -> HeaderMap {
+        let mut pairs: Vec<(&str, &str)> = vec![];
+        if let Some(origin) = origin {
+            pairs.push(("origin", origin));
+        }
+        if let Some(host) = host {
+            pairs.push(("host", host));
+        }
+        headers(&pairs)
+    }
+
+    #[test]
+    fn a_handshake_without_an_origin_is_not_a_browser_and_is_allowed() {
+        // CLI, TUI and test clients send no Origin; refusing them would break every non-browser
+        // client, including the existing WebSocket integration tests.
+        assert!(ws_origin_allowed(&HeaderMap::new(), None));
+        assert!(ws_origin_allowed(
+            &origin_headers(None, Some("127.0.0.1:7717")),
+            Some("127.0.0.1:7717")
+        ));
+    }
+
+    #[test]
+    fn a_same_origin_handshake_is_allowed() {
+        assert!(ws_origin_allowed(
+            &origin_headers(
+                Some("http://127.0.0.1:7717"),
+                Some("127.0.0.1:7717")
+            ),
+            Some("127.0.0.1:7717")
+        ));
+        // Same host, different port: the daemon serves the page and the socket from one port in
+        // practice, but a split deployment is still the operator's own origin.
+        assert!(ws_origin_allowed(
+            &origin_headers(Some("http://example.com:3000"), Some("example.com:7717")),
+            Some("example.com:7717")
+        ));
+        // Host comparison ignores case, as DNS does.
+        assert!(ws_origin_allowed(
+            &origin_headers(Some("http://Example.COM"), Some("example.com")),
+            Some("example.com")
+        ));
+    }
+
+    #[test]
+    fn a_loopback_origin_from_a_different_host_is_allowed() {
+        // A local dev UI on another port, and the desktop webview (`tauri://localhost`), are
+        // loopback pages, not attacker sites.
+        assert!(ws_origin_allowed(
+            &origin_headers(Some("http://localhost:3000"), Some("192.168.1.10:7717")),
+            Some("192.168.1.10:7717")
+        ));
+        assert!(ws_origin_allowed(
+            &origin_headers(Some("tauri://localhost"), Some("127.0.0.1:7717")),
+            Some("127.0.0.1:7717")
+        ));
+        assert!(ws_origin_allowed(
+            &origin_headers(Some("http://127.0.0.1:8080"), Some("example.com")),
+            Some("example.com")
+        ));
+    }
+
+    #[test]
+    fn a_foreign_origin_is_rejected_even_when_it_names_a_real_site() {
+        for (origin, host) in [
+            ("https://evil.example", "127.0.0.1:7717"),
+            ("https://evil.example", "example.com"),
+            ("http://127.0.0.2:3000", "127.0.0.1:7717"),
+            ("null", "127.0.0.1:7717"),
+            ("NULL", "127.0.0.1:7717"),
+            ("not a url", "127.0.0.1:7717"),
+            ("http://", "127.0.0.1:7717"),
+            ("https://evil.example", "evil.example.attacker.com"),
+        ] {
+            assert!(
+                !ws_origin_allowed(
+                    &origin_headers(Some(origin), Some(host)),
+                    Some(host)
+                ),
+                "origin {origin:?} against host {host:?} must be rejected"
+            );
+        }
+        // A foreign origin with no Host to compare against cannot prove same-origin either.
+        assert!(!ws_origin_allowed(
+            &origin_headers(Some("https://evil.example"), None),
+            None
+        ));
+    }
+
+    #[test]
+    fn the_cross_origin_refusal_is_a_403_without_a_bearer_challenge() {
+        let response = forbidden_cross_origin();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            response.headers().get(header::WWW_AUTHENTICATE).is_none(),
+            "a 403 must not carry the 401 challenge: it answers a different question"
         );
     }
 }
