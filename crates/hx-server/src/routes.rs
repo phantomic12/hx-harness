@@ -38,6 +38,11 @@ use std::sync::Arc;
 /// cannot half-succeed (a working API with a missing UI, or a UI from an older build).
 const WEB_CLIENT: &str = include_str!("../static/index.html");
 
+/// Hard cap on a single file served by the host/diff HTTP routes, mirroring the agent
+/// `read_file` tool's 512 KiB bound so the HTTP surfaces cannot be used to exhaust the
+/// daemon's memory on an oversized or pathological file.
+const FILE_READ_CAP: u64 = 512 * 1024;
+
 async fn web_client() -> impl IntoResponse {
     // `text/html` and not `text/plain`, or a browser renders the source. No cache header games: the
     // page is small, and a stale front end against a newer daemon is exactly the mismatch this
@@ -178,6 +183,8 @@ pub fn status_for(err: &HxError) -> StatusCode {
         HxError::NotFound(_) => StatusCode::NOT_FOUND,
         // A backend or connector misbehaved upstream.
         HxError::Search { .. } | HxError::Connector { .. } => StatusCode::BAD_GATEWAY,
+        // The caller asked for a bounded input (file read, diff) that is too large to serve in one go.
+        HxError::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
         // Deliberately not a wildcard over the whole enum: adding a variant to `HxError` should
         // force a decision here rather than silently becoming a 500. This arm exists only for
         // variants this surface does not know how to classify.
@@ -837,7 +844,10 @@ async fn diff_file(
     )
     .await?;
 
-    let bytes = host.read_file(&body.path).await.map_err(ApiError::from)?;
+    let bytes = host
+        .read_file_capped(&body.path, FILE_READ_CAP)
+        .await
+        .map_err(ApiError::from)?;
     // A binary file cannot be diffed as text — reporting that honestly beats inventing a diff of mangled
     // bytes. `Some` here means the bytes are not valid UTF-8.
     let binary = String::from_utf8(bytes.clone()).is_err();
@@ -1287,11 +1297,15 @@ async fn host_read_file(
     Query(query): Query<FileQuery>,
 ) -> Result<Json<FileBody>, ApiError> {
     let host = resolve_for_use(&state, &id, hx_core::capability::Action::Read).await?;
-    let bytes = host.read_file(&query.path).await.map_err(ApiError::from)?;
+    let bytes = host
+        .read_file_capped(&query.path, FILE_READ_CAP)
+        .await
+        .map_err(ApiError::from)?;
 
-    let (encoding, contents) = match String::from_utf8(bytes.clone()) {
-        Ok(text) => ("utf-8".to_string(), text),
-        Err(_) => ("base64".to_string(), base64_encode(&bytes)),
+    let (encoding, contents) = if let Ok(text) = String::from_utf8(bytes.clone()) {
+        ("utf-8".to_string(), text)
+    } else {
+        ("base64".to_string(), base64_encode(&bytes))
     };
 
     Ok(Json(FileBody {

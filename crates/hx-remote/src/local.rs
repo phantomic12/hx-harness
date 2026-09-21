@@ -11,6 +11,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
 
 /// Move `from` to `to` where a hard link cannot be made, keeping the "never replace" contract.
 ///
@@ -239,6 +240,44 @@ impl Host for LocalHost {
         tokio::fs::read(path)
             .await
             .map_err(|e| HxError::Remote(format!("could not read {path}: {e}")))
+    }
+
+    /// Stat first, then stream with a hard cap — the override of [`Host::read_file_capped`].
+    ///
+    /// The stat rejects an over-limit file (including a sparse one, whose apparent size is what
+    /// counts) without reading a byte of it. The `take(cap + 1)` then holds even when the stat
+    /// said nothing useful: a file that grew between the two calls, or a stream that reports size
+    /// zero (`/dev/zero`, a pipe), still cannot push more than `cap + 1` bytes into memory.
+    async fn read_file_capped(&self, path: &str, cap: u64) -> Result<Vec<u8>> {
+        let size = tokio::fs::metadata(path)
+            .await
+            .map_err(|e| HxError::Remote(format!("could not read {path}: {e}")))?
+            .len();
+        if size > cap {
+            return Err(HxError::TooLarge {
+                what: path.to_string(),
+                size,
+                limit: cap,
+            });
+        }
+        let file = tokio::fs::File::open(path)
+            .await
+            .map_err(|e| HxError::Remote(format!("could not read {path}: {e}")))?;
+        let mut limited = file.take(cap + 1);
+        let mut bytes = Vec::new();
+        limited
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|e| HxError::Remote(format!("could not read {path}: {e}")))?;
+        let size = bytes.len() as u64;
+        if size > cap {
+            return Err(HxError::TooLarge {
+                what: path.to_string(),
+                size,
+                limit: cap,
+            });
+        }
+        Ok(bytes)
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> Result<()> {
@@ -494,6 +533,27 @@ mod tests {
         host().write_file(&path_str, b"payload").await.unwrap();
         let back = host().read_file(&path_str).await.unwrap();
         assert_eq!(back, b"payload");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_file_capped_rejects_over_limit_files_before_reading() {
+        let dir = std::env::temp_dir().join(format!("hx-test-capped-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.bin");
+        std::fs::write(&path, vec![0u8; 8192]).unwrap();
+        let path_str = path.to_string_lossy().into_owned();
+
+        let err = host().read_file_capped(&path_str, 1024).await.unwrap_err();
+        assert!(
+            matches!(err, hx_core::error::HxError::TooLarge { .. }),
+            "{err}"
+        );
+
+        // Under the cap reads back in full.
+        let ok = host().read_file_capped(&path_str, 8192).await.unwrap();
+        assert_eq!(ok.len(), 8192);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -72,6 +72,15 @@ pub enum HxError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// A file or other bounded input exceeded the byte limit for serving it in one go.
+    ///
+    /// Separate from [`HxError::Remote`], which is a transport failure, and from
+    /// [`HxError::Denied`], which is a policy decision: this one is a size the caller can fix by
+    /// asking for less (a range, a narrower diff). The HTTP surface maps it to 413 so a client
+    /// knows not to retry the identical request.
+    #[error("{what} is {size} bytes, over the {limit}-byte limit")]
+    TooLarge { what: String, size: u64, limit: u64 },
+
     /// A durable-store failure — SQLite, a migration, or a row that does not parse.
     ///
     /// Deliberately *not* retryable: the transient case (`SQLITE_BUSY`) is absorbed by the store's
