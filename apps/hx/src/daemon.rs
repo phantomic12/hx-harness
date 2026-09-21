@@ -320,6 +320,22 @@ pub async fn fanout(
     Ok(reply)
 }
 
+/// Research a question: fan out over the configured backends, fetch and extract the pages they
+/// point at, and cite them.
+///
+/// `body` is built by [`crate::commands::research_body`], so the argument-to-request mapping is
+/// tested with the renderings rather than here. The reply is returned as it came: this layer does
+/// not re-shape a report whose fields are the pipeline's own.
+pub async fn research(client: &reqwest::Client, base: &str, body: &Value) -> anyhow::Result<Value> {
+    let (_, reply) = send(
+        client.post(format!("{base}/v1/research")).json(body),
+        base,
+        "the research request",
+    )
+    .await?;
+    Ok(reply)
+}
+
 /// A session's transcript as a document.
 pub async fn export(
     client: &reqwest::Client,

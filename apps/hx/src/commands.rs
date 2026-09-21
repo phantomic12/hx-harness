@@ -1459,6 +1459,152 @@ pub fn render_fanout(outcome: &serde_json::Value, json: bool) -> String {
     out
 }
 
+/// Parse `--fetch-mode` into the pipeline's own [`hx_search::FetchMode`].
+///
+/// Through `serde` rather than a second `match` on the strings, because `FetchMode`'s wire spelling
+/// is what the route deserialises: a mode this accepts is a mode the route accepts, and adding a
+/// mode to the enum cannot leave the CLI a step behind. The error lists the known modes, since a
+/// typo in a flag is the caller's to fix and "unknown" alone does not say with what.
+pub fn parse_fetch_mode(raw: &str) -> anyhow::Result<hx_search::FetchMode> {
+    serde_json::from_value::<hx_search::FetchMode>(serde_json::Value::String(raw.to_string()))
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "unknown fetch mode '{raw}'; known modes: http (plain fetch only), \
+                 auto (escalate to a browser for a page a plain fetch cannot read), \
+                 browser (drive a browser even for a page a plain fetch could read)"
+            )
+        })
+}
+
+/// Turn `hx research`'s arguments into the route's request body.
+///
+/// Only the fields the caller actually set are sent, the same rule `hx chat` follows: the daemon's
+/// defaults are the daemon's to decide, and serialising a CLI default of `auto` would make this
+/// command's default look like the daemon's policy — two things that could then drift apart without
+/// either saying so. A blank query is refused here rather than round-tripped, so the common mistake
+/// costs no daemon call and reads the same either way.
+pub fn research_body(
+    query: &str,
+    max_sources: Option<usize>,
+    fetch_mode: Option<&str>,
+) -> anyhow::Result<serde_json::Value> {
+    if query.trim().is_empty() {
+        anyhow::bail!("`hx research` needs a non-empty query");
+    }
+    let mut body = serde_json::json!({ "query": query });
+    if let Some(max) = max_sources {
+        body["max_sources"] = serde_json::json!(max);
+    }
+    if let Some(raw) = fetch_mode {
+        // Validated before the round trip: a mode the daemon would reject should be an argument
+        // error, not a request whose failure the caller has to read out of a response body.
+        let mode = parse_fetch_mode(raw)?;
+        body["fetch_mode"] = serde_json::to_value(mode)?;
+    }
+    Ok(body)
+}
+
+/// True when at least one backend answered.
+///
+/// What `hx research`'s exit status turns on: a report where every backend failed is not a success
+/// a script should treat as one, even though the request itself was answered with a 200.
+pub fn research_answered(outcome: &serde_json::Value) -> bool {
+    outcome["backends"]
+        .as_array()
+        .is_some_and(|backends| backends.iter().any(|o| o["status"] == "answered"))
+}
+
+/// Render a research report: the query, which fetcher ran it, what each backend did, and the cited
+/// sources in fused rank order.
+pub fn render_research(outcome: &serde_json::Value, json: bool) -> String {
+    if json {
+        return match serde_json::to_string_pretty(outcome) {
+            Ok(pretty) => format!("{pretty}\n"),
+            Err(err) => format!("{{\"error\":\"could not serialise the report: {err}\"}}\n"),
+        };
+    }
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "query:   {}",
+        outcome["query"].as_str().unwrap_or("(none)")
+    );
+    // The fetcher and its note are printed together because neither is honest alone: `http` on a
+    // request that asked for a browser is exactly the degradation the note exists to record.
+    let _ = writeln!(
+        out,
+        "fetcher: {} — {}",
+        outcome["fetcher"].as_str().unwrap_or("(none)"),
+        outcome["fetch_note"].as_str().unwrap_or("(no note)")
+    );
+
+    let backends = outcome["backends"].as_array().cloned().unwrap_or_default();
+    let mut answered = 0usize;
+    let mut failed = 0usize;
+    let mut out_backends = String::new();
+    for outcome in &backends {
+        match outcome["status"].as_str() {
+            Some("answered") => {
+                answered += 1;
+                let _ = writeln!(
+                    out_backends,
+                    "  {}: answered",
+                    outcome["backend"].as_str().unwrap_or("?")
+                );
+            }
+            Some("failed") => {
+                failed += 1;
+                let _ = writeln!(
+                    out_backends,
+                    "  {}: failed — {}",
+                    outcome["backend"].as_str().unwrap_or("?"),
+                    outcome["reason"].as_str().unwrap_or("no reason given")
+                );
+            }
+            other => {
+                let _ = writeln!(out_backends, "  unrecognised backend outcome {other:?}");
+            }
+        }
+    }
+    let _ = writeln!(out, "backends: {answered} answered, {failed} failed");
+    out.push_str(&out_backends);
+
+    let sources = outcome["sources"].as_array().cloned().unwrap_or_default();
+    let _ = writeln!(out, "sources:  {} cited", sources.len());
+    for source in &sources {
+        let _ = writeln!(
+            out,
+            "  {}. {} [{}]",
+            source["rank"].as_u64().unwrap_or(0),
+            source["title"].as_str().unwrap_or("(untitled)"),
+            source["rung"].as_str().unwrap_or("?")
+        );
+        let _ = writeln!(out, "     {}", source["url"].as_str().unwrap_or("?"));
+        if let Some(snippet) = source["snippet"].as_str() {
+            if !snippet.is_empty() {
+                let _ = writeln!(out, "     {snippet}");
+            }
+        }
+    }
+
+    let _ = writeln!(
+        out,
+        "paid calls: {} (keyless research spends nothing)",
+        outcome["paid_calls"].as_u64().unwrap_or(0)
+    );
+    if answered == 0 {
+        // The line a script's non-zero exit corresponds to, said out loud rather than left to the
+        // exit status alone.
+        let _ = writeln!(
+            out,
+            "no backend answered: the report is empty because nothing was reachable, not because \
+             the query matched nothing"
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod run_tests {
     use super::*;
@@ -1753,5 +1899,162 @@ mod run_tests {
         let rendered = render_audit(&report, true);
         // Pretty-printed JSON, so a caller piping it to `jq` gets a document rather than prose.
         assert!(rendered.contains("\"session_id\": \"ses_1\""), "{rendered}");
+    }
+
+    // ---- research -----------------------------------------------------------
+
+    #[test]
+    fn a_research_body_sends_only_the_arguments_the_caller_actually_set() {
+        // The daemon's defaults are the daemon's to decide. Serialising a CLI default here would
+        // make this command's opinion look like the daemon's policy, and the two could then drift
+        // apart with neither saying so — the same rule `hx chat` follows for its optional fields.
+        let body = research_body("rust ownership", None, None).expect("a query alone is enough");
+        assert_eq!(body["query"], "rust ownership");
+        assert!(
+            body.get("max_sources").is_none(),
+            "an unset cap must not be sent: {body}"
+        );
+        assert!(
+            body.get("fetch_mode").is_none(),
+            "an unset mode must not be sent: {body}"
+        );
+    }
+
+    #[test]
+    fn a_research_body_carries_an_explicit_cap_and_mode() {
+        let body =
+            research_body("rust", Some(3), Some("browser")).expect("both arguments are valid");
+        assert_eq!(body["query"], "rust");
+        assert_eq!(body["max_sources"], 3);
+        assert_eq!(body["fetch_mode"], "browser");
+    }
+
+    #[test]
+    fn every_mode_the_pipeline_accepts_is_a_mode_the_cli_accepts() {
+        // The CLI parses `--fetch-mode` through `FetchMode`'s own serde representation, which is
+        // what the route deserialises. This is the assertion that the two cannot drift: a mode the
+        // pipeline knows is a mode this command sends, spelled the way the route reads it.
+        for (raw, expected) in [
+            ("http", hx_search::FetchMode::Http),
+            ("auto", hx_search::FetchMode::Auto),
+            ("browser", hx_search::FetchMode::Browser),
+        ] {
+            let parsed = parse_fetch_mode(raw).unwrap_or_else(|err| panic!("{raw}: {err}"));
+            assert_eq!(parsed, expected);
+            let body = research_body("rust", None, Some(raw)).expect("a known mode is valid");
+            assert_eq!(body["fetch_mode"], raw, "the wire spelling must round-trip");
+        }
+    }
+
+    #[test]
+    fn a_fetch_mode_outside_the_pipelines_vocabulary_is_an_argument_error_that_lists_the_real_ones()
+    {
+        // A typo in a flag is the caller's to fix, and it is fixed before the round trip: a mode
+        // the daemon would reject as a 400 is an argument error here, not a request whose failure
+        // the caller has to read out of a response body.
+        let err = parse_fetch_mode("telepathy").expect_err("telepathy is not a fetch mode");
+        let message = err.to_string();
+        assert!(message.contains("telepathy"), "{message}");
+        for mode in ["http", "auto", "browser"] {
+            assert!(
+                message.contains(mode),
+                "the error must list the known modes so the typo is fixable, missing {mode}: {message}"
+            );
+        }
+        assert!(
+            research_body("rust", None, Some("telepathy")).is_err(),
+            "an invalid mode must not reach a request body"
+        );
+    }
+
+    #[test]
+    fn a_blank_research_query_is_refused_before_any_daemon_call() {
+        for blank in ["", "   ", "\t"] {
+            assert!(
+                research_body(blank, None, None).is_err(),
+                "{blank:?} is not a query"
+            );
+        }
+        // The daemon refuses the same request; refusing it here means the common mistake costs no
+        // call and reads the same whether or not a daemon is running.
+        assert!(research_body("  rust  ", None, None).is_ok());
+    }
+
+    #[test]
+    fn research_answered_turns_on_any_backend_answering() {
+        // What the command's exit status turns on: a report every backend failed is not a success.
+        assert!(research_answered(&json!({
+            "backends": [
+                {"backend": "a", "status": "failed", "reason": "HTTP 503"},
+                {"backend": "b", "status": "answered"},
+            ]
+        })));
+        assert!(!research_answered(&json!({
+            "backends": [{"backend": "a", "status": "failed", "reason": "HTTP 503"}]
+        })));
+        assert!(
+            !research_answered(&json!({"backends": []})),
+            "no backends is not an answered backend"
+        );
+    }
+
+    #[test]
+    fn a_research_report_names_the_fetcher_and_every_backend_outcome() {
+        let report = json!({
+            "query": "rust ownership",
+            "fetcher": "http",
+            "fetch_note": "http: plain fetch policy, no escalation",
+            "backends": [
+                {"backend": "duckduckgo", "status": "answered"},
+                {"backend": "mojeek", "status": "failed", "reason": "backend returned HTTP 503"},
+            ],
+            "sources": [
+                {"title": "Alpha", "url": "https://example.test/a", "snippet": "the text", "rank": 0, "rung": "readability"},
+            ],
+            "paid_calls": 0,
+        });
+        let rendered = render_research(&report, false);
+
+        assert!(rendered.contains("rust ownership"), "{rendered}");
+        // The fetcher and its note together: `http` alone on a request that asked for a browser is
+        // exactly the degradation the note records.
+        assert!(
+            rendered.contains("http: plain fetch policy, no escalation"),
+            "the note must be shown beside the fetcher: {rendered}"
+        );
+        assert!(rendered.contains("duckduckgo: answered"), "{rendered}");
+        assert!(
+            rendered.contains("backend returned HTTP 503"),
+            "a backend's reason must be shown, not just its name: {rendered}"
+        );
+        assert!(rendered.contains("1 answered, 1 failed"), "{rendered}");
+        assert!(rendered.contains("Alpha"), "{rendered}");
+        assert!(rendered.contains("https://example.test/a"), "{rendered}");
+        assert!(rendered.contains("readability"), "{rendered}");
+        assert!(!rendered.contains("no backend answered"), "{rendered}");
+    }
+
+    #[test]
+    fn a_research_report_no_backend_answered_says_so_and_still_renders_as_json() {
+        let report = json!({
+            "query": "rust",
+            "fetcher": "http",
+            "fetch_note": "http: plain fetch policy, no escalation",
+            "backends": [{"backend": "mojeek", "status": "failed", "reason": "timed out"}],
+            "sources": [],
+            "paid_calls": 0,
+        });
+        // The line the non-zero exit corresponds to, said out loud rather than left to the status.
+        let rendered = render_research(&report, false);
+        assert!(rendered.contains("no backend answered"), "{rendered}");
+        assert!(
+            rendered.contains("not because the query matched nothing"),
+            "an empty report from an unreachable backend must not read as an empty result set: {rendered}"
+        );
+
+        let as_json = render_research(&report, true);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&as_json).expect("the JSON mode emits JSON");
+        assert_eq!(parsed["query"], "rust");
     }
 }

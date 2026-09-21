@@ -157,7 +157,15 @@ pub struct Extracted {
 }
 
 /// One rung. `None` means "this rung could not do better than the one before it".
-pub trait ExtractionRung {
+///
+/// `Send + Sync` are supertraits, exactly as on [`crate::research::Fetcher`] and
+/// [`crate::backend::SearchBackend`]: a rung lives inside a [`Ladder`], the ladder inside a
+/// `ResearchTask`, and the task is held across an `await` in an async caller. Without the bounds
+/// the trait object is neither, so *every* async caller of the pipeline fails to compile with a
+/// `future is not Send` error that names the route rather than the real cause. A rung is stateless
+/// extraction over a borrowed page, so requiring the bounds costs an implementation nothing and is
+/// what makes the pipeline reachable from a threaded server at all.
+pub trait ExtractionRung: Send + Sync {
     fn rung(&self) -> Rung;
     fn extract(&self, page: &FetchedPage) -> Option<Extracted>;
 }

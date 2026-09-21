@@ -188,6 +188,31 @@ enum Command {
         limit: usize,
     },
 
+    /// Research a question: fan out over the configured backends, fetch and extract the pages they
+    /// point at, and return the citations with what each backend did.
+    ///
+    /// This is the M6 pipeline's command-line caller. Fetching happens in the daemon, through the
+    /// fetcher its fetch mode selected — a `--fetch-mode browser` the host cannot satisfy is refused
+    /// with the missing Chromium named, never quietly served by a plain fetch.
+    Research {
+        /// What to research.
+        query: String,
+
+        /// Maximum number of sources to cite. Omitted means the daemon's default.
+        #[arg(long, value_name = "N")]
+        max_sources: Option<usize>,
+
+        /// How pages are fetched: `http` never launches a browser, `auto` escalates to one for a
+        /// page a plain fetch cannot read, `browser` drives one even for a page it could read.
+        /// Omitted means the daemon's default.
+        #[arg(long, value_name = "MODE")]
+        fetch_mode: Option<String>,
+
+        /// Print the daemon's report as JSON instead of a rendering.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Inspect sandbox profiles.
     Sandbox {
         #[command(subcommand)]
@@ -426,6 +451,26 @@ async fn main() -> Result<()> {
             }
             let report = commands::run_search(&config, &query, limit).await?;
             print!("{}", commands::render_search(&report));
+        }
+
+        Command::Research {
+            query,
+            max_sources,
+            fetch_mode,
+            json,
+        } => {
+            let (client, base) = daemon::connect(&config, cli.daemon.as_deref())?;
+            // The argument-to-request mapping lives in `commands` beside the other renderings, so
+            // the CLI's meaning of a flag is tested without a daemon.
+            let body = commands::research_body(&query, max_sources, fetch_mode.as_deref())?;
+            let outcome = daemon::research(&client, &base, &body).await?;
+            print!("{}", commands::render_research(&outcome, json));
+
+            // A report no backend answered is not a success: the request was served, the research
+            // was not. Exit 1 so a script can gate on it without parsing the prose.
+            if !commands::research_answered(&outcome) {
+                std::process::exit(1);
+            }
         }
 
         Command::Sandbox { command } => match command {
