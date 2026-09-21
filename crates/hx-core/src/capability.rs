@@ -1095,7 +1095,11 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        // Resolve the temp root up front so the paths the assertions build share the same
+        // canonical prefix as `canonicalize_for_check` results. On macOS `$TMPDIR` lives
+        // under /var/folders which itself resolves to /private/var/folders; without this the
+        // expected path (un-prefixed) never equals the canonicalized actual (prefixed).
+        std::fs::canonicalize(&dir).unwrap()
     }
 
     #[cfg(unix)]

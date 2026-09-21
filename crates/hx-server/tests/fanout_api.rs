@@ -302,8 +302,10 @@ async fn a_fan_out_over_http_reaches_n_distinct_members_and_records_each() {
     assert_eq!(totals.input_tokens, 20);
 }
 
-/// Default off over HTTP: a fan-out child names no tools and records none — the child tool loop
-/// is opt-in per spec and the route does not opt in, so the record carries an empty `tools_used`.
+/// Default off over HTTP: a fan-out child does not opt into the tool loop, so the completion is a
+/// plain model answer with a usage row and no tool usage. The record shape has no `tools_used`
+/// member (the tool loop is not part of the fan-out record contract), so completing with a normal
+/// usage row and an answer is what proves the route did not run tools.
 #[tokio::test]
 async fn a_fan_out_without_tools_records_no_tools_used() {
     let state = harness(
@@ -326,10 +328,19 @@ async fn a_fan_out_without_tools_records_no_tools_used() {
     let children = out["children"].as_array().unwrap();
     assert_eq!(children.len(), 1);
     let rec = children[0]["Ran"].as_object().expect("the child ran");
-    assert_eq!(
-        rec["tools_used"],
-        serde_json::Value::Array(vec![]),
-        "no loop ran, so no tools are recorded: {rec:?}"
+    // The tool loop is opt-in and the route does not opt in: no `tools_used` key is recorded,
+    // and the child still answered with a real usage row.
+    assert!(
+        !rec.contains_key("tools_used"),
+        "no tool loop ran, so no tools_used key appears: {rec:?}"
+    );
+    assert!(
+        rec["usage"]["input_tokens"].as_u64().unwrap_or(0) > 0,
+        "the child still performed a model call: {rec:?}"
+    );
+    assert!(
+        rec["answer"].is_string(),
+        "the child produced a plain model answer: {rec:?}"
     );
 }
 
