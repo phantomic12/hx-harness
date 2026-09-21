@@ -339,6 +339,36 @@ mod tests {
         assert_eq!(out.hits, vec![RedactionKind::KnownSecret]);
     }
 
+    /// A standalone hyphenated bearer token (`signed-token-…`, which the notification layer in this
+    /// workspace names as one of "this repo's own bearer tokens") is **not** caught by any pattern — the
+    /// provider-key rule requires an `sk-`/`rk-` prefix, and the bearer-header rule requires the literal
+    /// word `bearer`/`token` directly before the value. This is a deliberate divergence from the
+    /// notification layer, whose whole-word bar (`>=16 alphanumerics, all of alnum|`-`|`_`|`.``)
+    /// would over-redact ordinary long hyphenated prose if applied to arbitrary tool output. The designed and
+    /// documented mechanism for such values is **literal registration from the vault** (see the module doc), and
+    /// this test pins both halves: unregistered it stays visible, registered it masks.
+    #[test]
+    fn a_standalone_hyphenated_bearer_token_is_caught_by_literal_registration_not_by_pattern() {
+        let r = Redactor::new();
+        let token = "signed-token-9f3a2b7c8d1e2f3a4b5c6d7e";
+        // Unregistered: no structural pattern recognizes a standalone hyphenated token.
+        let first = r.redact(&format!("the value is {token} now"));
+        assert!(
+            first.text.contains(token),
+            "the pattern engine does not recognize a standalone hyphenated bearer token; this pins the \
+             current behaviour so a future change is deliberate"
+        );
+        // Registered: the known-secret literal is the designed mechanism, and it masks exactly.
+        let mut r2 = Redactor::new();
+        r2.register(token);
+        let second = r2.redact(&format!("the value is {token} now"));
+        assert!(
+            !second.text.contains(token) && second.hits == vec![RedactionKind::KnownSecret],
+            "got {}",
+            second.text
+        );
+    }
+
     #[test]
     fn longest_literal_wins_so_no_fragment_survives() {
         let mut r = Redactor::new();
