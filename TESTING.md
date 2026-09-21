@@ -1479,7 +1479,7 @@ check matrix. `.github/workflows/ci.yml` runs the first five on every push/PR to
 ## Running the suite
 
 ```bash
-cargo test --workspace --locked   # 1566 tests, 0 failed, 60 ignored live tests
+cargo test --workspace --locked   # 1571 tests, 0 failed, 60 ignored live tests
 cargo test -p hx-store          # 58 — migrations, the transcript, and 4 that reopen the file
 cargo test -p hx-agent          # 63 — the loop's gate, the routed model call, the transcript sink
 cargo test -p hx-tools          # 102 — requirements, bounded output, the two-phase registry, workspace resolution, the trash
