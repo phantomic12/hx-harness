@@ -716,7 +716,12 @@ fn number(value: &Value, field: &str) -> u64 {
 /// Turn an HTTP failure into something the pool can act on.
 ///
 /// The distinction matters upstream: a `429` is "wait and retry", a `401` is "this credential is
-/// dead, bench it", and a `500` is "the provider is having a bad day, try another".
+/// dead, bench it", a `500` is "the provider is having a bad day, try another", and a `400` is
+/// "this request is wrong — another member would refuse it the same way". The last one is why
+/// `hx_provider` uses `HxError::ProviderRejected` for a refused request rather than folding it into
+/// `HxError::Provider` with the 5xx: a pool that cannot tell them apart re-draws a deterministic
+/// failure across every member and turns one error into one per member. A request that was *clamped*
+/// to what the member accepts does not reach here at all — that is what clamping is for.
 pub fn classify_error(
     id: &ProviderId,
     status: u16,
@@ -738,9 +743,10 @@ pub fn classify_error(
         404 => HxError::Provider(format!(
             "{id}: HTTP 404 — the model or the base URL is wrong: {detail}"
         )),
-        400 | 422 => HxError::Provider(format!(
-            "{id}: the request was rejected (HTTP {status}): {detail}"
-        )),
+        400 | 422 => HxError::ProviderRejected {
+            provider: id.to_string(),
+            reason: format!("the request was rejected (HTTP {status}): {detail}"),
+        },
         _ => HxError::Provider(format!("{id}: HTTP {status}: {detail}")),
     }
 }
@@ -1262,6 +1268,39 @@ mod tests {
             message.contains("the model or the base URL is wrong"),
             "{message}"
         );
+    }
+
+    /// A `400` is a refused *request*, not a member that failed: the pool's own rule must read the
+    /// two differently, because one is worth re-drawing onto another member and the other is not.
+    #[test]
+    fn a_refused_request_is_the_pools_rule_for_a_child_failure_not_a_member_death() {
+        let rejected = classify_error(&id(), 400, None, "unknown parameter: reasoning_effort");
+        assert!(
+            matches!(rejected, HxError::ProviderRejected { .. }),
+            "a 400 must not be spelled like a 500: {rejected:?}"
+        );
+        assert!(
+            !hx_core::pool::member_death(&rejected),
+            "every member refuses this request the same way, so re-drawing it makes N errors"
+        );
+        assert!(!rejected.is_retryable(), "{rejected:?}");
+        let message = rejected.to_string();
+        assert!(message.contains("rejected the request"), "{message}");
+        assert!(
+            message.contains("unknown parameter"),
+            "the body is the useful part: {message}"
+        );
+
+        // `422` is the same decision in a different status, and the pair must not diverge.
+        assert!(matches!(
+            classify_error(&id(), 422, None, "unprocessable"),
+            HxError::ProviderRejected { .. }
+        ));
+
+        // The control: a 500 is the member's failure, and the pool's rule says so — this is the
+        // assertion that would pass if every status were folded into `Provider`.
+        let down = classify_error(&id(), 500, None, "upstream on fire");
+        assert!(hx_core::pool::member_death(&down), "{down:?}");
     }
 
     #[test]

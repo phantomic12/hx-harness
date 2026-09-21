@@ -47,6 +47,7 @@
 //! Everything in this module is pure: no network, no filesystem, no clock read by the module itself —
 //! timestamps are handed in, which is what lets the tests script the pool.
 
+use crate::error::HxError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -184,6 +185,37 @@ impl PoolMember {
         }
         out
     }
+}
+
+/// Is this failure the **member's**, or the child's own?
+///
+/// This is the rule a re-route acts on, stated once here — with the pool, which is what health is —
+/// so that a spawner and a re-route cannot drift into two different readings of the same error.
+///
+/// A member failure is what another member's draw can serve, so it **benches this member**. Three
+/// errors are the member's:
+///
+/// - [`HxError::Provider`] — the member did not answer: a 5xx, a timeout, a connection that never
+///   opened, or a 404 saying its own model or base URL is wrong.
+/// - [`HxError::RateLimited`] — this member's quota is spent. Another member has its own.
+/// - [`HxError::ProviderAuth`] — this member's credential was refused, which that variant exists to
+///   say: bench it and try another.
+///
+/// Everything else is the **child's own** failure, and it is deliberately not a member death:
+///
+/// - [`HxError::ProviderRejected`] — the request was refused (a 400/422). Deterministic: every member
+///   refuses it the same way, so re-drawing turns one error into one per member.
+/// - [`HxError::Denied`] — a policy decision, and the same decision on every member.
+/// - [`HxError::Secret`] / [`HxError::Config`] — a reference that does not resolve is a deployment
+///   fault; trying every member with it produces N identical errors and hides the one that matters.
+/// - [`HxError::NoRoute`] — nothing is wired for that member: a configuration fact, not a health one.
+/// - [`HxError::Io`] — a local file or pipe failure is no evidence about a remote member; the
+///   provider clients report a transport failure to a member as [`HxError::Provider`].
+pub fn member_death(err: &HxError) -> bool {
+    matches!(
+        err,
+        HxError::Provider(_) | HxError::RateLimited { .. } | HxError::ProviderAuth { .. }
+    )
 }
 
 /// Why a draw could not return a member.
@@ -572,6 +604,81 @@ mod tests {
             vec![Param::reasoning_effort(ReasoningEffort::Medium)]
         );
         assert!(eff.clamps.is_empty());
+    }
+
+    /// A member that answers with a failure is a member death — the three errors that say the
+    /// *member* (or its credential, or its quota) failed rather than the request.
+    #[test]
+    fn a_failure_of_the_member_is_a_member_death() {
+        // A 5xx, a timeout and a connection that never opened all arrive as `Provider`; a 404 saying
+        // the member's own model or URL is wrong does too.
+        assert!(member_death(&HxError::Provider(
+            "openai-main: HTTP 500".into()
+        )));
+        assert!(member_death(&HxError::Provider(
+            "openai-main: request timed out after 30s".into()
+        )));
+        assert!(member_death(&HxError::Provider(
+            "openai-main: HTTP 404 — the model or the base URL is wrong".into()
+        )));
+        // This member's quota, and this member's credential — both are things another member does
+        // not share.
+        assert!(member_death(&HxError::RateLimited {
+            scope: "openai-main/tpm".into(),
+            retry_after_ms: 1_000,
+        }));
+        assert!(member_death(&HxError::ProviderAuth {
+            provider: "openai-main".into(),
+            reason: "HTTP 401 — the credential was refused".into(),
+        }));
+    }
+
+    /// A failure the child caused is **not** a member death, and this is the pair that keeps a lane
+    /// from turning one error into one per member.
+    #[test]
+    fn a_failure_of_the_request_or_the_child_is_not_a_member_death() {
+        // The 400 this rule exists for: the provider refused the request. Every member refuses it
+        // the same way, so a re-route would repeat it N times.
+        assert!(!member_death(&HxError::ProviderRejected {
+            provider: "openai-main".into(),
+            reason: "the request was rejected (HTTP 400): unknown parameter".into(),
+        }));
+        // A policy denial is the same decision on every member.
+        assert!(!member_death(&HxError::Denied(
+            "writes outside the workspace".into()
+        )));
+        // A credential reference that does not resolve is a deployment fault, not this member's
+        // health — and trying every member with it hides the one error that matters.
+        assert!(!member_death(&HxError::Secret(
+            "no store could resolve vault:pool/a".into()
+        )));
+        // Nothing is wired for that member: a configuration fact.
+        assert!(!member_death(&HxError::NoRoute(
+            "no provider is registered for a".into()
+        )));
+        // A local I/O failure is no evidence about a remote member; the provider clients report a
+        // transport failure to a member as `Provider`, which is a death above.
+        assert!(!member_death(&HxError::Io(std::io::Error::other(
+            "the local pipe closed"
+        ))));
+    }
+
+    /// The pair the whole rule turns on: two failures that both used to be `HxError::Provider` and
+    /// must now be told apart, because one is worth re-drawing and the other is not.
+    #[test]
+    fn the_same_variant_is_not_doing_both_jobs_a_five_hundred_is_a_death_and_a_four_hundred_is_not()
+    {
+        assert!(
+            member_death(&HxError::Provider("HTTP 500".into())),
+            "a member that did not answer is what another member is for"
+        );
+        assert!(
+            !member_death(&HxError::ProviderRejected {
+                provider: "openai-main".into(),
+                reason: "the request was rejected (HTTP 400)".into(),
+            }),
+            "a refused request is not a member failure: retrying it across the pool makes N errors"
+        );
     }
 
     /// Config round-trip: a pool parsed from a config document matches the same pool built from the same
