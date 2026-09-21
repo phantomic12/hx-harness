@@ -1015,7 +1015,17 @@ pub struct AgentConfig {
     pub max_concurrent_subagents: u32,
     #[serde(default = "default_pool_name")]
     pub default_pool: String,
+    /// Bound on how many fan-out children (`POST /v1/fanout`) run at once.
+    ///
+    /// Absent means [`DEFAULT_FANOUT_MAX_PARALLEL`] (4); an explicit `0` is clamped to 1 by the
+    /// fan-out rather than deadlocking a zero-permit semaphore. One knob only: the default
+    /// parallelism is the number of children, bounded by this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fanout_max_parallel: Option<usize>,
 }
+
+/// How many fan-out children run at once when the config names no bound.
+pub const DEFAULT_FANOUT_MAX_PARALLEL: usize = 4;
 
 impl Default for AgentConfig {
     fn default() -> Self {
@@ -1029,6 +1039,7 @@ impl Default for AgentConfig {
             approval: deployment_approval(),
             max_concurrent_subagents: default_concurrent(),
             default_pool: default_pool_name(),
+            fanout_max_parallel: None,
         }
     }
 }
