@@ -1341,9 +1341,13 @@ notification and the live OS dialog all need a desktop session and a display ser
   binding as a warning and still lets the window start. A real compositor binding is not exercised.
 - **Approval notification body** (`src/notification.rs`): `build_approval_notification` names the tool and
   the session, and **never leaks a token or a path outside the workspace** — the summary is redacted
-  per-token by shape (a ≥16-char all-alphanumeric token, or an absolute path that is not under the
-  workspace root), including a token hidden inside a URL's `?token=` or a `key=value` pair where the value is
-  masked while the URL/key structure stays visible. An unknown session is labeled, not omitted. Raising the actual notification (the plugin call) is not exercised.
+  per-token by shape (a ≥16-alphanumeric token made only of alphanumerics plus `-`/`_`/`.`, or an
+  absolute path that is not under the workspace root), including a token hidden inside a URL's `?token=` or a
+  `key=value` pair, where the value is masked while the URL/key structure stays visible. The same shape
+  heuristic is guarded against over-redaction: `?token=abc&other=def` and ordinary words
+  (`stakeholder`, `tokenizer`) pass through untouched, while the deliberate cost — a rare long hyphenated
+  compound like `well-known-pseudorandom-…` reads as token-shaped — is pinned as accepted. An unknown
+  session is labeled, not omitted. Raising the actual notification (the plugin call) is not exercised.
 - **Native file picker decision** (`src/picker.rs`): `decide_picker` turns the dialog's answer into a
   decision — a **cancelled** dialog is a silent keep (not an error, and never reported as one), a chosen
   path is validated against the same rule the rest of the app uses for a workspace root (non-empty and a real
@@ -1356,7 +1360,10 @@ notification and the live OS dialog all need a desktop session and a display ser
 Each assertion was proven to fail by mutating the production code: removing the tray `toggle-window` mapping,
 swallowing a refused hotkey as `Registered`, dropping the token redaction, dropping the path-outside check,
 the URL-`?token=`/`key=value` embedded-token masking (reverting `mask_embedded` put the token back in the body),
-omitting the unknown-session label, treating a cancelled dialog as an error, accepting any chosen path (not
+lowering `is_token_shaped`'s bar made the short-query and ordinary-word over-redaction tests fall, and omitting
+the unknown-session label each turned its specific test red. The shared `hx_secrets::Redactor` is likewise
+pinned **not** to mask the bare word `token` or short query values (proven red when the bearer-header pattern
+was widened to match `token` alone). Treating a cancelled dialog as an error, accepting any chosen path (not
 just a valid directory), swallowing an unavailable dialog, and dropping the `is_dir` workspace-root check each
 turned its specific test red.
 

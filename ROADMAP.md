@@ -668,11 +668,13 @@ promise about how it is used.
     `TRAY_MENU`/`action_for` pair so a renamed or dropped item fails a test; a refused hotkey binding
     surfaces as `Refused` rather than being swallowed; the approval notification names the tool and the
     session and redacts token-shaped values — including one hidden inside a URL's `?token=` or a `key=value`
-    pair — and paths outside the workspace; and the **native file picker** keeps its decision logic
-    (cancel vs not-a-directory vs accept, plus the unavailable-dialog degradation) in a pure,
-    headlessly-tested core with the OS dialog as a thin shell. Each degrades to a working window with a
-    warning rather than failing to start. The tray icon, a live hotkey binding, a raised notification and
-    the live OS dialog are not exercised headlessly — each module's doc says so.
+    pair — and paths outside the workspace, while being guarded **not** to over-redact ordinary text (the word
+    `token`, short query values like `?token=abc`, and words like `stakeholder`/`tokenizer` pass through). The
+    **native file picker** keeps its decision logic (cancel vs not-a-directory vs accept, plus the
+    unavailable-dialog degradation) in a pure, headlessly-tested core with the OS dialog as a thin shell.
+    Each degrades to a working window with a warning rather than failing to start. The tray icon, a live
+    hotkey binding, a raised notification and the live OS dialog are not exercised headlessly — each module's
+    doc says so.
   - ⬜ **The phone-approval exit criterion is still unmet**: approving from a phone lock screen needs
     Mobile (iOS/Android push), which is not reachable from this environment.
   - ⬜ **Mobile (iOS + Android)** — explicitly deferred (needs the Android NDK/SDK and a macOS host for
