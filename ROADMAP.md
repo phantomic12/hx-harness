@@ -491,12 +491,19 @@ report's addendum for the per-finding status and commits.
   canary was checked to *fail* (with a readable sentence) when pointed at a package that does not
   exist, so the pass is evidence rather than a canary that cannot fail. Recorded in TESTING.md. The
   canary stays `#[ignore]`d — it needs a package and a network, so it is not a CI default.
-- ⬜ **Still open, from this item:** the **streamable-HTTP** half of the canary (`HX_MCP_LIVE_URL`) is
-  still unrun: no third-party endpoint is available in this environment, and the HTTP suite's happy
-  path drives `rmcp`'s own server, which this project also built. So the session header, the SSE
-  framing and the `Last-Event-ID` resume are verified against an implementation we did not write but
-  *did* choose, not against a third party. Also unproven by the run: the canary calls one tool with
-  `{}`, so the round-trip is proven and a tool's *arguments* are not.
+- ✅ **Closed, from this item:** the **streamable-HTTP** half of the canary (`HX_MCP_LIVE_URL`) has
+  now been run, unmodified. First against the crate's own server (`hx-mcp-server --http` over a
+  real loopback socket, no token): the client completed a real `initialize` + `tools/list` handshake,
+  published the server's tools namespaced under `live__`, and round-tripped a real `tools/call` as a
+  `ToolOutcome`. Then against a **real third-party server**: the real `secure-filesystem-server` 0.2.0
+  was exposed over streamable HTTP by the `supergateway` HTTP-to-stdio bridge (`--outputTransport
+  streamableHttp`), and the same unmodified canary reached it, completed the handshake over the wire,
+  published its tools and answered a real call. **No defect was found** — the session header, SSE frame
+  and `Last-Event-ID` handling that the suite had only ever verified against a server this project also
+  built hold against a server nobody here wrote. The canary was checked to *fail* (with a readable
+  `Down` sentence) when pointed at an endpoint that is not there. Still unproven by the run: the
+  canary calls one tool with `{}`, so the round-trip is proven and a tool's *arguments* are not.
+  Recorded in TESTING.md. The canary stays `#[ignore]`d — it needs a server and a network.
 - ✅ `rmcp` **server**: expose `hx`'s tools to other agents/IDEs over **stdio only**. The server half
   is `hx-mcp/src/server.rs` plus the `hx-mcp-server` binary: it advertises `hx_tools::ToolRegistry`'s
   tools with the registry's own names and schemas (not hand-written duplicates), and every
