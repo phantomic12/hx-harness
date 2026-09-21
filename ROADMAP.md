@@ -135,8 +135,10 @@ killed an idle daemon while looking like a pass).
   renders the gap rather than the whole history.
 - ✅ **A diff/review pane** — the host directory browser gained a diff view: `POST /v1/diff` takes a
   path plus proposed text, the daemon reads the real file (through the same read-cap gate the file routes
-  use), computes a bounded unified diff and serves it redacted with the shared `hx_secrets::Redactor`,
-  flagging binary files rather than inventing a mangled diff. Still browser-by-eye: the pane's rendering is
+  use), computes a bounded unified diff and serves it redacted with the shared `hx_secrets::Redactor` —
+  including redaction that bridges a credential split across two adjacent added/removed lines so a `sk-` ending
+  one line and its body starting the next cannot smuggle past — flagging binary files rather than inventing a
+  mangled diff. Still browser-by-eye: the pane's rendering is
   not driven by an automated browser here.
 - **Two clients on one session simultaneously** (TUI + browser) — this is the real test that
   the daemon/client split is honest and not cosmetic
@@ -552,7 +554,10 @@ command with a button, receive a cron digest in a separate pinned thread.
     `Fetcher` — the caller the rung exists for — so research extraction and citation can run over
     rendered HTML. The caller honours the rung's guarantees (admission still runs, a refusal surfaces
     as `SearchError::Refused` not an empty body, the body cap and a caller-side timeout also apply,
-    and no browser child leaks on drop or timeout). **It is now selected by a running path**: the
+    and no browser child leaks on drop or timeout). The plain `HttpFetcher`'s transport failures
+    are stripped of the request URL (`transport_error` via `reqwest`'s `without_url`), so a
+    `?token=`/`key=`/`apikey=` credential in a fetched URL cannot reach a `SearchError` the report
+    (and so the model) reads. **It is now selected by a running path**: the
     research path's fetch step (`select_fetcher` and `research_with_fetch_mode`, same file) chooses
     `BrowserFetcher` for the `Auto` mode (plain HTTP first, escalating to Chromium for a page a plain
     fetch cannot read) and for an explicit `Browser` mode, and `HttpFetcher` otherwise. The fallback
