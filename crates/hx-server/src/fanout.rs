@@ -187,8 +187,12 @@ pub async fn run_fan_out(
     // recognisable shape. (This lane's finding: the fan-out used to apply the pattern pass *alone*,
     // and a patternless credential echoed by a dying member reached the HTTP response verbatim.)
     let mut children = Vec::with_capacity(wanted);
-    for spec in &specs {
-        match spawner.run_child(spec, session, "fan-out child").await {
+    // WHY the zip and not a shared string: each child was allocated its own member, and it gets
+    // its own prompt the same way — the fan-out used to run every child on the hardcoded
+    // "fan-out child" prompt, so N lanes did N copies of one piece of work while the outcome
+    // claimed one result per input prompt.
+    for (spec, prompt) in specs.iter().zip(prompts.iter()) {
+        match spawner.run_child(spec, session, prompt).await {
             Ok(record) => children.push(ChildOutcome::Ran(Box::new(record))),
             Err(err) => children.push(ChildOutcome::Errored {
                 member: spec.member_id.clone(),
@@ -258,6 +262,9 @@ mod tests {
     struct ScriptedProvider {
         id: ProviderId,
         fail: bool,
+        /// The prompt text of every call this member received, in order — so a test can prove
+        /// each child ran its own prompt rather than N copies of one shared string.
+        prompts: std::sync::Mutex<Vec<String>>,
     }
 
     impl ScriptedProvider {
@@ -265,10 +272,14 @@ mod tests {
             Self {
                 id: ProviderId::from(id),
                 fail: false,
+                prompts: std::sync::Mutex::new(Vec::new()),
             }
         }
         fn failing(self) -> Self {
             Self { fail: true, ..self }
+        }
+        fn prompts(&self) -> Vec<String> {
+            self.prompts.lock().expect("the prompts lock").clone()
         }
     }
 
@@ -283,7 +294,14 @@ mod tests {
         fn models(&self) -> &[String] {
             &[]
         }
-        async fn complete(&self, _req: ChatRequest, key: &Secret) -> Result<ChatResponse> {
+        async fn complete(&self, req: ChatRequest, key: &Secret) -> Result<ChatResponse> {
+            self.prompts.lock().expect("the prompts lock").push(
+                req.messages
+                    .iter()
+                    .map(|m| m.text())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
             if self.fail {
                 // Simulate a provider that echoes the key it was given in its error body.
                 return Err(HxError::Provider(format!(
@@ -311,6 +329,20 @@ mod tests {
             reg.insert(Arc::new(ScriptedProvider::new(id)));
         }
         Arc::new(reg)
+    }
+
+    /// A registry whose providers are kept, so a test can read back what each member was asked.
+    fn registry_with_providers(
+        ids: &[&str],
+    ) -> (Arc<ProviderRegistry>, Vec<Arc<ScriptedProvider>>) {
+        let mut reg = ProviderRegistry::new();
+        let mut providers = Vec::new();
+        for id in ids {
+            let p = Arc::new(ScriptedProvider::new(id));
+            reg.insert(Arc::clone(&p) as Arc<dyn Provider>);
+            providers.push(p);
+        }
+        (Arc::new(reg), providers)
     }
 
     /// The M8 exit criterion as a test: a fan-out of N requests over a pool of N healthy members
@@ -364,6 +396,32 @@ mod tests {
             };
             assert_eq!(rec.usage.model, rec.model);
         }
+    }
+
+    /// Each child runs its own prompt: the fan-out pairs `prompts[i]` with the i-th allocated
+    /// spec instead of running every child on one shared string. The fixture records what each
+    /// member was actually asked, so N copies of one prompt would show up here as N identical
+    /// entries rather than one result per input.
+    #[tokio::test]
+    async fn each_child_runs_its_own_prompt() {
+        let st = store();
+        let (reg, providers) = registry_with_providers(&["cheap", "strong"]);
+        let mut sp = Spawner::new(
+            hx_core::pool::ModelPool::new(vec![member("cheap"), member("strong")]),
+            reg,
+            secrets_for(&["cheap", "strong"]),
+            st.clone(),
+        );
+        let s = session(&st);
+        let prompts = ["alpha prompt", "bravo prompt"];
+
+        run_fan_out(&mut sp, s.id(), &prompts)
+            .await
+            .expect("two healthy members");
+        // Draw order follows the members vec (pinned by the N-distinct test above): the first
+        // child runs on cheap with the first prompt, the second on strong with the second.
+        assert_eq!(providers[0].prompts(), vec!["alpha prompt".to_string()]);
+        assert_eq!(providers[1].prompts(), vec!["bravo prompt".to_string()]);
     }
 
     /// Each child's model is recorded *with that child* and lands in the store's audit chain, so

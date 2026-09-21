@@ -118,6 +118,13 @@ enum Answer {
         input: u64,
         output: u64,
     },
+    /// Answers with caller-chosen text, so a test can tell the children's conclusions apart
+    /// through the HTTP response.
+    Text {
+        input: u64,
+        output: u64,
+        text: &'static str,
+    },
     /// A 5xx — the member is dead. Its body echoes back the very credential it was handed, which is
     /// what a real provider's auth-debugging error page does.
     Dead,
@@ -127,6 +134,9 @@ struct ScriptedProvider {
     id: ProviderId,
     answer: Answer,
     calls: AtomicUsize,
+    /// The prompt text of every call this member received, in order — so a test can prove each
+    /// child ran its own prompt rather than N copies of one shared string.
+    seen: std::sync::Mutex<Vec<String>>,
     in_flight: Arc<InFlight>,
 }
 
@@ -136,11 +146,15 @@ impl ScriptedProvider {
             id: ProviderId::from(id),
             answer,
             calls: AtomicUsize::new(0),
+            seen: std::sync::Mutex::new(Vec::new()),
             in_flight,
         })
     }
     fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+    fn prompts(&self) -> Vec<String> {
+        self.seen.lock().expect("the seen lock").clone()
     }
 }
 
@@ -155,8 +169,15 @@ impl Provider for ScriptedProvider {
     fn models(&self) -> &[String] {
         &[]
     }
-    async fn complete(&self, _req: ChatRequest, key: &Secret) -> HxResult<ChatResponse> {
+    async fn complete(&self, req: ChatRequest, key: &Secret) -> HxResult<ChatResponse> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.seen.lock().expect("the seen lock").push(
+            req.messages
+                .iter()
+                .map(|m| m.text())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
         self.in_flight.enter();
         // One yield, so a concurrent caller would overlap and a sequential one could not. No clock,
         // no sleep.
@@ -164,6 +185,21 @@ impl Provider for ScriptedProvider {
         let response = match self.answer {
             Answer::Ok { input, output } => Ok(ChatResponse {
                 message: Message::assistant("done"),
+                usage: Usage {
+                    input_tokens: input,
+                    output_tokens: output,
+                    ..Default::default()
+                },
+                finish: FinishReason::Stop,
+                model: self.id.to_string(),
+                raw: None,
+            }),
+            Answer::Text {
+                input,
+                output,
+                text,
+            } => Ok(ChatResponse {
+                message: Message::assistant(text),
                 usage: Usage {
                     input_tokens: input,
                     output_tokens: output,
@@ -501,15 +537,14 @@ async fn a_session_that_does_not_exist_is_refused_before_any_model_call_is_spent
     );
 }
 
-/// Every child's usage is recorded under the **first** child's session; the later `session` fields
-/// are accepted and silently ignored. That is the documented single-session contract of
-/// `run_fan_out` — this test pins it so the web pane's per-row session inputs stay a known cost, not
-/// a surprise.
+/// Children naming different sessions are refused with a 400 before any provider call is
+/// spent: billing one child's work to another child's session is a client error, not a silent
+/// re-bill. (The route used to accept the mix and record everything under the first child's
+/// session; the web pane's per-row session inputs made that a surprise worth refusing.)
 #[tokio::test]
-async fn every_childs_usage_lands_under_the_first_childrens_session_and_later_sessions_are_ignored()
-{
+async fn children_naming_different_sessions_are_refused_before_any_model_call_is_spent() {
     let in_flight = Arc::new(InFlight::default());
-    let reg = registry(
+    let (reg, handles) = registry_with_handles(
         &[
             (
                 "a",
@@ -550,17 +585,82 @@ async fn every_childs_usage_lands_under_the_first_childrens_session_and_later_se
         ],
     };
     let (status, out) = post(state.clone(), body).await;
-    assert_eq!(status, StatusCode::OK, "{out}");
-
-    let under_first = state.store.totals(&first).expect("totals");
-    let under_second = state.store.totals(&second).expect("totals");
     assert_eq!(
-        under_first.provider_calls, 2,
-        "both children are recorded under the first child's session"
+        status,
+        StatusCode::BAD_REQUEST,
+        "mixed sessions must be refused, got {status}: {out}"
+    );
+    assert!(
+        out["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("session"),
+        "the refusal names the problem: {out}"
     );
     assert_eq!(
-        under_second.provider_calls, 0,
-        "the second child's `session` field is unused — the route ignores it"
+        handles[0].calls(),
+        0,
+        "a refusal spends no provider call on the first member"
+    );
+    assert_eq!(
+        handles[1].calls(),
+        0,
+        "a refusal spends no provider call on the second member"
+    );
+}
+
+/// Each child runs its own prompt and each child's conclusion reaches the client: two children
+/// with distinct prompts are asked distinctly and answer distinctly, in request order.
+#[tokio::test]
+async fn each_childs_prompt_runs_and_each_childs_answer_reaches_the_client() {
+    let in_flight = Arc::new(InFlight::default());
+    let (reg, handles) = registry_with_handles(
+        &[
+            (
+                "a",
+                Answer::Text {
+                    input: 10,
+                    output: 5,
+                    text: "alpha says yes",
+                },
+            ),
+            (
+                "b",
+                Answer::Text {
+                    input: 20,
+                    output: 7,
+                    text: "bravo says no",
+                },
+            ),
+        ],
+        Arc::clone(&in_flight),
+    );
+    let state = harness(
+        ModelPool::new(vec![member("a"), member("b")]),
+        reg,
+        secrets_for(&["a", "b"]),
+    )
+    .await;
+    let sid = session(&state.store).as_str().to_string();
+
+    let (status, out) = post(state, body_for(&sid, &["ask alpha", "ask bravo"])).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+
+    // Draw order follows the pool order: the first child runs on "a" with the first prompt.
+    assert_eq!(handles[0].prompts(), vec!["ask alpha".to_string()]);
+    assert_eq!(handles[1].prompts(), vec!["ask bravo".to_string()]);
+
+    let children = out["children"].as_array().expect("children");
+    assert_eq!(children.len(), 2);
+    assert_eq!(
+        children[0]["Ran"]["answer"].as_str(),
+        Some("alpha says yes"),
+        "the first child's conclusion reaches the client: {out}"
+    );
+    assert_eq!(
+        children[1]["Ran"]["answer"].as_str(),
+        Some("bravo says no"),
+        "the second child's conclusion reaches the client: {out}"
     );
 }
 

@@ -47,11 +47,29 @@ use hx_core::error::{HxError, Result};
 use hx_core::ids::{ProviderId, SessionId};
 use hx_core::message::Message;
 use hx_core::pool::{member_death, DrawError, ModelPool, Param, ParamClamp};
-use hx_provider::{ChatRequest, ProviderRegistry};
+use hx_provider::{ChatRequest, ChatResponse, ProviderRegistry};
 use hx_secrets::{Redactor, Secret, SecretStores};
 use hx_store::UsageRecord;
 use serde::Serialize;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// The default deadline for one child's provider call.
+///
+/// WHY the value: the HTTP adapters already bound the network path at 120 s
+/// (`hx_provider::openai::DEFAULT_TIMEOUT`), but an in-process/scripted provider — or a future
+/// streaming adapter that holds the call open — has no such bound, so one stalled member kept its
+/// whole fan-out lane pending forever. The spawner applies the same 120 s at its own layer, so
+/// every child has a deadline no matter which provider serves it. Tests shrink it with
+/// [`Spawner::with_child_timeout`]; production keeps parity with the wire.
+pub const DEFAULT_CHILD_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How much of a child's final assistant message is carried on its record.
+///
+/// WHY a bound: the record is serialized into the fan-out HTTP response and rendered by the web
+/// pane, so an unbounded transcript would turn one verbose child into a multi-megabyte response.
+/// A conclusion fits; a transcript does not — callers that need the full text read the session.
+pub const MAX_ANSWER_CHARS: usize = 4_000;
 
 /// A child, as chosen at spawn: the model it will run on, its endpoint, its credential
 /// **reference**, and the parameters (with their clamps) that will be sent.
@@ -99,6 +117,38 @@ fn redact_death_reason(key: &Secret, err: &HxError) -> String {
     redactor.redact(&err.to_string()).text
 }
 
+/// Copy the spec's effective (clamped) parameters onto the provider request.
+///
+/// WHY a separate step: `build_spec` clamps at draw time so a member that rejects a kind never
+/// reaches the wire with it — but the clamp lived only on the spec, and `ChatRequest` had no
+/// field for it, so neither the clamped value nor any accepted value was ever sent. Every pool
+/// [`Param`] kind the request shape supports is mapped here; a kind with no wire field stays on
+/// the spec (recorded, not sent) rather than failing the call.
+fn apply_params(mut request: ChatRequest, params: &[Param]) -> ChatRequest {
+    for param in params {
+        match *param {
+            Param::ReasoningEffort { effort } => {
+                request = request.with_reasoning_effort(effort);
+            }
+        }
+    }
+    request
+}
+
+/// The child's final answer text, bounded and redacted for the record.
+///
+/// WHY both: the record is serialized into the fan-out HTTP response, so it carries at most
+/// [`MAX_ANSWER_CHARS`] chars of the assistant message (callers needing the full text read the
+/// session); and the text is passed through the same literal+pattern redaction as a death reason,
+/// because a model can echo a credential-bearing snippet of its own prompt back into its answer.
+fn final_answer(message: &Message, key: &Secret) -> String {
+    let text = message.text();
+    let bounded: String = text.chars().take(MAX_ANSWER_CHARS).collect();
+    let mut redactor = Redactor::new();
+    redactor.register(key.expose());
+    redactor.redact(&bounded).text
+}
+
 /// The spawner that draws children from a model pool.
 ///
 /// Owns the pool (and its health state), and the provider resolution, secret resolution and store it
@@ -108,6 +158,7 @@ pub struct Spawner {
     providers: Arc<ProviderRegistry>,
     secrets: Arc<SecretStores>,
     store: Arc<hx_store::Store>,
+    child_timeout: Duration,
 }
 
 impl Spawner {
@@ -122,7 +173,17 @@ impl Spawner {
             providers,
             secrets,
             store,
+            child_timeout: DEFAULT_CHILD_TIMEOUT,
         }
+    }
+
+    /// Shrink (or grow) the deadline for one child's provider call.
+    ///
+    /// WHY a builder: the production default matches the wire adapters' own 120 s, but a test
+    /// that scripts a hanging provider cannot wait two minutes to prove the deadline fires.
+    pub fn with_child_timeout(mut self, timeout: Duration) -> Self {
+        self.child_timeout = timeout;
+        self
     }
 
     /// Draw a healthy member and clamp the requested parameters to it, producing the child's spec.
@@ -147,7 +208,11 @@ impl Spawner {
     ///
     /// The provider is resolved by the **drawn member's id** and the request is built with the
     /// **drawn member's** model, so the recorded [`UsageRecord`]'s `model` is the member this spec
-    /// drew — not the first member, not a global. On a failed call the member is marked down, so the
+    /// drew — not the first member, not a global. The request also carries the spec's effective
+    /// (clamped) parameters, so a member that accepts a kind receives it. The call runs under the
+    /// spawner's child deadline: a member that never answers is a dead member, marked down like
+    /// any other 5xx/timeout, and the returned [`ChildRecord`] carries the child's final answer
+    /// text. On a failed call the member is marked down, so the
     /// next [`Self::build_spec`] draws from a healthy member. This is the narrow one-shot form; for a
     /// run that **re-routes onto a healthy member when the drawn one dies**, use [`Self::run_lane`].
     pub async fn run_child(
@@ -165,8 +230,11 @@ impl Spawner {
             .resolve_str(&spec.credential)
             .map_err(|err| hx_core::error::HxError::Secret(err.to_string()))?;
 
-        let request = ChatRequest::new(spec.model(), vec![Message::user(prompt)]);
-        let response = match provider.complete(request, &key).await {
+        let request = apply_params(
+            ChatRequest::new(spec.model(), vec![Message::user(prompt)]),
+            &spec.params,
+        );
+        let response = match self.complete_with_deadline(&*provider, request, &key).await {
             Ok(response) => response,
             Err(err) => {
                 self.pool
@@ -194,7 +262,32 @@ impl Spawner {
             usage: record,
             base_url: spec.base_url.clone(),
             dead_members: Vec::new(),
+            answer: final_answer(&response.message, &key),
         })
+    }
+
+    /// One provider call under the spawner's child deadline.
+    ///
+    /// WHY here and not in the adapters: the adapters bound only their own HTTP path, while the
+    /// spawner is the layer that decides what a stalled member *means*. A call that outlives the
+    /// deadline is reported as [`HxError::Provider`] — the same variant the adapters use for a
+    /// wire timeout — so [`member_death`] classifies it as a death: the member is marked down and
+    /// its siblings still run. A bare `Elapsed` would bypass that rule and read as an internal
+    /// spawner fault instead of a dead member.
+    async fn complete_with_deadline(
+        &self,
+        provider: &dyn hx_provider::Provider,
+        request: ChatRequest,
+        key: &Secret,
+    ) -> Result<ChatResponse> {
+        let deadline = self.child_timeout;
+        match tokio::time::timeout(deadline, provider.complete(request, key)).await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(HxError::Provider(format!(
+                "the provider call timed out after {:?}: the member never answered",
+                deadline
+            ))),
+        }
     }
 
     /// Redact a child's failure reason for a **caller** — registering the member's own resolved
@@ -285,8 +378,11 @@ impl Spawner {
                 .resolve_str(&spec.credential)
                 .map_err(|err| hx_core::error::HxError::Secret(err.to_string()))?;
 
-            let request = ChatRequest::new(spec.model(), vec![Message::user(prompt)]);
-            match provider.complete(request, &key).await {
+            let request = apply_params(
+                ChatRequest::new(spec.model(), vec![Message::user(prompt)]),
+                &spec.params,
+            );
+            match self.complete_with_deadline(&*provider, request, &key).await {
                 Ok(response) => {
                     let usage = response.usage;
                     let record = UsageRecord::new(
@@ -306,6 +402,7 @@ impl Spawner {
                         usage: record,
                         base_url: spec.base_url.clone(),
                         dead_members,
+                        answer: final_answer(&response.message, &key),
                     });
                 }
                 Err(err) => {
@@ -366,6 +463,14 @@ pub struct ChildRecord {
     /// This is the audit half of a re-route: it shows both the member that died *and* the member that
     /// finished, so a model switch is never silent.
     pub dead_members: Vec<(String, String)>,
+    /// The child's final assistant message text, bounded to [`MAX_ANSWER_CHARS`] chars and run
+    /// through the member-key redaction.
+    ///
+    /// WHY a field and not the store: usage rows carry cost, not conclusions — without this, every
+    /// child that ran had its model output discarded (`response.message` was dropped after usage
+    /// was read off it) and `POST /v1/fanout` could report *that* children ran but never *what*
+    /// they concluded. The bound keeps the fan-out response a summary, not a transcript dump.
+    pub answer: String,
 }
 
 #[cfg(test)]
@@ -374,7 +479,7 @@ mod tests {
     use async_trait::async_trait;
     use hx_core::config::ProviderKind;
     use hx_core::error::{HxError, Result};
-    use hx_core::pool::{MemberHealth, PoolMember, ReasoningEffort};
+    use hx_core::pool::{member_death, MemberHealth, PoolMember, ReasoningEffort};
     use hx_provider::{Provider, Usage};
     use hx_secrets::FixedSecrets;
     use hx_store::NewSession;
@@ -421,6 +526,10 @@ mod tests {
         /// A secret-resolution failure reported by the provider/client — a deployment fact,
         /// not this member's health, so it must not re-route.
         Secret,
+        /// Never answers — the spawner's child deadline is the only thing that can end the
+        /// call. A provider that hangs without a deadline keeps its whole fan-out lane
+        /// pending forever.
+        Hang,
     }
 
     /// A provider that answers without a network. The id is the member it stands in for.
@@ -434,6 +543,9 @@ mod tests {
         /// trap: a fixture whose echo is the id cannot tell a record that took its model from the
         /// drawn member from one that took it from the response.
         echoes: Option<String>,
+        /// The assistant text the provider answers with. `"done"` by default; tests that assert
+        /// the record carries the answer override it.
+        answer: String,
         seen: std::sync::Mutex<Vec<Seen>>,
     }
 
@@ -443,6 +555,18 @@ mod tests {
                 id: ProviderId::from(id),
                 err: ScriptedErr::None,
                 echoes: None,
+                answer: "done".to_string(),
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        /// A provider that answers with the given assistant text instead of `"done"`.
+        fn answering(id: &str, answer: &str) -> Arc<Self> {
+            Arc::new(Self {
+                id: ProviderId::from(id),
+                err: ScriptedErr::None,
+                echoes: None,
+                answer: answer.to_string(),
                 seen: std::sync::Mutex::new(Vec::new()),
             })
         }
@@ -452,6 +576,18 @@ mod tests {
                 id: self.id.clone(),
                 err: ScriptedErr::Die,
                 echoes: self.echoes.clone(),
+                answer: self.answer.clone(),
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        /// A provider that never answers, so the test proves the spawner's deadline fires.
+        fn hanging(self: &Arc<Self>) -> Arc<Self> {
+            Arc::new(Self {
+                id: self.id.clone(),
+                err: ScriptedErr::Hang,
+                echoes: self.echoes.clone(),
+                answer: self.answer.clone(),
                 seen: std::sync::Mutex::new(Vec::new()),
             })
         }
@@ -462,6 +598,7 @@ mod tests {
                 id: self.id.clone(),
                 err: self.err,
                 echoes: Some(model.to_string()),
+                answer: self.answer.clone(),
                 seen: std::sync::Mutex::new(Vec::new()),
             })
         }
@@ -584,6 +721,13 @@ mod tests {
                         "no store could resolve the credential reference".to_string(),
                     ))
                 }
+                ScriptedErr::Hang => {
+                    // Never resolves: the spawner's child deadline must end this call.
+                    // If the deadline is removed, the test's own outer timeout fails
+                    // instead of hanging the suite forever.
+                    std::future::pending::<()>().await;
+                    unreachable!("a hung provider never answers");
+                }
                 ScriptedErr::None => {}
             }
             let usage = Usage {
@@ -592,7 +736,7 @@ mod tests {
                 ..Default::default()
             };
             Ok(hx_provider::ChatResponse {
-                message: hx_core::message::Message::assistant("done"),
+                message: hx_core::message::Message::assistant(self.answer.clone()),
                 usage,
                 finish: hx_provider::FinishReason::Stop,
                 model: self.echoes.clone().unwrap_or_else(|| self.id.to_string()),
@@ -877,16 +1021,12 @@ mod tests {
         );
     }
 
-    /// DEFECT (verify-spawner): the clamped parameters never reach the provider call.
-    ///
-    /// The module doc says `run_child` makes its call "with the **clamped** parameters", and that the
-    /// clamp applied at spawn "is what prevents the `HTTP 400`". It does not: `hx-provider`'s
-    /// `ChatRequest` has no field for a pool `Param`, and `run_child` fills none, so a parameter a
-    /// member would reject is never sent — and neither is one it would accept. The clamp is recorded
-    /// on the spec and on the record and stops there. Un-ignore this when `ChatRequest` grows the
-    /// field and `run_child` sets it from `spec.params`.
+    /// The clamped parameter reaches the provider call: `run_child` copies the spec's effective
+    /// params onto the `ChatRequest` (whose `reasoning_effort` field the OpenAI-compatible adapter
+    /// serializes), so a member that accepts the kind receives the clamped value. The `Debug` of
+    /// the request the provider was handed names the parameter — a provider that was never told
+    /// cannot have its `Debug` mention it.
     #[tokio::test]
-    #[ignore = "the clamped parameters do not reach the request: hx-provider's ChatRequest has no field for a pool Param"]
     async fn the_clamped_parameter_reaches_the_provider_call() {
         let (reg, provider) = registry_and_provider("strong");
         let st = store();
@@ -906,10 +1046,128 @@ mod tests {
 
         let seen = provider.seen();
         assert_eq!(seen.len(), 1);
+        // The *clamped* value (Low), not the requested one (High): the member accepts only
+        // Low, so a request carrying High would prove the clamp was bypassed, and a request
+        // carrying neither would prove the old defect (the clamp stopping at the spec).
         assert!(
-            seen[0].request.contains("reasoning_effort"),
-            "the clamped parameter must reach the request the provider is handed: {}",
+            seen[0].request.contains("Low"),
+            "the clamped value must reach the request the provider is handed: {}",
             seen[0].request
+        );
+        assert!(
+            !seen[0].request.contains("High"),
+            "the unclamped request must not reach the provider: {}",
+            seen[0].request
+        );
+    }
+
+    /// A member that never answers dies by the spawner's deadline: the child fails with a
+    /// provider timeout — a member death, so the member is marked down and the next draw
+    /// passes it over — and the call takes milliseconds, not forever.
+    #[tokio::test]
+    async fn a_child_that_never_answers_dies_by_deadline_and_marks_its_member_down() {
+        let hanging = ScriptedProvider::new("stall").hanging();
+        let mut reg = ProviderRegistry::new();
+        reg.insert(hanging);
+        reg.insert(ScriptedProvider::new("live"));
+        let st = store();
+        let mut pen = Spawner::new(
+            ModelPool::new(vec![member("stall", &[]), member("live", &[])]),
+            Arc::new(reg),
+            secrets_for("stall"),
+            st.clone(),
+        )
+        .with_child_timeout(Duration::from_millis(50));
+        let spec = pen.build_spec(&[]).expect("draws");
+        assert_eq!(spec.member_id, "stall");
+        let s = session(&st);
+        // The outer timeout is the backstop: if the child deadline is removed, this fails
+        // the test in seconds instead of hanging the suite forever.
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(5), pen.run_child(&spec, s.id(), "hi"))
+                .await
+                .expect("the child deadline must fire long before the test timeout");
+        let err = outcome.expect_err("a hung member fails its child");
+        assert!(
+            err.to_string().contains("timed out"),
+            "the failure names the deadline: {err}"
+        );
+        assert!(
+            member_death(&err),
+            "a timeout is a member death, not a spawner fault: {err:?}"
+        );
+        let next = pen.build_spec(&[]).expect("the live member still draws");
+        assert_eq!(next.member_id, "live", "the stalled member was marked down");
+    }
+
+    /// The child's answer reaches its record: a provider that concludes with its own text
+    /// has that text on the record — the model output is carried, not discarded.
+    #[tokio::test]
+    async fn a_childs_answer_reaches_its_record() {
+        let provider = ScriptedProvider::answering("strong", "the conclusion is qed");
+        let mut reg = ProviderRegistry::new();
+        reg.insert(provider);
+        let st = store();
+        let mut pen = Spawner::new(
+            ModelPool::new(vec![member("strong", &[])]),
+            Arc::new(reg),
+            secrets_for("strong"),
+            st.clone(),
+        );
+        let spec = pen.build_spec(&[]).expect("draws");
+        let s = session(&st);
+        let rec = pen.run_child(&spec, s.id(), "hi").await.expect("runs");
+        assert_eq!(rec.answer, "the conclusion is qed");
+    }
+
+    /// The carried answer is bounded: a verbose child does not turn the fan-out response into a
+    /// multi-kilobyte transcript dump. (The bound applies before redaction, whose placeholders
+    /// can expand the text again — redaction is pinned by the next test.)
+    #[tokio::test]
+    async fn a_carried_answer_is_bounded() {
+        let verbose = "lorem ipsum ".repeat(1_000);
+        let provider = ScriptedProvider::answering("strong", &verbose);
+        let mut reg = ProviderRegistry::new();
+        reg.insert(provider);
+        let st = store();
+        let mut pen = Spawner::new(
+            ModelPool::new(vec![member("strong", &[])]),
+            Arc::new(reg),
+            secrets_for("strong"),
+            st.clone(),
+        );
+        let spec = pen.build_spec(&[]).expect("draws");
+        let s = session(&st);
+        let rec = pen.run_child(&spec, s.id(), "hi").await.expect("runs");
+        assert_eq!(
+            rec.answer.chars().count(),
+            MAX_ANSWER_CHARS,
+            "the carried answer is a summary, not a transcript dump"
+        );
+    }
+
+    /// The carried answer is redacted: a child that echoes its own credential does not smuggle
+    /// a live key into the fan-out response.
+    #[tokio::test]
+    async fn a_carried_answer_is_redacted() {
+        // `secrets_for` resolves this member's credential to "sentinel".
+        let provider = ScriptedProvider::answering("strong", "the key is sentinel, echoed back");
+        let mut reg = ProviderRegistry::new();
+        reg.insert(provider);
+        let st = store();
+        let mut pen = Spawner::new(
+            ModelPool::new(vec![member("strong", &[])]),
+            Arc::new(reg),
+            secrets_for("strong"),
+            st.clone(),
+        );
+        let spec = pen.build_spec(&[]).expect("draws");
+        let s = session(&st);
+        let rec = pen.run_child(&spec, s.id(), "hi").await.expect("runs");
+        assert!(
+            !rec.answer.contains("sentinel"),
+            "the echoed credential is redacted out of the carried answer: {}",
+            rec.answer
         );
     }
 
@@ -965,6 +1223,7 @@ mod tests {
                 id: ProviderId::from(id),
                 err,
                 echoes: None,
+                answer: "done".to_string(),
                 seen: std::sync::Mutex::new(Vec::new()),
             }));
         }
