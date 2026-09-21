@@ -23,3 +23,8 @@ futures.workspace = true
 tracing.workspace = true
 url.workspace = true
 regex.workspace = true
+
+[dev-dependencies]
+# The live browser canary serves its page from a loopback listener and needs a scratch pool root
+# that cleans itself up. Already in the workspace lock (via `hx-browser`), so no new crate.
+tempfile.workspace = true
