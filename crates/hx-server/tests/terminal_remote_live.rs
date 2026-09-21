@@ -184,6 +184,7 @@ hosts:
         models: Arc::new(Dead(Arc::new(DeadModel))),
         tools: Arc::new(hx_server::chat::default_tools(vec![], client)),
         approvals: ApprovalQueue::new(std::time::Duration::from_secs(1)),
+        phone: None,
         search: Arc::new(search),
         sandboxes: None,
         sandbox_unavailable_reason: Some("no container engine in a test".to_string()),

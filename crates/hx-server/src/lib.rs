@@ -20,6 +20,7 @@ pub mod chat;
 pub mod diff;
 pub mod fanout;
 pub mod hosts;
+pub mod phone;
 pub mod remote_sandbox;
 pub mod routes;
 pub mod sandbox;

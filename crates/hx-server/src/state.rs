@@ -66,6 +66,11 @@ pub struct AppState {
     /// a client asks "what is waiting for *this* session" rather than being shown every prompt on the
     /// machine.
     pub approvals: Arc<ApprovalQueue>,
+    /// The phone/lock-screen approval push, when `config.approval.push_url` is set.
+    ///
+    /// `None` when no webhook is configured: a daemon that names no push posts nothing, and the respond
+    /// route refuses every token (there is nothing for a token to authorise). See [`crate::phone`].
+    pub phone: Option<Arc<crate::phone::PhoneApprover>>,
     pub search: Arc<BackendRegistry>,
     /// One lock per session, held for the duration of a run: two requests on one session would
     /// otherwise interleave into a transcript neither of them wrote.
@@ -115,6 +120,8 @@ pub struct AppStateParts {
     pub models: Arc<dyn crate::chat::ModelFactory>,
     pub tools: Arc<ToolRegistry>,
     pub approvals: Arc<ApprovalQueue>,
+    /// The phone approval push, or `None`. See [`AppState::phone`].
+    pub phone: Option<Arc<crate::phone::PhoneApprover>>,
     pub search: Arc<BackendRegistry>,
     pub sandboxes: Option<Arc<SandboxManager>>,
     pub sandbox_unavailable_reason: Option<String>,
@@ -194,6 +201,19 @@ impl AppState {
             crate::chat::DEFAULT_APPROVAL_WAIT_SECS,
         ));
 
+        // The phone push, enabled only when a webhook is configured. `respond_base` is the daemon's
+        // public origin; a daemon without one cannot build a `respond_url`, so on the loopback default
+        // the push is off unless the operator names a base. The wait matches the queue's, so a phone that
+        // answers wins the same race a queue client would.
+        let phone = config.approval.push_url.as_ref().map(|push_url| {
+            let respond_base = crate::phone::origin_of(&config.daemon.http_addr);
+            crate::phone::PhoneApprover::new(
+                push_url.clone(),
+                respond_base,
+                std::time::Duration::from_secs(crate::chat::DEFAULT_APPROVAL_WAIT_SECS),
+            )
+        });
+
         let (sandboxes, sandbox_unavailable_reason) = match hx_sandbox::docker_manager(
             config.agent.max_concurrent_subagents as usize,
         )
@@ -222,6 +242,7 @@ impl AppState {
             models,
             tools,
             approvals,
+            phone,
             search,
             sandboxes,
             sandbox_unavailable_reason,
@@ -242,6 +263,7 @@ impl AppState {
             models: parts.models,
             tools: parts.tools,
             approvals: parts.approvals,
+            phone: parts.phone,
             search: parts.search,
             chats: Mutex::new(HashMap::new()),
             terminals: Arc::new(crate::terminal::Terminals::new()),

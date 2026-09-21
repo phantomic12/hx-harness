@@ -503,6 +503,7 @@ async fn harness_with(config_yaml: &str, replies: Vec<Result<ChatResponse>>) -> 
         // Long enough for the test to answer from another request, which is the shape a real client
         // has: the run waits while the answer comes in over the same surface.
         approvals: ApprovalQueue::new(std::time::Duration::from_secs(1)),
+        phone: None,
         search: Arc::new(search),
         sandboxes: None::<Arc<SandboxManager>>,
         sandbox_unavailable_reason: Some("no container engine in a test".to_string()),
