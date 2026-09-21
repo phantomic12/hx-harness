@@ -34,6 +34,7 @@ pub mod router;
 pub mod telegram;
 pub mod telegram_stream;
 pub mod types;
+pub mod webhook;
 
 pub use bridge::{AnswerOutcome, AnswerSource, AnsweringChannel, ApprovalBridge, ChannelApprover};
 pub use connector::Connector;

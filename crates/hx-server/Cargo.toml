@@ -13,6 +13,7 @@ hx-sandbox.workspace = true
 hx-remote.workspace = true
 hx-secrets.workspace = true
 hx-agent.workspace = true
+hx-gateway.workspace = true
 hx-tools.workspace = true
 hx-store.workspace = true
 axum.workspace = true

@@ -103,6 +103,12 @@ pub struct AppState {
     /// configuration that never starts on any other. The check that makes that true is
     /// [`hx_core::api_auth::require_token_for_bind`], called by `hxd` before it binds.
     pub api_token: Option<hx_core::api_auth::ApiToken>,
+    /// The generic webhook connectors' push endpoints and verification tokens, keyed by connector id.
+    ///
+    /// Populated from `config.connectors` with `kind: webhook`; each registers a token and the
+    /// sender end of the channel the matching `hx-gateway::WebhookConnector` reads from, so
+    /// `POST /v1/connectors/{id}/webhook` can be authenticated and pushed in one place.
+    pub webhooks: crate::webhook::WebhookRegistry,
 }
 
 /// Everything [`AppState::build`] assembles, so a test can assemble it differently.
@@ -123,6 +129,12 @@ pub struct AppStateParts {
     /// wants the authenticated surface passes one here; a test that does not passes `None`, which
     /// is the same thing a default-config daemon does.
     pub api_token: Option<hx_core::api_auth::ApiToken>,
+    /// The generic webhook connectors' push endpoints and verification tokens.
+    ///
+    /// Populated from `config.connectors` with `kind: webhook`: each registers a token and a channel
+    /// that its `hx_gateway::WebhookConnector` reads from. A webhook connector with no configured
+    /// secrets still registers — the [`crate::webhook`] route fails closed on an unknown id.
+    pub webhooks: crate::webhook::WebhookRegistry,
 }
 
 impl AppState {
@@ -213,6 +225,34 @@ impl AppState {
             Arc::clone(&secrets),
         ));
 
+        // M5's webhook half: every `kind: webhook` connector is registered once here, so
+        // `POST /v1/connectors/{id}/webhook` can authenticate against its own token and push into the
+        // channel the runtime `hx-gateway::WebhookConnector` reads from. A token that cannot be
+        // resolved is a **startup failure** — a webhook route with no verifiable token would push into the
+        // harness from anyone who guesses a URL, which is the exposure the per-connector token exists to
+        // close. See `crate::webhook`.
+        let mut webhooks = crate::webhook::WebhookRegistry::default();
+        for (id, connector) in &config.connectors {
+            if connector.kind != hx_core::config::ConnectorKind::Webhook {
+                continue;
+            }
+            let Some(token_ref) = connector.token.as_deref() else {
+                return Err(HxError::Config(format!(
+                    "webhook connector '{id}' has no `token`; a webhook needs a bearer token to \
+                     verify its callers, so this is a startup error, not a route left open"
+                )));
+            };
+            let secret = secrets.resolve_str(token_ref).map_err(|err| {
+                HxError::Config(format!(
+                    "webhook connector '{id}' references a token that cannot be resolved: {err}"
+                ))
+            })?;
+            webhooks.register(
+                &hx_core::ids::ConnectorId::from(id.clone()),
+                hx_core::api_auth::ApiToken::new(secret.expose()),
+            );
+        }
+
         Ok(Self::from_parts(AppStateParts {
             config,
             router,
@@ -227,6 +267,7 @@ impl AppState {
             sandbox_unavailable_reason,
             started_at: now,
             api_token,
+            webhooks,
         }))
     }
 
@@ -256,6 +297,7 @@ impl AppState {
             sandbox_unavailable_reason: parts.sandbox_unavailable_reason,
             vault_unlocked: false,
             api_token: parts.api_token,
+            webhooks: parts.webhooks,
         })
     }
 

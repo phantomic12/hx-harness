@@ -611,6 +611,10 @@ pub enum ConnectorKind {
     Slack,
     Matrix,
     Email,
+    /// A generic webhook connector: a remote chat platform pushes inbound events here via an
+    /// HTTP `POST` to `/v1/connectors/{id}/webhook`, authenticated with a per-connector bearer
+    /// token, and the connector hands them to the harness the way a long-poll connector does.
+    Webhook,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -620,6 +624,13 @@ pub struct ConnectorConfig {
     /// `vault:` reference to the bot token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// The base URL to `POST` outbound replies to, for a connector that supports replies at all.
+    ///
+    /// A webhook-only channel may not support replies; absent means `deliver`/`ask` **fail closed**
+    /// rather than dropping output silently. A generic webhook that does support replies names an endpoint
+    /// here and the connector posts to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_url: Option<String>,
     /// Allowlist of platform user/chat ids. Empty means deny everyone (fail closed).
     #[serde(default)]
     pub allow_from: Vec<String>,
@@ -1107,6 +1118,42 @@ connectors:
     token: "vault:telegram/bot"
     allow_from: ["12345"]
 "#;
+
+    #[test]
+    fn a_webhook_connector_parses_with_an_optional_outbound_url() {
+        // The webhook half of M5: a generic push connector, token-authenticated, that may or may not
+        // support outbound replies. The `outbound_url` is optional precisely so a webhook-only channel that
+        // cannot reply is an honest configuration rather than a missing field.
+        let yaml = r#"
+connectors:
+  main-web:
+    kind: webhook
+    token: "vault:webhook/token"
+    outbound_url: "https://reply.example.com/hooks/main-web"
+    allow_from: ["abc"]
+  push-only:
+    kind: webhook
+    token: "vault:webhook/push"
+"#;
+        let c = Config::from_yaml(yaml).expect("webhook connectors must parse");
+        assert_eq!(c.connectors["main-web"].kind, ConnectorKind::Webhook);
+        assert_eq!(
+            c.connectors["main-web"].outbound_url.as_deref(),
+            Some("https://reply.example.com/hooks/main-web")
+        );
+        assert_eq!(
+            c.connectors["push-only"].outbound_url, None,
+            "a webhook-only channel has no outbound endpoint"
+        );
+
+        // And an existing telegram connector still parses with no outbound_url at all: the field is
+        // additive, so a config that never heard of it is unchanged.
+        let old = Config::from_yaml(
+            "connectors:\n  main-tg:\n    kind: telegram\n    token: \"vault:telegram/bot\"\n",
+        )
+        .expect("a telegram connector without outbound_url still parses");
+        assert_eq!(old.connectors["main-tg"].outbound_url, None);
+    }
 
     #[test]
     fn documented_config_parses() {

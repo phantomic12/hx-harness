@@ -334,7 +334,8 @@ CIDR or raw IP — is still refused, with a reason naming the way out.*
 - ✅ **Telegram (long-poll) connector** — the first real connector, proving the trait over the actual Bot
   API with a hermetic HTTP stub (`tests/telegram_http.rs`). Long-poll with advancing offset, message
   and button-callback parsing, and the `Coalescer` primitive for streaming via coalesced `editMessageText`.
-  **Not landed here:** the webhook half.
+  **Not landed here:** the daemon-side receive loop that drives `Connector::receive` per channel (that is
+  the integration surface that turns a connector *into* a live chat bridge); see M5's "not here" notes later.
 - ✅ **Telegram streaming via coalesced `editMessageText`** — the driver that wires a model's token
   stream to those calls (`crates/hx-gateway/src/telegram_stream.rs`): the first chunk writes immediately
   (an empty screen while a model thinks is the worst of both worlds), later writes wait for a unit of new
@@ -349,6 +350,19 @@ CIDR or raw IP — is still refused, with a reason naming the way out.*
   very fast model can still outrun Telegram's per-chat edit rate (community-observed at roughly one per
   second; the Bot API documents no number). When it does, the `429` path keeps the run correct and the
   display lags while generation does not.
+- ✅ **Generic webhook connector** (`crates/hx-gateway/src/webhook.rs` + `crates/hx-server/src/webhook.rs`) —
+  the **push** half of M5, complementing Telegram's long-poll. A webhook connector holds a
+  `tokio::sync::mpsc` receiver and implements `Connector` exactly like Telegram: `receive` yields what
+  the route pushed, and `deliver`/`ask` `POST` outbound replies to an optional `outbound_url`,
+  **failing closed** when none is set (a webhook-only channel that cannot reply is an error, not a silent
+  drop). The HTTP surface (`POST /v1/connectors/{id}/webhook`) authenticates against the **connector's
+  own** bearer token — it is exempt from the daemon's global middleware because a remote platform holds only its
+  own key — and fails closed: unknown id `404`, missing/wrong token `401` (byte-identical), malformed
+  body `400`. Config: a `ConnectorConfig` with `kind: webhook`, a required `token`, and an optional
+  `outbound_url`. A configured webhook connector whose token cannot be resolved is a **startup failure**.
+  Proven by `tests/webhook_connector.rs` (hermetic) and `tests/webhook_api.rs` (through the server).
+  **Not here:** the daemon-side receive loop that drives `Connector::receive` per channel (the last umbrella
+  "not here" below).
 - ✅ **A button answer resumes the run** (`crates/hx-gateway/src/bridge.rs`) — the gap this milestone
   was actually missing. A question posted to a channel is waited on under its conversation; a tap comes
   back through the long-poll as `Inbound::ApprovalAnswer`, is matched to **the question its button

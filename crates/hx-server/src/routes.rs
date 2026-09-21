@@ -105,6 +105,9 @@ pub fn app(state: Arc<AppState>) -> Router {
         // model pool (see `crate::fanout`). It is gated by the same bearer token as everything
         // else on this router.
         .route("/v1/fanout", post(fanout))
+        // M5's webhook half: external platforms `POST` inbound events here, authenticated by their
+        // own per-connector bearer token rather than the daemon's (see `crate::auth::is_webhook_route`).
+        .merge(crate::webhook::routes())
         .with_state(state)
         // Applied last, so it wraps every route including the WebSocket upgrades. `from_fn_with_state`
         // rather than `from_fn`: the token lives on `AppState`, and reading it from a request

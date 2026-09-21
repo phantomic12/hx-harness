@@ -230,14 +230,15 @@ async fn harness() -> Option<(Arc<AppState>, std::path::PathBuf, tempfile::TempD
         store: Arc::new(store),
         models: Arc::new(Scripted(model)),
         tools: Arc::new(hx_server::chat::default_tools(vec![], client)),
-        approvals: ApprovalQueue::new(std::time::Duration::from_secs(1)),
-        search: Arc::new(search),
+                approvals: ApprovalQueue::new(std::time::Duration::from_secs(1)),
+                search: Arc::new(search),
         sandboxes: Some(manager),
         sandbox_unavailable_reason: None,
         started_at: now,
         // No token: these tests bind loopback, which is exactly the deployment where a token is
         // optional. A test that needed one here would mean the rule, not the test, was wrong.
         api_token: None,
+        webhooks: Default::default(),
     });
 
     Some((state, workspace, dir))

@@ -30,6 +30,7 @@ pub mod stream_ws;
 pub mod terminal;
 #[cfg(unix)]
 pub mod terminal_ws;
+pub mod webhook;
 
 pub use chat::{ChatReply, ChatRequest, ModelFactory, RouterModels};
 pub use routes::{app, status_for, ApiError};

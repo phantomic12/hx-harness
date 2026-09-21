@@ -112,14 +112,15 @@ async fn harness(replies: Vec<Result<ChatResponse>>) -> Arc<AppState> {
             replies: Mutex::new(VecDeque::from(replies)),
         }))),
         tools: Arc::new(hx_server::chat::default_tools(vec![], client)),
-        approvals: ApprovalQueue::new(std::time::Duration::from_secs(1)),
-        search: Arc::new(search),
+                approvals: ApprovalQueue::new(std::time::Duration::from_secs(1)),
+                search: Arc::new(search),
         sandboxes: None,
         sandbox_unavailable_reason: Some("no container engine in a test".to_string()),
         started_at: now,
         // No token: these tests bind loopback, which is exactly the deployment where a token is
         // optional. A test that needed one here would mean the rule, not the test, was wrong.
         api_token: None,
+        webhooks: Default::default(),
     })
 }
 
