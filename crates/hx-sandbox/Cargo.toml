@@ -20,11 +20,15 @@ tracing.workspace = true
 chrono.workspace = true
 bollard.workspace = true
 futures.workspace = true
-hyperlocal.workspace = true
-hyper-util.workspace = true
 http-body-util.workspace = true
 http.workspace = true
 hyper.workspace = true
+
+# Firecracker speaks HTTP over a Unix domain socket; `hyperlocal` is Unix-only
+# and does not compile on Windows (no `tokio::net::UnixListener/UnixStream`).
+[target.'cfg(unix)'.dependencies]
+hyperlocal.workspace = true
+hyper-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

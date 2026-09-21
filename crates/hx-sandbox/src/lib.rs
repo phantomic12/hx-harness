@@ -19,6 +19,7 @@
 
 pub mod docker;
 pub mod egress;
+#[cfg(unix)]
 pub mod firecracker;
 pub mod remote;
 pub mod runtime;
@@ -26,6 +27,7 @@ pub mod spec;
 
 pub use docker::{logs, to_container_config, to_host_config, wait_for_engine, DockerRuntime};
 pub use egress::EgressProxy;
+#[cfg(unix)]
 pub use firecracker::{ExecChannel, FirecrackerRuntime, VmExecTarget};
 pub use remote::{
     create_command, egress_network_name, egress_setup_commands, egress_sidecar_name,
@@ -47,10 +49,12 @@ pub async fn docker_manager(max_concurrent: usize) -> hx_core::error::Result<San
 }
 
 /// Build a manager on a Firecracker microVM runtime.
+/// Firecracker needs Linux/KVM, so this constructor only exists on Unix.
 ///
 /// `work_dir` is where each microVM's staging dir and API socket are created; `kernel` and `rootfs`
 /// are the guest images every microVM boots from. The runtime is not connected (there is no daemon to
 /// connect to); `available()` reports whether the `firecracker` binary and `/dev/kvm` are usable.
+#[cfg(unix)]
 pub fn firecracker_manager(
     work_dir: std::path::PathBuf,
     kernel: std::path::PathBuf,

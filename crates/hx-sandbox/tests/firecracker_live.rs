@@ -16,6 +16,9 @@
 //! A missing binary or missing `/dev/kvm` is a **skip**, not a pass: `available()` returning
 //! false is exactly the signal that the prerequisites are absent, and the test says so.
 //! `HX_FC_BIN` (default `firecracker`) overrides the binary path for non-PATH installs.
+//!
+//! Unix-only: Firecracker needs Linux/KVM.
+#![cfg(unix)]
 
 use hx_core::config::IsolationLevel;
 use hx_core::ids::SandboxId;
