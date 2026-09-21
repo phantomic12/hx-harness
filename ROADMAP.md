@@ -735,14 +735,23 @@ The routing reasoning this milestone is about, restated for what remains: lanes 
 has no per-child model to differ; one model's parameter set is not another's because a 400 for `reasoning_effort`
 is a 400; one upstream can take down every lane because all children share the model. The pool and now the spawner
 here remove the second ceiling (clamping), the shared-model property (members carry their own endpoint, credential,
-parameters and health) and the per-child model + cost in the audit chain; the first (a fan-out across members) and the
-third (re-route on member death across *running* lanes) still need running children, which nothing in this repository
-spawns as a runtime yet — the spawner that landed is the narrowest real provider call, not a fan-out.
+parameters and health) and the per-child model + cost in the audit chain. The first ceiling — a fan-out
+across members — is now lifted by a **[fan-out module]**(`crates/hx-server/src/fanout.rs`) that
+consumes the spawner's public API: it allocates N children across **N distinct** members of one pool
+(rejecting a short pool that cannot supply N distinct healthy members *before* any child runs) and then runs
+every allocated child, so a member that dies mid-fan-out fails only its own child while the others complete;
+each completed child's record names the member it ran on and its recorded usage, so which model did which work
+is answerable per child. What still needs the third ceiling is the **re-route on member death across
+*running* lanes**, which is the sibling lane (`feat/m8-reroute`)'s job and still needs running children
+that survive a member's death — not supplied by this fan-out, which stops a dead child and completes the rest.
 
-**Exit criteria** (still open — they describe the spawner): a fan-out of N lanes runs across N members of a
-pool, each lane's model recorded in the audit chain; killing one member's upstream mid-run re-routes new lanes
-to a healthy member with no operator action and no lane stalled by retry backoff; a lane whose model rejects a
-configured parameter is clamped and runs instead of failing at spawn.
+**Exit criteria**: ✅ **a fan-out of N lanes runs across N members of a pool, each lane's model recorded
+in the audit chain** — met by the fan-out module (see above), tested over a scripted pool and a scripted
+provider with each assertion proven to fail by a mutation; killing one member's upstream mid-run **re-routes
+new lanes** to a healthy member with no operator action and no lane stalled by retry backoff — **still open,
+owned by the sibling lane** (this fan-out isolates a dead member rather than re-route it, and says so in its
+doc); ✅ a lane whose model rejects a configured parameter is clamped and runs instead of failing at spawn — met
+by the spawner.
 
 ---
 
