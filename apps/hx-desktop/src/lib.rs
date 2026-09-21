@@ -9,7 +9,7 @@
 //!
 //! ## The desktop three (M7)
 //!
-//! Three desktop features make the shell an *app* rather than a window, each in its own module and each
+//! Four desktop features make the shell an *app* rather than a window, each in its own module and each
 //! **degrading to a working window with a reported warning** if the desktop session cannot provide it:
 //!
 //! - [`tray`] — a system tray icon with a menu (toggle the window, open approvals, quit). The menu
@@ -19,6 +19,9 @@
 //!   refusal-surfacing are tested behind a [`hotkey::HotkeyBackend`] trait.
 //! - [`notification`] — a native notification when an approval is requested. The body is a pure value,
 //!   asserted **not** to leak a token or a path outside the workspace.
+//! - [`picker`] — a native file picker to point the app at a workspace directory. The decision
+//!   logic (cancel vs invalid vs accept) is a pure, headlessly-tested core; the OS dialog is a
+//!   thin shell and degrades to a working window with a warning when it cannot run.
 //!
 //! ## Why the web bundle is not forked
 //!
@@ -60,9 +63,11 @@
 //! 2. The bundle path identity asserting that the frontend asset configured for Tauri resolves to the
 //!    exact same file that `hx-server` embeds and serves.
 //! 3. The desktop-three testable cores: the tray menu's item set and id→action mapping, the hotkey
-//!    string parsing and refusal-surfacing (behind a trait), and the approval-notification body with its
-//!    no-leak guarantees. The actual tray icon, a real hotkey binding, and a raised notification all
-//!    need a live desktop session and are **not** asserted here — each module's doc says so.
+//!    string parsing and refusal-surfacing (behind a trait), the approval-notification body with its
+//!    no-leak guarantees, and the file-picker decision core (cancel vs invalid vs accept, and the
+//!    unavailable-dialog degradation, behind a [`picker::PickerBackend`] trait). The actual tray
+//!    icon, a real hotkey binding, a raised notification, and the live OS dialog all need a desktop
+//!    session and are **not** asserted here — each module's doc says so.
 
 use hx_core::api_auth::{bind_is_loopback, ApiToken, API_TOKEN_ENV};
 use hx_core::config::Config;
@@ -70,6 +75,7 @@ use hx_secrets::SecretStores;
 
 pub mod hotkey;
 pub mod notification;
+pub mod picker;
 pub mod tray;
 
 /// Relative path from `apps/hx-desktop` to the shared web UI bundle.
@@ -217,6 +223,7 @@ pub fn run(target: DaemonTarget) -> Result<(), Box<dyn std::error::Error>> {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             let mut builder = tauri::WebviewWindowBuilder::new(
                 app,
