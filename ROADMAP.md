@@ -239,7 +239,8 @@ attempted capability escalation shows up as a denial event, not a hang.
   held by the same internal-network + `hx-egress-proxy` sidecar as the local runtime, but placed
   on the *far* host by a few docker CLI commands the far daemon already accepts; it needs only the
   far-host path of the compiled binary. The only non-empty allowlist cases still refused are the honest
-  ones — a CIDR or raw IP the proxy cannot match, or a spec created without a far-host proxy binary
+  ones — an entry that is none of a hostname, a raw IP or a valid CIDR (chiefly the ambiguous
+  `inet_aton` family), or a spec created without a far-host proxy binary
   configured. An isolated
   remote sandbox — empty allowlist and the network off — needs no proxy and **works**. It is now wired
   into `hx-server`: a `SandboxProfile` can carry a `host:` key naming a machine from `hosts:`, and
@@ -319,8 +320,10 @@ against a real Apple-signed arm64 VM, and no private key reaches the model, the 
 not merely fail-closed** — an allowlist is held by the same internal-network + `hx-egress-proxy` sidecar
 the local runtime uses, placed on the far host, and live-verified by observation rather than by reading
 back the command: an allowed host is relayed, a denied host is refused by the allowlist itself rather
-than by a blanket block, and the sandbox has no direct route out. Only what the proxy cannot match — a
-CIDR or raw IP — is still refused, with a reason naming the way out.*
+than by a blanket block, and the sandbox has no direct route out. The allowlist takes a hostname, a
+`*.domain` globe, a **raw IP**, or a **CIDR**: an IP/CIDR entry is enforced by resolving the
+`CONNECT` target and testing its address. What remains refused — with a reason naming the way out — is only
+the shape that is none of those: chiefly the ambiguous `inet_aton` family (`0x01010101`, `127.1`, `2130706433`).*
 
 ---
 

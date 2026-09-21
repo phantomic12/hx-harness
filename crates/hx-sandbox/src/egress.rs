@@ -61,11 +61,13 @@
 //!
 //! ## What is deliberately NOT enforced here
 //!
-//! The allowlist is owner by hostname/`*.domain`. A raw IP or CIDR entry cannot be matched
-//! against an unresolved `CONNECT` target, so such an entry is refused by
-//! [`crate::spec::SandboxSpec::validate`] (`SpecError::EgressNotEnforced`) rather than
-//! silently accepted — that case genuinely remains unenforceable through this mechanism, and accepting it
-//! would be the exact fiction this module exists to prevent.
+//! Hostname entries are matched by name. A **raw IP** or **CIDR** entry is matched by resolving
+//! the `CONNECT` target to an address first (see [`EgressRule`]); the only forms that remain
+//! refused by [`crate::spec::SandboxSpec::validate`] (`SpecError::EgressNotEnforced`) are the
+//! ones that are neither a name, a canonical IP, nor a valid CIDR — chiefly the ambiguous
+//! `inet_aton` family (`0x01010101`, `127.1`, `2130706433`, `0177.0.0.1`, …), which is not
+//! a canonical IP and is *really dialed* as an address, so there is no honest way to say what an
+//! operator meant by it.
 //!
 //! Teardown is the caller's responsibility via [`teardown`]; a proxy or network left behind when
 //! its sandbox dies is an orphan that still permits the (now absent) sandbox's traffic, which is
@@ -77,6 +79,9 @@ use bollard::query_parameters::{
 };
 use bollard::Docker;
 use hx_core::error::{HxError, Result};
+
+pub mod policy;
+pub use policy::EgressRule;
 
 /// The port the proxy listens on inside its sidecar, on the internal network.
 ///

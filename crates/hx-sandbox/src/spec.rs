@@ -88,53 +88,43 @@ fn is_inet_aton_number(part: &str) -> bool {
 
 /// Whether an egress allowlist entry can actually be enforced by the proxy.
 ///
-/// The proxy matches a `CONNECT` target by hostname (exact or `*.domain` suffix). A CIDR, a raw IP
-/// or anything *address-shaped* is not a hostname, so the proxy cannot decide it — such an entry
-/// must be refused at validation rather than quietly half-enforced. This is the one shape that
-/// genuinely remains unenforceable by the current mechanism, and it is why
-/// [`SpecError::EgressNotEnforced`] still exists.
+/// The proxy matches a `CONNECT` target three ways: a **name** by hostname (exact or `*.domain`
+/// suffix), a **raw IP** by resolving the target first, and a **CIDR** by checking the resolved
+/// address against the network. An entry is enforceable when it is one of those three. Only the shapes
+/// that are *none* of them — chiefly the ambiguous `inet_aton` family (`0x01010101`, `127.1`,
+/// `2130706433`, `0177.0.0.1`, …), a `host:port`, a bare `*` — are refused, and that is
+/// why [`SpecError::EgressNotEnforced`] still exists.
 ///
-/// Three gates, and the third is the one that used to be missing:
-///
-/// 1. the label shape (letters, digits, hyphens, dots) — rejects a CIDR, a `host:port`, an IPv6
-///    literal, a bare `*`;
-/// 2. [`is_address_shaped`] — rejects the whole `inet_aton` family (`0x01010101`, `127.1`,
-///    `2130706433`, `0177.0.0.1`, …), which is *not* rejected by (1) because its labels are
-///    alphanumerics and which is *really dialed* as an address;
-/// 3. `IpAddr::from_str` — kept, and **no longer described as "the definitive test"**, because it is
-///    not one: it parses canonical dotted-quad and IPv6 only. It is retained because it still catches
-///    the IPv6 forms, which (1) already rejects but (3) documents as an address.
-fn is_proxy_enforceable(entry: &str) -> bool {
+/// [`crate::egress::policy::EgressRule::parse`] holds the canonical split — it accepts a CIDR, a
+/// canonical IP, or a name — and this function adds the *name-within-DNS* gates (a name must be
+/// letters/digits/hyphens, and must not itself be address-shaped) on top of it. `pub(crate)` so
+/// the local validator (this module) and the far validator (`crate::remote`) share one
+/// answer and cannot drift apart.
+pub(crate) fn is_proxy_enforceable(entry: &str) -> bool {
     let entry = entry.trim().trim_end_matches('.');
     if entry.is_empty() {
         return false;
     }
-    let host = if let Some(domain) = entry.strip_prefix("*.") {
-        domain
-    } else {
-        entry
-    };
-    // A hostname is letters/digits/hyphens separated by dots; anything else (a slash, a colon, a
-    // space) is a CIDR or an address and cannot be matched by name.
-    let looks_like_a_hostname = host.split('.').all(|label| {
-        !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-    });
-    if !looks_like_a_hostname {
-        return false;
+    match crate::egress::policy::EgressRule::parse(entry) {
+        // A canonical IP or a valid CIDR is enforced by address — the target is resolved and tested.
+        Some(crate::egress::policy::EgressRule::Ip(_))
+        | Some(crate::egress::policy::EgressRule::Cidr { .. }) => true,
+        // A name must itself look like one: letters/digits/hyphens separated by dots, and not
+        // address-shaped in the `inet_aton` grammar (`10.0.0.1` is a canonical IP — the parse
+        // above returns `Ip` — but `0x01010101` is not canonical, parses as a "name", and is
+        // refused here): the resolver would dial it as an address, so recording it as a name would be
+        // a destination the operator believed they denied being let through anyway.
+        Some(crate::egress::policy::EgressRule::Name(host)) => {
+            // A `*.domain` globe is a name too — the leading `*.` is a matcher prefix, not part
+            // of a label, so strip it before checking the labels and the address grammar.
+            let host = host.strip_prefix("*.").unwrap_or(&host);
+            let looks_like_a_hostname = host.split('.').all(|label| {
+                !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            });
+            looks_like_a_hostname && !is_address_shaped(host)
+        }
+        None => false,
     }
-    // ...and the letter-shape test above is not sufficient on its own: a dotted IPv4 address is
-    // entirely digits, dots and hyphens, so `10.0.0.1` passes it while being an address the proxy
-    // cannot decide by name. Matching it as a "hostname" would produce an allowlist entry that is
-    // silently never satisfied — a destination the operator believes they permitted and that no
-    // connection ever reaches.
-    if is_address_shaped(host) {
-        return false;
-    }
-    // The IPv6 forms reach here only if (1) let them through (it does not — a colon is not a label
-    // character), but the parse is kept as the belt to that braces, and the comment above it is
-    // corrected: it used to claim this was the definitive test, which is exactly why the
-    // `inet_aton` hole existed.
-    host.parse::<std::net::IpAddr>().is_err()
 }
 
 /// The user a sandbox runs as. Never root: a container escape from uid 0 is a much shorter path
@@ -914,10 +904,11 @@ mod tests {
 
     #[test]
     fn an_allowlist_entry_the_proxy_cannot_match_is_refused() {
-        // The proxy matches a CONNECT target by hostname. A CIDR or a raw IP cannot be decided
-        // by name, so accepting it would be a half-enforced allowlist — the one shape that
-        // genuinely remains unenforceable, and the reason `EgressNotEnforced` still exists.
-        for bad in ["10.0.0.0/8", "10.0.0.1", "1.2.3.4:443"] {
+        // An allowlist entry that is none of the three enforceable shapes — not a name, not a
+        // canonical IP, not a valid CIDR — is the one that still falls to `EgressNotEnforced`.
+        // A `host:port` is the clean example: the proxy's CONNECT target is already split from its
+        // port, so an entry carrying one can never match.
+        for bad in ["1.2.3.4:443", "*", "*.", "2001:db8::/129"] {
             let mut s = spec(IsolationLevel::L1);
             s.network = true;
             s.egress_allow = vec![bad.into()];
@@ -929,11 +920,33 @@ mod tests {
             );
             let message = err.to_string();
             assert!(message.contains("cannot be enforced"), "{message}");
-            assert!(
-                message.contains("hostname") && message.contains("*.domain"),
-                "the error has to say what shape is allowed: {message}"
+        }
+    }
+
+    #[test]
+    fn a_canonical_ip_and_cidr_allowlist_are_now_accepted_and_enforced() {
+        // The capacity this milestone adds: a raw IP and a CIDR are both enforceable now (the proxy
+        // resolves the CONNECT target and tests its address), so they must validate cleanly — exactly
+        // the shapes `EgressNotEnforced` used to refuse.
+        for entry in ["10.0.0.1", "10.0.0.0/8", "192.168.1.1/32", "2001:db8::1"] {
+            let mut s = spec(IsolationLevel::L1);
+            s.network = true;
+            s.egress_allow = vec![entry.into()];
+            assert_eq!(
+                s.validate(),
+                Ok(()),
+                "{entry} is enforceable and must validate"
             );
         }
+        // A mixed allowlist (names + IP + CIDR) is a single list and must validate as one.
+        let mut s = spec(IsolationLevel::L1);
+        s.network = true;
+        s.egress_allow = vec![
+            "crates.io".into(),
+            "10.0.0.0/8".into(),
+            "*.crates.io".into(),
+        ];
+        assert_eq!(s.validate(), Ok(()));
     }
 
     #[test]
@@ -1008,17 +1021,11 @@ mod tests {
 
     #[test]
     fn the_non_name_shapes_are_still_refused_alongside_the_new_address_guard() {
-        // The guard added above must not have replaced the earlier refusals: a CIDR, a `host:port`, an
-        // IPv6 literal and a bare globe were all refused before, and are refused now.
-        for bad in [
-            "10.0.0.0/8",
-            "1.2.3.4:443",
-            "[::1]",
-            "::1",
-            "2001:db8::1",
-            "*",
-            "*.",
-        ] {
+        // The guard must not have replaced the earlier refusals wholesale: a `host:port`, an IPv6
+        // literal with brackets, and a bare globe were refused before, and the ones that are *not*
+        // a name, a canonical IP or a valid CIDR are still refused. What is new is that a *canonical*
+        // IPv6 literal (`::1`) and a valid CIDR are no longer refused — they are enforceable.
+        for bad in ["1.2.3.4:443", "[::1]", "*", "*."] {
             let mut s = spec(IsolationLevel::L1);
             s.network = true;
             s.egress_allow = vec![bad.into()];

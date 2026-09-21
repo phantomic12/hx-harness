@@ -467,29 +467,19 @@ pub fn egress_sidecar_name(name: &str) -> String {
 
 /// Whether an egress allowlist entry can actually be enforced by the proxy sidecar.
 ///
-/// The proxy matches a `CONNECT` target by hostname (exact or `*.domain` suffix); a CIDR, a raw IP
-/// or anything *address-shaped* is not a hostname, so it cannot be decided and must be refused
-/// rather than half-enforced. This mirrors [`crate::spec`]'s `is_proxy_enforceable`, and — unlike the
-/// version this replaces — it uses the *same* address grammar rather than an `IpAddr` parse.
+/// The proxy matches a `CONNECT` target three ways: a name by hostname, a raw IP by resolving the
+/// target first, and a CIDR by checking the resolved address against the network. An entry is
+/// enforceable when it is one of those; anything else — chiefly the ambiguous `inet_aton` family — is
+/// refused rather than half-enforced. This mirrors [`crate::spec`]'s `is_proxy_enforceable` so
+/// the near and far validators cannot drift apart.
 ///
-/// The `IpAddr` parse was the hole: a bare IPv4 passes a hostname-shape check (its labels are
-/// alphanumeric), and so does the whole `inet_aton` family, which `IpAddr::from_str` does not
-/// recognise but the resolver really does — `0x01010101` is 1.1.1.1, `127.1` is 127.0.0.1,
-/// `2130706433` is 127.0.0.1. On the far host that produced `egress ALLOWED 0x01010101:443 → dialed
-/// 1.1.1.1`: an allowlist entry that read as a name and dialed an address. The grammar lives once,
-/// in [`crate::spec::is_address_shaped`], so the near and far validators cannot drift apart.
+/// The `IpAddr` parse was the hole this had to close: a bare IPv4 and the whole `inet_aton`
+/// family pass a hostname-shape check, and the resolver really dials them as addresses — on the far
+/// host `0x01010101` produced `egress ALLOWED 0x01010101:443 → dialed 1.1.1.1`. The
+/// canonical split (CIDR / IP / name, with the address grammar applied to a "name") lives in
+/// [`crate::egress::policy`] and [`crate::spec::is_address_shaped`].
 fn is_egress_enforceable(entry: &str) -> bool {
-    let entry = entry.trim().trim_end_matches('.');
-    if entry.is_empty() {
-        return false;
-    }
-    let host = entry.strip_prefix("*.").unwrap_or(entry);
-    let looks_hostname = host
-        .split('.')
-        .all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
-    looks_hostname
-        && !crate::spec::is_address_shaped(host)
-        && host.parse::<std::net::IpAddr>().is_err()
+    crate::spec::is_proxy_enforceable(entry)
 }
 
 /// The docker commands that create the internal egress network and the proxy sidecar on the far daemon.
@@ -950,19 +940,47 @@ mod tests {
 
     #[test]
     fn an_egress_allowlist_entry_the_proxy_cannot_match_is_refused_before_any_command_runs() {
-        // The honest refusal that survives: an entry the proxy cannot match against an unresolved
-        // CONNECT target (a raw IP, and by extension a CIDR) is refused up front, the same shape
-        // the spec validator refuses locally. A bare IPv4 passes a hostname-shape check, so the
-        // refusal proves the `IpAddr` guard actually fires.
+        // A raw IP is enforceable now (the proxy resolves and tests the address), so it must no longer
+        // be refused. The shape that still is — a `host:port` — is refused up front, the same
+        // shape the spec validator refuses locally, proving the guard still fires before any command runs.
         let mut s = spec(IsolationLevel::L1);
         s.network = true;
-        s.egress_allow = vec!["93.184.216.34".into()];
+        s.egress_allow = vec!["93.184.216.34:443".into()];
         let settings = s.host_settings();
         let err = create_command("hx-sbx_x", &s, &settings).unwrap_err();
         let message = err.to_string();
         assert!(
-            message.contains("cannot be enforced") && message.contains("93.184.216.34"),
+            message.contains("cannot be enforced") && message.contains("93.184.216.34:443"),
             "{message}"
+        );
+    }
+
+    #[test]
+    fn a_canonical_ip_and_cidr_allowlist_is_accepted_on_the_far_path() {
+        // The capacity this milestone adds, on the near-and-far path: a raw IP and a CIDR are
+        // enforceable, so `create_command` must *accept* them (not refuse) and still ride the
+        // internal egress network. The sidecar's `HX_EGRESS_ALLOW` is rendered separately in
+        // `egress_setup_commands` (pinned by `egress_setup_and_teardown_render_...`); the
+        // point here is that these shapes pass the far validator where they used to be refused.
+        for entry in ["93.184.216.34", "10.0.0.0/8"] {
+            let mut s = spec(IsolationLevel::L1);
+            s.network = true;
+            s.egress_allow = vec![entry.into()];
+            let settings = s.host_settings();
+            let (name, cmd) = create_command("hx-sbx_x", &s, &settings).unwrap();
+            assert_eq!(name, "hx-sbx_x");
+            assert!(
+                cmd.contains("--network='hx-sbx_x-egress'"),
+                "the sandbox must ride its egress network: {cmd}"
+            );
+        }
+        // The sidecar carries the raw entry through to the proxy, so the far daemon enforces it.
+        let setup = egress_setup_commands("hx-sbx_x", &["10.0.0.0/8".to_string()], "/opt/hx");
+        assert!(
+            setup
+                .iter()
+                .any(|c| c.contains("HX_EGRESS_ALLOW=10.0.0.0/8")),
+            "the CIDR entry must reach the sidecar: {setup:?}"
         );
     }
 
@@ -1299,7 +1317,7 @@ mod tests {
         // configured here precisely so the old order would have gone straight into the setup loop.
         let mut s = spec(IsolationLevel::L1);
         s.network = true;
-        s.egress_allow = vec!["10.0.0.0/8".into()];
+        s.egress_allow = vec!["10.0.0.0/8:443".into()];
         let settings = s.host_settings();
         let runner = Arc::new(RecordingRunner::new(vec![]));
         let runtime = RemoteSandboxRuntime::new(runner)
@@ -1312,7 +1330,7 @@ mod tests {
 
         let message = err.to_string();
         assert!(
-            message.contains("cannot be enforced") && message.contains("10.0.0.0/8"),
+            message.contains("cannot be enforced") && message.contains("10.0.0.0/8:443"),
             "{message}"
         );
         assert!(
