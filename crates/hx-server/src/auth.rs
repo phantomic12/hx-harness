@@ -132,10 +132,11 @@ pub async fn require_bearer(
         // bind without one. The check that makes that true is at startup, not here, which is why
         // this arm can be a pass-through rather than a second refusal. The WebSocket Origin check
         // below still runs: cross-origin protection does not depend on a token being set.
-        if is_websocket_route(&path) && is_websocket_upgrade(request.headers()) {
-            if !ws_origin_allowed(request.headers(), host_of(request.headers())) {
-                return forbidden_cross_origin();
-            }
+        if is_websocket_route(&path)
+            && is_websocket_upgrade(request.headers())
+            && !ws_origin_allowed(request.headers(), host_of(request.headers()))
+        {
+            return forbidden_cross_origin();
         }
         return next.run(request).await;
     };
@@ -153,10 +154,11 @@ pub async fn require_bearer(
 
     // Bearer auth passed, but a browser page from another site presenting a stolen token must
     // still not be able to open a shell. See `ws_origin_allowed`.
-    if is_websocket_route(&path) && is_websocket_upgrade(request.headers()) {
-        if !ws_origin_allowed(request.headers(), host_of(request.headers())) {
-            return forbidden_cross_origin();
-        }
+    if is_websocket_route(&path)
+        && is_websocket_upgrade(request.headers())
+        && !ws_origin_allowed(request.headers(), host_of(request.headers()))
+    {
+        return forbidden_cross_origin();
     }
     next.run(request).await
 }
