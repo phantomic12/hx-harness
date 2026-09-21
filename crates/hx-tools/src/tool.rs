@@ -26,6 +26,12 @@ pub struct ToolOutcome {
     pub ok: bool,
     /// Set when the content was truncated, so the model (and the transcript) can say so.
     pub truncated: bool,
+    /// Bytes this call actually moved, when the tool can state it: file size on read, bytes
+    /// written on write/patch. `None` is "not measured", not zero — and the loop treats it as
+    /// unmeasurable rather than as free, re-checking it against the granting bound only when
+    /// present. A tool that moves bytes and reports nothing here silently opts out of
+    /// `max_bytes`; fs tools always report.
+    pub bytes_moved: Option<u64>,
 }
 
 impl ToolOutcome {
@@ -35,6 +41,7 @@ impl ToolOutcome {
             content,
             ok: true,
             truncated,
+            bytes_moved: None,
         }
     }
 
@@ -45,7 +52,16 @@ impl ToolOutcome {
             content,
             ok: false,
             truncated,
+            bytes_moved: None,
         }
+    }
+
+    /// Record how many bytes this call actually moved (file size on read, bytes written on
+    /// write). The loop re-checks this against the granting `max_bytes` when the requirement
+    /// could not state the size up front — which is how bounded reads are enforced.
+    pub fn bytes_moved(mut self, bytes: u64) -> Self {
+        self.bytes_moved = Some(bytes);
+        self
     }
 }
 
@@ -82,6 +98,15 @@ pub struct Requirement {
     ///
     /// [`RiskClass`]: hx_core::approval::RiskClass
     pub third_party: bool,
+    /// Bytes this call would move, when the tool can state it *before* running: a write states
+    /// its content length, so the loop refuses an over-bound write without touching the disk. A
+    /// read cannot state its size (the size is what the read discovers) and leaves this `None`;
+    /// the loop enforces the bound on the outcome's measured bytes instead. `None` is "unknown",
+    /// never "zero".
+    ///
+    /// Defaults to `None` from [`Requirement::new`]: most tools move no bytes at all, and the ones
+    /// that do say so deliberately — exactly like `third_party`.
+    pub bytes: Option<u64>,
 }
 
 impl Requirement {
@@ -91,6 +116,7 @@ impl Requirement {
             action,
             describes: describes.into(),
             third_party: false,
+            bytes: None,
         }
     }
 
@@ -98,6 +124,12 @@ impl Requirement {
     /// [`Self::third_party`].
     pub fn third_party(mut self) -> Self {
         self.third_party = true;
+        self
+    }
+
+    /// State how many bytes this call would move. See [`Self::bytes`].
+    pub fn bytes(mut self, bytes: u64) -> Self {
+        self.bytes = Some(bytes);
         self
     }
 

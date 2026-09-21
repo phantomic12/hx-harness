@@ -925,6 +925,38 @@ impl Host for SshHost {
         self.rename_shell(from, to).await
     }
 
+    /// Resolve through the far side's own filesystem. `readlink -f` canonicalizes a missing tail
+    /// against its existing parent (GNU coreutils allows all but the last component to be absent),
+    /// which matches the `Host::canonicalize` contract closely enough to re-check against;
+    /// anything it cannot resolve errors, and the caller keeps the lexical decision.
+    async fn canonicalize(&self, path: &str) -> Result<String> {
+        if !self.caps.is_unix() {
+            return Err(HxError::Remote(format!(
+                "resolving symlinks over SSH is only implemented for POSIX hosts; {} is {:?}",
+                self.address, self.caps.os
+            )));
+        }
+        let output = self
+            .exec(
+                &format!("readlink -f -- {}", shell_quote(path)),
+                Duration::from_secs(10),
+            )
+            .await?;
+        if !output.success() {
+            return Err(HxError::Remote(format!(
+                "could not resolve {path}: {}",
+                output.combined().trim()
+            )));
+        }
+        let resolved = output.stdout.trim().to_string();
+        if resolved.is_empty() {
+            return Err(HxError::Remote(format!(
+                "could not resolve {path}: empty answer"
+            )));
+        }
+        Ok(resolved)
+    }
+
     async fn open_pty(
         &self,
         command: Option<&str>,

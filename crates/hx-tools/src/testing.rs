@@ -119,6 +119,10 @@ pub struct FakeHost {
     /// Held so a test can reach into the session the server opened and assert on what the client
     /// actually sent it — `written()` and `resizes()` are the interesting ones.
     pub ptys: Mutex<Vec<FakePty>>,
+    /// Symlinks, as link path -> target path. Resolution is longest-prefix, like the kernel's,
+    /// so tests can stage the exact escape shape (`/ws/link` -> `/etc`) and assert the loop
+    /// refuses it.
+    pub symlinks: Mutex<BTreeMap<String, String>>,
 }
 
 impl FakeHost {
@@ -138,6 +142,7 @@ impl FakeHost {
             listings: Mutex::new(Vec::new()),
             exec_response: Mutex::new(None),
             ptys: Mutex::new(Vec::new()),
+            symlinks: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -200,6 +205,66 @@ impl FakeHost {
         self
     }
 
+    /// Stage a symlink: `link` resolves to `target`, longest-prefix wins, like the kernel.
+    pub fn with_symlink(self, link: &str, target: &str) -> Self {
+        self.symlinks
+            .lock()
+            .unwrap()
+            .insert(link.to_string(), target.to_string());
+        self
+    }
+
+    /// Follow staged links, longest-prefix-first, with a cycle guard. A link cycle resolves to
+    /// wherever the guard stops — tests stage acyclic links; this just must not hang on a typo.
+    fn resolve_links(&self, path: &str) -> String {
+        let mut current = path.to_string();
+        for _ in 0..16 {
+            let links = self.symlinks.lock().unwrap();
+            let mut best: Option<(String, String)> = None;
+            for (link, target) in links.iter() {
+                let covers = current == *link || current.starts_with(&format!("{link}/"));
+                if covers && best.as_ref().is_none_or(|(b, _)| link.len() > b.len()) {
+                    best = Some((link.clone(), target.clone()));
+                }
+            }
+            drop(links);
+            match best {
+                Some((link, target)) => {
+                    let rest = current[link.len()..].trim_start_matches('/');
+                    current = if rest.is_empty() {
+                        target
+                    } else {
+                        format!("{}/{}", target.trim_end_matches('/'), rest)
+                    };
+                }
+                None => break,
+            }
+        }
+        current
+    }
+
+    /// Collapse `.`, `..` and duplicate separators lexically — the fake filesystem has no kernel
+    /// to ask, so normalization stands in for it.
+    fn normalize_lexical(path: &str) -> String {
+        let absolute = path.starts_with('/');
+        let mut parts: Vec<&str> = Vec::new();
+        for segment in path.split('/') {
+            match segment {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                s => parts.push(s),
+            }
+        }
+        let joined = parts.join("/");
+        if absolute {
+            format!("/{joined}")
+        } else {
+            joined
+        }
+    }
+
     pub fn file(&self, path: &str) -> Option<String> {
         self.files
             .lock()
@@ -242,19 +307,23 @@ impl Host for FakeHost {
     }
 
     async fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+        // Links resolve before the lookup, like the kernel: a test that stages an escape reads
+        // through it, which is what makes the agent-level re-check test meaningful.
+        let resolved = self.resolve_links(path);
         self.files
             .lock()
             .unwrap()
-            .get(path)
+            .get(&resolved)
             .cloned()
             .ok_or_else(|| HxError::Remote(format!("no such file: {path}")))
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> Result<()> {
+        let resolved = self.resolve_links(path);
         self.files
             .lock()
             .unwrap()
-            .insert(path.to_string(), contents.to_vec());
+            .insert(resolved, contents.to_vec());
         Ok(())
     }
 
@@ -291,6 +360,12 @@ impl Host for FakeHost {
 
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
+    }
+
+    /// Resolve staged links plus lexical normalization — the fake stand-in for the kernel's
+    /// answer, so the agent's canonical re-check is testable without a real filesystem.
+    async fn canonicalize(&self, path: &str) -> Result<String> {
+        Ok(Self::normalize_lexical(&self.resolve_links(path)))
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
