@@ -27,7 +27,10 @@ use hx_core::config::SandboxProfile;
 use hx_core::error::HxError;
 use hx_core::ids::SessionId;
 use hx_sandbox::SandboxSpec;
-use hx_search::{Recency, SearchQuery};
+use hx_search::{
+    default_pool_root, select_fetcher, FetchMode, FetchRouteError, Recency, ResearchRequest,
+    ResearchTask, SearchQuery,
+};
 use hx_secrets::Redactor;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -105,6 +108,9 @@ pub fn app(state: Arc<AppState>) -> Router {
         // model pool (see `crate::fanout`). It is gated by the same bearer token as everything
         // else on this router.
         .route("/v1/fanout", post(fanout))
+        // The M6 research pipeline's production caller: runs the keyless fan-out, extraction and
+        // citation through the fetch selector, behind the same bearer-token gate.
+        .route("/v1/research", post(research))
         .with_state(state)
         // Applied last, so it wraps every route including the WebSocket upgrades. `from_fn_with_state`
         // rather than `from_fn`: the token lives on `AppState`, and reading it from a request
@@ -916,6 +922,129 @@ async fn fanout(
         })?;
 
     Ok(Json(outcome))
+}
+
+// ---------------------------------------------------------------------------
+// Research: the M6 pipeline's production caller
+// ---------------------------------------------------------------------------
+//
+// `hx-search` owns the pipeline (`ResearchTask`) and the fetch decision (`select_fetcher`);
+// this route is the caller that runs one through the other. It never reaches the network
+// itself: every page fetch goes through the selected `Fetcher`, plain or browser-backed.
+
+/// `POST /v1/research` — the research request.
+///
+/// `fetch_mode` is the `hx_search::FetchMode` vocabulary (`http`, `auto`, `browser`); omitted
+/// means `auto`, the mode the browser rung exists for. `max_sources` caps the cited sources;
+/// omitted means the pipeline default.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ResearchBody {
+    pub query: String,
+    #[serde(default)]
+    pub max_sources: Option<usize>,
+    #[serde(default)]
+    pub fetch_mode: Option<FetchMode>,
+}
+
+impl ResearchBody {
+    /// Split the wire body into the pipeline request and the fetch decision it runs under.
+    ///
+    /// Pure, so the CLI mapping test and the route share one meaning of the fields rather than
+    /// two parsers that can drift.
+    pub fn into_request_and_mode(self) -> (ResearchRequest, FetchMode) {
+        let mode = self.fetch_mode.unwrap_or(FetchMode::Auto);
+        let request = match self.max_sources {
+            Some(max) => ResearchRequest::new(self.query).with_max_sources(max),
+            None => ResearchRequest::new(self.query),
+        };
+        (request, mode)
+    }
+}
+
+/// `POST /v1/research` — the research report, plus which fetcher ran it.
+///
+/// `fetcher` is `http` or `browser` — the `SelectedFetcher` the selector landed on — and
+/// `fetch_note` is its honest record of why (including the `auto` degradation when no browser
+/// is installed). The rest is the pipeline's own report.
+#[derive(Debug, Serialize)]
+pub struct ResearchResponse {
+    pub query: String,
+    pub fetcher: &'static str,
+    pub fetch_note: String,
+    pub backends: Vec<hx_search::BackendOutcome>,
+    pub sources: Vec<hx_search::Citation>,
+    pub paid_calls: usize,
+}
+
+/// Turn a refused fetch selection into the status a caller should react to.
+///
+/// An explicit browser request with no browser installed is `409 Conflict`, not a 500: the
+/// daemon is fine, the request asked for a rung this host cannot run. `auto` never reaches
+/// here — it degrades inside `select_fetcher` — so this fires only for an explicit mode.
+pub fn research_route_error(err: FetchRouteError) -> ApiError {
+    ApiError::new(StatusCode::CONFLICT, err.to_string())
+}
+
+/// `POST /v1/research` — fan out over the configured backends, extract, and cite.
+///
+/// The fetcher is chosen by the existing `select_fetcher` — the selection logic lives in
+/// `hx-search` and is called here, never duplicated. A blank query is a 400; a daemon with no
+/// backends configured is a 503, the same answer `/v1/search` gives.
+async fn research(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<ResearchBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    // A thin shell over `research_inner`: the extractor plumbing stays trivial and the route's
+    // real work is testable as a plain async fn taking the state by value.
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return ApiError::new(StatusCode::BAD_REQUEST, rejection.body_text()).into_response()
+        }
+    };
+    match research_inner(state, body).await {
+        Ok(json) => json.into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+/// The route's real work.
+async fn research_inner(
+    state: Arc<AppState>,
+    body: ResearchBody,
+) -> Result<Json<ResearchResponse>, ApiError> {
+    if body.query.trim().is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "a research request needs a non-empty `query`",
+        ));
+    }
+    if state.search.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no search backends are configured; set `search.backends` in the config",
+        ));
+    }
+
+    let (request, mode) = body.into_request_and_mode();
+    let client = state.search.client().clone();
+    let selection =
+        select_fetcher(&client, mode, default_pool_root()).map_err(research_route_error)?;
+    let task = ResearchTask::new(state.search.all(), client, selection.fetcher());
+    let report = task.run(&request).await;
+
+    let fetcher = match selection.kind {
+        hx_search::SelectedFetcher::Http => "http",
+        hx_search::SelectedFetcher::Browser => "browser",
+    };
+    Ok(Json(ResearchResponse {
+        query: report.query,
+        fetcher,
+        fetch_note: selection.note.to_string(),
+        backends: report.backends,
+        sources: report.sources,
+        paid_calls: report.paid_calls,
+    }))
 }
 
 /// Every event of a session, in order: what a client that just attached renders.
@@ -2186,5 +2315,102 @@ search:
             body["denied"].is_string(),
             "the reason must be reported: {body}"
         );
+    }
+
+    // ---- research -----------------------------------------------------------
+
+    #[test]
+    fn a_research_body_without_options_means_auto_and_the_pipeline_default() {
+        // The default is `Auto` — the mode the browser rung exists for — and not `Http`: a
+        // caller that says nothing gets escalation where possible, not a silent downgrade.
+        let body = ResearchBody {
+            query: "rust".to_string(),
+            max_sources: None,
+            fetch_mode: None,
+        };
+        let (request, mode) = body.into_request_and_mode();
+        assert_eq!(mode, FetchMode::Auto, "an omitted mode must mean auto");
+        assert_eq!(request.query, "rust");
+        assert_eq!(
+            request.max_sources,
+            hx_search::DEFAULT_MAX_SOURCES,
+            "an omitted cap must mean the pipeline default"
+        );
+    }
+
+    #[test]
+    fn a_research_body_honours_an_explicit_mode_and_cap() {
+        let body = ResearchBody {
+            query: "rust".to_string(),
+            max_sources: Some(3),
+            fetch_mode: Some(FetchMode::Http),
+        };
+        let (request, mode) = body.into_request_and_mode();
+        assert_eq!(mode, FetchMode::Http);
+        assert_eq!(request.max_sources, 3);
+    }
+
+    #[test]
+    fn a_refused_fetch_selection_is_a_409_carrying_the_reason() {
+        // The 409 is the route's whole answer to "explicit browser, no browser": the status must
+        // be conflict (retrying is pointless, nothing is broken) and the message must name the
+        // missing rung rather than say "error".
+        let err = FetchRouteError {
+            reason: "browser mode requested but no Chromium is installed at /usr/lib/chromium/chromium"
+                .to_string(),
+        };
+        let api = research_route_error(err);
+        assert_eq!(api.status, StatusCode::CONFLICT);
+        assert!(
+            api.message.contains("Chromium"),
+            "the 409 must name the unavailable rung: {}",
+            api.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blank_research_query_is_a_400_not_an_empty_report() {
+        let state = test_state().await;
+        let (status, body) = post(
+            state,
+            "/v1/research",
+            serde_json::json!({ "query": "   ", "fetch_mode": "http" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["error"].as_str().unwrap_or("").contains("query"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn research_without_backends_says_so_instead_of_returning_nothing() {
+        // The same answer `/v1/search` gives: an empty registry is a configuration problem, not
+        // an empty report.
+        let state = test_state().await;
+        let (status, body) = post(
+            state,
+            "/v1/research",
+            serde_json::json!({ "query": "rust", "fetch_mode": "http" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_research_body_that_does_not_parse_is_a_400() {
+        // `fetch_mode: "telepathy"` parses as JSON but not as a `ResearchBody`; the route maps
+        // every such rejection to 400 rather than axum's default 422.
+        let state = test_state().await;
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/research")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query": "rust", "fetch_mode": "telepathy"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
