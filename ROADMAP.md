@@ -711,12 +711,22 @@ promise about how it is used.
     (`x86_64`/`aarch64` linux-musl via `cross`, `x86_64`/`aarch64` apple-darwin and
     `x86_64` windows-msvc on their own runners), so a lockfile or `#[cfg]` change that breaks a
     release target fails on the PR instead of at the next tagged release. All five compile.
-  - ✅ **Auto-update, code signing** — the signing half landed (`m9-code-signing`): `release.yml` now
-    signs every `dist/` artifact (including `SHA256SUMS`) with **keyless Sigstore cosign**, so a user can
-    verify a release with their own cosign against the public transparency log, independent of GitHub's
-    attestation store. `install.sh` verifies `SHA256SUMS.sig` when cosign is present (checksum-only
-    with a warning otherwise, `COSIGN_SKIP=1` to skip), and `docs/code-signing.md` documents the
-    expected identity and issuer. Auto-update itself remains in the roadmap.
+  - ✅ **Auto-update, code signing** — both halves landed. The signing half (`m9-code-signing`):
+    `release.yml` now signs every `dist/` artifact (including `SHA256SUMS`) with **keyless Sigstore
+    cosign**, so a user can verify a release with their own cosign against the public transparency log,
+    independent of GitHub's attestation store. `install.sh` verifies `SHA256SUMS.sig` when cosign is
+    present (checksum-only with a warning otherwise, `COSIGN_SKIP=1` to skip), and
+    `docs/code-signing.md` documents the expected identity and issuer. The auto-update half landed
+    (`m9-auto-update`): `hxd` gained an **opt-in, non-intrusive** update checker. It is **off by
+    default** (`update.enabled: false`) — a daemon upgrading onto the code makes no request and spawns no
+    task until an operator opts in. When enabled it polls a configured releases feed (`update.url`, default the
+    GitHub `/releases/latest` API) on an interval (`update.interval_secs`, default 24h), never on the
+    startup path, compares the remote `tag_name` to the running build (dotted-numeric, so `0.1.10` >
+    `0.1.2`), and on finding a newer version logs a single `info!` line with the new version, the URL
+    and the install command. It never downloads and never restarts; a failed fetch logs a single `debug!`
+    line. Config, version comparison and GitHub-payload parsing live in `hx-core/src/update.rs`
+    (pure, unit-tested); the fetch loop is `spawn_update_checker` in `apps/hxd/src/main.rs`; an
+    integration test drives the real binary against a loopback mock release feed.
 
 **Exit criteria:** an approval requested by a running agent pings your phone; you approve it
 from the lock screen and the agent continues. **Unmet.** The desktop shell is a window that points at the

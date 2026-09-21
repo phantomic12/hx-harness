@@ -307,3 +307,23 @@ connectors:
 # A server that is down, wedged, or exiting on startup surfaces as a tool result
 # the model can read ("mcp server 'files' is not running: ..."), never as a hang.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Update checking: opt-in and non-intrusive (M9).
+#
+# **Off by default.** Omitted (as here) means `enabled: false`: `hxd` spawns no
+# update task and makes no network request. Turn it on only if you want the daemon to
+# check a releases feed on an interval and log a single line when a newer build exists.
+# It never downloads, never restarts, and never blocks startup.
+#
+#   update:
+#     enabled: true
+#     # url: https://api.github.com/repos/phantomic12/hx-harness/releases/latest
+#     interval_secs: 86400    # 24h
+#
+# When a newer version is found the daemon logs, at `info!`:
+#   a newer version is available — run the install command to update
+# alongside the new version, the current version, the feed URL, and the install command.
+# A failed check logs a single `debug!` line; it does not spam or take the daemon down.
+# ---------------------------------------------------------------------------
+

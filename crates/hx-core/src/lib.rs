@@ -20,6 +20,7 @@ pub mod event;
 pub mod ids;
 pub mod message;
 pub mod pool;
+pub mod update;
 
 pub use api_auth::{bind_is_loopback, require_token_for_bind, ApiToken, API_TOKEN_ENV};
 pub use approval::{
@@ -41,4 +42,8 @@ pub use message::{Message, Part, Role};
 pub use pool::{
     DrawError, EffectiveParams, MemberHealth, ModelPool, ModelPoolMemberConfig, Param, ParamClamp,
     PoolMember, ReasoningEffort,
+};
+pub use update::{
+    compare_versions, release_tag_name, UpdateConfig, DEFAULT_UPDATE_INTERVAL_SECS,
+    DEFAULT_UPDATE_URL,
 };

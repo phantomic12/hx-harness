@@ -52,6 +52,8 @@ pub struct Config {
     #[serde(default)]
     pub terminal: TerminalConfig,
     #[serde(default)]
+    pub update: crate::update::UpdateConfig,
+    #[serde(default)]
     pub api: ApiConfig,
 }
 
@@ -1272,6 +1274,33 @@ search:
             err.to_string().contains("brave_key"),
             "the field must be gone, and saying so is the error: {err}"
         );
+    }
+
+    #[test]
+    fn the_default_update_config_is_disabled_and_has_no_surprise_traffic() {
+        // The default-off promise, asserted through the whole config: an operator who has never heard
+        // of `update` gets a disabled checker, so upgrading onto this code fetches nothing until
+        // they opt in.
+        let c = Config::default();
+        assert!(!c.update.enabled, "update checking must default off");
+        assert_eq!(c.update.url, crate::update::DEFAULT_UPDATE_URL);
+
+        // And the same through YAML, which is what a real config does.
+        let c = Config::from_yaml("{}").unwrap();
+        assert!(!c.update.enabled);
+        assert_eq!(
+            c.update.interval_secs,
+            crate::update::DEFAULT_UPDATE_INTERVAL_SECS
+        );
+
+        // An explicit block is honoured.
+        let c = Config::from_yaml(
+            "update:\n  enabled: true\n  url: https://example.com/releases/latest\n  interval_secs: 3600\n",
+        )
+        .unwrap();
+        assert!(c.update.enabled);
+        assert_eq!(c.update.url, "https://example.com/releases/latest");
+        assert_eq!(c.update.interval_secs, 3600);
     }
 
     #[test]
