@@ -408,16 +408,6 @@ mod tests {
             })
         }
 
-        /// A refused request — the child's fault, deterministic across every member.
-        fn rejecting(self: &Arc<Self>) -> Arc<Self> {
-            Arc::new(Self {
-                id: self.id.clone(),
-                err: ScriptedErr::Reject,
-                echoes: self.echoes.clone(),
-                seen: std::sync::Mutex::new(Vec::new()),
-            })
-        }
-
         /// The upstream names a different model than the pool member's id.
         fn echoing(self: &Arc<Self>, model: &str) -> Arc<Self> {
             Arc::new(Self {
