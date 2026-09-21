@@ -422,6 +422,11 @@ command with a button, receive a cron digest in a separate pinned thread.
 
 ## M6 — MCP + browser pool + full search
 
+**Adversarial verification:** `docs/verification-m6.md` attacked six security claims and returned findings
+F1–F8. All eight are now closed on main: F1/F2 (`779c042`), F3/F4 (`56498de`), F5 (`8a49ffc`),
+F6 (`f13b529`), F7 (`80222ac`) and F8 (`2db46ca`, documented, deliberately unchanged). See that
+report's addendum for the per-finding status and commits.
+
 - ✅ `rmcp` host: consume stdio and streamable-HTTP MCP servers, per-server tool namespacing,
   health checks and restarts. Landed with a hand-rolled MCP server as the double — real
   newline-delimited JSON-RPC 2.0 over a real pipe, with scripted misbehaviour modes (silent,
