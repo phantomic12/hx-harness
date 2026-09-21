@@ -49,6 +49,18 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # hx-desktop (Tauri/GTK) links glib-2.0 via glib-sys, which shells out to
+      # pkg-config at build time. The stock runner image ships no GTK dev
+      # libraries, so install the webkit2gtk stack before linting.
+      - name: Install GTK system deps (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential curl wget file \
+            libssl-dev \
+            libgtk-3-dev libglib2.0-dev \
+            libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev \
+            libxdo-dev libayatana-appindicator3-dev librsvg2-dev
       # --all-targets so test code is linted too — a warning in a test is still a warning.
       # -D warnings makes the build fail rather than printing advice into a log nobody reads.
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -65,6 +77,19 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # hx-desktop (Tauri/GTK) needs the webkit2gtk dev stack on Linux; macOS
+      # and Windows runners already provide what glib-sys needs via their own
+      # toolchains, so only install on ubuntu.
+      - name: Install GTK system deps (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential curl wget file \
+            libssl-dev \
+            libgtk-3-dev libglib2.0-dev \
+            libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev \
+            libxdo-dev libayatana-appindicator3-dev librsvg2-dev
       # --locked fails if Cargo.lock is out of date with the manifests. That is deliberate:
       # an un-updated lockfile is a real bug, and better caught here than by a user.
       - run: cargo test --workspace --locked
@@ -98,6 +123,17 @@ jobs:
           toolchain: ${{ steps.msrv.outputs.version }}
 
       - uses: Swatinem/rust-cache@v2
+      # Same GTK dev stack as clippy: `cargo check` builds hx-desktop's
+      # glib-sys build script, which fails without glib-2.0 pkg-config files.
+      - name: Install GTK system deps (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential curl wget file \
+            libssl-dev \
+            libgtk-3-dev libglib2.0-dev \
+            libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev \
+            libxdo-dev libayatana-appindicator3-dev librsvg2-dev
       # Printed so the log records which toolchain actually ran, not just which was asked for.
       - run: rustc --version
       - run: cargo check --workspace --all-targets --locked
