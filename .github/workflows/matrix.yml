@@ -72,10 +72,14 @@ jobs:
       # `--locked`: the PR must compile against exactly the locked dependency set, and `--all-targets`
       # makes a compile error hiding in test or example code fail the PR too. `cargo check` never
       # links, so the Apple and Windows targets need no cross-linker here.
+      # musl note: apps/hx-desktop is Tauri/GTK (glib-sys needs system GTK dev libs that do
+      # not exist for the musl cross containers, and Tauri on musl is not supportable), so the
+      # musl cross check excludes it — mirroring release.yml, which ships only `--bin hx --bin hxd`
+      # and never builds the desktop crate for these targets.
       - name: Check (cross)
         if: matrix.use_cross
         shell: bash
-        run: cross check --workspace --all-targets --locked --target ${{ matrix.target }}
+        run: cross check --workspace --exclude hx-desktop --all-targets --locked --target ${{ matrix.target }}
 
       - name: Check (native toolchain)
         if: ${{ !matrix.use_cross }}
