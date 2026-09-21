@@ -109,6 +109,39 @@ impl KdfParams {
     }
 }
 
+/// Policy bounds for vault-supplied KDF parameters (see [`validate_kdf`]).
+///
+/// The envelope carries `m_cost_kib`/`t_cost`/`p_cost` in the clear so the cost can be raised over
+/// time — which also means a tampered envelope (or a vault crafted by someone else) can name
+/// absurd values. Without a check, `open` would hand them straight to Argon2: gigabytes of
+/// allocation, or hours of iterations, from one malicious file read.
+const KDF_M_COST_KIB_MIN: u32 = 8; // the `for_tests` floor; anything weaker is not Argon2, it is a wish
+const KDF_M_COST_KIB_MAX: u32 = 1024 * 1024; // 1 GiB: far above the 64 MiB default, far below OOM
+const KDF_T_COST_MIN: u32 = 1;
+const KDF_T_COST_MAX: u32 = 100; // 100 passes at 64 MiB is already minutes; more is not a vault
+const KDF_P_COST_MIN: u32 = 1;
+const KDF_P_COST_MAX: u32 = 64; // beyond core counts parallelism buys nothing but confusion
+
+/// Reject out-of-policy KDF parameters *before* any allocation or hashing.
+///
+/// Called by both [`Vault::create`] (fail fast on a misconfigured caller) and [`Vault::open`]
+/// (refuse a tampered envelope without invoking Argon2). The shipped default (64 MiB, 3, 4) and
+/// the test params (8 KiB, 1, 1) sit inside the range, so every vault written by this code —
+/// past or present — still opens.
+fn validate_kdf(kdf: &KdfParams) -> Result<(), VaultError> {
+    if !(KDF_M_COST_KIB_MIN..=KDF_M_COST_KIB_MAX).contains(&kdf.m_cost_kib)
+        || !(KDF_T_COST_MIN..=KDF_T_COST_MAX).contains(&kdf.t_cost)
+        || !(KDF_P_COST_MIN..=KDF_P_COST_MAX).contains(&kdf.p_cost)
+    {
+        return Err(VaultError::Kdf(format!(
+            "kdf parameters out of policy \
+             (m_cost_kib={} t_cost={} p_cost={}); refusing before key derivation",
+            kdf.m_cost_kib, kdf.t_cost, kdf.p_cost
+        )));
+    }
+    Ok(())
+}
+
 /// A secret value that refuses to print itself.
 ///
 /// `Debug` is redacted and the bytes are zeroed on drop, so an accidental `{:?}` in a log line
@@ -183,6 +216,7 @@ pub struct Vault {
 impl Vault {
     /// Create a new, empty vault protected by `passphrase`.
     pub fn create(passphrase: &str, kdf: KdfParams) -> Result<Self, VaultError> {
+        validate_kdf(&kdf)?;
         let mut salt = [0u8; SALT_LEN];
         fill_random(&mut salt)?;
         let key = derive_key(passphrase, &salt, &kdf)?;
@@ -235,6 +269,10 @@ impl Vault {
         if env.version != ENVELOPE_VERSION {
             return Err(VaultError::UnsupportedVersion(env.version));
         }
+
+        // Before a single base64 decode, let alone an allocation: a tampered envelope naming
+        // gigabytes of memory or millions of passes must fail here, not inside Argon2.
+        validate_kdf(&env.kdf)?;
 
         let b64 = base64::engine::general_purpose::STANDARD;
         let salt_vec = b64.decode(&env.salt_b64)?;
@@ -624,6 +662,101 @@ mod tests {
         assert!(v.is_empty());
         let reopened = Vault::open("pw", &v.seal().unwrap()).unwrap();
         assert!(reopened.is_empty());
+    }
+
+    /// A sealed envelope with its KDF parameters rewritten, so `open` faces vault-supplied
+    /// params without any hashing having happened yet.
+    fn sealed_with_kdf(kdf: KdfParams) -> String {
+        let v = Vault::create("pw", fast()).unwrap();
+        let mut parsed: serde_json::Value = serde_json::from_str(&v.seal().unwrap()).unwrap();
+        parsed["kdf"]["m_cost_kib"] = serde_json::json!(kdf.m_cost_kib);
+        parsed["kdf"]["t_cost"] = serde_json::json!(kdf.t_cost);
+        parsed["kdf"]["p_cost"] = serde_json::json!(kdf.p_cost);
+        serde_json::to_string(&parsed).unwrap()
+    }
+
+    #[test]
+    fn absurd_kdf_params_are_rejected_before_key_derivation() {
+        // Each of these would be catastrophic (or at least endless) inside Argon2: 4 TiB of
+        // memory, billions of passes, billions of lanes, or a degenerate zero. The policy
+        // check must refuse every one without invoking the KDF — hence the time bound, which
+        // no real key derivation could meet for the large cases and which pins "rejected
+        // before hashing" rather than "rejected by hashing".
+        let base = KdfParams {
+            m_cost_kib: 64 * 1024,
+            t_cost: 3,
+            p_cost: 4,
+        };
+        let cases = [
+            KdfParams {
+                m_cost_kib: u32::MAX,
+                ..base
+            },
+            KdfParams {
+                t_cost: u32::MAX,
+                ..base
+            },
+            KdfParams {
+                p_cost: u32::MAX,
+                ..base
+            },
+            KdfParams {
+                m_cost_kib: 0,
+                ..base
+            },
+            KdfParams { t_cost: 0, ..base },
+            KdfParams { p_cost: 0, ..base },
+        ];
+        for kdf in cases {
+            let started = std::time::Instant::now();
+            let err = Vault::open("pw", &sealed_with_kdf(kdf)).unwrap_err();
+            assert!(
+                matches!(err, VaultError::Kdf(_)),
+                "m={} t={} p={}: got {err:?}",
+                kdf.m_cost_kib,
+                kdf.t_cost,
+                kdf.p_cost
+            );
+            assert!(
+                err.to_string().contains("out of policy"),
+                "the refusal must say why: {err}"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "m={} t={} p={} took {:?}: Argon2 must not have run",
+                kdf.m_cost_kib,
+                kdf.t_cost,
+                kdf.p_cost,
+                started.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn creating_a_vault_with_absurd_kdf_params_fails_fast() {
+        let err = Vault::create(
+            "pw",
+            KdfParams {
+                m_cost_kib: u32::MAX,
+                t_cost: 3,
+                p_cost: 4,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, VaultError::Kdf(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn historical_kdf_ranges_still_open() {
+        // The policy must not brick vaults this code already wrote: the shipped default and
+        // the test params both sit inside the range, and `open` accepts them.
+        for kdf in [KdfParams::default(), KdfParams::for_tests()] {
+            validate_kdf(&kdf).expect("shipped params must stay in policy");
+            let mut v = Vault::create("pw", kdf).unwrap();
+            v.put("k", "v");
+            let reopened = Vault::open("pw", &v.seal().unwrap()).unwrap();
+            assert_eq!(reopened.get("k").unwrap().expose(), "v");
+        }
     }
 
     #[test]

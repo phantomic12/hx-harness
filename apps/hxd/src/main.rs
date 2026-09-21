@@ -84,6 +84,12 @@ async fn main() -> Result<()> {
     // than at 3am on the first request. It also resolves the API's bearer token, so a `api.token`
     // reference that cannot be resolved fails here rather than leaving the API unprotected.
     let update_cfg = config.update.clone();
+    // Fail closed on a zero update interval before anything is bound: `enabled: true` with
+    // `interval_secs: 0` would panic the check ticker after startup. `--check` validates this
+    // too, since it shares the startup path.
+    update_cfg
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid `update` configuration: {e}"))?;
     let state = AppState::build(config, Utc::now())
         .await
         .context("could not build the daemon state")?;
@@ -155,6 +161,13 @@ fn spawn_reaper(state: &Arc<AppState>) {
 fn spawn_update_checker(cfg: UpdateConfig, current_version: &str) {
     if !cfg.enabled {
         tracing::debug!("update checking is disabled; no task spawned");
+        return;
+    }
+    // Defense in depth: startup validation already rejected `interval_secs: 0`, but this type
+    // is also constructed programmatically, and a zero period would panic the ticker. Never
+    // arm a zero-period interval; refuse loudly instead of clamping silently.
+    if cfg.interval_secs == 0 {
+        tracing::error!("update checking is enabled with interval_secs: 0; refusing to start the checker");
         return;
     }
 
@@ -231,5 +244,26 @@ async fn check_once(client: &reqwest::Client, cfg: &UpdateConfig, current: &str)
         _ => {
             tracing::debug!(current = current, "already on the latest version");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_rejects_an_enabled_checker_with_a_zero_interval() {
+        // The startup path (`main`) validates `config.update` before binding: enabled + zero
+        // must fail there rather than panic the ticker after startup. This pins the validation
+        // the startup path depends on, against the exact config shape that would crash.
+        let raw = "update:\n  enabled: true\n  url: https://example.com/releases/latest\n  interval_secs: 0\n";
+        let config = Config::from_yaml(raw).expect("the fixture must parse");
+        assert!(config.update.enabled);
+        assert_eq!(config.update.interval_secs, 0);
+        let err = config
+            .update
+            .validate()
+            .expect_err("startup must reject enabled + interval 0");
+        assert!(err.contains("interval_secs"), "{err}");
     }
 }

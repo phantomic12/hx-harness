@@ -41,7 +41,7 @@ use hx_agent::{ApprovalDecision, Approver};
 use hx_core::approval::{ActionRequest, ApprovalOption, ApprovalRequest, RiskClass};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -301,16 +301,33 @@ impl Approver for PhoneApprover {
             "pushing an approval to the phone webhook"
         );
 
-        if let Err(err) = post_payload(&self.push_url, &payload).await {
-            tracing::warn!(
-                id = %request.id,
-                error = %err,
-                url = %SanitizedUrl(&self.push_url),
-                "approval push failed; the run will time out to a denial unless answered by the webhook"
-            );
+        // The push is inside the approval deadline, not before it: a relay that accepts the
+        // connection and never answers must not hold the run past `wait`. The client-level
+        // timeouts in `phone_client` bound a single attempt; this outer timeout bounds the
+        // attempt against the run's own budget, so the total time from here to the denial below
+        // never exceeds `wait` by more than a scheduling margin.
+        let started = tokio::time::Instant::now();
+        match tokio::time::timeout(self.wait, post_payload(&self.push_url, &payload)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    id = %request.id,
+                    error = %err,
+                    url = %SanitizedUrl(&self.push_url),
+                    "approval push failed; the run will time out to a denial unless answered by the webhook"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    id = %request.id,
+                    url = %SanitizedUrl(&self.push_url),
+                    "approval push timed out; the run will time out to a denial unless answered by the webhook"
+                );
+            }
         }
 
-        let waited = tokio::time::timeout(self.wait, answer).await;
+        let remaining = self.wait.checked_sub(started.elapsed()).unwrap_or_default();
+        let waited = tokio::time::timeout(remaining, answer).await;
 
         // Whatever happened, the entry goes: a queue that keeps answered or expired questions grows
         // without bound.
@@ -338,22 +355,41 @@ impl Approver for PhoneApprover {
 ///
 /// Thin and `pub(crate)` so a unit test can pin the wire shape without a socket; the real-socket path is
 /// `tests/phone_approval.rs`.
+///
+/// Two bounds apply. The shared client carries a connect timeout and an overall request timeout,
+/// so a relay that stalls mid-response cannot hold a connection forever. And the error is
+/// reported with [`reqwest::Error::without_url`]: the transport error otherwise embeds the full
+/// request URL, and `push_url` is operator configuration that may itself carry a credential
+/// (basic-auth userinfo, a `?token=` query) which must never reach a log line via `%err`.
 pub(crate) async fn post_payload(
     url: &str,
     payload: &PushPayload,
 ) -> std::result::Result<(), String> {
-    let client = reqwest::Client::new();
-    let response = client
+    let response = phone_client()
         .post(url)
         .json(payload)
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.without_url().to_string())?;
     if response.status().is_success() {
         Ok(())
     } else {
         Err(format!("webhook responded {}", response.status()))
     }
+}
+
+/// The one webhook client for all phone pushes: connection and request timeouts bound every
+/// attempt, and sharing it across pushes reuses connections instead of building a client per
+/// approval.
+fn phone_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("the phone webhook client has no invalid configuration")
+    })
 }
 
 fn brief(action: &ActionRequest) -> String {
@@ -523,5 +559,83 @@ mod tests {
         );
         let (option, _by) = answer.blocking_recv().unwrap();
         assert_eq!(option, ApprovalOption::Deny);
+    }
+
+    fn payload_for_test() -> PushPayload {
+        PushPayload {
+            id: "apr_phone_test".to_string(),
+            question: "git push".to_string(),
+            choices: vec!["allow".to_string(), "deny".to_string()],
+            respond_url: "https://daemon/v1/approvals/apr_phone_test/respond?token=abc".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hanging_push_server_cannot_hold_the_run_past_its_deadline() {
+        // A relay that accepts the connection and never answers: without the outer timeout in
+        // `decide`, the bare client would hold the run for its whole 10s request timeout *plus*
+        // the full answer wait. The approval deadline must bound the push too.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener");
+        let addr = listener.local_addr().expect("listener addr");
+        tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+            }
+        });
+
+        let wait = Duration::from_secs(2);
+        let approver = PhoneApprover::new(
+            format!("http://{addr}/push"),
+            "https://daemon".into(),
+            wait,
+        );
+        let action = hx_core::approval::ActionRequest::tool(
+            "shell",
+            "git push",
+            RiskClass::External,
+            "test",
+        );
+
+        let started = tokio::time::Instant::now();
+        let decision = approver.decide(&request("git push", RiskClass::External), &action).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            decision.option,
+            ApprovalOption::Deny,
+            "an unanswered push must fail closed"
+        );
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "decide took {elapsed:?}: the hanging push escaped the {wait:?} deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_push_error_never_carries_the_push_url() {
+        // The push URL is operator configuration and may carry its own credential
+        // (`?token=`, userinfo). The reqwest transport error embeds the request URL by
+        // default; `without_url` must have stripped it before it can reach `%err` log lines.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener");
+        let closed_port = probe.local_addr().expect("listener addr").port();
+        drop(probe);
+
+        let sentinel = "PUSH-URL-SENTINEL-9f3c2a";
+        let url = format!("http://127.0.0.1:{closed_port}/push?token={sentinel}");
+        let err = post_payload(&url, &payload_for_test()).await.expect_err(
+            "a POST to a closed port must fail so the error can be inspected",
+        );
+        assert!(
+            !err.contains(sentinel),
+            "push error leaked the push URL query: {err}"
+        );
+        assert!(
+            !err.contains(&closed_port.to_string()),
+            "push error leaked the push URL at all: {err}"
+        );
     }
 }

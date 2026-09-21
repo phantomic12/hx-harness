@@ -702,3 +702,130 @@ fn the_token_appears_in_no_error_body_no_log_line_and_no_debug_output() {
         "probe event missing; logging capture did not receive events"
     );
 }
+
+fn mcp_post(uri: &str, host: &str, auth: Option<String>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("host", host)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream");
+    if let Some(auth) = auth {
+        builder = builder.header("authorization", auth);
+    }
+    builder.body(Body::from("{}")).unwrap()
+}
+
+#[tokio::test]
+async fn a_spoofed_host_header_is_rejected_even_with_a_valid_token() {
+    // The DNS-rebinding defense: rmcp's loopback allowlist is retained, so a request whose
+    // `Host` names an attacker domain is refused before authentication is even consulted.
+    let fixture = Fixture::new();
+    let server = fixture
+        .server(ApprovalPolicy::at(AutonomyLevel::Balanced))
+        .await;
+    let app = router(server, Some(ApiToken::new(SENTINEL)));
+
+    let res = app
+        .oneshot(mcp_post(
+            "http://localhost/mcp",
+            "rebind.attacker.example",
+            Some(format!("Bearer {SENTINEL}")),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "a rebinding Host must be refused despite a valid token"
+    );
+}
+
+#[tokio::test]
+async fn unauthenticated_loopback_keeps_host_protection() {
+    // The exact configuration the old unconditional `disable_allowed_hosts()` left exposed: no
+    // token on loopback. Loopback hosts still reach the bearer layer; anything else is refused.
+    let fixture = Fixture::new();
+    let server = fixture
+        .server(ApprovalPolicy::at(AutonomyLevel::Balanced))
+        .await;
+    let app = router(server, None);
+
+    let res = app
+        .clone()
+        .oneshot(mcp_post("http://127.0.0.1/mcp", "127.0.0.1", None))
+        .await
+        .unwrap();
+    assert_ne!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "a loopback Host must not be host-rejected"
+    );
+
+    let res = app
+        .oneshot(mcp_post(
+            "http://localhost/mcp",
+            "rebind.attacker.example",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "an unauthenticated server must still refuse a rebinding Host"
+    );
+}
+
+#[tokio::test]
+async fn an_explicit_allowlist_serves_its_host_but_requires_a_token() {
+    use hx_mcp::server_http::router_with_allowed_hosts;
+
+    let fixture = Fixture::new();
+    let server = fixture
+        .server(ApprovalPolicy::at(AutonomyLevel::Balanced))
+        .await;
+
+    // No token with an explicit allowlist is the same misconfiguration as a non-loopback bind
+    // without one: refused at construction, not at request time.
+    assert!(
+        router_with_allowed_hosts(Arc::clone(&server), None, vec!["mcp.example.com".into()])
+            .is_none()
+    );
+
+    let app = router_with_allowed_hosts(
+        server,
+        Some(ApiToken::new(SENTINEL)),
+        vec!["mcp.example.com".into()],
+    )
+    .expect("token + allowlist must build");
+
+    let res = app
+        .clone()
+        .oneshot(mcp_post(
+            "http://mcp.example.com/mcp",
+            "mcp.example.com",
+            Some(format!("Bearer {SENTINEL}")),
+        ))
+        .await
+        .unwrap();
+    assert_ne!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "an explicitly allowed host must reach the handler"
+    );
+
+    let res = app
+        .oneshot(mcp_post(
+            "http://mcp.example.com/mcp",
+            "other.example.com",
+            Some(format!("Bearer {SENTINEL}")),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "a host outside the explicit allowlist must be refused"
+    );
+}

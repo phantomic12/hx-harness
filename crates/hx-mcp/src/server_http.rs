@@ -59,10 +59,14 @@ use crate::server::McpServer;
 /// When a token is configured, the `require_bearer` middleware protects all routes except
 /// the liveness probe `/healthz`.
 pub fn router(server: Arc<McpServer>, token: Option<ApiToken>) -> axum::Router {
-    let mut mcp_config = StreamableHttpServerConfig::default().with_sse_keep_alive(None);
-    // When bound to non-loopback or custom authorities, disable allowed hosts check so
-    // legitimate callers routed to this server are not rejected by DNS rebinding checks.
-    mcp_config = mcp_config.disable_allowed_hosts();
+    // The rmcp default keeps its DNS-rebinding defense: only loopback `Host` values
+    // (`localhost`, `127.0.0.1`, `::1`) are accepted. An earlier revision called
+    // `disable_allowed_hosts()` here unconditionally, which left an *unauthenticated* loopback
+    // server — the legal no-token configuration — accepting requests whose `Host` named any
+    // attacker domain a rebinding DNS record pointed at localhost. The allowlist is therefore
+    // retained as-is; a deployment that must answer under a public hostname sets its own list
+    // via `router_with_allowed_hosts` (and must present a bearer token with it).
+    let mcp_config = StreamableHttpServerConfig::default().with_sse_keep_alive(None);
 
     let service: StreamableHttpService<Arc<McpServer>, LocalSessionManager> =
         StreamableHttpService::new(
@@ -79,6 +83,45 @@ pub fn router(server: Arc<McpServer>, token: Option<ApiToken>) -> axum::Router {
         .nest_service("/mcp", service.clone())
         .fallback_service(service)
         .layer(axum::middleware::from_fn_with_state(token, require_bearer))
+}
+
+/// Build the router with an explicit `Host` allowlist for non-loopback deployments.
+///
+/// The allowlist replaces rmcp's loopback default (it does not extend it: callers that still
+/// serve loopback clients list those names too), and a bearer token is required — serving a
+/// tool-execution endpoint to a named public host without authentication is the misconfiguration
+/// [`require_token_for_bind`] exists to refuse, and this constructor refuses it the same way by
+/// returning `None` when `token` is `None`.
+pub fn router_with_allowed_hosts(
+    server: Arc<McpServer>,
+    token: Option<ApiToken>,
+    allowed_hosts: Vec<String>,
+) -> Option<axum::Router> {
+    let token = token?;
+    let mcp_config = StreamableHttpServerConfig::default()
+        .with_sse_keep_alive(None)
+        .with_allowed_hosts(allowed_hosts);
+
+    let service: StreamableHttpService<Arc<McpServer>, LocalSessionManager> =
+        StreamableHttpService::new(
+            {
+                let server = Arc::clone(&server);
+                move || Ok(Arc::clone(&server))
+            },
+            Arc::<LocalSessionManager>::default(),
+            mcp_config,
+        );
+
+    Some(
+        axum::Router::new()
+            .route("/healthz", axum::routing::get(healthz))
+            .nest_service("/mcp", service.clone())
+            .fallback_service(service)
+            .layer(axum::middleware::from_fn_with_state(
+                Some(token),
+                require_bearer,
+            )),
+    )
 }
 
 /// Liveness probe: returns `ok` and reveals no server state.

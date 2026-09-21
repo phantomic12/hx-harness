@@ -204,15 +204,37 @@ pub fn resolve_daemon_target(
 ///
 /// The web client (`crates/hx-server/static/index.html`) reads `localStorage.getItem("hx.api.token")`.
 /// Pre-populating it allows seamless authentication without prompting the user.
+///
+/// The token is serialized as a JSON string literal — never interpolated raw. A token containing
+/// `"`, `\`, or a newline would otherwise break out of the JS string and either corrupt the
+/// script or, worse, execute part of the token as code. `<`, `>`, `&` and the Unicode line
+/// separators are additionally `\u`-escaped so a token containing `</script>` cannot break out
+/// of a surrounding script element and U+2028/2029 cannot break the JS string itself; all of
+/// these escapes decode back to the identical value.
 pub fn generate_init_script(target: &DaemonTarget) -> String {
     let mut script = String::new();
     if let Some(ref token) = target.token {
+        let literal = js_string_literal(token.expose());
         script.push_str(&format!(
-            r#"try {{ localStorage.setItem("hx.api.token", "{}"); }} catch (e) {{ console.error("failed to set token", e); }}"#,
-            token.expose()
+            r#"try {{ localStorage.setItem("hx.api.token", {literal}); }} catch (e) {{ console.error("failed to set token", e); }}"#,
         ));
     }
     script
+}
+
+/// Serialize a value as a JavaScript string literal that decodes byte-identically.
+///
+/// `serde_json::to_string` on a `str` already quotes and escapes `"`, `\` and control
+/// characters with escapes that are also valid JavaScript. The extra replacements cover the
+/// characters JSON leaves raw but JavaScript-in-HTML does not tolerate.
+fn js_string_literal(value: &str) -> String {
+    serde_json::to_string(value)
+        .expect("a &str always serializes to a JSON string")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace(" ", "\\u2028")
+        .replace(" ", "\\u2029")
 }
 
 /// Run the Tauri desktop application window targeting the specified daemon.
