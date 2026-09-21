@@ -160,7 +160,7 @@ async fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
 /// `Z` is the answer worth having: a zombie is a child that was killed but never reaped, which is
 /// exactly the failure the reaping property exists to catch, and it is invisible to a check that only
 /// asks whether the process is still running.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn process_state(pid: &str) -> Option<char> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // The command name is in parentheses and may contain spaces or parentheses of its own, so the
@@ -576,7 +576,11 @@ async fn a_servers_stderr_is_counted_and_never_reaches_a_result_or_a_health_repo
     host.shutdown().await;
 }
 
-#[cfg(unix)]
+/// Linux is the one target where the child PID can be observed through `/proc/<pid>/stat` (state
+/// bit) and a `kill -0` style existence check, so only there can the test prove the child was
+/// actually reaped (not left as a `Z` zombie). macOS has no `/proc`, so it falls to the
+/// portable arm below just like Windows.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn the_host_reaps_every_child_it_spawned_when_it_shuts_down() {
     let fixture = Fixture::new();
@@ -601,11 +605,11 @@ async fn the_host_reaps_every_child_it_spawned_when_it_shuts_down() {
     fixture.assert_scripted_only();
 }
 
-/// Windows has no `/proc` and no `kill -0`, so the process-gone check cannot be made from a test
-/// process there. What this arm asserts is the half that is portable and still load-bearing: the
-/// shutdown completes, and the server it closed is no longer reported as up. A shutdown that hung, or
-/// that left the state claiming `Up`, fails on either platform.
-#[cfg(not(unix))]
+/// Windows and macOS have no `/proc` (macOS lacks `/proc/<pid>/stat` too), so the process-gone
+/// check cannot be made from a test process there. What this arm asserts is the half that is portable
+/// and still load-bearing: the shutdown completes, and the server it closed is no longer reported as up.
+/// A shutdown that hung, or that left the state claiming `Up`, fails on either platform.
+#[cfg(not(target_os = "linux"))]
 #[tokio::test]
 async fn the_host_reaps_every_child_it_spawned_when_it_shuts_down() {
     let fixture = Fixture::new();
