@@ -919,4 +919,16 @@ Closing it is a deliberate, reviewable change with its own test — not a doc ed
 
 Full-text search across session history (FTS5 is fine until it isn't) · skill marketplace
 with signing · multi-tenant auth · a graph memory backend · RL/replay tooling · voice
-(STT/TTS) — voice lands once the connector layer exists, since it's the same inbound pipeline.
+(STT/TTS) — voice lands once the connector layer exists, since it's the same inbound pipeline. ·
+**Real-time computer use via Laya** (https://brainfunctioncollapse.com/laya) — an
+open-source (Apache-2.0), local, non-autoregressive System-1 decision engine (typed
+choice/score/noul answers with probabilities in ~20–30 ms on a laptop GPU, 0 tokens generated,
+~650 MB, 322M params) as the fast decision layer for real-time UI/OS control (driving a
+terminal, browser or remote desktop frame-per-frame where an LLM round-trip is too slow), and as a
+cheap classifier/re-router in front of slower rungs. Deferred by decision: it adds a runtime +
+model download, is orthogonal to the model-pool/fan-out spawner (it is not an LLM and speaks no
+chat API), and there is no consumer that needs a sub-100 ms decision yet. When one appears
+(human-in-the-loop browser pane, egress/approval triage, an agent that must react to a live
+screen), it slots in as a `hx-browser` rung or a `hx-core` decision helper rather than a
+provider. Exact integration (screen→state encoding, the typed-question schema, per-frame pipelining)
+is left to that milestone.
