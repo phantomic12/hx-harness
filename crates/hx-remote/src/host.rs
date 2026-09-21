@@ -319,6 +319,29 @@ pub trait Host: Send + Sync {
 
     async fn read_file(&self, path: &str) -> Result<Vec<u8>>;
 
+    /// Read a file with a hard byte cap, for surfaces that serve what they read.
+    ///
+    /// WHY a second method rather than a cap on [`Host::read_file`]: the agent loop already bounds
+    /// reads at its own layer (and reports them as failed tool calls, not errors), while the HTTP
+    /// surface must refuse with a 413 before a multi-gigabyte file becomes a multi-gigabyte
+    /// response. The default implementation reads then rejects, which bounds the *answer* on every
+    /// transport; transports that can stat first (local) override it to bound the *read* as well —
+    /// stat, reject, and stream with `take(cap + 1)` so a file that grows between the stat and the
+    /// read, or reports no size at all (`/dev/zero`, a pipe), still cannot push more than `cap + 1`
+    /// bytes into memory.
+    async fn read_file_capped(&self, path: &str, cap: u64) -> Result<Vec<u8>> {
+        let bytes = self.read_file(path).await?;
+        let size = bytes.len() as u64;
+        if size > cap {
+            return Err(HxError::TooLarge {
+                what: path.to_string(),
+                size,
+                limit: cap,
+            });
+        }
+        Ok(bytes)
+    }
+
     async fn write_file(&self, path: &str, contents: &[u8]) -> Result<()>;
 
     async fn list_dir(&self, path: &str) -> Result<Vec<RemoteEntry>>;
