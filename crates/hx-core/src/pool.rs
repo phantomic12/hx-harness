@@ -1,18 +1,19 @@
-//! A model pool a future subagent spawner draws children from (M8).
+//! A model pool a subagent spawner draws children from (M8).
 //!
-//! ## Nothing draws from this pool yet — said plainly
+//! ## What this module is, said plainly
 //!
-//! There is **no subagent runtime in this repository**. `ROADMAP.md`'s M8 is written as if a
-//! subagent system already exists (\"today a subagent's model is a process-global `delegation.model`
-//! key\"); it does not — there is no `ChildSpec`, no orchestrator, no `spawn_child` anywhere in
-//! `crates/` or `apps/`. This module is the **pure routing logic** that a future spawner will draw
-//! from. Nothing calls [`ModelPool`] today. That gap is the deliverable's honest shape: the routing
-//! rules are the hard part, and they are worth landing and testing on their own before a spawner exists
-//! to exercise them. When that spawner lands, it draws a member from here, not the other way round.
+//! This module is the **pure routing logic** that a spawner draws from: it is the hard part, worth
+//! landing and testing on its own before a spawner exists to exercise it. The spawner that draws
+//! from it now **does** exist — `crates/hx-server/src/spawn.rs` (`Spawner::build_spec` draws a
+//! member from here and records it with the child; `run_child` marks a failed member down). That
+//! spawner is the **narrowest real thing** — one provider call per child, no agent-loop fan-out and
+//! no re-route across running lanes — and it draws a member from here, not the other way round. (There
+//! is still no full subagent runtime in this repository; the earlier claim that nothing called [`ModelPool`]
+//! was true when the pool landed and has since been overtaken by that spawner.)
 //!
 //! (Recording *which model and cost* a turn spent is not this module's job either: `UsageRecord` in
-//! `hx-store/src/session.rs` already carries `provider`, `credential`, `model` and `cost_usd`, so the
-//! audit half of M8 is already possible per turn.)
+//! `hx-store/src/session.rs` already carries `provider`, `credential`, `model` and `cost_usd`, and
+//! `Spawner::run_child` records it; the audit half of M8 is possible per child as well as per turn.)
 //!
 //! ## What a member is
 //!
