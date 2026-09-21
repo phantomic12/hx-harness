@@ -1005,6 +1005,7 @@ fn kind_of(event: &AgentEvent) -> &'static str {
         AgentEvent::SessionStarted { .. } => "session_started",
         AgentEvent::TurnStarted { .. } => "turn_started",
         AgentEvent::TextDelta { .. } => "text_delta",
+        AgentEvent::MessageReceived { .. } => "message_received",
         AgentEvent::ReasoningDelta { .. } => "reasoning_delta",
         AgentEvent::ToolCallStarted { .. } => "tool_call_started",
         AgentEvent::ToolCallFinished { .. } => "tool_call_finished",
