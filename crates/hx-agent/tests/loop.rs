@@ -20,7 +20,7 @@ use hx_core::ids::{AgentId, CredentialId, ProviderId, ToolCallId};
 use hx_core::message::{Message, Part};
 use hx_provider::{ChatRequest, ChatResponse, FinishReason, Usage};
 use hx_tools::testing::{BrokenHost, FakeHost, FakeSandbox};
-use hx_tools::{ReadFileTool, ShellTool, Tool, ToolContext, ToolError, ToolOutcome, ToolRegistry};
+use hx_tools::{ReadFileTool, ShellTool, Tool, ToolContext, ToolError, ToolOutcome, ToolRegistry, WriteFileTool};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -37,6 +37,9 @@ struct ScriptedModel {
     /// Every request the loop sent, so a test can assert what the model was *told* — the tool
     /// specs, and the tool results from the previous turn.
     seen: Mutex<Vec<ChatRequest>>,
+    /// Settled spend this double reports, so budget tests can start over budget without making a
+    /// priced call first.
+    spent: f64,
 }
 
 impl ScriptedModel {
@@ -44,6 +47,16 @@ impl ScriptedModel {
         Arc::new(Self {
             replies: Mutex::new(VecDeque::from(replies)),
             seen: Mutex::new(Vec::new()),
+            spent: 0.0,
+        })
+    }
+
+    /// A model that has already spent `spent` USD before the run starts.
+    fn indebted(replies: Vec<Result<ChatResponse>>, spent: f64) -> Arc<Self> {
+        Arc::new(Self {
+            replies: Mutex::new(VecDeque::from(replies)),
+            seen: Mutex::new(Vec::new()),
+            spent,
         })
     }
 
@@ -73,6 +86,10 @@ impl ModelCall for ScriptedModel {
 
     fn credential_id(&self) -> CredentialId {
         CredentialId::from("cred_test")
+    }
+
+    fn spent_usd(&self) -> f64 {
+        self.spent
     }
 }
 
@@ -1511,4 +1528,212 @@ async fn a_pattern_deletion_is_refused_rather_than_asked_about() {
         "nothing ran: {:?}",
         h.host.commands()
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Capability bounds: symlink escapes, byte caps, spend budgets
+// ---------------------------------------------------------------------------------------------
+
+/// A read grant capped at `max_bytes` on one path.
+fn bounded_read(path: &str, max_bytes: u64) -> Capability {
+    Capability::new(
+        Resource::FsPath {
+            path: path.to_string(),
+        },
+        [Action::Read],
+    )
+    .with_max_bytes(max_bytes)
+}
+
+#[tokio::test]
+async fn a_read_through_a_symlink_escape_is_refused_and_nothing_opens() {
+    // The exact shape of the escape: lexically `/ws/link/secret` is under the grant, physically
+    // the link points at `/etc`. The loop must refuse before anything opens — and the refusal
+    // must name the escape, not merely the missing grant.
+    let h = harness_on(
+        FakeHost::unix()
+            .with_file("/etc/secret", "classified")
+            .with_symlink("/ws/link", "/etc"),
+        vec![
+            Ok(reply_with(vec![(
+                "tc_1",
+                "read_file",
+                json!({ "path": "/ws/link/secret" }),
+            )])),
+            Ok(reply("I cannot read that")),
+        ],
+        vec![read_under("/ws")],
+        ApprovalPolicy::at(AutonomyLevel::Balanced),
+        Arc::new(AlwaysDeny),
+    );
+
+    let mut transcript = transcript_start();
+    let outcome = h.agent_loop.run(&mut transcript, &h.ctx).await.unwrap();
+
+    assert_eq!(outcome.refusals, 1);
+    assert_eq!(outcome.tool_calls, 0, "refused calls never run");
+    let results = tool_results(&transcript);
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].1);
+    assert!(
+        results[0].2.contains("symlink escape"),
+        "the refusal names the escape: {}",
+        results[0].2
+    );
+    assert!(
+        !results[0].2.contains("classified"),
+        "the target's bytes never reach the model: {}",
+        results[0].2
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_read_is_refused_before_the_model_sees_it() {
+    // A read cannot state its size up front, so this is the post-run check: the tool reports the
+    // measured bytes and the loop replaces the outcome with a refusal.
+    let h = harness(
+        vec![
+            Ok(reply_with(vec![(
+                "tc_1",
+                "read_file",
+                json!({ "path": "/ws/big.txt" }),
+            )])),
+            Ok(reply("too big, understood")),
+        ],
+        vec![bounded_read("/ws", 4)],
+        ApprovalPolicy::at(AutonomyLevel::Balanced),
+        Arc::new(AlwaysDeny),
+    );
+    h.host
+        .files
+        .lock()
+        .unwrap()
+        .insert("/ws/big.txt".to_string(), b"hello world".to_vec());
+
+    let mut transcript = transcript_start();
+    let outcome = h.agent_loop.run(&mut transcript, &h.ctx).await.unwrap();
+
+    assert_eq!(outcome.refusals, 1);
+    let results = tool_results(&transcript);
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].1);
+    assert!(
+        results[0].2.contains("over the 4-byte grant bound"),
+        "the refusal states the bound: {}",
+        results[0].2
+    );
+    assert!(
+        !results[0].2.contains("hello world"),
+        "the file's bytes never reach the model: {}",
+        results[0].2
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_write_is_refused_before_anything_lands() {
+    // A write states its size up front, so this is the pre-run check: nothing is written.
+    // Trusting + AlwaysAllow proves the refusal comes from the capability, not the approver.
+    let host = Arc::new(FakeHost::unix());
+    let model = ScriptedModel::new(vec![
+        Ok(reply_with(vec![(
+            "tc_1",
+            "write_file",
+            json!({ "path": "/ws/x.txt", "content": "abc" }),
+        )])),
+        Ok(reply("too big, understood")),
+    ]);
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(WriteFileTool::new()));
+    let agent_loop = AgentLoop::new(
+        agent(),
+        model,
+        Arc::new(registry),
+        token(vec![
+            Capability::new(
+                Resource::FsPath {
+                    path: "/ws".to_string(),
+                },
+                [Action::Write],
+            )
+            .with_max_bytes(2),
+        ]),
+        ApprovalSession::new(ApprovalPolicy::at(AutonomyLevel::Trusting)),
+        Arc::new(AlwaysAllow),
+    );
+    let ctx = ToolContext::new(host.clone());
+
+    let mut transcript = transcript_start();
+    let outcome = agent_loop.run(&mut transcript, &ctx).await.unwrap();
+
+    assert_eq!(outcome.refusals, 1);
+    assert_eq!(outcome.tool_calls, 0, "refused calls never run");
+    assert!(
+        host.file("/ws/x.txt").is_none(),
+        "the over-bound write never landed"
+    );
+    let results = tool_results(&transcript);
+    assert!(results[0].2.contains("over the 2-byte grant bound"), "{}", results[0].2);
+}
+
+#[tokio::test]
+async fn a_spent_budget_stops_the_run_before_the_next_model_call() {
+    // The model reports $6 already spent against a $5 provider budget: the loop must stop before
+    // sending another request, not after it.
+    let model = ScriptedModel::indebted(vec![Ok(reply("unused"))], 6.0);
+    let agent_loop = AgentLoop::new(
+        agent(),
+        model.clone(),
+        Arc::new(tools()),
+        token(vec![
+            Capability::new(
+                Resource::Provider {
+                    id: ProviderId::from("test"),
+                },
+                [Action::Connect],
+            )
+            .with_budget(5.0),
+        ]),
+        ApprovalSession::new(ApprovalPolicy::paranoid()),
+        Arc::new(AlwaysDeny),
+    );
+    let ctx = ToolContext::new(Arc::new(FakeHost::unix()));
+
+    let mut transcript = transcript_start();
+    let outcome = agent_loop.run(&mut transcript, &ctx).await.unwrap();
+
+    assert_eq!(outcome.stop, StopReason::BudgetExhausted);
+    assert_eq!(outcome.turns, 0);
+    assert!(
+        model.seen().is_empty(),
+        "no model call went out after the budget was spent"
+    );
+}
+
+#[tokio::test]
+async fn an_unspent_budget_lets_the_run_proceed() {
+    // The same budget with spend under it changes nothing: the run completes normally.
+    let model = ScriptedModel::indebted(vec![Ok(reply("all done"))], 1.0);
+    let agent_loop = AgentLoop::new(
+        agent(),
+        model.clone(),
+        Arc::new(tools()),
+        token(vec![
+            Capability::new(
+                Resource::Provider {
+                    id: ProviderId::from("test"),
+                },
+                [Action::Connect],
+            )
+            .with_budget(5.0),
+        ]),
+        ApprovalSession::new(ApprovalPolicy::paranoid()),
+        Arc::new(AlwaysDeny),
+    );
+    let ctx = ToolContext::new(Arc::new(FakeHost::unix()));
+
+    let mut transcript = transcript_start();
+    let outcome = agent_loop.run(&mut transcript, &ctx).await.unwrap();
+
+    assert_eq!(outcome.stop, StopReason::Completed);
+    assert_eq!(model.seen().len(), 1);
 }

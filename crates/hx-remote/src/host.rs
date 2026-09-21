@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use hx_core::config::HostKind;
-use hx_core::error::Result;
+use hx_core::error::{HxError, Result};
 use hx_core::ids::HostId;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -322,6 +322,30 @@ pub trait Host: Send + Sync {
     async fn write_file(&self, path: &str, contents: &[u8]) -> Result<()>;
 
     async fn list_dir(&self, path: &str) -> Result<Vec<RemoteEntry>>;
+
+    /// Resolve `path` to the absolute physical location the host would open, symlinks settled.
+    ///
+    /// WHY this is on the host rather than in `hx-core`: only the machine that owns the
+    /// filesystem can resolve its links — the daemon canonicalizing an SSH path against its own
+    /// disk would compare the wrong tree and either deny legitimate access or, worse, allow an
+    /// escape it cannot see. The agent loop calls this after the lexical capability check and
+    /// re-checks the answer against the token, so a path that *reads* as inside the grant but
+    /// *opens* as outside it is refused with `SymlinkEscape`.
+    ///
+    /// Contract, kept identical across implementations:
+    /// - existing paths resolve fully (links, `.`, `..` collapsed);
+    /// - not-yet-existing paths (write/create targets) resolve through the nearest existing
+    ///   ancestor with the missing tail joined back on, so creates stay checkable;
+    /// - `Err` **only** when this transport cannot resolve at all (never for a merely missing
+    ///   file). Callers treat `Err` as "resolution unavailable" and keep the lexical decision —
+    ///   a documented residual risk for those transports, not a per-file veto an attacker could
+    ///   trigger with a dangling link.
+    async fn canonicalize(&self, path: &str) -> Result<String> {
+        let _ = path;
+        Err(HxError::Remote(
+            "this host cannot resolve symlinks; containment is lexical only".to_string(),
+        ))
+    }
 
     /// Move a file or directory within the host, creating the destination's parent directory.
     ///

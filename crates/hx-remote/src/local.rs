@@ -191,8 +191,15 @@ impl Host for LocalHost {
             .await
             .map_err(|e| HxError::Remote(format!("error reading {path}: {e}")))?
         {
-            // `metadata` follows symlinks; a dangling link should not abort the whole listing.
-            let meta = match entry.metadata().await {
+            // `symlink_metadata` deliberately does NOT follow symlinks: the entry describes the
+            // link itself, never its target.
+            //
+            // WHY: `metadata` answers "what is at the end of this link" — for a link pointing at
+            // `/etc`, `is_dir` and `size` would describe `/etc`, and any consumer that recurses on
+            // `is_dir` (the trash measurement walk does) would walk a tree outside the grant while
+            // believing it is inside it. A listing names links; opening one is a separate, checked
+            // operation. A dangling link still must not abort the whole listing.
+            let meta = match tokio::fs::symlink_metadata(entry.path()).await {
                 Ok(meta) => meta,
                 Err(_) => continue,
             };
@@ -206,6 +213,18 @@ impl Host for LocalHost {
 
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
+    }
+
+    /// Resolve through the real filesystem, sharing [`hx_core::capability::canonicalize_for_check`]
+    /// so the host and the policy engine never disagree on what "resolved" means.
+    async fn canonicalize(&self, path: &str) -> Result<String> {
+        hx_core::capability::canonicalize_for_check(path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .ok_or_else(|| {
+                HxError::Remote(format!(
+                    "could not resolve {path}: no existing ancestor to resolve through"
+                ))
+            })
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<()> {

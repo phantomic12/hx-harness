@@ -28,7 +28,7 @@ use crate::approver::{ApprovalDecision, Approver};
 use crate::context::{ContextBuilder, ContextFacts};
 use crate::model::ModelCall;
 use hx_core::approval::{ActionRequest, ApprovalSession, RiskClass, Verdict};
-use hx_core::capability::{Action, CapabilityToken, Decision, Resource};
+use hx_core::capability::{Action, CapabilityToken, Decision, RequestUsage, Resource};
 use hx_core::error::Result;
 use hx_core::event::{AgentEvent, StopReason};
 use hx_core::ids::{AgentId, ToolCallId};
@@ -236,6 +236,29 @@ impl AgentLoop {
                 }
             }
 
+            // The capability spend ceiling: once the run's settled model spend passes the token's
+            // provider budget, no further model call goes out. Priced from reconciled cost, not
+            // the pessimistic reservation — and only when the token expresses a budget at all
+            // (see `provider_budget_usd`: no provider grants, or an uncapped one, means no stop).
+            if let Some(limit) = self.capability.provider_budget_usd() {
+                let spent = self.model.spent_usd();
+                if spent > limit {
+                    self.emit(AgentEvent::TurnFinished {
+                        agent: self.agent.clone(),
+                        turn,
+                        stop: StopReason::BudgetExhausted,
+                    });
+                    return Ok(RunOutcome {
+                        stop: StopReason::BudgetExhausted,
+                        turns: turn.saturating_sub(1),
+                        usage,
+                        final_text: last_assistant_text(transcript),
+                        tool_calls,
+                        refusals,
+                    });
+                }
+            }
+
             self.emit(AgentEvent::TurnStarted {
                 agent: self.agent.clone(),
                 turn,
@@ -380,23 +403,73 @@ impl AgentLoop {
     ) -> CallOutcome {
         // Phase 1: parse and ask the tool what it would need. `prepare` also rejects an unknown
         // tool or unusable arguments, which is a result the model can act on.
-        let prepared = match self.tools.prepare(name, arguments, ctx) {
+        let mut prepared = match self.tools.prepare(name, arguments, ctx) {
             Ok(prepared) => prepared,
             Err(err) => {
                 return CallOutcome::refused(format!("could not run {name}: {err}"));
             }
         };
 
+        // The resource the post-run byte check enforces against: the lexical requirement, replaced
+        // by the canonical path when the re-check below resolves one. A read through a link that
+        // lands under a *different* grant must be measured against that grant's bound, not the
+        // lexical one's — otherwise a wide grant at the target still trips a tight grant at the name.
+        let mut enforced_resource: Option<(Resource, Action)> = None;
+
         // Phase 2: the capability. A denial here is auditable and not something a prompt can
         // approve away — that is the whole distinction between a capability and an approval.
-        if let Some(requirement) = prepared.requirement() {
-            let decision = self.capability.check(
+        if let Some(requirement) = prepared.requirement().cloned() {
+            let now = chrono::Utc::now();
+            let usage = requirement
+                .bytes
+                .map(RequestUsage::bytes)
+                .unwrap_or_default();
+            let decision = self.capability.check_with_usage(
                 &requirement.resource,
                 requirement.action,
-                chrono::Utc::now(),
+                now,
+                usage,
             );
             if let Decision::Allow = decision {
-                // Allowed by the token; approval still has its say below.
+                enforced_resource =
+                    Some((requirement.resource.clone(), requirement.action));
+
+                // Phase 2b: the symlink re-check. The lexical check above compares strings; the
+                // host resolves what it would actually open, and the token is asked again about
+                // that. A path that reads as inside the grant but opens as outside it is refused
+                // here — closing the escape lexical containment leaves open.
+                //
+                // Residual risks, stated rather than hidden: a host that cannot resolve at all
+                // keeps the lexical decision (see `Host::canonicalize`), and a link swapped
+                // between this re-check and the open still wins its race. The tool opens the
+                // resolved path (`set_path`), so at least the checked and the opened path are the
+                // same string.
+                if let Resource::FsPath { path } = &requirement.resource {
+                    if let Ok(canonical) = ctx.host.canonicalize(path).await {
+                        let canonical_resource = Resource::FsPath {
+                            path: canonical.clone(),
+                        };
+                        let recheck = self.capability.check_with_usage(
+                            &canonical_resource,
+                            requirement.action,
+                            now,
+                            usage,
+                        );
+                        if let Decision::Allow = recheck {
+                            if canonical != *path {
+                                prepared.set_path(&canonical);
+                                enforced_resource =
+                                    Some((canonical_resource, requirement.action));
+                            }
+                        } else {
+                            return CallOutcome::refused(format!(
+                                "refused: {path} resolves to {canonical}, outside the agent's \
+                                 filesystem grants (symlink escape). This is not something you \
+                                 can retry — ask the operator to widen the grant."
+                            ));
+                        }
+                    }
+                }
             } else {
                 let Decision::Deny(reason) = decision else {
                     unreachable!("checked above")
@@ -480,15 +553,59 @@ impl AgentLoop {
         // Phase 4: run it. A tool that ran and reported failure is still a call that ran: the
         // model gets the error text and decides what to do about it, which is the whole point of
         // a tool result being a result rather than an abort.
-        match prepared.run(ctx).await {
-            Ok(outcome) => CallOutcome::Ran {
-                ok: outcome.ok,
-                content: if outcome.truncated {
-                    format!("{}\n[output truncated]", outcome.content)
+        //
+        // The byte bound is enforced here when the requirement could not state the size up front
+        // (reads, patches): the outcome reports what actually moved, and an over-bound result is
+        // replaced with a refusal before the model sees it. For a read nothing left the machine,
+        // so the refusal is complete; for a mutation the effect already landed, and the message
+        // says so rather than pretending otherwise.
+        let byte_gate = match &enforced_resource {
+            Some((resource, action)) => {
+                let stated = prepared
+                    .requirement()
+                    .and_then(|requirement| requirement.bytes);
+                if stated.is_none() {
+                    Some((resource.clone(), *action))
                 } else {
-                    outcome.content
-                },
-            },
+                    None
+                }
+            }
+            None => None,
+        };
+        match prepared.run(ctx).await {
+            Ok(outcome) => {
+                if outcome.ok {
+                    if let (Some((resource, action)), Some(moved)) =
+                        (&byte_gate, outcome.bytes_moved)
+                    {
+                        let now = chrono::Utc::now();
+                        if let Some(cap) =
+                            self.capability.max_bytes_for(resource, *action, now)
+                        {
+                            if moved > cap {
+                                let landed = if action.is_mutating() {
+                                    " The write already landed; nothing about it is shown."
+                                } else {
+                                    ""
+                                };
+                                return CallOutcome::refused(format!(
+                                    "refused: the call moved {moved} bytes, over the {cap}-byte \
+                                     grant bound.{landed} This is not something you can retry — ask \
+                                     the operator to widen the grant."
+                                ));
+                            }
+                        }
+                    }
+                }
+                CallOutcome::Ran {
+                    ok: outcome.ok,
+                    content: if outcome.truncated {
+                        format!("{}\n[output truncated]", outcome.content)
+                    } else {
+                        outcome.content
+                    },
+                }
+            }
             // The tool could not act at all. Still a result: the model needs to know the call went
             // nowhere, not to have the run end under it.
             Err(ToolError::Arguments(message)) => {

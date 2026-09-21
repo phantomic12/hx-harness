@@ -41,6 +41,21 @@ fn fs_requirement(path: &str, action: Action, verb: &str) -> Requirement {
     )
 }
 
+/// Resolve `path` to what the host will actually open, before touching it.
+///
+/// WHY: the capability token is checked against the resolved string, but a symlink between the
+/// check and the open would redirect the effect elsewhere. Canonicalizing here — and opening the
+/// answer — makes the effect match the re-checked path even for callers that bypass the agent
+/// loop (`registry.dispatch`, `hx tool`). When the host cannot resolve (a transport without
+/// symlink support), the lexical path is opened unchanged: a documented residual risk, and the
+/// loop's own canonical re-check already refused whatever it could see.
+async fn effective_path(ctx: &ToolContext, path: &str) -> String {
+    ctx.host
+        .canonicalize(path)
+        .await
+        .unwrap_or_else(|_| path.to_string())
+}
+
 // ---------------------------------------------------------------------------------------------
 // read_file
 // ---------------------------------------------------------------------------------------------
@@ -96,12 +111,13 @@ impl Tool for ReadFileTool {
 
     async fn call(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutcome, ToolError> {
         let mut parsed: ReadArgs = parse_args(&args)?;
-        parsed.path = ctx.resolve(&parsed.path);
+        parsed.path = effective_path(ctx, &ctx.resolve(&parsed.path)).await;
 
         let bytes = match ctx.host.read_file(&parsed.path).await {
             Ok(bytes) => bytes,
             Err(err) => return Ok(ToolOutcome::failed(format!("{err}"))),
         };
+        let byte_len = bytes.len() as u64;
 
         if bytes.len() > MAX_READ_BYTES {
             return Ok(ToolOutcome::failed(format!(
@@ -125,6 +141,8 @@ impl Tool for ReadFileTool {
 
         let empty = text.is_empty();
         let (content, truncated) = bound(text);
+        // Measured, not guessed: the loop enforces the granting byte bound on this before the
+        // model sees it, which is what makes bounded reads real.
         Ok(ToolOutcome {
             content: if empty {
                 format!("({} is empty)", parsed.path)
@@ -133,6 +151,7 @@ impl Tool for ReadFileTool {
             },
             ok: true,
             truncated,
+            bytes_moved: Some(byte_len),
         })
     }
 }
@@ -184,16 +203,18 @@ impl Tool for WriteFileTool {
         ctx: &ToolContext,
     ) -> Result<Option<Requirement>, ToolError> {
         let parsed: WriteArgs = parse_args(args)?;
-        Ok(Some(fs_requirement(
-            &ctx.resolve(&parsed.path),
-            Action::Write,
-            "write",
-        )))
+        // The content length is known before anything runs, so the loop can refuse an over-bound
+        // write without touching the disk.
+        Ok(Some(
+            fs_requirement(&ctx.resolve(&parsed.path), Action::Write, "write")
+                .bytes(parsed.content.len() as u64),
+        ))
     }
 
     async fn call(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutcome, ToolError> {
         let mut parsed: WriteArgs = parse_args(&args)?;
-        parsed.path = ctx.resolve(&parsed.path);
+        parsed.path = effective_path(ctx, &ctx.resolve(&parsed.path)).await;
+        let byte_len = parsed.content.len() as u64;
 
         match ctx
             .host
@@ -204,7 +225,8 @@ impl Tool for WriteFileTool {
                 "wrote {} bytes to {}",
                 parsed.content.len(),
                 parsed.path
-            ))),
+            ))
+            .bytes_moved(byte_len)),
             Err(err) => Ok(ToolOutcome::failed(format!("could not write: {err}"))),
         }
     }
@@ -288,6 +310,9 @@ impl Tool for PatchTool {
         ctx: &ToolContext,
     ) -> Result<Option<Requirement>, ToolError> {
         let parsed: PatchArgs = parse_args(args)?;
+        // No byte count here on purpose: the patched size depends on the file's current contents,
+        // which the requirement cannot see. The outcome reports the written size instead, and the
+        // loop enforces the bound on that.
         Ok(Some(fs_requirement(
             &ctx.resolve(&parsed.path),
             Action::Write,
@@ -297,7 +322,7 @@ impl Tool for PatchTool {
 
     async fn call(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutcome, ToolError> {
         let mut parsed: PatchArgs = parse_args(&args)?;
-        parsed.path = ctx.resolve(&parsed.path);
+        parsed.path = effective_path(ctx, &ctx.resolve(&parsed.path)).await;
         if parsed.old.is_empty() {
             return Ok(ToolOutcome::failed(
                 "`old` is empty: a patch with nothing to find would either do nothing or match \
@@ -334,11 +359,13 @@ impl Tool for PatchTool {
                 } else {
                     contents.replacen(&parsed.old, &parsed.new, 1)
                 };
+                let byte_len = updated.len() as u64;
                 match ctx.host.write_file(&parsed.path, updated.as_bytes()).await {
                     Ok(()) => Ok(ToolOutcome::ok(format!(
                         "patched {replaced} occurrence(s) in {}",
                         parsed.path
-                    ))),
+                    ))
+                    .bytes_moved(byte_len)),
                     Err(err) => Ok(ToolOutcome::failed(format!("could not write: {err}"))),
                 }
             }
@@ -560,6 +587,89 @@ mod tests {
             .unwrap()
             .expect("writing a file has an external effect");
         assert_eq!(requirement.action, Action::Write);
+    }
+
+    #[test]
+    fn a_write_requirement_states_its_byte_count_up_front() {
+        // The loop refuses an over-bound write before it runs; the count has to be here, not
+        // discovered after the bytes landed.
+        let requirement = WriteFileTool
+            .requirement(
+                &json!({"path": "/ws/x.txt", "content": "abc"}),
+                &ctx(Arc::new(FakeHost::unix())),
+            )
+            .unwrap()
+            .expect("writing a file has an external effect");
+        assert_eq!(requirement.bytes, Some(3));
+    }
+
+    #[test]
+    fn a_read_requirement_states_no_byte_count_it_cannot_know() {
+        // The size is what the read discovers. Stating a guess would be worse than stating
+        // nothing: the loop enforces the bound on the outcome's measured bytes instead.
+        let requirement = ReadFileTool
+            .requirement(
+                &json!({"path": "/ws/x.txt"}),
+                &ctx(Arc::new(FakeHost::unix())),
+            )
+            .unwrap()
+            .expect("reading a file has an external effect");
+        assert_eq!(requirement.bytes, None);
+    }
+
+    #[tokio::test]
+    async fn a_read_reports_its_measured_bytes_for_the_post_run_check() {
+        let host = Arc::new(FakeHost::unix().with_file("/ws/x.txt", "hello"));
+        let outcome = ReadFileTool
+            .call(json!({"path": "/ws/x.txt"}), &ctx(host))
+            .await
+            .unwrap();
+        assert!(outcome.ok);
+        assert_eq!(outcome.bytes_moved, Some(5));
+    }
+
+    #[tokio::test]
+    async fn a_read_through_a_symlink_opens_the_target_not_the_name() {
+        // The tool opens what the host resolves — the agent's canonical re-check (which refuses
+        // this path under a `/ws` grant) is then deciding about the file actually read.
+        let host = Arc::new(
+            FakeHost::unix()
+                .with_file("/etc/secret", "classified")
+                .with_symlink("/ws/link", "/etc"),
+        );
+        let outcome = ReadFileTool
+            .call(json!({"path": "/ws/link/secret"}), &ctx(host))
+            .await
+            .unwrap();
+        assert!(outcome.ok, "{outcome:?}");
+        assert_eq!(outcome.content, "classified");
+
+        // And the re-check the loop runs on the resolved path refuses it under a `/ws` grant:
+        // lexically covered, physically outside.
+        assert!(hx_core::capability::path_grant_covers(
+            "/ws",
+            "/ws/link/secret"
+        ));
+        let canonical = "/etc/secret";
+        assert!(!hx_core::capability::path_grant_covers_canonical(
+            "/ws",
+            std::path::Path::new(canonical)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_write_through_a_symlink_lands_at_the_target() {
+        let host = Arc::new(FakeHost::unix().with_symlink("/ws/link", "/etc"));
+        let outcome = WriteFileTool
+            .call(
+                json!({"path": "/ws/link/marker", "content": "x"}),
+                &ctx(host.clone()),
+            )
+            .await
+            .unwrap();
+        assert!(outcome.ok, "{outcome:?}");
+        assert_eq!(host.file("/etc/marker").as_deref(), Some("x"));
+        assert_eq!(outcome.bytes_moved, Some(1));
     }
 
     // ---- patch -------------------------------------------------------------------------------

@@ -81,6 +81,22 @@ impl PreparedCall {
     pub async fn run(self, ctx: &ToolContext) -> Result<ToolOutcome, ToolError> {
         self.tool.call(self.args, ctx).await
     }
+
+    /// Point this call at the host-resolved path, after the capability re-check.
+    ///
+    /// WHY: the token is checked against the lexical path first and the canonical path second;
+    /// the tool must then open the *canonical* one, or a symlink swapped between check and open
+    /// redirects the effect. Only touches `args["path"]` when the tool takes one.
+    pub fn set_path(&mut self, canonical: &str) {
+        if let Some(obj) = self.args.as_object_mut() {
+            if obj.contains_key("path") {
+                obj.insert(
+                    "path".to_string(),
+                    serde_json::Value::String(canonical.to_string()),
+                );
+            }
+        }
+    }
 }
 
 /// The tools available to an agent.

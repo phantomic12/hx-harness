@@ -224,10 +224,13 @@ impl Tool for ShellTool {
         // dropped stderr's label, and never reported that it had truncated anything.
         let (content, truncated) = crate::tool::bound(report);
 
+        // Shell output is unbounded by nature and never a file transfer: no byte count is stated,
+        // so `max_bytes` does not apply to it. A shell that needs a byte bound is a different tool.
         Ok(ToolOutcome {
             content,
             ok,
             truncated,
+            bytes_moved: None,
         })
     }
 }

@@ -24,6 +24,17 @@ pub trait ModelCall: Send + Sync {
     fn provider_id(&self) -> ProviderId;
 
     fn credential_id(&self) -> CredentialId;
+
+    /// Model spend accumulated through this callable, in USD, for capability budgets.
+    ///
+    /// Defaults to `0.0`: a callable that cannot price its calls (a direct provider with no rate
+    /// card, a scripted test double) reports no spend, and a capability `budget_usd` never trips
+    /// on it. That is an honest unknown, not a claim of freeness — and the reason budget
+    /// enforcement in the loop is documented as router-priced spend. [`RouterModel`] overrides
+    /// this with the settled cost of every call it made.
+    fn spent_usd(&self) -> f64 {
+        0.0
+    }
 }
 
 /// One provider, one credential.
@@ -120,6 +131,11 @@ pub struct RouterModel {
     /// The model this role currently prefers, for [`ModelCall::model`] — see its docs.
     preferred: String,
     last: Mutex<Option<Routed>>,
+    /// Settled model spend through this callable, in USD. Accumulated from the reconciled cost of
+    /// every successful call — the same number the router settles its limiters with — so the
+    /// agent loop's capability-budget check prices exactly what the run spent, not the pessimistic
+    /// reservation (whose surplus goes back on reconcile).
+    spent: Mutex<f64>,
 }
 
 impl RouterModel {
@@ -161,6 +177,7 @@ impl RouterModel {
             secrets,
             preferred,
             last: Mutex::new(None),
+            spent: Mutex::new(0.0),
         })
     }
 
@@ -232,6 +249,12 @@ impl ModelCall for RouterModel {
                     // back: the ceiling is enforced on real spend, not on the estimate.
                     let cost = router.estimate_cost(&lease.route, &usage);
                     router.reconcile(lease, usage.total_tokens(), cost, now);
+                    // The same settled number feeds capability budgets: the loop stops the run
+                    // once this passes the token's provider budget.
+                    *self
+                        .spent
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) += cost;
                 }
 
                 *self.lock_last() = Some(Routed {
@@ -275,6 +298,13 @@ impl ModelCall for RouterModel {
         self.last_call()
             .map(|routed| routed.credential)
             .unwrap_or_else(|| CredentialId::from("unrouted"))
+    }
+
+    fn spent_usd(&self) -> f64 {
+        *self
+            .spent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
