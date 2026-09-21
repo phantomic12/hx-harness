@@ -19,32 +19,6 @@ the property the claim asserts, and the suite was watched for red. Every mutatio
 
 ---
 
-## Addendum — status of F1–F8 on `main` (2026-09-20)
-
-This report was written on the `feat/verify-m6` branch against `main` `46eada2`. Since then,
-**main has landed a fix for every finding that was a defect.** F1, F2, F3, F4, F5, F6, F7 and
-F8 are all closed on current `main` (`415d4e1`). None remains open. The findings that were
-already self-correct (claims 2, 3, 4, 6 "held") stand as recorded and required no code change.
-
-| Finding | Status on `main` | Fix |
-|---|---|---|
-| F1 — startup refusal untested | **Fixed** | `779c042` adds `apps/hxd/tests/startup.rs`, spawning the built `hxd` via `env!("CARGO_BIN_EXE_hxd")` with `--bind 0.0.0.0:<free port>` and no token, asserting a non-zero exit, a reason naming both `api.token` and `HX_API_TOKEN`, and that nothing is left listening. Mutation-checked: removing `require_token_for_bind` turns it red. |
-| F2 — `?token=` on every route | **Fixed** | `779c042` narrows the query-parameter consultation to a **route check** (`is_websocket_route`) *and* an upgrade check, so `?token=` is now accepted only on a real WebSocket route. The module doc's sentence is true as written. Mutation-checked. |
-| F3 — query token reaches a transport error | **Fixed** | `56498de` strips the request URL with `err.without_url()` before converting to `SearchError::Transport` in `UrlCache::fetch`, so neither `Display` nor `Debug` of a transport failure carries the token. |
-| F4 — the stored token sits in a field nothing reads | **Fixed** | `56498de` drops `Entry::url` entirely, keeping live query credentials off disk. Legacy on-disk entries containing `url` still deserialize cleanly; tests pin the no-`url`-field on-disk JSON. |
-| F5 — extraction doc claims fail on the fallback path | **Fixed (hardening)** | `8a49ffc` makes `PlainRung` strip with the same tokenizer the readability pass uses, so the CDATA skip, quote tracking and chrome drop hold on **whichever rung answers**. Four new "under the floor" fixtures make `PlainRung` the answerer and assert it by name. Mutation-checked (test reds on the loose-regex fallback). |
-| F6 — stealth rung leaks the daemon environment | **Fixed** | `f13b529` gives the stealth browser child a fail-closed allowlist (mirroring `hx-mcp` `b483298`) instead of inheriting everything, so a third-party browser binary no longer receives daemon credentials. Pinned by `crates/hx-browser/tests/stealth_env.rs`. |
-| F7 — the injection test's `file:///etc/passwd` assertion is vacuous | **Fixed** | `80222ac` embeds a `file:///etc/passwd` href into the fixture under test and asserts both that its label appears as prose and that its href does not survive — the assertion now has teeth. |
-| F8 — ordering deviation has an undocumented consequence | **Fixed (documented)** | `2db46ca` documents the unstated cost across `docs/approvals.md`, `ROADMAP.md` and `TESTING.md`: on a chat-bridge deployment the `ThirdParty`> `External` ordering means a stdio MCP prompt cannot be answered from the bridge (ceiling `Mutate`), and names the operator's real options (raise the bridge ceiling or answer locally). The behaviour itself is deliberate and unchanged. |
-
-The eight throwaway probes that produced the quoted output in this report were removed from the
-`feat/verify-m6` worktree before this branch was cut; none is part of the deliverable.
-
-Documented here so a later reader does not re-report a fixed finding or "fix" the documented
-consequence back.
-
----
-
 ## Findings, ranked by severity
 
 ### F1 — The startup refusal is not covered by any test, and deleting it leaves the whole suite green
