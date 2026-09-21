@@ -1,6 +1,9 @@
 //! Hermetic tests for the Firecracker runtime, against a tiny axum mock of the Firecracker HTTP
 //! API on a Unix socket.
 //!
+//! Unix-only: Firecracker needs Linux/KVM and the mock binds a Unix socket.
+#![cfg(unix)]
+
 //! Real `firecracker` needs `/dev/kvm` and a guest kernel/rootfs; none of that exists on a
 //! build host. The runtime calls its `bin` with `--api-sock <path>` and then PUTs over that
 //! socket. These tests point `bin` at `/bin/sleep` (a real spawnable file that never reads its
