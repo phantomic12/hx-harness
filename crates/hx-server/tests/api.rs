@@ -472,6 +472,12 @@ async fn harness_with(config_yaml: &str, replies: Vec<Result<ChatResponse>>) -> 
     let mut config = hx_core::config::Config::from_yaml(config_yaml).expect("config parses");
     let dir = tempfile::tempdir().expect("temp dir");
     let root = dir.keep();
+    // Canonicalize the temp root up front so paths derived from it (the workspace, the data dir,
+    // and any tool path built on the workspace) share the same prefix as the canonicalized workspace
+    // root checked by the tools. On macOS `$TMPDIR` lives under /var/folders which itself
+    // resolves to /private/var/folders; without this, a tool path from the workspace never matches
+    // the canonical root and the read is spuriously denied (tool_calls=0, refusals=1).
+    let root = std::fs::canonicalize(&root).expect("canonicalize temp root");
     config.daemon.data_dir = root.join("data").display().to_string();
 
     let workspace = root.join("work");
