@@ -108,9 +108,12 @@ async fn receive_yields_what_the_route_pushed() {
 
 #[tokio::test]
 async fn receive_from_a_closed_channel_is_none_not_an_error() {
-    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Inbound>();
     let con = webhook_connector(None, rx);
-    // The sender was dropped, so nothing can ever be pushed: the loop must see `None`, not a failure.
+    // The sender must be dropped *before* the receive: a live sender means "a push may still come",
+    // so `recv` would wait forever and the test would hang rather than fail. Dropping it is what makes
+    // "nothing can ever be pushed" true, which is the case under test.
+    drop(tx);
     let received = con.receive(&Secret::new("")).await.unwrap();
     assert!(received.is_none());
 }

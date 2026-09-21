@@ -203,7 +203,16 @@ pub fn build_edit_body(conversation: &Conversation, message_id: i64, text: &str)
 /// real API, and a streaming driver that never learns the id can only ever send whole answers: the
 /// visible message would never grow. A bare integer is still tolerated, because the field is
 /// unambiguous and a proxy may flatten the object.
+///
+/// A body that is not signed `ok: true` yields `None` even when it carries a `message_id`: the id
+/// of a message Telegram refused to send names nothing on screen, and handing it to the driver
+/// would have it edit a message that does not exist instead of reporting the failure. Fail closed,
+/// the same way `receive` treats a missing `ok` and [`crate::telegram_stream::classify`] treats a
+/// `2xx` without one.
 pub fn sent_message_id(response: &Value) -> Option<i64> {
+    if response.get("ok") != Some(&Value::Bool(true)) {
+        return None;
+    }
     let result = response.get("result")?;
     result
         .get("message_id")
@@ -662,6 +671,21 @@ mod tests {
         assert_eq!(sent_message_id(&refusal), None);
         let empty = json!({ "ok": true, "result": {} });
         assert_eq!(sent_message_id(&empty), None);
+    }
+
+    #[test]
+    fn a_refused_send_reports_no_id_even_when_a_message_id_is_present() {
+        // `ok: false` is the verdict; a `message_id` beside it names nothing on screen (a proxy's
+        // error page, a half-parsed body). The driver must report the failure, not edit a ghost.
+        let wire = json!({
+            "ok": false,
+            "error_code": 400,
+            "description": "Bad Request: chat not found",
+            "result": { "message_id": 1234 }
+        });
+        assert_eq!(sent_message_id(&wire), None);
+        let missing_ok = json!({ "result": { "message_id": 1234 } });
+        assert_eq!(sent_message_id(&missing_ok), None);
     }
 
     #[test]
