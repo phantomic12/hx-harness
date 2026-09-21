@@ -36,6 +36,7 @@ use hx_core::message::{Message, Part};
 use hx_provider::{ToolSpec, Usage};
 use hx_tools::{Requirement, ToolContext, ToolError, ToolRegistry};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -81,6 +82,15 @@ pub struct RunOutcome {
     pub tool_calls: u32,
     /// Tool calls a capability or an approval refused.
     pub refusals: u32,
+    /// Events the run produced that never reached the event channel.
+    ///
+    /// WHY counted rather than hidden: in a daemon run the channel's reader is the writer that
+    /// persists events to the store, so a dropped event is a hole in the audit trail. Surfacing
+    /// the count in the outcome makes that hole visible to the caller instead of silent. A
+    /// closed channel is *not* counted: nobody listening is a configured shape (live clients
+    /// come and go), not a loss — and the transcript sink remains the durable path regardless.
+    /// Zero in the common case, where the writer keeps up.
+    pub dropped_events: u32,
 }
 
 /// Where the messages of a run go as they are produced.
@@ -112,6 +122,10 @@ pub struct AgentLoop {
     events: Option<mpsc::Sender<AgentEvent>>,
     sink: Option<Arc<dyn TranscriptSink>>,
     system: Option<String>,
+    /// Events produced but never delivered (channel full *and* the deadline expired while waiting
+    /// for capacity). Atomic because `run` takes `&self` while every emit site needs to record a
+    /// loss; reset at the start of each run and read into the outcome at its end.
+    dropped: AtomicU32,
 }
 
 impl AgentLoop {
@@ -134,6 +148,7 @@ impl AgentLoop {
             events: None,
             sink: None,
             system: None,
+            dropped: AtomicU32::new(0),
         }
     }
 
@@ -196,7 +211,13 @@ impl AgentLoop {
 
     fn emit(&self, event: AgentEvent) {
         if let Some(sender) = &self.events {
-            let _ = sender.try_send(event);
+            if sender.try_send(event).is_err() {
+                // Sink full. The event would otherwise be silently lost before the writer persisted
+                // it (in a daemon run the channel's reader is the event writer). Count it so the
+                // closing RunOutcome makes the audit-trail hole visible instead of hiding it. A *closed*
+                // channel is not counted: nobody listening is a configured shape, not a loss.
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
         }
     }
 
@@ -232,6 +253,7 @@ impl AgentLoop {
                         final_text: last_assistant_text(transcript),
                         tool_calls,
                         refusals,
+                        dropped_events: self.dropped.load(Ordering::SeqCst),
                     });
                 }
             }
@@ -246,7 +268,37 @@ impl AgentLoop {
             // are offered, and whether a system prompt exists at all. See `crate::context`.
             let request = context.request(&self.model.model(), transcript);
 
-            let response = match self.model.complete(request).await {
+            // The wall-clock deadline must hold across an in-flight provider call, not just between turns:
+            // a stalled upstream must not hold the session past its bound (GH #26). We wrap the call in
+            // the remaining budget rather than trusting the client's own timeout, which is about a single
+            // request and not this run's bound.
+            let complete = async { self.model.complete(request).await };
+            let response = match self.limits.deadline {
+                None => complete.await,
+                Some(deadline) => {
+                    let left = deadline.saturating_sub(started.elapsed());
+                    match tokio::time::timeout(left, complete).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            self.emit(AgentEvent::TurnFinished {
+                                agent: self.agent.clone(),
+                                turn,
+                                stop: StopReason::BudgetExhausted,
+                            });
+                            return Ok(RunOutcome {
+                                stop: StopReason::BudgetExhausted,
+                                turns: turn.saturating_sub(1),
+                                usage,
+                                final_text: last_assistant_text(transcript),
+                                tool_calls,
+                                refusals,
+                                dropped_events: self.dropped.load(Ordering::SeqCst),
+                            });
+                        }
+                    }
+                }
+            };
+            let response = match response {
                 Ok(response) => response,
                 Err(err) => {
                     self.emit(AgentEvent::Error {
@@ -311,6 +363,7 @@ impl AgentLoop {
                     final_text: text,
                     tool_calls,
                     refusals,
+                    dropped_events: self.dropped.load(Ordering::SeqCst),
                 });
             }
 
@@ -367,6 +420,7 @@ impl AgentLoop {
             final_text: last_assistant_text(transcript),
             tool_calls,
             refusals,
+            dropped_events: self.dropped.load(Ordering::SeqCst),
         })
     }
 

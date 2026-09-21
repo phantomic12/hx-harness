@@ -171,6 +171,25 @@ impl ApprovalQueue {
         action: &ActionRequest,
         session: Option<&str>,
     ) -> ApprovalDecision {
+        self.decide_in_with_wait(request, action, session, self.wait)
+            .await
+    }
+
+    /// The same, waiting `wait` instead of the queue's own default.
+    ///
+    /// WHY a per-question wait rather than a per-request queue: the question has to stay visible on
+    /// the one queue clients poll (`GET /v1/approvals` reads the daemon's shared queue, and answers
+    /// arrive through it). A second queue per request would hold a question no client can see and no
+    /// answer route can reach. The wait is therefore a property of the *ask*, not of the queue — the
+    /// queue stays shared, and each run's ask carries how long that run will wait for silence to
+    /// become a denial.
+    pub async fn decide_in_with_wait(
+        &self,
+        request: &ApprovalRequest,
+        action: &ActionRequest,
+        session: Option<&str>,
+        wait: Duration,
+    ) -> ApprovalDecision {
         let (reply, answer) = oneshot::channel();
 
         {
@@ -185,7 +204,7 @@ impl ApprovalQueue {
             );
         }
 
-        let waited = tokio::time::timeout(self.wait, answer).await;
+        let waited = tokio::time::timeout(wait, answer).await;
 
         // Whatever happened, the entry goes: a queue that keeps answered or expired questions grows
         // without bound and a client that polls it sees ghosts.
@@ -202,7 +221,7 @@ impl ApprovalQueue {
             )),
             Err(_) => ApprovalDecision::deny(format!(
                 "nobody answered within {}s for {}",
-                self.wait.as_secs(),
+                wait.as_secs(),
                 brief(action)
             )),
         }
@@ -232,6 +251,9 @@ fn truncate(text: &str) -> String {
 pub struct SessionScopedQueue {
     queue: Arc<ApprovalQueue>,
     session: String,
+    /// A per-request wait, overriding the queue's own default for this run's asks. `None` means
+    /// "the queue decides" — which is the daemon-wide wait, and the shape every existing caller has.
+    wait: Option<Duration>,
 }
 
 impl SessionScopedQueue {
@@ -239,6 +261,23 @@ impl SessionScopedQueue {
         Arc::new(Self {
             queue,
             session: session.into(),
+            wait: None,
+        })
+    }
+
+    /// The same, waiting `wait` for an answer instead of the queue's default.
+    ///
+    /// The question still lands on the shared queue (see `decide_in_with_wait` for why that
+    /// matters); only the silence-becomes-denial horizon moves, to what the request asked for.
+    pub fn new_with_wait(
+        queue: Arc<ApprovalQueue>,
+        session: impl Into<String>,
+        wait: Duration,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            queue,
+            session: session.into(),
+            wait: Some(wait),
         })
     }
 }
@@ -246,9 +285,18 @@ impl SessionScopedQueue {
 #[async_trait]
 impl Approver for SessionScopedQueue {
     async fn decide(&self, request: &ApprovalRequest, action: &ActionRequest) -> ApprovalDecision {
-        self.queue
-            .decide_in(request, action, Some(&self.session))
-            .await
+        match self.wait {
+            Some(wait) => {
+                self.queue
+                    .decide_in_with_wait(request, action, Some(&self.session), wait)
+                    .await
+            }
+            None => {
+                self.queue
+                    .decide_in(request, action, Some(&self.session))
+                    .await
+            }
+        }
     }
 }
 
@@ -554,5 +602,26 @@ mod tests {
             AnswerResult::Answered
         );
         assert!(asking.await.expect("resumes").option == ApprovalOption::AllowOnce);
+    }
+
+    #[tokio::test]
+    async fn a_custom_wait_overrides_the_queues_own_silence_horizon() {
+        // The queue's default is far longer than the custom wait: if the custom wait were ignored the
+        // denial would arrive late (or never, within the test's window). A short custom wait must win.
+        let queue = ApprovalQueue::new(Duration::from_secs(60));
+        let request = request_for("ls");
+        let action = ActionRequest::shell("ls");
+
+        let began = std::time::Instant::now();
+        let decision = queue
+            .decide_in_with_wait(&request, &action, None, Duration::from_millis(40))
+            .await;
+
+        assert_eq!(decision.option, ApprovalOption::Deny);
+        assert!(
+            began.elapsed() < Duration::from_secs(60),
+            "the custom wait must win over the queue's 60s default"
+        );
+        assert!(queue.is_empty(), "an expired question does not linger");
     }
 }
