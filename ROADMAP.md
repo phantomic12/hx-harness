@@ -713,9 +713,19 @@ pure, self-contained module a future spawner will draw from. That is what has la
   with `sent: None` rather than sent. The real case this exists for: one model rejects `reasoning_effort`
   with `HTTP 400` while another accepts it. Asserted over a **scripted pool** — no network, members fail,
   clamp and recover on command — with each routing invariant proven by a mutation that turns its test red.
-- ⬜ **Re-route on member death across *running* lanes is still to come** — it needs running
-  children, which needs the spawner to exist; it is explicitly out of scope for the spawner that
-  has landed (it would be half-built without them). The spawner itself has **landed**:
+- ✅ **Re-route on member death across a *running* child** — [`Spawner::run_lane`] makes **one**
+  provider call against the drawn member, and if that member **dies while it is running** (the pool's
+  [`member_death`] rule: a 5xx/timeout/404, an exhausted quota, a refused credential) it marks the
+  member **down in the pool** and **re-draws onto the next healthy member**, running the same prompt
+  there. It fails **bounded** when every member is down, using the pool's own [`DrawError::AllDown`]
+  (never a second error type, never a retry-forever loop). The audit shows **both** sides: the members
+  that died appear on [`ChildRecord::dead_members`] (each with its reason) and the member that finished
+  is the recorded model — a re-route is never a silent model switch. A failure that is the child's own
+  (a refused request, a policy denial, an unresolved credential, a missing route) does **not** re-route and
+  does not bench the member, because every member would refuse the same request the same way. Health is the
+  pool's, so a benched member stays down for later draws. All over a **scripted pool and a scripted
+  provider**, each assertion proven to fail by a mutation (see `TESTING.md`). The spawner itself has
+  **landed**:
 - ✅ **The child spawner that draws from this pool** (`crates/hx-server/src/spawn.rs`) — the
   **narrowest real thing** that exercises the path: [`Spawner::build_spec`] draws a **healthy**
   member and clamps the requested parameters to it (reusing the pool's `clamp` and [`DrawError`],
@@ -733,16 +743,19 @@ pure, self-contained module a future spawner will draw from. That is what has la
 
 The routing reasoning this milestone is about, restated for what remains: lanes could not differ because a fan-out
 has no per-child model to differ; one model's parameter set is not another's because a 400 for `reasoning_effort`
-is a 400; one upstream can take down every lane because all children share the model. The pool and now the spawner
-here remove the second ceiling (clamping), the shared-model property (members carry their own endpoint, credential,
-parameters and health) and the per-child model + cost in the audit chain; the first (a fan-out across members) and the
-third (re-route on member death across *running* lanes) still need running children, which nothing in this repository
-spawns as a runtime yet — the spawner that landed is the narrowest real provider call, not a fan-out.
+is a 400; one upstream can take down every lane because all children share the model. The pool, the spawner and
+`run_lane` here remove the second ceiling (clamping), the shared-model property (members carry their own endpoint,
+credential, parameters and health), the per-child model + cost in the audit chain, and the re-route of a running
+child onto a healthy member when its member dies. What still is **not** built is a full subagent runtime: nothing in
+this repository yet spawns **N concurrent lanes** as a fan-out and drives them to a result — `run_lane` is a
+single prompt run that re-draws on death, not an orchestrator over many concurrent children.
 
-**Exit criteria** (still open — they describe the spawner): a fan-out of N lanes runs across N members of a
-pool, each lane's model recorded in the audit chain; killing one member's upstream mid-run re-routes new lanes
-to a healthy member with no operator action and no lane stalled by retry backoff; a lane whose model rejects a
-configured parameter is clamped and runs instead of failing at spawn.
+**Exit criteria** (mostly met by the spawner; the fan-out remains open): **a fan-out of N lanes runs across N
+members of a pool, each lane's model recorded in the audit chain** — still open, needs a runtime that spawns N
+concurrent children; **killing one member's upstream mid-run re-routes** — **met** for a single running child
+(`Spawner::run_lane` re-draws onto a healthy member, bounded by the pool's `AllDown`, with both the dying and
+the finishing member recorded, no operator action and no stall); a lane whose model rejects a configured parameter is
+clamped and runs instead of failing at spawn — **met** (`build_spec` clamps at spawn).
 
 ---
 
