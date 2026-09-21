@@ -291,6 +291,37 @@ async fn a_fan_out_over_http_reaches_n_distinct_members_and_records_each() {
     assert_eq!(totals.input_tokens, 20);
 }
 
+/// Default off over HTTP: a fan-out child names no tools and records none — the child tool loop
+/// is opt-in per spec and the route does not opt in, so the record carries an empty `tools_used`.
+#[tokio::test]
+async fn a_fan_out_without_tools_records_no_tools_used() {
+    let state = harness(
+        ModelPool::new(vec![member("cheap")]),
+        registry_for(&["cheap"]),
+        secrets_for(&["cheap"]),
+    )
+    .await;
+    let sid = session(&state.store).as_str().to_string();
+
+    let body = FanOutBody {
+        children: vec![FanOutChild {
+            session: sid,
+            prompt: "do a".to_string(),
+        }],
+    };
+
+    let (status, out) = post_fanout(state, serde_json::to_value(&body).unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let children = out["children"].as_array().unwrap();
+    assert_eq!(children.len(), 1);
+    let rec = children[0]["Ran"].as_object().expect("the child ran");
+    assert_eq!(
+        rec["tools_used"],
+        serde_json::Value::Array(vec![]),
+        "no loop ran, so no tools are recorded: {rec:?}"
+    );
+}
+
 /// A member that dies mid-fan-out fails only its own child; the other completes. Both are reported
 /// over HTTP, each a distinct-members allocation.
 #[tokio::test]
