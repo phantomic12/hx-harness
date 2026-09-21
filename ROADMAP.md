@@ -588,10 +588,17 @@ report's addendum for the per-finding status and commits.
     than silently returning a page fetched the wrong way; a browser that runs but cannot fetch still surfaces
     as `SearchError::Refused`, never an empty body. Launching a browser is deliberate and documented — a
     caller selects `Browser` or `Auto`, and the `may_launch_browser` flag records which modes may
-    launch one; an ordinary `Http` fetch never becomes a browser launch. No `hx-server` route or tool
-    yet drives a research run through this selector (research is still invoked only by tests and by code that
-    hand-constructs a `Fetcher`), so a call that reaches the browser today must go through
-    `research_with_fetch_mode` with `Auto` or `Browser`; that is the one remaining unwired seam.
+    launch one; an ordinary `Http` fetch never becomes a browser launch. **A production caller now
+    drives a research run through this selector.** `POST /v1/research`
+    (`crates/hx-server/src/routes.rs`) and `hx research` (`apps/hx/src/main.rs`) run the pipeline with
+    the fetcher `select_fetcher` chose, and the report says which one ran (`fetcher`) and why
+    (`fetch_note`) — so a caller can tell a plain fetch it asked for from an `Auto` degradation, and
+    the route never lies about which it got. An explicit `Browser` mode this host cannot satisfy is a
+    `409 Conflict` naming the missing Chromium, never a silent plain fetch; `Auto` is the only mode
+    that degrades, and it says so in the note. The route never reaches the network itself: every page
+    fetch goes through the selected `Fetcher`. *(Corrected in M6 — an earlier version of this
+    paragraph said no route or tool drove the research path and called that the one remaining unwired
+    seam; that was true when written and is false now. Do not restore it.)*
 - Search: SearXNG, DDG, Mojeek, Marginalia, Brave, Google PSE, Wikipedia, plus the
   extraction ladder and URL/ETag caching
   - ◐ **The extraction ladder.** `crates/hx-search/src/extract.rs` is a hand-rolled ladder — plain
@@ -627,10 +634,16 @@ report's addendum for the per-finding status and commits.
     by canonical URL, fuses ranks with RRF, fetches the top 8 sources through `UrlCache` using an
     in-crate `Fetcher` (with per-fetch timeout and body cap, avoiding any inverted dependency on
     `hx-browser`), extracts with `Ladder::default_rungs()`, and produces citations with zero paid
-    API calls.
+    API calls. **It has a production caller**: `POST /v1/research` behind the same bearer-token gate
+    as every other route, returning the citations, each backend's outcome and the selected fetcher;
+    and `hx research <QUERY> [--max-sources N] [--fetch-mode http|auto|browser] [--json]`, which
+    exits 1 when no backend answered so a script can gate on it without parsing prose. A blank query
+    is a `400` and an unconfigured daemon a `503`, the same answer `/v1/search` gives.
 
 **Exit criteria:** ✅ a research task runs 6 free backends in parallel, dedupes, RRF-ranks,
-extracts the top 8, and cites them — with zero paid API calls.
+extracts the top 8, and cites them — with zero paid API calls. ✅ **and it is reachable**: the
+pipeline is callable over HTTP (`POST /v1/research`) and from the command line (`hx research`),
+not only from tests.
 
 **What has landed so far (search).** The backend set is now one file per engine, and four more
 keyless engines are wired into the registry: **Mojeek** (its own crawler, so its results are
