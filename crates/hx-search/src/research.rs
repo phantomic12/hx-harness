@@ -1215,6 +1215,23 @@ mod tests {
     use std::sync::Mutex;
     use tokio::net::TcpListener;
 
+    /// The pipeline's types must be usable as state held across an `await` on a threaded runtime.
+    ///
+    /// This is a compile-time assertion, and it is the test that would have caught the M6 research
+    /// route failing to compile: `ResearchTask` holds a `Ladder`, the ladder holds
+    /// `Box<dyn ExtractionRung>`, and a trait object without the `Send + Sync` supertraits makes
+    /// `&ResearchTask` non-`Send` — so *any* `async fn` that awaits `run` is rejected, with an
+    /// error that names the caller's route rather than the missing bound. Remove `Send + Sync` from
+    /// [`crate::extract::ExtractionRung`] and this test stops compiling; that is the whole point of
+    /// it. A `#[test]` and not a doc claim, because a doc claim cannot fail a build.
+    #[test]
+    fn the_research_pipeline_can_be_held_across_an_await_on_a_threaded_runtime() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ResearchTask>();
+        assert_send_sync::<Ladder>();
+        assert_send_sync::<Arc<dyn Fetcher>>();
+    }
+
     /// A scripted loopback HTTP server.
     struct TestServer {
         addr: std::net::SocketAddr,
