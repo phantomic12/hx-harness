@@ -144,25 +144,17 @@ fn lcs_ops(a: &[&str], b: &[&str]) -> Vec<Op> {
 
 /// Coarse O(n+m) fallback for inputs too large for the LCS table.
 ///
-/// Every line that appears in both sequences is emitted as context in the order it appears in `a`; every line
-/// that appears only in `a` is a removal, only in `b` an addition. True (the removed and added sets are
-/// exact); it simply will not align an out-of-order shared block.
+/// WHY a blunt whole-file rewrite instead of a set-difference: the previous
+/// fallback built `set_b` from the proposed lines and then emitted additions
+/// with `!set_b.contains(line)`, a predicate false for every line from `b`,
+/// so large reviews silently omitted all added content; set membership also
+/// collapsed duplicates. Emitting every old line as a removal and every
+/// proposed line as an addition is coarse (it does not align shared blocks)
+/// but never drops content and preserves order and multiplicity.
 fn whole_line_ops(a: &[&str], b: &[&str]) -> Vec<Op> {
-    let set_b: std::collections::BTreeSet<&str> = b.iter().copied().collect();
     a.iter()
-        .map(|&line| {
-            if set_b.contains(line) {
-                Op::Keep(line.to_string())
-            } else {
-                Op::Delete(line.to_string())
-            }
-        })
-        .chain(
-            b.iter()
-                .copied()
-                .filter(|&line| !set_b.contains(line))
-                .map(|line| Op::Insert(line.to_string())),
-        )
+        .map(|&line| Op::Delete(line.to_string()))
+        .chain(b.iter().map(|&line| Op::Insert(line.to_string())))
         .collect()
 }
 
@@ -327,6 +319,35 @@ mod tests {
         assert!(d
             .iter()
             .any(|l| matches!(l, DiffLine::Added(t) if t == "two")));
+    }
+
+    #[test]
+    fn the_large_diff_fallback_keeps_additions_and_duplicates() {
+        // Force the O(n+m) whole-line fallback by exceeding the LCS cell budget; a
+        // b with a length that pushes n·m over MAX_LCS_CELLS while staying small enough
+        // to be quick. Every proposed line must appear as an addition (the old fallback
+        // dropped all of them and collapsed duplicates via a set).
+        let a: Vec<&str> = vec!["old"; 3000];
+        let mut b: Vec<&str> = vec!["new"; 3000];
+        b.push("new"); // duplicate
+        let a_s = a.join("\n");
+        let b_s = b.join("\n");
+        assert!(
+            a.len() as u64 * b.len() as u64 > MAX_LCS_CELLS as u64,
+            "test must exercise the fallback"
+        );
+        let d = unified_diff(&a_s, &b_s);
+        let added = d.iter().filter(|l| matches!(l, DiffLine::Added(_))).count();
+        assert_eq!(
+            added,
+            b.len(),
+            "every proposed line (incl. duplicate) must be an addition, got {added}"
+        );
+        let removed = d
+            .iter()
+            .filter(|l| matches!(l, DiffLine::Removed(_)))
+            .count();
+        assert_eq!(removed, a.len());
     }
 
     #[test]
