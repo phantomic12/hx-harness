@@ -1342,13 +1342,19 @@ and a display server, which CI does not have — so what is tested, headlessly, 
   the session, and **never leaks a token or a path outside the workspace** — the summary is redacted
   per-token by shape (a ≥16-alphanumeric token made only of alphanumerics plus `-`/`_`/`.`, or an
   absolute path that is not under the workspace root), including a token hidden inside a URL's `?token=` or a
-  `key=value` pair, where the value is masked while the URL/key structure stays visible. An unknown session is
-  labeled, not omitted. Raising the actual notification (the plugin call) is not exercised.
+  `key=value` pair, where the value is masked while the URL/key structure stays visible. The same shape
+  heuristic is guarded against over-redaction: `?token=abc&other=def` and ordinary words
+  (`stakeholder`, `tokenizer`) pass through untouched, while the deliberate cost — a rare long hyphenated
+  compound like `well-known-pseudorandom-…` reads as token-shaped — is pinned as accepted. An unknown
+  session is labeled, not omitted. Raising the actual notification (the plugin call) is not exercised.
 
 Each assertion was proven to fail by mutating the production code: removing the tray `toggle-window` mapping,
 swallowing a refused hotkey as `Registered`, dropping the token redaction, dropping the path-outside check, the
 URL-`?token=`/`key=value` embedded-token masking (reverting `mask_embedded` put the token back in the body),
-and omitting the unknown-session label each turned its specific test red.
+lowering `is_token_shaped`'s bar made the short-query and ordinary-word over-redaction tests fall, and omitting
+the unknown-session label each turned its specific test red. The shared `hx_secrets::Redactor` is likewise
+pinned **not** to mask the bare word `token` or short query values (proven red when the bearer-header pattern
+was widened to match `token` alone).
 
 ## Running the suite
 

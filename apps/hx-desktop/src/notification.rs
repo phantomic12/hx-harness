@@ -305,6 +305,61 @@ mod tests {
         }
     }
 
+    /// The over-redaction guard: `mask_embedded` splits a word into runs and masks only a run that is
+    /// token-shaped (`>=16 alphanumerics of alnum|`-`|`_`|`.`). A query string with *short*
+    /// values (`?token=abc&other=def`) has no token-shaped run, so the word `token`, the parameter
+    /// names and the short values must all survive — the redactor must not blank everything that mentions a
+    /// token, or it would corrupt the very summaries it is meant to keep readable.
+    #[test]
+    fn a_query_string_with_short_values_is_not_over_redacted() {
+        let leaky = "curl \"https://example.com/?token=abc&other=def\"";
+        let req = sample_req("shell", leaky);
+        let n = build_approval_notification(&req, &ApprovalContext::default());
+        assert!(
+            n.body().contains("?token=abc&other=def"),
+            "short, non-token-shaped values must stay visible, not be over-redacted: {}",
+            n.body()
+        );
+        assert!(
+            !n.body().contains("[redacted]"),
+            "nothing in `?token=abc&other=def` is token-shaped: {}",
+            n.body()
+        );
+        // The word `token` itself must never be masked just because it names a credential.
+        assert!(
+            n.body().contains("token="),
+            "the literal word `token` is not a secret and must survive: {}",
+            n.body()
+        );
+    }
+
+    /// `is_token_shaped` counts only non-hyphen/non-underscore/non-dot characters, and demands
+    /// `>=16` of them. Ordinary long words like `stakeholder` (10) and `tokenizer` (9) fall well
+    /// under the bar and must never be caught by the shape heuristic — a redactor that ate them would be
+    /// worse than useless. The whole-word check and the embedded-run check are the same heuristic, so one test
+    /// exercises both paths.
+    #[test]
+    fn ordinary_words_are_not_token_shaped() {
+        for word in ["stakeholder", "tokenizer", "counterexample"] {
+            assert!(
+                !is_token_shaped(word),
+                "ordinary word `{word}` must not be mistaken for a token by shape"
+            );
+        }
+        // The documented tradeoff: a *rare* long hyphenated compound (>=16 alphanumerics) is treated
+        // as token-shaped, because real bearer tokens in this repo (`sk-proj-…`, `signed-token-…`)
+        // read exactly that way. It is a deliberate cost of the shape heuristic (see `is_token_shaped`'s
+        // doc) and is what makes ordinary *short* words safe. Pinning it so a future change is aware.
+        assert!(is_token_shaped("well-known-pseudorandom-compounded"));
+        let req = sample_req("shell", "run stakeholder tokenizer in the pipeline");
+        let n = build_approval_notification(&req, &ApprovalContext::default());
+        assert!(
+            n.body().contains("stakeholder") && n.body().contains("tokenizer"),
+            "ordinary prose must pass through unredacted: {}",
+            n.body()
+        );
+    }
+
     #[test]
     fn the_notification_never_leaks_a_path_outside_the_workspace() {
         // An absolute path that is not under the workspace is the second thing the notification must not

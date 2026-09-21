@@ -432,4 +432,28 @@ mod tests {
         let twice = r.redact(&once).text;
         assert_eq!(once, twice);
     }
+
+    /// The over-redaction guard for the pattern engine. A value only masks when it matches a *structural*
+    /// credential shape; the bare word `token`, a query string with short values
+    /// (`?token=abc&other=def`), and ordinary long words must all pass through untouched — a redactor
+    /// that blanked them would corrupt every prompt it was protecting. (The notification layer's
+    /// shape heuristic is the exact, separate mechanism in `hx-desktop::notification`; this pins the
+    /// pattern side.)
+    #[test]
+    fn the_word_token_and_short_query_values_are_not_masked() {
+        let r = Redactor::new();
+        for input in [
+            "token",
+            "the token is a word, not a credential",
+            "curl \"https://example.com/?token=abc&other=def\"",
+            "run stakeholder tokenizer in the pipeline",
+        ] {
+            let out = r.redact(input);
+            assert_eq!(
+                out.text, input,
+                "`{input}` contains no masked credential shape and must be untouched"
+            );
+            assert!(!out.changed(), "no pattern should fire on `{input}`");
+        }
+    }
 }
