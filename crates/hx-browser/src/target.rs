@@ -29,19 +29,25 @@
 //! only the address rule: a scheme is never fetchable just because someone allowed local hosts, and
 //! that is asserted.
 //!
+//! ## Hostnames are resolved once, judged, and pinned
+//!
+//! A public-looking hostname can resolve to loopback or private space
+//! (`http://127.0.0.1.nip.io/`), and a DNS answer can change between a check and a
+//! connect (rebinding). So [`TargetUrl::pin`] resolves the hostname once through a
+//! controlled [`HostResolver`], refuses when *any* returned address is not public, and
+//! carries the approved addresses in a [`PinnedTarget`] for the rung to pin into the
+//! connection — `reqwest`'s `resolve_to_addrs` on the plain rung,
+//! `--host-resolver-rules` on the Chromium rung — so the socket can only go where
+//! admission looked. An IP literal needs none of this: the literal *is* the address,
+//! judged by [`TargetUrl::parse`] itself, with no name a rebinding could change.
+//!
 //! ## What is deliberately NOT done
 //!
-//! - **No DNS resolution check.** `http://127.0.0.1.nip.io/` is a public hostname that resolves to
-//!   loopback, and nothing here catches it: the check is on the *name*, and resolving it is a
-//!   network call this module deliberately does not make (a resolver that runs during validation is
-//!   itself an SSRF surface, and the answer can change between the check and the connect — DNS
-//!   rebinding). Catching that class properly means resolving once and pinning the address on the
-//!   connection, which belongs in the rung that owns the socket, and is not done here.
 //! - **No robots.txt or rate policy.** This module decides *what may be reached*, not *how often*.
 //! - **No path sanitisation.** A URL's path is the site's business. What this module does do is keep
 //!   the path out of nothing and the *query* out of everything: see [`TargetUrl::redacted`].
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use url::{Host, Url};
 
 /// The longest redacted form kept in a report or an error, in bytes.
@@ -84,6 +90,9 @@ pub enum BlockReason {
 
     #[error("it redirected to {host}, which is not on the public internet: {reason}")]
     Redirected { host: String, reason: &'static str },
+
+    #[error("{host} did not resolve to an address admission can verify: {reason}")]
+    Unresolvable { host: String, reason: String },
 }
 
 /// A target admission refused, with the redacted form of what was refused.
@@ -165,8 +174,8 @@ impl TargetUrl {
 
         if admission == Admission::PublicInternet {
             let refusal = match url.host() {
-                Some(Host::Ipv4(v4)) => why_not_public_v4(v4),
-                Some(Host::Ipv6(v6)) => why_not_public_v6(v6),
+                Some(Host::Ipv4(v4)) => why_not_public_ip(&IpAddr::V4(v4)),
+                Some(Host::Ipv6(v6)) => why_not_public_ip(&IpAddr::V6(v6)),
                 _ => local_name_reason(host),
             };
             if let Some(reason) = refusal {
@@ -178,6 +187,124 @@ impl TargetUrl {
         }
 
         Ok(Self { url })
+    }
+
+    /// Admit `raw` and pin its hostname's resolution in one step.
+    ///
+    /// [`TargetUrl::parse_with`] judges the name; [`TargetUrl::pin`] judges what the name
+    /// resolves to. A rung needs both before it connects.
+    pub fn pin_with(
+        admission: Admission,
+        raw: &str,
+        resolver: &dyn HostResolver,
+    ) -> Result<PinnedTarget, TargetRefusal> {
+        TargetUrl::parse_with(admission, raw)?.pin(admission, resolver)
+    }
+
+    /// Pin an already-admitted target: resolve its hostname once, judge every address,
+    /// and carry the approved ones for the connection.
+    ///
+    /// WHY every address, not just the first: DNS answers rotate, and admitting a name one
+    /// of whose addresses is loopback is admitting loopback on the next rotation. A name
+    /// that resolves to nothing is refused too — there is nothing admission looked at.
+    ///
+    /// WHY the rung pins rather than re-resolving at connect time: the answer can change
+    /// between the check and the connect (rebinding), so the addresses judged here are the
+    /// addresses the connection is pinned to. An IP literal carries no pins: `parse` judged
+    /// the exact address the socket will use, and there is no name a rebinding could change.
+    pub fn pin(
+        self,
+        admission: Admission,
+        resolver: &dyn HostResolver,
+    ) -> Result<PinnedTarget, TargetRefusal> {
+        if self.dns_name().is_none() {
+            return Ok(PinnedTarget {
+                target: self,
+                addrs: Vec::new(),
+            });
+        }
+        // `dns_name` returned `Some`, so this is the hostname it named.
+        let name = self.host().to_string();
+        let display = self.redacted();
+        let refused = |reason: BlockReason| TargetRefusal {
+            reason,
+            display: display.clone(),
+        };
+
+        let mut addrs = resolver.resolve_host(&name).map_err(|err| {
+            refused(BlockReason::Unresolvable {
+                host: name.clone(),
+                reason: err.to_string(),
+            })
+        })?;
+        addrs.sort();
+        addrs.dedup();
+
+        if addrs.is_empty() {
+            return Err(refused(BlockReason::Unresolvable {
+                host: name,
+                reason: "it resolved to no addresses".to_string(),
+            }));
+        }
+
+        if admission == Admission::PublicInternet {
+            for addr in &addrs {
+                if let Some(reason) = why_not_public_ip(addr) {
+                    return Err(refused(BlockReason::PrivateHost {
+                        host: addr.to_string(),
+                        reason,
+                    }));
+                }
+            }
+        }
+
+        Ok(PinnedTarget {
+            target: self,
+            addrs,
+        })
+    }
+
+    /// Admit a redirect `location` seen on this target and pin the result.
+    ///
+    /// A `Location` is routinely relative, so it is resolved against the URL that produced
+    /// it the way a browser would before admission runs — admission judges the destination,
+    /// never the spelling the page used. The refusal names the redirect target; a rung that
+    /// wants the "the page redirected to X" sentence relabels and re-displays (see the plain
+    /// rung's `admit_redirect`).
+    pub fn pin_redirect(
+        &self,
+        admission: Admission,
+        location: &str,
+        resolver: &dyn HostResolver,
+    ) -> Result<PinnedTarget, TargetRefusal> {
+        // `request_url` is the string this target was admitted from, so this parse cannot
+        // fail; it is reported rather than unwrapped, because an internal invariant
+        // violation must not panic a fetch.
+        let base = Url::parse(self.request_url()).map_err(|_| TargetRefusal {
+            reason: BlockReason::Malformed {
+                reason: "the admitted target could not be parsed back into a URL".to_string(),
+            },
+            display: self.redacted(),
+        })?;
+        // `url`'s parse errors name the problem and never echo the input — which matters,
+        // because a `Location` can carry a token too.
+        let next = base.join(location).map_err(|err| TargetRefusal {
+            reason: BlockReason::Malformed {
+                reason: format!("the redirect could not be resolved: {err}"),
+            },
+            display: self.redacted(),
+        })?;
+        TargetUrl::parse_with(admission, next.as_str())?.pin(admission, resolver)
+    }
+
+    /// The hostname when the host is a DNS name rather than an IP literal.
+    ///
+    /// `None` for literals: there is nothing to resolve and nothing to pin.
+    pub fn dns_name(&self) -> Option<String> {
+        match self.url.host() {
+            Some(Host::Domain(_)) => Some(self.host().to_string()),
+            _ => None,
+        }
     }
 
     /// The full URL, **for the request a rung makes** and nothing else.
@@ -264,6 +391,79 @@ fn unbracket(host: &str) -> &str {
     {
         Some(inner) => inner,
         None => host,
+    }
+}
+
+/// How a rung turns a hostname into the addresses it may connect to.
+///
+/// WHY a trait rather than calling the system resolver inline: the check-then-connect
+/// gap is the whole vulnerability, so the resolution a rung judges must be the resolution
+/// it pins — and a test must be able to dictate answers (loopback, mixed, empty) without
+/// owning DNS. The production implementation is [`SystemResolver`]; tests script this.
+pub trait HostResolver: Send + Sync + std::fmt::Debug {
+    /// Every address `host` currently resolves to.
+    ///
+    /// An empty `Ok` means "no addresses" and is refused downstream — it is not an error
+    /// here because some resolvers report it without one.
+    fn resolve_host(&self, host: &str) -> std::io::Result<Vec<IpAddr>>;
+}
+
+/// [`HostResolver`] over the operating system's resolver (`getaddrinfo`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemResolver;
+
+impl HostResolver for SystemResolver {
+    fn resolve_host(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
+        use std::net::ToSocketAddrs as _;
+        // Port 0: the port is irrelevant — only the addresses are judged — and a numeric
+        // port keeps `getaddrinfo` from consulting the services database.
+        Ok((host, 0).to_socket_addrs()?.map(|addr| addr.ip()).collect())
+    }
+}
+
+/// A [`TargetUrl`] whose hostname has been resolved and judged, carrying the addresses
+/// the connection may use.
+///
+/// Built only through [`TargetUrl::pin`], [`TargetUrl::pin_with`] and
+/// [`TargetUrl::pin_redirect`], so a rung holding one has already refused every
+/// non-public resolution. Pinning is the rung's half: the plain rung maps these addresses
+/// into `reqwest`'s `resolve_to_addrs`, the Chromium rung into `--host-resolver-rules`.
+#[derive(Clone, Debug)]
+pub struct PinnedTarget {
+    target: TargetUrl,
+    /// Empty when the host is an IP literal — there is no name to pin.
+    addrs: Vec<IpAddr>,
+}
+
+impl PinnedTarget {
+    /// The admitted target, for the request a rung makes.
+    pub fn target(&self) -> &TargetUrl {
+        &self.target
+    }
+
+    /// The approved addresses the connection must be pinned to.
+    ///
+    /// Empty when the host is an IP literal: the literal *is* the address, so the rung
+    /// connects normally.
+    pub fn pinned_addrs(&self) -> &[IpAddr] {
+        &self.addrs
+    }
+
+    /// Take the admitted target back out.
+    pub fn into_target(self) -> TargetUrl {
+        self.target
+    }
+}
+
+/// `None` when the address is on the public internet, otherwise why it is not.
+///
+/// WHY one function for literals and resolutions: a hostname can resolve to any of these
+/// ranges, so the DNS check judges resolved addresses with exactly the same rule the
+/// literal check uses — one rule cannot drift the way two copies of the range list can.
+pub(crate) fn why_not_public_ip(ip: &IpAddr) -> Option<&'static str> {
+    match ip {
+        IpAddr::V4(v4) => why_not_public_v4(*v4),
+        IpAddr::V6(v6) => why_not_public_v6(*v6),
     }
 }
 
@@ -585,5 +785,200 @@ mod tests {
             other => panic!("expected a private host refusal, got {other:?}"),
         }
         assert!(refused.to_string().contains("loopback"), "{refused}");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // DNS resolution pinning: the name is judged, then what the name resolves to
+    // ---------------------------------------------------------------------------------------
+
+    /// A scripted resolver: hostname to dictated addresses.
+    ///
+    /// WHY a double rather than real DNS: the cases under test — a name resolving to
+    /// loopback, to a mix of public and private, to nothing — cannot be produced with the
+    /// system resolver hermetically, and a test that depends on a real zone owns DNS.
+    #[derive(Debug, Default)]
+    struct ScriptResolver {
+        answers: std::collections::HashMap<String, Result<Vec<IpAddr>, String>>,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ScriptResolver {
+        fn answering(host: &str, addrs: Vec<&str>) -> Self {
+            let mut answers = std::collections::HashMap::new();
+            answers.insert(
+                host.to_string(),
+                Ok(addrs
+                    .iter()
+                    .map(|addr| addr.parse().expect("a test address"))
+                    .collect()),
+            );
+            Self {
+                answers,
+                asked: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing(host: &str) -> Self {
+            let mut answers = std::collections::HashMap::new();
+            answers.insert(
+                host.to_string(),
+                Err("the test resolver refuses".to_string()),
+            );
+            Self {
+                answers,
+                asked: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().expect("the asked lock").clone()
+        }
+    }
+
+    impl HostResolver for ScriptResolver {
+        fn resolve_host(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
+            self.asked
+                .lock()
+                .expect("the asked lock")
+                .push(host.to_string());
+            match self.answers.get(host) {
+                Some(Ok(addrs)) => Ok(addrs.clone()),
+                Some(Err(_)) => Err(std::io::Error::other("the test resolver refuses")),
+                // A hostname nobody scripted is a test bug, not an empty answer: answering
+                // empty would let a pin that resolved nothing pass as refused-for-emptiness
+                // while the real question went unasked.
+                None => panic!("the test resolver was not scripted for {host}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_hostname_resolving_to_loopback_is_refused() {
+        // The `127.0.0.1.nip.io` shape: a public-looking name whose resolution is local.
+        let resolver = ScriptResolver::answering("public.test", vec!["127.0.0.1"]);
+        let err = TargetUrl::pin_with(Admission::PublicInternet, "http://public.test/", &resolver)
+            .expect_err("loopback resolution must be refused");
+        assert!(
+            matches!(err.reason, BlockReason::PrivateHost { .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("127.0.0.1"), "{err}");
+        assert_eq!(resolver.asked(), vec!["public.test".to_string()]);
+    }
+
+    #[test]
+    fn a_hostname_with_one_private_address_among_public_ones_is_refused() {
+        // DNS answers rotate, so one private address among public ones is a refusal of the
+        // whole name — admitting it would admit loopback on the next rotation.
+        let resolver = ScriptResolver::answering("mixed.test", vec!["93.184.216.34", "10.0.0.5"]);
+        let err = TargetUrl::pin_with(Admission::PublicInternet, "http://mixed.test/", &resolver)
+            .expect_err("a mixed resolution must be refused");
+        assert!(
+            matches!(
+                err.reason,
+                BlockReason::PrivateHost { ref host, .. } if host == "10.0.0.5"
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_hostname_resolving_only_to_public_addresses_is_pinned() {
+        let resolver =
+            ScriptResolver::answering("cdn.test", vec!["93.184.216.34", "2606:4700:4700::1111"]);
+        let pinned = TargetUrl::pin_with(
+            Admission::PublicInternet,
+            "https://cdn.test/page",
+            &resolver,
+        )
+        .expect("an all-public resolution is admitted");
+        assert_eq!(pinned.target().redacted(), "https://cdn.test/page");
+        assert_eq!(
+            pinned.pinned_addrs(),
+            &[
+                "93.184.216.34".parse::<std::net::IpAddr>().unwrap(),
+                "2606:4700:4700::1111".parse::<std::net::IpAddr>().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn an_ip_literal_is_pinned_without_touching_dns() {
+        // The literal *is* the address: resolving it would be a network call that cannot
+        // change the answer, so the resolver must not even be asked.
+        let resolver = ScriptResolver::default();
+        let pinned = TargetUrl::pin_with(
+            Admission::PublicInternet,
+            "http://93.184.216.34/page",
+            &resolver,
+        )
+        .expect("a public literal is admitted");
+        assert!(pinned.pinned_addrs().is_empty());
+        assert!(resolver.asked().is_empty());
+    }
+
+    #[test]
+    fn a_hostname_that_does_not_resolve_is_refused_without_a_guess() {
+        let resolver = ScriptResolver::failing("gone.test");
+        let err = TargetUrl::pin_with(Admission::PublicInternet, "http://gone.test/", &resolver)
+            .expect_err("an unresolvable name must be refused");
+        assert!(
+            matches!(err.reason, BlockReason::Unresolvable { .. }),
+            "{err:?}"
+        );
+
+        let empty = ScriptResolver::answering("empty.test", vec![]);
+        let err = TargetUrl::pin_with(Admission::PublicInternet, "http://empty.test/", &empty)
+            .expect_err("a name resolving to nothing must be refused");
+        assert!(
+            matches!(err.reason, BlockReason::Unresolvable { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn the_allow_local_policy_admits_a_private_resolution_but_still_pins_it() {
+        // `AllowLocal` lifts the address rule without lifting resolution: the rung still
+        // needs the addresses to pin the connection to.
+        let resolver = ScriptResolver::answering("box.test", vec!["192.168.1.10"]);
+        let pinned = TargetUrl::pin_with(Admission::AllowLocal, "http://box.test/", &resolver)
+            .expect("AllowLocal admits private resolutions");
+        assert_eq!(
+            pinned.pinned_addrs(),
+            &["192.168.1.10".parse::<std::net::IpAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn a_redirect_to_a_privately_resolving_hostname_is_refused() {
+        // The redirect destination is resolved and judged like any other target: a page on
+        // the public internet cannot bounce the fetcher onto a privately-resolving name.
+        let base =
+            TargetUrl::parse_with(Admission::PublicInternet, "http://public.test/a").unwrap();
+        let resolver = ScriptResolver::answering("evil.test", vec!["169.254.169.254"]);
+        let err = base
+            .pin_redirect(Admission::PublicInternet, "http://evil.test/x", &resolver)
+            .expect_err("a privately-resolving redirect must be refused");
+        assert!(
+            matches!(err.reason, BlockReason::PrivateHost { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_relative_redirect_resolves_against_its_page_and_keeps_its_pins() {
+        let base =
+            TargetUrl::parse_with(Admission::PublicInternet, "http://public.test/a").unwrap();
+        let resolver = ScriptResolver::answering("public.test", vec!["93.184.216.34"]);
+        let pinned = base
+            .pin_redirect(Admission::PublicInternet, "../b?token=SECRET", &resolver)
+            .expect("a relative redirect on a pinned host is admitted");
+        // The query travels with the request but never reaches the display form.
+        assert!(pinned.target().request_url().contains("token=SECRET"));
+        assert_eq!(pinned.target().redacted(), "http://public.test/b");
+        assert_eq!(
+            pinned.pinned_addrs(),
+            &["93.184.216.34".parse::<std::net::IpAddr>().unwrap()]
+        );
     }
 }

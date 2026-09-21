@@ -76,4 +76,6 @@ pub use pool::BrowserPool;
 pub use profile::{PoolRoot, ProfileError, SessionProfile, COOKIE_FILE};
 pub use rung::{FetchRequest, Fetcher, RungKind, UntrustedPage};
 pub use rungs::{ChromiumRung, HttpRung, StealthRung};
-pub use target::{Admission, BlockReason, TargetRefusal, TargetUrl};
+pub use target::{
+    Admission, BlockReason, HostResolver, PinnedTarget, SystemResolver, TargetRefusal, TargetUrl,
+};
