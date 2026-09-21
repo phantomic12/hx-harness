@@ -1301,3 +1301,76 @@ async fn a_request_for_an_unknown_role_is_refused_by_name() {
         "a request that cannot run must not create a session"
     );
 }
+
+#[tokio::test]
+async fn post_sessions_opens_a_session_on_an_empty_store() {
+    // The embedded web client's first call on a fresh daemon: a bare `POST /v1/sessions`, no
+    // body, no content type (`ensureSession` in `static/index.html`). Before this route existed
+    // the call answered 405, the client fell back to "the most recent session", and an empty
+    // store meant "could not open a session" with no way forward.
+    let h = harness(vec![]).await;
+
+    let (status, list) = get(Arc::clone(&h.state), "/v1/sessions?limit=50").await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(
+        list.as_array().expect("a list").len(),
+        0,
+        "the store starts empty"
+    );
+
+    let response = app(Arc::clone(&h.state))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED, "a bare POST opens a session");
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let created: serde_json::Value = serde_json::from_slice(&bytes).expect("create answers JSON");
+    let id = created["id"]
+        .as_str()
+        .expect("the answer carries the id under `id`")
+        .to_string();
+    assert!(id.starts_with("ses_"), "sessions keep their prefix: {id}");
+    assert_eq!(created["session"].as_str(), Some(id.as_str()));
+
+    // The session is real, not a stub: retrievable on its own route and present in the list the
+    // client's fallback would have read.
+    let (status, fetched) = get(Arc::clone(&h.state), &format!("/v1/sessions/{id}")).await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    let (status, list) = get(Arc::clone(&h.state), "/v1/sessions?limit=50").await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert!(
+        list.to_string().contains(&id),
+        "the opened session is listed: {list}"
+    );
+}
+
+#[tokio::test]
+async fn a_session_opened_by_post_accepts_a_first_prompt() {
+    // An explicitly opened session must behave exactly like one a chat run created implicitly:
+    // the first prompt resumes it rather than starting over, so the client's attach-then-chat
+    // flow is one session, not two.
+    let h = harness(vec![Ok(answer("hi there"))]).await;
+
+    let (status, created) = post(
+        Arc::clone(&h.state),
+        "/v1/sessions",
+        serde_json::json!({ "title": "web chat" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().expect("the answer carries the id");
+
+    let mut body = h.body("hello");
+    body["session"] = serde_json::json!(id);
+    let (status, reply) = chat(&h.state, body).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply["created"], false, "the prompt resumed the session");
+    assert_eq!(reply["session_id"].as_str(), Some(id));
+    assert_eq!(reply["final_text"], "hi there", "{reply}");
+}

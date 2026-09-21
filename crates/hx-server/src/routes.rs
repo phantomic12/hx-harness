@@ -79,7 +79,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/sandboxes/{id}/exec", post(exec_sandbox))
         .route("/v1/chat", post(chat))
         .route("/v1/chat/stream", post(crate::stream::chat_stream))
-        .route("/v1/sessions", get(list_sessions))
+        .route("/v1/sessions", get(list_sessions).post(create_session))
         .route("/v1/sessions/{id}", get(get_session).delete(delete_session))
         .route("/v1/sessions/{id}/rename", post(rename_session))
         .route("/v1/sessions/{id}/export", get(export_session))
@@ -446,6 +446,53 @@ async fn list_sessions(
 ) -> Result<Json<Vec<hx_store::SessionSummary>>, ApiError> {
     let limit = params.limit.unwrap_or(50).clamp(1, 500);
     Ok(Json(state.store.list(limit)?))
+}
+
+/// What a client may ask for when opening a session without running a turn.
+#[derive(Debug, Default, Deserialize)]
+struct CreateSessionBody {
+    /// A title for the session. Absent becomes the store's honest `"untitled"`, the same as a
+    /// session a chat run would create.
+    #[serde(default)]
+    title: Option<String>,
+    /// The directory the session will act in. Absent means the daemon's working directory, the
+    /// same default a chat run gets.
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+/// Open a session without running a turn.
+///
+/// WHY a route for doing nothing: the embedded web client starts from an empty session store by
+/// `POST`ing `/v1/sessions` (`ensureSession` in `static/index.html`). Sessions were otherwise
+/// created only implicitly by `POST /v1/chat`, so on a fresh daemon the create call answered 405,
+/// the client fell back to "the most recent session", and an empty store meant "could not open a
+/// session" with no way forward. An explicit create is also the honest primitive: a client that
+/// wants a titled, empty session to attach a WebSocket to should not have to send a fake first
+/// prompt to get one. The body is optional — a bare `POST` opens a session with defaults — and the
+/// answer carries the id under both `id` and `session`, the two fields clients read.
+async fn create_session(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<CreateSessionBody>>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let body = body.map(|Json(inner)| inner).unwrap_or_default();
+    // The same identity a chat run would file this session under: a session opened here and a
+    // session opened by the first prompt of a run in the same checkout must read as one agent's.
+    let workspace = body.workspace.unwrap_or_else(|| state.default_workspace());
+    let mut new = hx_store::NewSession::new()
+        .in_workspace(&workspace)
+        .run_by(crate::chat::agent_id(&workspace));
+    new.title = body.title;
+    let record = state.store.create(new, chrono::Utc::now())?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "id": record.id.as_str(),
+            "session": record.id.as_str(),
+            "created": true,
+            "record": record,
+        })),
+    ))
 }
 
 async fn get_session(
