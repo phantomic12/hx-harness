@@ -2565,12 +2565,18 @@ name = "hx-sandbox"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "axum",
  "bollard",
  "chrono",
  "futures",
+ "http",
+ "http-body-util",
  "hx-core",
  "hx-remote",
  "hx-secrets",
+ "hyper",
+ "hyper-util",
+ "hyperlocal",
  "serde",
  "serde_json",
  "tempfile",

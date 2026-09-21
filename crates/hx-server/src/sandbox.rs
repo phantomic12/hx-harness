@@ -480,6 +480,7 @@ mod tests {
             workspace_path: "/workspace".to_string(),
             user: None,
             env: Vec::new(),
+            runtime: None,
         };
         spec.adopt_workspace_owner().ok();
         spec

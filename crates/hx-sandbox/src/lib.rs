@@ -10,6 +10,7 @@
 //! - [`runtime`] — the lifecycle: create, start, exec, stop, remove, plus the concurrency cap
 //!   and TTL reaper that stop sandboxes accumulating.
 //! - [`docker`] — the `bollard`-backed engine implementation.
+//! - [`firecracker`] — a Firecracker microVM runtime (the real L3 tier, via KVM).
 //! - [`remote`] — a second runtime that reaches a Docker daemon on a *remote* host through a
 //!   tiny transport trait, when the engine is not the machine running the daemon.
 //!
@@ -18,12 +19,14 @@
 
 pub mod docker;
 pub mod egress;
+pub mod firecracker;
 pub mod remote;
 pub mod runtime;
 pub mod spec;
 
 pub use docker::{logs, to_container_config, to_host_config, wait_for_engine, DockerRuntime};
 pub use egress::EgressProxy;
+pub use firecracker::{ExecChannel, FirecrackerRuntime};
 pub use remote::{
     create_command, egress_network_name, egress_setup_commands, egress_sidecar_name,
     egress_teardown_commands, exec_command, remove_command, start_command, stop_command,
@@ -41,6 +44,21 @@ use std::sync::Arc;
 pub async fn docker_manager(max_concurrent: usize) -> hx_core::error::Result<SandboxManager> {
     let runtime = Arc::new(DockerRuntime::connect().await?);
     Ok(SandboxManager::new(runtime, max_concurrent))
+}
+
+/// Build a manager on a Firecracker microVM runtime.
+///
+/// `work_dir` is where each microVM's staging dir and API socket are created; `kernel` and `rootfs`
+/// are the guest images every microVM boots from. The runtime is not connected (there is no daemon to
+/// connect to); `available()` reports whether the `firecracker` binary and `/dev/kvm` are usable.
+pub fn firecracker_manager(
+    work_dir: std::path::PathBuf,
+    kernel: std::path::PathBuf,
+    rootfs: std::path::PathBuf,
+    max_concurrent: usize,
+) -> SandboxManager {
+    let runtime = Arc::new(FirecrackerRuntime::new(work_dir, kernel, rootfs));
+    SandboxManager::new(runtime, max_concurrent)
 }
 
 #[cfg(test)]
