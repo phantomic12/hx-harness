@@ -707,16 +707,31 @@ pure, self-contained module a future spawner will draw from. That is what has la
   with `sent: None` rather than sent. The real case this exists for: one model rejects `reasoning_effort`
   with `HTTP 400` while another accepts it. Asserted over a **scripted pool** — no network, members fail,
   clamp and recover on command — with each routing invariant proven by a mutation that turns its test red.
-- ⬜ **Still to come** — per-child model selection (the model as part of the child's spec, recorded with the
-  child), the child spawner that draws from this pool, re-route on member death across *running* lanes, and
-  per-child model + cost in the audit chain (that last one is already possible per turn via `UsageRecord`, but
-  nothing consumes this pool yet to record against).
+- ⬜ **Re-route on member death across *running* lanes is still to come** — it needs running
+  children, which needs the spawner to exist; it is explicitly out of scope for the spawner that
+  has landed (it would be half-built without them). The spawner itself has **landed**:
+- ✅ **The child spawner that draws from this pool** (`crates/hx-server/src/spawn.rs`) — the
+  **narrowest real thing** that exercises the path: [`Spawner::build_spec`] draws a **healthy**
+  member and clamps the requested parameters to it (reusing the pool's `clamp` and [`DrawError`],
+  not a second error type), producing a [`ChildSpec`] that carries **the drawn member as its model**,
+  its endpoint, its credential **reference**, and the clamps applied. [`Spawner::run_child`] makes
+  **one provider call** against the drawn member's endpoint and credential with the clamped parameters
+  (through `hx-provider`, no network in tests), marks the member down on failure, and on success
+  records a `UsageRecord` whose `model` is the **drawn member** — so "which model did this child
+  work" and "did this lane spend money" are answerable after the fact. A member that rejects a
+  requested kind is **clamped and run rather than failing at spawn** — the exit criterion, and the
+  `HTTP 400` it prevents is a real observed failure mode. **[`Spawner::run_child`] does not run an
+  agent loop or dispatch tools**, and does exactly what it claims: one provider call per child, recorded.
+  Tested over a scripted pool and a scripted provider with each assertion proven to fail by a mutation
+  (see `TESTING.md`).
 
 The routing reasoning this milestone is about, restated for what remains: lanes could not differ because a fan-out
 has no per-child model to differ; one model's parameter set is not another's because a 400 for `reasoning_effort`
-is a 400; one upstream can take down every lane because all children share the model. The pool here removes the
-second ceiling (clamping) and the shared-model property (members carry their own endpoint, credential, parameters and
-health); the first and third need the spawner that does not exist yet.
+is a 400; one upstream can take down every lane because all children share the model. The pool and now the spawner
+here remove the second ceiling (clamping), the shared-model property (members carry their own endpoint, credential,
+parameters and health) and the per-child model + cost in the audit chain; the first (a fan-out across members) and the
+third (re-route on member death across *running* lanes) still need running children, which nothing in this repository
+spawns as a runtime yet — the spawner that landed is the narrowest real provider call, not a fan-out.
 
 **Exit criteria** (still open — they describe the spawner): a fan-out of N lanes runs across N members of a
 pool, each lane's model recorded in the audit chain; killing one member's upstream mid-run re-routes new lanes

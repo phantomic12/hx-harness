@@ -492,6 +492,37 @@ asserted `target Low, member accepts [Medium, High]`, where nearest **and** `.mi
 regression passed it. It needed a case where the two differ (`target High, member accepts [Low, Medium]`) to
 be able to fail at all.
 
+## The M8 child spawner, drawn from the pool (B — unit-tested)
+
+`crates/hx-server/src/spawn.rs` is the spawner that draws a child from the pool (M8's "Still to come"
+made real): `Spawner::build_spec` draws a **healthy** member and clamps the requested parameters to it
+(reusing the pool's `clamp` and `DrawError`, not a second error type), producing a `ChildSpec` that carries
+**the drawn member as its model**, its endpoint, its credential reference and the clamps applied; `run_child`
+makes **one provider call** through `hx-provider` against the drawn member with the clamped parameters, marks the
+member down on failure, and records a `UsageRecord` whose `model` is the **drawn member** (and whose cost
+lands in the store's totals) — so "which model did this child work" and "did this lane spend money" are
+answerable after the fact. It is **not** a fan-out: it does not run an agent loop, dispatch tools, or
+re-route a *running* lane when a member dies — that last one needs running children, needs this spawner to exist
+first, and is explicitly out of scope. Tested over a **scripted pool and a scripted provider, no network**.
+
+| Test | The spawner rule it pins |
+|---|---|
+| `a_member_that_rejects_reasoning_effort_is_clamped_and_runs_not_errored_at_spawn` | The exit criterion: a member whose parameters reject `reasoning_effort` is **clamped at spawn and runs**, not errored at spawn, not a 400 |
+| `the_recorded_model_is_the_drawn_member_not_the_first_or_a_global` | The recorded `UsageRecord.model` is the member this spec drew (a down first member ⇒ `b` is recorded, not `a`) |
+| `the_recorded_cost_and_model_survive_into_the_store_totals` | The record lands in the store: one provider call and its input tokens are in the session's totals |
+| `a_failed_member_marks_down_and_the_next_spec_draws_a_healthy_one` | A failed call marks the member down; the next spec is drawn from a healthy member |
+| `a_spec_cannot_be_built_from_an_empty_pool` / `a_spec_cannot_be_built_when_every_member_is_down` | A spec on an empty pool or an all-down pool fails loudly with the pool's own `DrawError` |
+| `build_spec_carries_the_drawn_member_and_its_identity` | The spec carries the drawn member's model, endpoint and credential reference |
+
+**Every assertion was proven to fail by a mutation, then reverted** (each reddening ran against the specific
+test):
+
+| Mutation to `src/spawn.rs` | Turned red |
+|---|---|
+| `run_child` never calls `mark_down` on failure | `a_failed_member_marks_down_and_the_next_spec_draws_a_healthy_one` (after the test was strengthened to draw repeatedly — the first version only drew once, where round-robin happened to pick `b` anyway and the mutation passed, the defect note records) |
+| `build_spec` clamps but never records the clamps (`clamps: Vec::new()`) | `a_member_that_rejects_reasoning_effort_is_clamped_and_runs_not_errored_at_spawn` |
+| The recorded usage uses the **first** member / a hard-coded model instead of the drawn one | `the_recorded_model_is_the_drawn_member_not_the_first_or_a_global` |
+
 ## The four tiers
 
 Every claim in the repo falls into one of these. The gap that bites is B→C.
@@ -1254,7 +1285,7 @@ cargo test --workspace --locked   # 1478 tests, 0 failed, 60 ignored live tests
 cargo test -p hx-store          # 58 — migrations, the transcript, and 4 that reopen the file
 cargo test -p hx-agent          # 63 — the loop's gate, the routed model call, the transcript sink
 cargo test -p hx-tools          # 102 — requirements, bounded output, the two-phase registry, workspace resolution, the trash
-cargo test -p hx-server         # 139 — routes, and the loop end to end over HTTP
+cargo test -p hx-server         # 146 — routes, the loop end to end over HTTP, and the M8 child spawner
 cargo test -p hx-sandbox        # 108 — includes the ladder and the rollback invariants
 cargo test -p hx-remote         # 132 — includes known_hosts parsing and the host key policy
 cargo test -p hx-gateway        # 72 — the connector trait, the Telegram wire, and the approval loop-back
