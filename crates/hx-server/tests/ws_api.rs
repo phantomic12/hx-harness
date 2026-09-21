@@ -167,6 +167,7 @@ async fn harness_with_token(models: Arc<dyn ModelFactory>, token: Option<&str>) 
         // token is optional. A test that needed one here would mean the rule, not the test, was
         // wrong.
         api_token: token.map(hx_core::api_auth::ApiToken::new),
+        webhooks: Default::default(),
     });
 
     let a = state

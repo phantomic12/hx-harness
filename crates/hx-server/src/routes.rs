@@ -916,8 +916,9 @@ fn default_fanout_pool() -> String {
 /// `POST /v1/fanout` — run N child model calls across N distinct pool members.
 ///
 /// The M8 exit criterion as an HTTP surface: every child is allocated a spec on a *distinct*
-/// healthy member before any runs, a short pool fails loudly (no child runs), and a member that
-/// dies mid-fan-out fails only its own child while the others complete. Each completed child's
+/// healthy member before any runs, the children then run **concurrently** (bounded by the
+/// configured `agent.fanout_max_parallel`), a short pool fails loudly (no child runs), and a
+/// member that dies mid-fan-out fails only its own child while the others complete. Each completed child's
 /// response names the member it ran on and its recorded usage; a dying member's error is already
 /// redacted at the fanout boundary (see `crate::fanout`).
 ///
@@ -967,19 +968,22 @@ async fn fanout(
 
     let prompts: Vec<&str> = body.children.iter().map(|c| c.prompt.as_str()).collect();
 
-    let outcome = crate::fanout::run_fan_out(&mut spawner, &session, &prompts)
-        .await
-        .map_err(|e| {
-            let status = match &e {
-                // A shortage is the client's to fix (run fewer, retry later) — client error.
-                crate::fanout::FanOutError::NotEnoughMembers { .. } => {
-                    StatusCode::UNPROCESSABLE_ENTITY
-                }
-                // An all-down/empty pool is a server-side capability problem.
-                crate::fanout::FanOutError::Draw(_) => StatusCode::SERVICE_UNAVAILABLE,
-            };
-            ApiError::new(status, e.to_string())
-        })?;
+    let outcome = crate::fanout::run_fan_out(
+        &mut spawner,
+        &session,
+        &prompts,
+        state.config.agent.fanout_max_parallel,
+    )
+    .await
+    .map_err(|e| {
+        let status = match &e {
+            // A shortage is the client's to fix (run fewer, retry later) — client error.
+            crate::fanout::FanOutError::NotEnoughMembers { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            // An all-down/empty pool is a server-side capability problem.
+            crate::fanout::FanOutError::Draw(_) => StatusCode::SERVICE_UNAVAILABLE,
+        };
+        ApiError::new(status, e.to_string())
+    })?;
 
     Ok(Json(outcome))
 }

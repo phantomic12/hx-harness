@@ -25,13 +25,10 @@
 //!    silent. A failure that is the child's own (a refused request, a policy denial) does **not**
 //!    re-route: it would be deterministic across every member.
 //!
-//! **What it does *not* run**, and which it names rather than claims: it does not start a
-//! general agent loop. `run_child` is a single provider call against the drawn member — unless the
-//! spec opts into the **bounded child tool loop** (`ChildSpec::tools` non-empty), in which case it
-//! runs provider call → `read_file`/`write_file` tool calls → tool results, capped at
-//! `ChildSpec::max_tool_iters` and gated by the child's capability token. `run_lane` is a single
-//! prompt run that re-draws on member death. Neither is a fan-out — the spawner draws one lane,
-//! narrow and real.
+//! **What it does *not* run**, and which it names rather than claims: it does not start an agent
+//! loop or dispatch tools. `run_child` is a single provider call against the drawn member; `run_lane`
+//! is a single prompt run that re-draws on member death. Neither is a fan-out — the spawner draws one
+//! lane, narrow and real.
 //!
 //! The pool, the clamp rule, and [`DrawError`] all live in `hx-core` (`pool.rs`); this module
 //! **reuses** them rather than inventing a second error type or a second clamp. A spec construction on
@@ -46,32 +43,15 @@
 //! proven to fail by a mutation.
 
 use chrono::Utc;
-use hx_core::capability::{CapabilityToken, Decision};
 use hx_core::error::{HxError, Result};
 use hx_core::ids::{ProviderId, SessionId};
-use hx_core::message::{Message, Part};
+use hx_core::message::Message;
 use hx_core::pool::{member_death, DrawError, ModelPool, Param, ParamClamp};
-use hx_provider::{ChatRequest, Provider, ProviderRegistry, ToolSpec, Usage};
+use hx_provider::{ChatRequest, Provider, ProviderRegistry};
 use hx_secrets::{Redactor, Secret, SecretStores};
 use hx_store::UsageRecord;
-use hx_tools::{ToolContext, ToolRegistry};
 use serde::Serialize;
 use std::sync::Arc;
-
-/// The tool names a fan-out child may execute, and nothing else.
-///
-/// DECIDED: `read_file` and `write_file` only. Shell/terminal execution inside a
-/// child is a separate review — unattended command execution needs its own threat
-/// model — so a child that names anything else is refused, not executed, even when
-/// that name exists in the registry.
-const CHILD_TOOL_ALLOWLIST: &[&str] = &["read_file", "write_file"];
-
-/// The iterations a child tool loop runs before it stops asking, when the spec does
-/// not say otherwise.
-///
-/// A named constant rather than a literal so the bound test can pin it: raising this
-/// value must turn `an_always_tool_calling_child_stops_at_max_tool_iters` red.
-pub const DEFAULT_MAX_TOOL_ITERS: u32 = 8;
 
 /// A child, as chosen at spawn: the model it will run on, its endpoint, its credential
 /// **reference**, and the parameters (with their clamps) that will be sent.
@@ -94,36 +74,12 @@ pub struct ChildSpec {
     /// The clamps that were applied at spawn, recorded with the child so "what was clamped" is
     /// answerable after the fact rather than sent and hoped for.
     pub clamps: Vec<ParamClamp>,
-    /// Names of tools this child may call. Empty by default — no loop, exactly today's single
-    /// provider call. Non-empty opts into the bounded tool loop in [`Spawner::run_child`]; every
-    /// name must be in the child allow-list (`read_file`, `write_file`), anything else is refused,
-    /// not executed.
-    pub tools: Vec<String>,
-    /// Cap on tool-executing iterations of the child loop. Defaults to
-    /// [`DEFAULT_MAX_TOOL_ITERS`]; unused when `tools` is empty.
-    pub max_tool_iters: u32,
 }
 
 impl ChildSpec {
     /// The model id this child runs on — the **drawn member**, not a global.
     pub fn model(&self) -> &str {
         &self.member_id
-    }
-
-    /// Opt this child into the bounded tool loop with these allowed tool names.
-    ///
-    /// Every name must be in the child allow-list (`read_file`, `write_file`); anything else
-    /// fails the child when it runs — the check lives at execution, where the refusal is
-    /// observable, not here where it would be a silent clamp.
-    pub fn with_tools(mut self, tools: Vec<String>) -> Self {
-        self.tools = tools;
-        self
-    }
-
-    /// Override the cap on tool-executing iterations of the child loop.
-    pub fn with_max_tool_iters(mut self, max_tool_iters: u32) -> Self {
-        self.max_tool_iters = max_tool_iters;
-        self
     }
 }
 
@@ -143,16 +99,74 @@ fn redact_death_reason(key: &Secret, err: &HxError) -> String {
     redactor.redact(&err.to_string()).text
 }
 
-/// What a child tool loop executes against: the tool registry, the host and workspace the
-/// tools act in, and the capability token that gates them.
+/// What one prepared child's run produced: either its record, or its member's death.
 ///
-/// A spawner built with [`Spawner::new`] holds none of this and runs the single-call path
-/// exactly as before. [`Spawner::with_child_tools`] opts in; a spec that names tools on a
-/// spawner without one fails honestly instead of running unconfined.
-pub struct ChildToolEnv {
-    pub registry: Arc<ToolRegistry>,
-    pub ctx: ToolContext,
-    pub capability: CapabilityToken,
+/// `Failed` carries **both** redactions' inputs: `reason` is the death reason already redacted
+/// with the resolved key as a registered literal (what `mark_down` stores), and `error` is the
+/// raw provider error for the caller to redact at its own boundary (what the fan-out reports).
+/// A store-write failure is not a member death, so it is a `Result::Err` instead — no member is
+/// benched for it, exactly as `run_child`'s `?` behaved.
+pub enum PreparedOutcome {
+    /// The child completed. Carries the same [`ChildRecord`] `run_child` would have returned.
+    Ran(ChildRecord),
+    /// The provider call failed. `member` is the member the child was drawn to run on.
+    Failed {
+        member: String,
+        reason: String,
+        error: HxError,
+    },
+}
+
+/// One allocated child with everything its run needs, owned rather than borrowed.
+///
+/// Built by [`Spawner::prepare_child`]; run with [`PreparedChild::run`].
+pub struct PreparedChild {
+    provider: Arc<dyn Provider>,
+    key: Secret,
+    spec: ChildSpec,
+    store: Arc<hx_store::Store>,
+}
+
+impl PreparedChild {
+    /// Make the child's one provider call and record its usage — shareably.
+    ///
+    /// This is the `&mut`-free middle of `run_child`: the same request, the same record, the
+    /// same redacted death reason. The pool-health write is the caller's job
+    /// ([`Spawner::mark_down`]), applied after the concurrent join.
+    pub async fn run(self, session: &SessionId, prompt: &str) -> Result<PreparedOutcome> {
+        let request = ChatRequest::new(self.spec.model(), vec![Message::user(prompt)]);
+        let response = match self.provider.complete(request, &self.key).await {
+            Ok(response) => response,
+            Err(err) => {
+                return Ok(PreparedOutcome::Failed {
+                    member: self.spec.member_id.clone(),
+                    reason: redact_death_reason(&self.key, &err),
+                    error: err,
+                });
+            }
+        };
+
+        let usage = response.usage;
+        let record = UsageRecord::new(
+            self.spec.member_id.clone(),
+            self.spec.credential.clone(),
+            self.spec.model(),
+            usage.input_tokens,
+            usage.output_tokens,
+        )
+        .cached(usage.cached_input_tokens)
+        .reasoning(usage.reasoning_tokens);
+        self.store.record_usage(session, &record, Utc::now())?;
+
+        Ok(PreparedOutcome::Ran(ChildRecord {
+            model: self.spec.model().to_string(),
+            credential: self.spec.credential.clone(),
+            clamps: self.spec.clamps.clone(),
+            usage: record,
+            base_url: self.spec.base_url.clone(),
+            dead_members: Vec::new(),
+        }))
+    }
 }
 
 /// The spawner that draws children from a model pool.
@@ -164,7 +178,6 @@ pub struct Spawner {
     providers: Arc<ProviderRegistry>,
     secrets: Arc<SecretStores>,
     store: Arc<hx_store::Store>,
-    child_tools: Option<ChildToolEnv>,
 }
 
 impl Spawner {
@@ -179,15 +192,7 @@ impl Spawner {
             providers,
             secrets,
             store,
-            child_tools: None,
         }
-    }
-
-    /// Opt this spawner into the child tool loop: specs naming tools execute them against this
-    /// registry, host/workspace and capability token. Specs naming no tools are unaffected.
-    pub fn with_child_tools(mut self, env: ChildToolEnv) -> Self {
-        self.child_tools = Some(env);
-        self
     }
 
     /// Draw a healthy member and clamp the requested parameters to it, producing the child's spec.
@@ -205,9 +210,6 @@ impl Spawner {
             credential: member.credential.clone(),
             params: effective.params,
             clamps: effective.clamps,
-            // Default off: no tools, so `run_child` takes exactly today's single-call path.
-            tools: Vec::new(),
-            max_tool_iters: DEFAULT_MAX_TOOL_ITERS,
         })
     }
 
@@ -218,17 +220,39 @@ impl Spawner {
     /// drew — not the first member, not a global. On a failed call the member is marked down, so the
     /// next [`Self::build_spec`] draws from a healthy member. This is the narrow one-shot form; for a
     /// run that **re-routes onto a healthy member when the drawn one dies**, use [`Self::run_lane`].
-    ///
-    /// When the spec names tools ([`ChildSpec::tools`] non-empty) this runs the bounded child tool
-    /// loop instead ([`Self::run_child_loop`]): provider call → tool calls → tool results, until the
-    /// model answers without a tool call or `max_tool_iters` is hit. Empty `tools` keeps exactly
-    /// today's single call — same request, same recording, same cost.
     pub async fn run_child(
         &mut self,
         spec: &ChildSpec,
         session: &SessionId,
         prompt: &str,
     ) -> Result<ChildRecord> {
+        // One implementation of "one provider call, recorded": prepare the shareable work, run
+        // it, then apply the pool-health write. The fan-out (`crate::fanout`) runs the middle
+        // step concurrently across children and applies the write serially after the join; doing
+        // it here keeps the two paths from drifting apart.
+        let prepared = self.prepare_child(spec)?;
+        match prepared.run(session, prompt).await? {
+            PreparedOutcome::Ran(record) => Ok(record),
+            PreparedOutcome::Failed {
+                member,
+                reason,
+                error,
+            } => {
+                self.mark_down(&member, reason);
+                Err(error)
+            }
+        }
+    }
+
+    /// Split one allocated child into an owned unit of work that can run without `&mut self`.
+    ///
+    /// Resolving the provider and the credential is read-only (both registries sit behind `Arc`),
+    /// so this takes `&self`. The returned [`PreparedChild::run`] does the provider call and the
+    /// usage record — both shareable — but deliberately **not** the pool-health write: `mark_down`
+    /// needs `&mut`, so the caller applies [`Spawner::mark_down`] with the [`PreparedOutcome`]'s
+    /// reason afterwards. A resolve failure is returned as-is (that child's own error, exactly as
+    /// `run_child`'s pre-call `?` did — no member is benched for a request that never ran).
+    pub fn prepare_child(&self, spec: &ChildSpec) -> Result<PreparedChild> {
         let provider = self
             .providers
             .resolve(&ProviderId::from(spec.member_id.clone()), spec.model())
@@ -237,215 +261,20 @@ impl Spawner {
             .secrets
             .resolve_str(&spec.credential)
             .map_err(|err| hx_core::error::HxError::Secret(err.to_string()))?;
-
-        if !spec.tools.is_empty() {
-            return self
-                .run_child_loop(spec, session, prompt, &provider, &key)
-                .await;
-        }
-
-        let request = ChatRequest::new(spec.model(), vec![Message::user(prompt)]);
-        let response = match provider.complete(request, &key).await {
-            Ok(response) => response,
-            Err(err) => {
-                self.pool
-                    .mark_down(&spec.member_id, redact_death_reason(&key, &err), Utc::now());
-                return Err(err);
-            }
-        };
-
-        let usage = response.usage;
-        let record = UsageRecord::new(
-            spec.member_id.clone(),
-            spec.credential.clone(),
-            spec.model(),
-            usage.input_tokens,
-            usage.output_tokens,
-        )
-        .cached(usage.cached_input_tokens)
-        .reasoning(usage.reasoning_tokens);
-        self.store.record_usage(session, &record, Utc::now())?;
-
-        Ok(ChildRecord {
-            model: spec.model().to_string(),
-            credential: spec.credential.clone(),
-            clamps: spec.clamps.clone(),
-            usage: record,
-            base_url: spec.base_url.clone(),
-            dead_members: Vec::new(),
-            tools_used: Vec::new(),
+        Ok(PreparedChild {
+            provider,
+            key,
+            spec: spec.clone(),
+            store: Arc::clone(&self.store),
         })
     }
 
-    /// The opt-in bounded tool loop: provider call → tool calls → tool results, until the model
-    /// answers without a tool call, `max_tool_iters` tool-executing iterations run, or a tool is
-    /// denied.
+    /// Bench a member with a reason, timestamped now.
     ///
-    /// Deliberately **not** `hx-agent`'s loop: that loop is coupled to sessions, the transcript
-    /// store, the approval queue and a human approver, and reusing it would pull the daemon's
-    /// session machinery into a child. A child has no approver to ask, so the gate is the
-    /// capability token alone — the same two phases a normal run applies *before* approval
-    /// (`prepare`, then the capability check): an unknown tool or unusable arguments comes back as
-    /// a tool result the model can act on, while a capability denial fails the child as a recorded
-    /// error, never a bypass, and there is no approval prompt to answer.
-    ///
-    /// Only [`CHILD_TOOL_ALLOWLIST`] names may run (`read_file`, `write_file`): a call for any
-    /// other name — outside the allow-list, or simply not in this spec's `tools` — is refused, not
-    /// executed, and fails the child. Token usage is summed across iterations and recorded once,
-    /// on the final answer; a child that never answers (bound hit, denial, provider failure)
-    /// records nothing, the same as any failed single call.
-    async fn run_child_loop(
-        &mut self,
-        spec: &ChildSpec,
-        session: &SessionId,
-        prompt: &str,
-        provider: &Arc<dyn Provider>,
-        key: &Secret,
-    ) -> Result<ChildRecord> {
-        let env = self.child_tools.as_ref().ok_or_else(|| {
-            HxError::Config(format!(
-                "child '{}' names tools ({}) but this spawner was built without a tool \
-                 environment; refusing to run unconfined",
-                spec.member_id,
-                spec.tools.join(", ")
-            ))
-        })?;
-        for name in &spec.tools {
-            if !CHILD_TOOL_ALLOWLIST.contains(&name.as_str()) {
-                return Err(HxError::Denied(format!(
-                    "child tool '{name}' is not in the child allow-list ({}); refused, not executed",
-                    CHILD_TOOL_ALLOWLIST.join(", ")
-                )));
-            }
-        }
-        // Advertise exactly the allowed tools — and only ones the registry actually holds. An
-        // allowed name with no implementation is refused now, not mid-loop.
-        let mut tool_specs = Vec::new();
-        for info in env.registry.describe() {
-            if spec.tools.iter().any(|name| name == &info.name) {
-                tool_specs.push(ToolSpec {
-                    name: info.name,
-                    description: info.description,
-                    input_schema: info.schema,
-                });
-            }
-        }
-        for name in &spec.tools {
-            if !tool_specs.iter().any(|tool| &tool.name == name) {
-                return Err(HxError::Denied(format!(
-                    "child tool '{name}' is allowed but no such tool is registered; refused, not executed"
-                )));
-            }
-        }
-
-        let mut messages = vec![Message::user(prompt)];
-        let mut tools_used: Vec<String> = Vec::new();
-        let mut total = Usage::default();
-        for _ in 0..spec.max_tool_iters {
-            let request =
-                ChatRequest::new(spec.model(), messages.clone()).with_tools(tool_specs.clone());
-            let response = match provider.complete(request, key).await {
-                Ok(response) => response,
-                Err(err) => {
-                    self.pool
-                        .mark_down(&spec.member_id, redact_death_reason(key, &err), Utc::now());
-                    return Err(err);
-                }
-            };
-            total.input_tokens += response.usage.input_tokens;
-            total.output_tokens += response.usage.output_tokens;
-            total.cached_input_tokens += response.usage.cached_input_tokens;
-            total.reasoning_tokens += response.usage.reasoning_tokens;
-
-            let calls: Vec<(hx_core::ids::ToolCallId, String, serde_json::Value)> = response
-                .message
-                .parts
-                .iter()
-                .filter_map(|part| match part {
-                    Part::ToolCall {
-                        id,
-                        name,
-                        arguments,
-                    } => Some((id.clone(), name.clone(), arguments.clone())),
-                    _ => None,
-                })
-                .collect();
-            messages.push(response.message);
-            if calls.is_empty() {
-                let record = UsageRecord::new(
-                    spec.member_id.clone(),
-                    spec.credential.clone(),
-                    spec.model(),
-                    total.input_tokens,
-                    total.output_tokens,
-                )
-                .cached(total.cached_input_tokens)
-                .reasoning(total.reasoning_tokens);
-                self.store.record_usage(session, &record, Utc::now())?;
-                return Ok(ChildRecord {
-                    model: spec.model().to_string(),
-                    credential: spec.credential.clone(),
-                    clamps: spec.clamps.clone(),
-                    usage: record,
-                    base_url: spec.base_url.clone(),
-                    dead_members: Vec::new(),
-                    tools_used,
-                });
-            }
-
-            for (id, name, arguments) in calls {
-                // The model was advertised exactly `spec.tools`: anything else is refused, not
-                // executed — even when the registry holds that name.
-                if !spec.tools.iter().any(|allowed| allowed == &name) {
-                    return Err(HxError::Denied(format!(
-                        "child called tool '{name}', which is not in its allowed tools ({}); \
-                         refused, not executed",
-                        spec.tools.join(", ")
-                    )));
-                }
-                let prepared = match env.registry.prepare(&name, arguments, &env.ctx) {
-                    Ok(prepared) => prepared,
-                    Err(err) => {
-                        messages.push(Message::tool_result(
-                            id,
-                            false,
-                            format!("could not run {name}: {err}"),
-                        ));
-                        continue;
-                    }
-                };
-                if let Some(requirement) = prepared.requirement() {
-                    match env
-                        .capability
-                        .check(&requirement.resource, requirement.action, Utc::now())
-                    {
-                        Decision::Allow => {}
-                        Decision::Deny(reason) => {
-                            return Err(HxError::Denied(format!(
-                                "child tool '{name}' denied: {reason}; never a bypass"
-                            )));
-                        }
-                    }
-                }
-                match prepared.run(&env.ctx).await {
-                    Ok(outcome) => {
-                        tools_used.push(name);
-                        messages.push(Message::tool_result(id, outcome.ok, outcome.content));
-                    }
-                    Err(err) => {
-                        messages.push(Message::tool_result(
-                            id,
-                            false,
-                            format!("{name} failed: {err}"),
-                        ));
-                    }
-                }
-            }
-        }
-        Err(HxError::Tool(format!(
-            "child tool loop hit its bound of {} iterations without a final answer",
-            spec.max_tool_iters
-        )))
+    /// This is the pool-health half of a failed child run, exposed so the fan-out can apply it
+    /// serially after its concurrent join. Same write `run_child` always did, same clock.
+    pub fn mark_down(&mut self, member: &str, reason: String) {
+        self.pool.mark_down(member, reason, Utc::now());
     }
 
     /// Run a child that **re-routes on member death** and continues, rather than failing the lane.
@@ -534,9 +363,6 @@ impl Spawner {
                         usage: record,
                         base_url: spec.base_url.clone(),
                         dead_members,
-                        // `run_lane` is a single prompt run that re-draws on death; it never runs
-                        // the child tool loop, so there are no tools to record.
-                        tools_used: Vec::new(),
                     });
                 }
                 Err(err) => {
@@ -597,9 +423,6 @@ pub struct ChildRecord {
     /// This is the audit half of a re-route: it shows both the member that died *and* the member that
     /// finished, so a model switch is never silent.
     pub dead_members: Vec<(String, String)>,
-    /// The tools this child executed, in order, one entry per execution (repeats included).
-    /// Empty when the loop never ran — every single-call child and every `run_lane` run.
-    pub tools_used: Vec<String>,
 }
 
 #[cfg(test)]
@@ -1491,399 +1314,5 @@ mod tests {
             b_seen[0].credential, "secret-for-a",
             "one member's credential must never pay for another member's call"
         );
-    }
-
-    // -----------------------------------------------------------------------------------------
-    // The bounded child tool loop.
-    // -----------------------------------------------------------------------------------------
-
-    use hx_core::capability::{Capability, CapabilityToken};
-    use hx_core::ids::{AgentId, ToolCallId};
-    use hx_core::message::{Part, Role};
-    use hx_tools::testing::FakeHost;
-    use hx_tools::{ReadFileTool, ShellTool, ToolContext, ToolRegistry, WriteFileTool};
-    use std::collections::VecDeque;
-
-    /// One scripted turn of a loop provider: either a tool call the child must execute or the
-    /// final answer that ends the loop.
-    #[derive(Clone)]
-    enum LoopTurn {
-        Call {
-            name: String,
-            arguments: serde_json::Value,
-        },
-        Final(String),
-    }
-
-    /// A provider that answers from a script so the loop can be driven without a network. Every
-    /// call is recorded as a debug string of the request — the messages array included — so a test
-    /// can ask whether a tool result actually reached the model. When the script runs out, `drain`
-    /// answers instead: `Final` for a provider that eventually answers, `Call` for one that never
-    /// does (the bound test).
-    struct LoopProvider {
-        id: ProviderId,
-        turns: std::sync::Mutex<VecDeque<LoopTurn>>,
-        drain: LoopTurn,
-        seen: std::sync::Mutex<Vec<String>>,
-    }
-
-    impl LoopProvider {
-        fn new(id: &str, turns: Vec<LoopTurn>, drain: LoopTurn) -> Arc<Self> {
-            Arc::new(Self {
-                id: ProviderId::from(id),
-                turns: std::sync::Mutex::new(turns.into()),
-                drain,
-                seen: std::sync::Mutex::new(Vec::new()),
-            })
-        }
-
-        fn calls(&self) -> usize {
-            self.seen.lock().expect("the seen lock").len()
-        }
-
-        fn seen(&self) -> Vec<String> {
-            self.seen.lock().expect("the seen lock").clone()
-        }
-    }
-
-    #[async_trait]
-    impl hx_provider::Provider for LoopProvider {
-        fn id(&self) -> &ProviderId {
-            &self.id
-        }
-        fn kind(&self) -> ProviderKind {
-            ProviderKind::Openai
-        }
-        fn models(&self) -> &[String] {
-            &[]
-        }
-        async fn complete(
-            &self,
-            req: ChatRequest,
-            _key: &hx_secrets::Secret,
-        ) -> Result<hx_provider::ChatResponse> {
-            self.seen
-                .lock()
-                .expect("the seen lock")
-                .push(format!("{req:?}"));
-            let turn = self
-                .turns
-                .lock()
-                .expect("the turn lock")
-                .pop_front()
-                .unwrap_or_else(|| self.drain.clone());
-            let message = match turn {
-                LoopTurn::Call { name, arguments } => Message::new(
-                    Role::Assistant,
-                    vec![Part::ToolCall {
-                        id: ToolCallId::from_raw(format!("tc_{}", self.calls())),
-                        name,
-                        arguments,
-                    }],
-                ),
-                LoopTurn::Final(text) => Message::assistant(text),
-            };
-            Ok(hx_provider::ChatResponse {
-                message,
-                usage: Usage {
-                    input_tokens: 10,
-                    output_tokens: 5,
-                    ..Default::default()
-                },
-                finish: hx_provider::FinishReason::ToolUse,
-                model: self.id.to_string(),
-                raw: None,
-            })
-        }
-    }
-
-    /// The tool environment a child loop test runs in: the real `read_file`/`write_file` tools on
-    /// an in-memory host, gated by a workspace-scoped capability token — the same two phases
-    /// (`prepare`, then the capability check) a normal run applies before approval.
-    ///
-    /// `shell` is registered on purpose: it is outside the child allow-list, so a test where the
-    /// model calls it proves the *allow-list* refused — a registry without `shell` could not tell
-    /// "refused" from "unknown tool".
-    ///
-    /// The token is issued at the real now, not the fixed test timestamp: the loop checks it
-    /// against `Utc::now`, and a token issued at the fixed 2023 timestamp would already be expired.
-    fn child_env(host: Arc<FakeHost>, workspace: &str) -> ChildToolEnv {
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(ReadFileTool::new()));
-        registry.register(Arc::new(WriteFileTool::new()));
-        registry.register(Arc::new(ShellTool::new()));
-        ChildToolEnv {
-            registry: Arc::new(registry),
-            ctx: ToolContext::new(host as Arc<dyn hx_remote::Host>)
-                .in_workspace(workspace.to_string()),
-            capability: CapabilityToken::issue(
-                AgentId::from_raw("test-child"),
-                vec![Capability::workspace(workspace)],
-                chrono::Utc::now(),
-                3600,
-            ),
-        }
-    }
-
-    fn loop_spawner(
-        provider: Arc<LoopProvider>,
-        host: Arc<FakeHost>,
-        workspace: &str,
-    ) -> (Spawner, Arc<LoopProvider>, Arc<FakeHost>) {
-        let member_id = provider.id.to_string();
-        let mut reg = ProviderRegistry::new();
-        reg.insert(provider.clone());
-        let st = store();
-        let pen = Spawner::new(
-            ModelPool::new(vec![member(&member_id, &[])]),
-            Arc::new(reg),
-            secrets_for(&member_id),
-            st,
-        )
-        .with_child_tools(child_env(host.clone(), workspace));
-        (pen, provider, host)
-    }
-
-    /// A scripted provider emits one `read_file` call, then a final answer: the file's content
-    /// must reach the model (visible in the next request) and `tools_used` must name the tool.
-    #[tokio::test]
-    async fn a_child_tool_call_reads_a_file_and_its_result_reaches_the_model() {
-        let host = Arc::new(
-            FakeHost::unix().with_file("/work/notes.txt", "the-launch-code-is-seven"),
-        );
-        let provider = LoopProvider::new(
-            "b",
-            vec![
-                LoopTurn::Call {
-                    name: "read_file".to_string(),
-                    arguments: serde_json::json!({"path": "notes.txt"}),
-                },
-                LoopTurn::Final("got it".to_string()),
-            ],
-            LoopTurn::Final("done".to_string()),
-        );
-        let (mut pen, provider, _host) = loop_spawner(provider, host, "/work");
-        let spec = pen
-            .build_spec(&[])
-            .expect("draws")
-            .with_tools(vec!["read_file".to_string()]);
-        let st = pen.store.clone();
-        let s = session(&st);
-        let rec = pen
-            .run_child(&spec, s.id(), "read the notes")
-            .await
-            .expect("the loop answers");
-        assert_eq!(rec.tools_used, vec!["read_file".to_string()]);
-        assert_eq!(provider.calls(), 2, "one tool turn, then the final answer");
-        let second_request = &provider.seen()[1];
-        assert!(
-            second_request.contains("the-launch-code-is-seven"),
-            "the tool result reached the model: {second_request}"
-        );
-        // Two provider calls at 10 input tokens each are recorded once, summed.
-        assert_eq!(rec.usage.input_tokens, 20);
-    }
-
-    /// A provider that always emits a tool call never gets a final answer: the loop must stop at
-    /// `max_tool_iters`. The `8` below is a literal on purpose: it pins [`DEFAULT_MAX_TOOL_ITERS`],
-    /// so raising the constant turns this test red (asserting against the constant itself would
-    /// agree with any value and could never fail).
-    #[tokio::test]
-    async fn an_always_tool_calling_child_stops_at_max_tool_iters() {
-        let host = Arc::new(FakeHost::unix().with_file("/work/notes.txt", "x"));
-        let always_call = LoopTurn::Call {
-            name: "read_file".to_string(),
-            arguments: serde_json::json!({"path": "notes.txt"}),
-        };
-        let provider = LoopProvider::new("b", vec![], always_call);
-        let (mut pen, provider, _host) = loop_spawner(provider, host, "/work");
-        // The default cap, not an override: the mutation this pins is the constant itself.
-        let spec = pen
-            .build_spec(&[])
-            .expect("draws")
-            .with_tools(vec!["read_file".to_string()]);
-        assert_eq!(spec.max_tool_iters, DEFAULT_MAX_TOOL_ITERS);
-        let st = pen.store.clone();
-        let s = session(&st);
-        let err = pen
-            .run_child(&spec, s.id(), "never answer")
-            .await
-            .expect_err("a child that never answers fails");
-        assert!(
-            err.to_string().contains("bound"),
-            "the failure names the bound: {err}"
-        );
-        assert_eq!(
-            provider.calls(),
-            8,
-            "exactly the default cap, no more provider calls"
-        );
-    }
-
-    /// A tool call for a path outside the workspace is denied by the capability token: the child
-    /// errors, the outside file is byte-identical, and only the one provider call ever happened —
-    /// the denied content never reached the model.
-    #[tokio::test]
-    async fn a_child_tool_call_outside_the_workspace_is_denied_and_reads_nothing() {
-        let host = Arc::new(
-            FakeHost::unix()
-                .with_file("/work/notes.txt", "x")
-                .with_file("/outside/secret.txt", "top-secret"),
-        );
-        let provider = LoopProvider::new(
-            "b",
-            vec![LoopTurn::Call {
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "/outside/secret.txt"}),
-            }],
-            LoopTurn::Final("done".to_string()),
-        );
-        let (mut pen, provider, host) = loop_spawner(provider, host, "/work");
-        let spec = pen
-            .build_spec(&[])
-            .expect("draws")
-            .with_tools(vec!["read_file".to_string()]);
-        let st = pen.store.clone();
-        let s = session(&st);
-        let err = pen
-            .run_child(&spec, s.id(), "read outside")
-            .await
-            .expect_err("an outside-workspace read fails the child");
-        assert!(
-            err.to_string().contains("denied"),
-            "the failure is a denial, never a bypass: {err}"
-        );
-        assert_eq!(provider.calls(), 1, "no second call carried denied content");
-        assert_eq!(
-            host.file("/outside/secret.txt").as_deref(),
-            Some("top-secret"),
-            "the outside file is untouched"
-        );
-    }
-
-    /// A tool call for a path outside the workspace fails closed on writes too: the file is never
-    /// created on the host.
-    #[tokio::test]
-    async fn a_child_tool_write_outside_the_workspace_is_denied_and_writes_nothing() {
-        let host = Arc::new(FakeHost::unix().with_file("/work/notes.txt", "x"));
-        let provider = LoopProvider::new(
-            "b",
-            vec![LoopTurn::Call {
-                name: "write_file".to_string(),
-                arguments: serde_json::json!({"path": "/outside/pwned.txt", "content": "pwned"}),
-            }],
-            LoopTurn::Final("done".to_string()),
-        );
-        let (mut pen, provider, host) = loop_spawner(provider, host, "/work");
-        let spec = pen
-            .build_spec(&[])
-            .expect("draws")
-            .with_tools(vec!["write_file".to_string()]);
-        let st = pen.store.clone();
-        let s = session(&st);
-        let err = pen
-            .run_child(&spec, s.id(), "write outside")
-            .await
-            .expect_err("an outside-workspace write fails the child");
-        assert!(
-            err.to_string().contains("denied"),
-            "the failure is a denial, never a bypass: {err}"
-        );
-        assert_eq!(provider.calls(), 1);
-        assert!(
-            host.file("/outside/pwned.txt").is_none(),
-            "the denied write created nothing"
-        );
-    }
-
-    /// A tool call for a name outside the spec's `tools` is refused, not executed — even though
-    /// `shell` is registered in the environment. The host ran nothing.
-    #[tokio::test]
-    async fn a_child_tool_call_for_a_name_outside_tools_is_refused_not_executed() {
-        let host = Arc::new(FakeHost::unix().with_file("/work/notes.txt", "x"));
-        let provider = LoopProvider::new(
-            "b",
-            vec![LoopTurn::Call {
-                name: "shell".to_string(),
-                arguments: serde_json::json!({"command": "touch /work/pwned"}),
-            }],
-            LoopTurn::Final("done".to_string()),
-        );
-        let (mut pen, provider, host) = loop_spawner(provider, host, "/work");
-        let spec = pen
-            .build_spec(&[])
-            .expect("draws")
-            .with_tools(vec!["read_file".to_string()]);
-        let st = pen.store.clone();
-        let s = session(&st);
-        let err = pen
-            .run_child(&spec, s.id(), "run a shell")
-            .await
-            .expect_err("an unallowed tool fails the child");
-        assert!(
-            err.to_string().contains("refused"),
-            "the failure is a refusal, not an execution: {err}"
-        );
-        assert!(
-            host.commands().is_empty(),
-            "the refused tool never ran: {:?}",
-            host.commands()
-        );
-        assert_eq!(provider.calls(), 1);
-    }
-
-    /// A spec naming a tool outside the child allow-list is refused before any provider call:
-    /// `shell` in `tools` fails even though the child opted in and the registry holds `shell`.
-    #[tokio::test]
-    async fn a_spec_naming_a_tool_outside_the_allow_list_is_refused() {
-        let host = Arc::new(FakeHost::unix().with_file("/work/notes.txt", "x"));
-        let provider = LoopProvider::new(
-            "b",
-            vec![LoopTurn::Final("done".to_string())],
-            LoopTurn::Final("done".to_string()),
-        );
-        let (mut pen, provider, _host) = loop_spawner(provider, host, "/work");
-        let spec = pen
-            .build_spec(&[])
-            .expect("draws")
-            .with_tools(vec!["shell".to_string()]);
-        let st = pen.store.clone();
-        let s = session(&st);
-        let err = pen
-            .run_child(&spec, s.id(), "run a shell")
-            .await
-            .expect_err("shell is outside the child allow-list");
-        assert!(
-            err.to_string().contains("allow-list"),
-            "the failure names the allow-list: {err}"
-        );
-        assert_eq!(
-            provider.calls(),
-            0,
-            "the refusal precedes any provider call, so no tool could run"
-        );
-    }
-
-    /// Default off: a spec straight from `build_spec` names no tools, so `run_child` makes exactly
-    /// one provider call even on a spawner with a tool environment — and records no tools used.
-    #[tokio::test]
-    async fn a_default_spec_on_a_tool_ready_spawner_still_makes_one_call() {
-        let host = Arc::new(FakeHost::unix().with_file("/work/notes.txt", "x"));
-        let provider = LoopProvider::new(
-            "b",
-            vec![LoopTurn::Final("done".to_string())],
-            LoopTurn::Final("done".to_string()),
-        );
-        let (mut pen, provider, _host) = loop_spawner(provider, host, "/work");
-        let spec = pen.build_spec(&[]).expect("draws");
-        assert!(spec.tools.is_empty());
-        let st = pen.store.clone();
-        let s = session(&st);
-        let rec = pen
-            .run_child(&spec, s.id(), "hi")
-            .await
-            .expect("a default child runs");
-        assert_eq!(provider.calls(), 1);
-        assert!(rec.tools_used.is_empty());
     }
 }

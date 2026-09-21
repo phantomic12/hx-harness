@@ -511,6 +511,7 @@ async fn harness_with(config_yaml: &str, replies: Vec<Result<ChatResponse>>) -> 
         // No token: these tests bind loopback, which is exactly the deployment where a token is
         // optional. A test that needed one here would mean the rule, not the test, was wrong.
         api_token: None,
+        webhooks: Default::default(),
     });
 
     Harness {

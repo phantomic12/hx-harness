@@ -239,8 +239,7 @@ attempted capability escalation shows up as a denial event, not a hang.
   held by the same internal-network + `hx-egress-proxy` sidecar as the local runtime, but placed
   on the *far* host by a few docker CLI commands the far daemon already accepts; it needs only the
   far-host path of the compiled binary. The only non-empty allowlist cases still refused are the honest
-  ones — an entry that is none of a hostname, a raw IP or a valid CIDR (chiefly the ambiguous
-  `inet_aton` family), or a spec created without a far-host proxy binary
+  ones — a CIDR or raw IP the proxy cannot match, or a spec created without a far-host proxy binary
   configured. An isolated
   remote sandbox — empty allowlist and the network off — needs no proxy and **works**. It is now wired
   into `hx-server`: a `SandboxProfile` can carry a `host:` key naming a machine from `hosts:`, and
@@ -320,10 +319,8 @@ against a real Apple-signed arm64 VM, and no private key reaches the model, the 
 not merely fail-closed** — an allowlist is held by the same internal-network + `hx-egress-proxy` sidecar
 the local runtime uses, placed on the far host, and live-verified by observation rather than by reading
 back the command: an allowed host is relayed, a denied host is refused by the allowlist itself rather
-than by a blanket block, and the sandbox has no direct route out. The allowlist takes a hostname, a
-`*.domain` globe, a **raw IP**, or a **CIDR**: an IP/CIDR entry is enforced by resolving the
-`CONNECT` target and testing its address. What remains refused — with a reason naming the way out — is only
-the shape that is none of those: chiefly the ambiguous `inet_aton` family (`0x01010101`, `127.1`, `2130706433`).*
+than by a blanket block, and the sandbox has no direct route out. Only what the proxy cannot match — a
+CIDR or raw IP — is still refused, with a reason naming the way out.*
 
 ---
 
@@ -337,8 +334,7 @@ the shape that is none of those: chiefly the ambiguous `inet_aton` family (`0x01
 - ✅ **Telegram (long-poll) connector** — the first real connector, proving the trait over the actual Bot
   API with a hermetic HTTP stub (`tests/telegram_http.rs`). Long-poll with advancing offset, message
   and button-callback parsing, and the `Coalescer` primitive for streaming via coalesced `editMessageText`.
-  **Not landed here:** the daemon-side receive loop that drives `Connector::receive` per channel (that is
-  the integration surface that turns a connector *into* a live chat bridge); see M5's "not here" notes later.
+  **Not landed here:** the webhook half.
 - ✅ **Telegram streaming via coalesced `editMessageText`** — the driver that wires a model's token
   stream to those calls (`crates/hx-gateway/src/telegram_stream.rs`): the first chunk writes immediately
   (an empty screen while a model thinks is the worst of both worlds), later writes wait for a unit of new
@@ -353,19 +349,6 @@ the shape that is none of those: chiefly the ambiguous `inet_aton` family (`0x01
   very fast model can still outrun Telegram's per-chat edit rate (community-observed at roughly one per
   second; the Bot API documents no number). When it does, the `429` path keeps the run correct and the
   display lags while generation does not.
-- ✅ **Generic webhook connector** (`crates/hx-gateway/src/webhook.rs` + `crates/hx-server/src/webhook.rs`) —
-  the **push** half of M5, complementing Telegram's long-poll. A webhook connector holds a
-  `tokio::sync::mpsc` receiver and implements `Connector` exactly like Telegram: `receive` yields what
-  the route pushed, and `deliver`/`ask` `POST` outbound replies to an optional `outbound_url`,
-  **failing closed** when none is set (a webhook-only channel that cannot reply is an error, not a silent
-  drop). The HTTP surface (`POST /v1/connectors/{id}/webhook`) authenticates against the **connector's
-  own** bearer token — it is exempt from the daemon's global middleware because a remote platform holds only its
-  own key — and fails closed: unknown id `404`, missing/wrong token `401` (byte-identical), malformed
-  body `400`. Config: a `ConnectorConfig` with `kind: webhook`, a required `token`, and an optional
-  `outbound_url`. A configured webhook connector whose token cannot be resolved is a **startup failure**.
-  Proven by `tests/webhook_connector.rs` (hermetic) and `tests/webhook_api.rs` (through the server).
-  **Not here:** the daemon-side receive loop that drives `Connector::receive` per channel (the last umbrella
-  "not here" below).
 - ✅ **A button answer resumes the run** (`crates/hx-gateway/src/bridge.rs`) — the gap this milestone
   was actually missing. A question posted to a channel is waited on under its conversation; a tap comes
   back through the long-poll as `Inbound::ApprovalAnswer`, is matched to **the question its button
@@ -452,9 +435,7 @@ command with a button, receive a cron digest in a separate pinned thread.
 **Adversarial verification:** `docs/verification-m6.md` attacked six security claims and returned findings
 F1–F8. All eight are now closed on main: F1/F2 (`779c042`), F3/F4 (`56498de`), F5 (`8a49ffc`),
 F6 (`f13b529`), F7 (`80222ac`) and F8 (`2db46ca`, documented, deliberately unchanged). See that
-report's addendum for the per-finding status and commits. The report's source branch `feat/verify-m6`
-carries nothing `main` lacks — its copy of the file is `main`'s minus the addendum — and its eight
-throwaway `tmp_*.rs` probes are gone; see *Worktree hygiene*.
+report's addendum for the per-finding status and commits.
 
 - ✅ `rmcp` host: consume stdio and streamable-HTTP MCP servers, per-server tool namespacing,
   health checks and restarts. Landed with a hand-rolled MCP server as the double — real
@@ -721,15 +702,10 @@ promise about how it is used.
     Each degrades to a working window with a warning rather than failing to start. The tray icon, a live
     hotkey binding, a raised notification and the live OS dialog are not exercised headlessly — each module's
     doc says so.
+  - ⬜ **The phone-approval exit criterion is still unmet**: approving from a phone lock screen needs
+    Mobile (iOS/Android push), which is not reachable from this environment.
   - ⬜ **Mobile (iOS + Android)** — explicitly deferred (needs the Android NDK/SDK and a macOS host for
     iOS signing; neither is available).
-  - ✅ **Phone/lock-screen approval path via a push webhook** — the transport half landed: with
-    `approval.push_url` configured, a run's prompt is `POST`ed to a generic webhook whose `respond_url`
-    carries a **one-time** token, and the lock-screen tap comes back to `POST /v1/approvals/{id}/respond`
-    (the one bearer-exempt route, which authenticates with that token instead). `allow` maps to a one-shot
-    grant and can never authorise above the phone ceiling; a failed push expires to a denial (fail-closed). The
-    token is redacted from logs and a replay cannot answer twice. No real iOS/Android client — the webhook is
-    the transport an operator fills in with their own push relay — see `docs/phone-approval.md`.
   - ✅ **CI matrix for all five release targets** — landed (`m9-ci-matrix`): `cargo check
     --workspace --all-targets --locked` now runs on every PR for all five targets release.yml builds
     (`x86_64`/`aarch64` linux-musl via `cross`, `x86_64`/`aarch64` apple-darwin and
@@ -826,17 +802,10 @@ pure, self-contained module a future spawner will draw from. That is what has la
   clamps are recorded on the spec and the record but **do not yet reach the provider call** —
   `hx-provider`'s `ChatRequest` has no field for a pool `Param`, so `run_child` sends none; the gap
   is pinned by `the_clamped_parameter_reaches_the_provider_call`, left `#[ignore]`d until `ChatRequest`
-  grows the field. **[`Spawner::run_child`] runs one provider call per child by default, and an
-  opt-in bounded tool loop when the spec names tools**: `ChildSpec::tools` (default empty) with
-  `max_tool_iters` (default 8) runs provider call → tool calls → tool results until the model
-  answers without a tool call or the cap is hit. Only `read_file` and `write_file` may run — a call
-  for any other name is refused, not executed — each call is gated by the child's capability token
-  (`prepare`, then the token check, the same two phases a normal run applies before approval; a
-  child has no approver to ask), a denial fails the child as a recorded error, never a bypass, and
-  `ChildRecord::tools_used` names what ran. The loop is deliberately *not* `hx-agent`'s (coupled to
-  sessions/store/approvals), and usage is summed across iterations and recorded once on the final
-  answer. Tested over a scripted pool and a scripted provider with each assertion proven to fail by
-  a mutation (see `TESTING.md`).
+  grows the field. **[`Spawner::run_child`] does not run an
+  agent loop or dispatch tools**, and does exactly what it claims: one provider call per child, recorded.
+  Tested over a scripted pool and a scripted provider with each assertion proven to fail by a mutation
+  (see `TESTING.md`).
 
 The routing reasoning this milestone is about, restated for what remains: lanes could not differ because a fan-out
 has no per-child model to differ; one model's parameter set is not another's because a 400 for `reasoning_effort`
@@ -844,15 +813,14 @@ is a 400; one upstream can take down every lane because all children share the m
 fan-out module and `run_lane` here remove the three ceilings: clamping, the shared-model property (members carry
 their own endpoint, credential, parameters and health), the per-child model + cost in the audit chain, the fan-out
 of N children across N distinct members, and the re-route of a running child onto a healthy member when its member
-dies. What still is **not** built is a full subagent runtime: nothing in this repository yet spawns **N concurrent
-lanes** as a fan-out and drives them to a result — `run_lane` is a single prompt run that re-draws on death, and
-the fan-out runs the children it allocates sequentially (a dead child stops its own lane and the rest continue).
-Nor does the child tool loop reach everything: it runs `read_file`/`write_file` only (shell execution in a child
-is a separate review), `run_lane` never runs it, and neither the `/v1/fanout` route nor the `hx fan` CLI exposes
-it — over HTTP every child is still exactly one provider call with an empty `tools_used`.
+dies. What still is **not** built is a full subagent runtime: the fan-out runs **N concurrent
+lanes** across N members (bounded by `agent.fanout_max_parallel`, default 4), but nothing in this
+repository yet drives those lanes through an agent loop to a result — `run_lane` is a single prompt
+run that re-draws on death, and a dead child fails only its own lane while the rest continue.
 
-**Exit criteria**: ✅ **a fan-out of N lanes runs across N members of a pool, each lane's model recorded in the
-audit chain** — met by the fan-out module (`crates/hx-server/src/fanout.rs`), tested over a scripted pool and a
+**Exit criteria**: ✅ **a fan-out of N lanes runs concurrently across N members of a pool, each lane's model recorded in the
+audit chain** — met by the fan-out module (`crates/hx-server/src/fanout.rs`): N lanes in flight over a bounded pool
+(`agent.fanout_max_parallel`, default 4), outcomes in request order, tested over a scripted pool and a
 scripted provider with each assertion proven to fail by a mutation; **killing one member's upstream mid-run
 re-routes** — **met** for a single running child (`Spawner::run_lane` re-draws onto a healthy member, bounded by
 the pool's `AllDown`, with both the dying and the finishing member recorded, no operator action and no stall); a
@@ -866,13 +834,6 @@ It draws from the daemon's configured `agent.default_pool` — the route's `FanO
 [{session, prompt}]}`, with the pool decided server-side, which is why the CLI takes a `session` per child and no
 pool/model/parameter flags. A `FanOutChild`'s usage is recorded under its `session`, so the session must already
 exist on the daemon.
-
-The built-in web client has a matching **fan-out pane** (`crates/hx-server/static/index.html`): N rows of
-session + prompt, an add-row button and a run button, POSTing the same `{children: [{session, prompt}]}` shape to
-`/v1/fanout` through the page's bearer-token helper and rendering one card per child — member, model, ran/errored
-status, token usage, and the (already redacted) error for failed children — with the route's 400/422/503 refusals
-shown as sentences rather than raw JSON. Vanilla HTML/JS, no build step; the tripwire is a served-content assertion
-in `crates/hx-server/tests/web_client_api.rs`, same style as the diff pane's.
 
 **Security audit (this milestone).** The spawn/fan-out/re-route path was audited against credential
 leakage and re-route semantics, and three concrete issues were fixed, each with a test that fails before
@@ -898,9 +859,8 @@ and passes after (see `TESTING.md`):
 
 ## Open security items
 
-**A remote sandbox can reach the far host's own bridge address.** *(Measured, pinned, with a
-provisioning step that closes it — but enforcement is host-side and must be verified per
-host.)* The internal `-egress` network a remote sandbox rides carries no **default** route, which is
+**A remote sandbox can reach the far host's own bridge address.** *(Open. Measured, pinned, not
+closed.)* The internal `-egress` network a remote sandbox rides carries no **default** route, which is
 what makes the proxy sidecar the only way *to the internet* — but "no default route" is not "no
 reachable address". The network's IPAM config still assigns a gateway, and that gateway **is the far
 host's own bridge interface on the same on-link subnet as the sandbox**. On-link delivery needs no
@@ -910,86 +870,26 @@ host's own sshd banner, along with `4330`, `9191`, `20140` and `44321-44323`. Co
 ports are dropped by Docker's network isolation; **host-native services are not.**
 
 So the honest statement of what egress enforcement buys is: *no internet route except the sidecar; the
-far host's own services remain reachable from inside the sandbox — until the host is provisioned
-otherwise.* `crates/hx-sandbox/src/egress.rs`
+far host's own services remain reachable from inside the sandbox.* `crates/hx-sandbox/src/egress.rs`
 and `src/remote.rs` claimed more than that ("literally no route" off the network; the sidecar the only
 way out) and both are corrected, with the correction saying the old claim was wrong so it is not
 "fixed" back. The behaviour is pinned by
 `a_sandbox_reaches_the_far_hosts_own_bridge_address_and_that_is_a_known_hole` in
 `crates/hx-sandbox/tests/remote_live.rs`, which asserts the hole **is still there** *and* that the
-no-default-route half still holds — a test that fails when the hole closes is the point. That test
-is deliberately untouched by the change below: run it per host, and when the hole closes there it
-fails there, which is the good-news signal (do not weaken the probe to make it pass).
+no-default-route half still holds — a test that fails when the hole closes is the point.
 
-The provisioning step now exists: `scripts/harden-sandbox-egress.sh`. Run as root on each sandbox
-host, once per egress subnet (`--apply SUBNET PROXY_PORT`, e.g. `--apply 10.200.7.0/24 3128`),
-then verify from inside a sandbox (`nc -vz <bridge-ip> 22` must time out while the proxy port
-still answers). It installs the same policy in two chains, because the two destinations take
-different netfilter paths: `DOCKER-USER` for the forwarded path, and `INPUT` for traffic to
-addresses the host itself owns — the bridge address is delivered locally and never traverses
-`DOCKER-USER`, so forward-path rules alone would leave the measured sshd hole open. `--check`
-re-verifies (exit 0 only when every rule is present), `--revert` removes exactly what `--apply`
-added, and `--print-rules` prints the lines without touching anything. Pinned by the tripwire
-`crates/hx-sandbox/tests/egress_hardening_rules.rs`, which asserts the exact rule fragments for
-the sample subnet (gateway DROP, proxy-port ACCEPT, both chain anchors) and fails if the script
-is edited without updating it. Enforcement still lives outside the runtime and lapses silently if
-the rules are flushed, so re-run `--check` after any firewall reset — the runtime alone still
-does NOT close this hole.
+The two ways to close it, and why neither is taken now:
 
-The two ways to close it, and where each stands now:
-
-- **A packet-filter rule on the far host** dropping sandbox→bridge traffic. ✅ This is the
-  standard answer and it now exists: `scripts/harden-sandbox-egress.sh` (see above). It still
-  needs far-host root and has to be installed and *verified* per host, which is why it lives in
-  host provisioning and not in the sandbox runtime — the module would otherwise depend on a
-  configuration it cannot verify.
+- **A `DOCKER-USER` chain rule on the far host** dropping sandbox→bridge traffic. It works and it is
+  the standard answer, but it needs far-host root, it has to be installed and *verified* per host, and
+  the module would then depend on a configuration outside its control — enforcement that silently
+  lapses when the rule is missing is worse than a documented hole, because the docs would still claim
+  it. A version of this belongs in a host-provisioning step, not in the sandbox runtime.
 - **Running the sandbox in a network namespace the runtime controls itself** (rather than letting
   Docker place it on a bridge). This is the privileged route and it weakens the isolation this module
   exists to provide.
 
 Closing it is a deliberate, reviewable change with its own test — not a doc edit.
-
-## Worktree hygiene
-
-Each fix lane lives in its own worktree under `/home/yoav/projects/hx-wt/`. Once a lane's
-branch is merged into `main`, its worktree is just disk — `scripts/prune-merged-worktrees.sh`
-reclaims it. Run it after a batch of lanes lands:
-
-```bash
-# Dry-run first (the default): prints what would be removed.
-scripts/prune-merged-worktrees.sh --skip-recent 2 \
-  --keep feat/<each-still-active-lane>...
-# Then for real:
-scripts/prune-merged-worktrees.sh --apply --skip-recent 2 \
-  --keep feat/<each-still-active-lane>...
-```
-
-The script never touches the main worktree or detached-HEAD worktrees, skips dirty worktrees
-(uncommitted changes are never discarded), skips branches not merged into `main`, and deletes
-branches with `git branch -d` only — if git refuses, the branch is left alone and reported.
-`--skip-recent HOURS` additionally skips worktrees modified within the window, so lanes with
-agents still working are not pulled out from under them. First real run (2026-09-21) removed
-34 merged worktrees/branches and freed ~96 GiB (366→270 GiB used on `/home`).
-
-**Stale-branch triage (2026-09-21).** `feat/verify-m6`, `phase/polish` and `phase/remote-egress` were
-judged by their merge base, not by `git diff main..branch`. All three are already on `main` in full, so
-nothing was landed and no gate was needed for them:
-
-- `feat/verify-m6` — its one commit (`f2f1ca5`) adds `docs/verification-m6.md`; `main` has that file
-  (blob `14c4fdd`) as a 26-line **superset** (the per-finding addendum), merged at `a812670`. The
-  branch's eight untracked `tmp_*.rs` probes were discarded by the lane that landed the report
-  (`a9ef1d7`, whose message says so) and are no longer on disk anywhere; its worktree is clean.
-- `phase/polish` — three commits, all landed as PR #23 (`7389560`, first parent of the squash):
-  `git diff d735c99..phase/polish` and `git diff 7389560^1..7389560` share patch-id `807fb2b6`.
-- `phase/remote-egress` — three commits, all landed as PR #21 (`1ae5d80`):
-  `git diff 7389560..phase/remote-egress` and `git diff 1ae5d80^1..1ae5d80` share patch-id `0ffda538`.
-
-Nothing from these branches is deliberately unmerged — they are dead duplicates, and their content is
-superseded where `main` moved on afterwards (e.g. `m4-egress-cidr` on top of PR #21). One trap: because
-all three were squash-merged, **none is an ancestor of `main`**, so `prune-merged-worktrees.sh`'s
-ancestry test classifies them as unmerged and will never reclaim them; and each branch is checked out in
-its own worktree, so `git branch -d` cannot remove it while that worktree exists. Removing the three
-worktrees is the prerequisite for deleting the branches.
 
 ## Deliberately deferred
 

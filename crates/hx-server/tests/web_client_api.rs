@@ -117,6 +117,7 @@ async fn harness_with_token(token: Option<&str>) -> Server {
         // token is optional. A test that needed one here would mean the rule, not the test, was
         // wrong.
         api_token: token.map(hx_core::api_auth::ApiToken::new),
+        webhooks: Default::default(),
     });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
