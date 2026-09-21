@@ -118,6 +118,76 @@ async fn run_probe(program: &str, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Spawn the shell detached in its own process group, so a timeout can kill the whole
+/// descendant tree rather than just the shell.
+///
+/// WHY detached: without its own group the shell shares the daemon's process group, and a
+/// group kill would take the daemon down with the timed-out command. With its own group
+/// (pgid == the shell's own pid) `kill_process_tree` signals exactly that tree and nothing
+/// else. Built through `std::process::Command` because only `std` exposes the pre-exec
+/// hook (`process_group`) and creation flags; tokio then takes the configured handle over
+/// with `From`.
+fn spawn_detached(program: &str, args: &[String]) -> Result<tokio::process::Child> {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // A fresh group led by the shell: every descendant inherits it, so one
+        // `kill(-pgid)` reaches the shell and everything it ever forked.
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0000_0200 | 0x0800_0000); // CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
+    }
+    Ok(tokio::process::Command::from(cmd)
+        // The fast path for the common case: a command with no detached descendants dies
+        // with the handle. The tree kill on timeout covers the rest.
+        .kill_on_drop(true)
+        .spawn()?)
+}
+
+/// Kill the whole descendant tree of a timed-out command, given the shell's pid.
+///
+/// On Unix the shell runs as a process-group leader (see `spawn_detached`), so signalling
+/// the negative pid reaches the shell and everything it forked — including backgrounded
+/// grandchildren that reparented to init when the shell died. On Windows the same is done
+/// with `taskkill /T`. Best-effort by design: the tree may already be gone (a kill racing
+/// a natural exit), and that is the good outcome, not an error.
+async fn kill_process_tree(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    #[cfg(unix)]
+    {
+        // SAFETY: `kill(2)` with a constant signal number takes no pointers and touches no
+        // shared state; a negative pid names the process group rather than one process.
+        // The return is deliberately ignored: ESRCH (already gone) and EPERM both mean
+        // there is nothing left to kill, which is the outcome this function exists to
+        // produce.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = tokio::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+    }
+}
+
 #[async_trait]
 impl Host for LocalHost {
     fn id(&self) -> &HostId {
@@ -134,15 +204,10 @@ impl Host for LocalHost {
             .split_first()
             .ok_or_else(|| HxError::Remote("shell produced an empty argv".to_string()))?;
 
-        let child = tokio::process::Command::new(program)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // Critical: a timed-out command must actually die. Without this, `sleep 10000` would
-            // outlive the timeout and keep holding whatever it holds.
-            .kill_on_drop(true)
-            .spawn()?;
+        let child = spawn_detached(program, args)?;
+        // `wait_with_output` takes the child by value, so the pid for the timeout kill must
+        // be read before the wait below moves it.
+        let pid = child.id();
 
         let started = Instant::now();
 
@@ -154,10 +219,19 @@ impl Host for LocalHost {
                 duration_ms: started.elapsed().as_millis() as u64,
             }),
             Ok(Err(err)) => Err(HxError::Remote(format!("failed to run command: {err}"))),
-            Err(_) => Err(HxError::Remote(format!(
-                "command timed out after {:.1}s",
-                timeout.as_secs_f64()
-            ))),
+            Err(_) => {
+                // WHY a tree kill, not just the shell: `kill_on_drop` (set in
+                // `spawn_detached`) kills the immediate child when `child` is dropped below,
+                // but a command like `(sleep 60; do_thing) & sleep 60` has already forked
+                // descendants that reparent to init and keep running — holding locks, ports
+                // or GPUs long after the caller gave up. Killing the whole process group
+                // (Unix) or tree (Windows) is what makes "timed out" actually mean stopped.
+                kill_process_tree(pid).await;
+                Err(HxError::Remote(format!(
+                    "command timed out after {:.1}s",
+                    timeout.as_secs_f64()
+                )))
+            }
         }
     }
 
@@ -357,6 +431,39 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_command_kills_its_background_descendants() {
+        // WHY this test exists: `kill_on_drop` kills only the immediate shell. A command
+        // that backgrounded work used to leave the grandchild reparented to init, so the
+        // marker below appeared *after* the timeout had reported the command dead — a
+        // process leak that kept holding whatever the descendant held. The process-group
+        // kill must prevent that: nothing in the tree may outlive the timeout.
+        let marker = std::env::temp_dir().join(format!(
+            "hx-timeout-tree-{}-descendant-marker",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let command = format!(
+            "(sleep 2; touch '{}') & sleep 30",
+            marker.to_string_lossy().replace('\'', "'\\''")
+        );
+
+        let err = host()
+            .exec(&command, Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+
+        // Past the grandchild's own deadline: had it survived, the marker would exist now.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !marker.exists(),
+            "the backgrounded grandchild survived the timeout and touched {}",
+            marker.display()
+        );
     }
 
     #[tokio::test]

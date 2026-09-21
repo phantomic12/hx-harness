@@ -10,7 +10,7 @@ use hx_agent::ApprovalQueue;
 use hx_core::config::{Config, HostConfig};
 use hx_core::error::{HxError, Result};
 use hx_core::event::AgentEvent;
-use hx_core::ids::{HostId, SessionId};
+use hx_core::ids::{HostId, SandboxId, SessionId};
 use hx_provider::{ModelRouter, ProviderRegistry};
 use hx_remote::LocalHost;
 use hx_sandbox::SandboxManager;
@@ -468,6 +468,37 @@ impl AppState {
                 Ok(Arc::clone(cache.entry(id.to_string()).or_insert(manager)))
             }
         }
+    }
+
+    /// Reap expired sandboxes from the local manager *and* every cached remote manager.
+    ///
+    /// WHY this exists instead of reaping `state.sandboxes` alone: TTL enforcement lives
+    /// inside [`SandboxManager::reap`], and each remote host gets its own manager cached in
+    /// `remote_sandbox_managers`. A reaper that only visits the local manager leaves every
+    /// remote container set to grow until its TTL-bearing owner happens to call `destroy` —
+    /// which is the same leak the local reaper was built to close, on someone else's disk.
+    /// Managers are snapshotted under the lock and reaped after releasing it, so a slow
+    /// engine on one host cannot stall manager creation for the others.
+    pub async fn reap_all_sandboxes(&self, now: DateTime<Utc>) -> Vec<SandboxId> {
+        let mut managers: Vec<Arc<SandboxManager>> = Vec::new();
+        if let Some(local) = self.sandboxes.as_ref() {
+            managers.push(Arc::clone(local));
+        }
+        managers.extend(self.remote_sandbox_managers.lock().await.values().cloned());
+
+        let mut reaped = Vec::new();
+        for manager in managers {
+            match manager.reap(now).await {
+                Ok(ids) => {
+                    for id in ids {
+                        tracing::info!(sandbox = %id, "reaped expired sandbox");
+                        reaped.push(id);
+                    }
+                }
+                Err(err) => tracing::warn!(error = %err, "the sandbox reaper failed"),
+            }
+        }
+        reaped
     }
 
     /// Build a fresh remote [`SandboxManager`] for `id`, without touching the per-host cache.

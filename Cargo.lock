@@ -2549,6 +2549,7 @@ dependencies = [
  "hmac",
  "hx-core",
  "hx-secrets",
+ "libc",
  "md5",
  "reqwest",
  "russh",

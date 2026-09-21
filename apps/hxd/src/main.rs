@@ -118,16 +118,15 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Periodically reap sandboxes past their TTL.
+/// Periodically reap sandboxes past their TTL, on every manager the daemon owns.
 ///
 /// Without this, a sandbox whose owner forgot about it holds a concurrency slot and its disk
 /// forever. The manager also enforces the TTL at query time, so a failed sweep degrades rather
-/// than leaks.
+/// than leaks. Reaping goes through [`AppState::reap_all_sandboxes`] — the local manager *and*
+/// every cached per-host remote manager — because a reaper that only visited the local set
+/// would leave remote containers to accumulate on someone else's disk.
 fn spawn_reaper(state: &Arc<AppState>) {
-    let Some(manager) = state.sandboxes.clone() else {
-        tracing::debug!("no sandbox manager; the reaper is not needed");
-        return;
-    };
+    let state = Arc::clone(state);
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(REAP_INTERVAL);
@@ -136,12 +135,9 @@ fn spawn_reaper(state: &Arc<AppState>) {
 
         loop {
             ticker.tick().await;
-            match manager.reap(Utc::now()).await {
-                Ok(reaped) if !reaped.is_empty() => {
-                    tracing::info!(count = reaped.len(), "reaped expired sandboxes");
-                }
-                Ok(_) => {}
-                Err(err) => tracing::warn!(error = %err, "the sandbox reaper failed"),
+            let reaped = state.reap_all_sandboxes(Utc::now()).await;
+            if !reaped.is_empty() {
+                tracing::info!(count = reaped.len(), "reaped expired sandboxes");
             }
         }
     });
