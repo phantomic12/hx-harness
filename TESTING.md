@@ -1,6 +1,8 @@
 # Testing roadmap — what is verified, and what only looks verified
 
 Status: 2026-09-20. Companion to `ROADMAP.md` (which tracks features); this file tracks **evidence**.
+Adversarial verification reports: `docs/verification-m6.md` (M6 security claims), `docs/verification-m8.md`
+(M8/M7), `docs/verification-secrets.md` and `docs/verification-spawner.md`.
 
 ```console
 $ cargo test --workspace
