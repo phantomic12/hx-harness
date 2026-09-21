@@ -494,9 +494,7 @@ impl SandboxRuntime for FirecrackerRuntime {
             .arg(&sock)
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| {
-                HxError::Sandbox(format!("could not spawn firecracker ({bin:?}): {e}"))
-            })?;
+            .map_err(|e| HxError::Sandbox(format!("could not spawn firecracker ({bin:?}): {e}")))?;
         self.state
             .lock()
             .expect("firecracker state lock")

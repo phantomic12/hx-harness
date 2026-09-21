@@ -87,8 +87,8 @@ use reqwest::header::{
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
@@ -867,7 +867,7 @@ mod tests {
             for (name, value) in &self.headers {
                 head.push_str(&format!("{name}: {value}\r\n"));
             }
-            let mut bytes = if self.chunked {
+            let bytes = if self.chunked {
                 // No `Content-Length`: chunked framing only, in small pieces so the body arrives
                 // as several stream chunks rather than one.
                 head.push_str("transfer-encoding: chunked\r\n");
@@ -1428,7 +1428,11 @@ mod tests {
         let outcome = cache.fetch(&client(), &url).await.unwrap();
 
         assert_eq!(outcome, CacheOutcome::TooLarge);
-        assert_eq!(outcome.body(), None, "there is no bounded body to hand over");
+        assert_eq!(
+            outcome.body(),
+            None,
+            "there is no bounded body to hand over"
+        );
         assert!(outcome.made_a_request());
         assert!(
             !cache.contains(&url),
