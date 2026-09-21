@@ -541,6 +541,11 @@ pool and a scripted provider, no network**.
 | `a_successful_call_leaves_the_member_healthy` | A single-member pool (so round-robin cannot hide a success that wrongly marks its member down) |
 | `two_spawns_in_a_row_draw_two_different_healthy_members` | `build_spec` goes through the pool's own cursor draw, not a first-healthy pick |
 | `the_recorded_model_is_the_drawn_member_even_when_the_upstream_names_another_model` | The record's model is the drawn member, not the model the upstream *echoes back* |
+| `a_policy_denial_does_not_reroute_and_does_not_bench_the_member` | A **policy denial** is the child's own, deterministic failure — it must not re-route and must not bench the member |
+| `a_secret_failure_does_not_reroute_and_does_not_bench_the_member` | A **secret-resolution failure** reported by the provider is a deployment fact, not a member death — it must not re-route and must not bench |
+| `a_dead_members_reason_has_a_leaked_key_masked` | A credential that a dying provider echoes in its error body is **masked** (registered-literal + pattern redaction) before it is stored on the pool and returned on `dead_members` |
+| `a_child_records_debug_never_carries_the_resolved_credential` | A `ChildRecord`'s `Debug` names the credential **reference**, never the resolved value, so a log line or trace cannot print a live key |
+| `a_rerouted_member_is_paid_with_its_own_credential_not_the_dead_members` | Credential isolation across a re-route: the member a lane re-draws onto is paid with its **own** secret, never the dead member's |
 | `the_clamped_parameter_reaches_the_provider_call` (**`#[ignore]`d — defect pinned**) | Fails on the current code: the clamped parameter never reaches the `ChatRequest`. Un-ignore when `hx-provider`'s `ChatRequest` grows a pool-`Param` field |
 
 **Every assertion was proven to fail by a mutation, then reverted** (each reddening ran against the specific
@@ -577,6 +582,7 @@ with a reported shortage. Tested over a **scripted pool and a scripted provider,
 | `a_dead_member_mid_fan_out_does_not_kill_the_others` | Item 4: one member scripted to fail; its child errors and the other completes on its own member |
 | `an_all_down_pool_fails_at_allocation_with_the_pools_error` | An all-down pool fails at allocation with the spawner's own `DrawError::AllDown`, naming both members |
 | `an_empty_pool_fails_at_allocation` | An empty pool fails at allocation with `DrawError::Empty` |
+| `a_dead_members_error_is_redacted_at_the_fanout_boundary` | A failing child that echoes a recognisable key (`sk-`) in its body has that key **masked** on the `ChildOutcome::Errored` string before a caller (or client) reads it — the fanout's pattern-pass redaction at its boundary |
 
 **Every assertion was proven to fail by a mutation, then reverted** (each reddening ran against the specific
 test):

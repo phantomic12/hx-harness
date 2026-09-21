@@ -57,6 +57,7 @@
 
 use crate::spawn::{ChildRecord, Spawner};
 use hx_core::ids::SessionId;
+use hx_secrets::Redactor;
 use std::collections::BTreeSet;
 
 /// A recognized way a fan-out can fail to meet its guarantee, before or during execution.
@@ -175,13 +176,20 @@ pub async fn run_fan_out(
     }
 
     // Phase 2 — run every allocated child, regardless of how its siblings fare.
+    //
+    // The error string is redacted at this boundary before it is handed to a caller (and
+    // eventually rendered as client JSON): `run_child` returns the raw `HxError`, whose provider
+    // variants carry the upstream body — which can echo a key or a `?token=` URL. The shared
+    // `Redactor`'s pattern pass masks the recognisable shapes; opaque values are the separate
+    // duty of `Spawner`'s registered-literal pass on the stored death reason.
+    let redactor = Redactor::new();
     let mut children = Vec::with_capacity(wanted);
     for spec in &specs {
         match spawner.run_child(spec, session, "fan-out child").await {
             Ok(record) => children.push(ChildOutcome::Ran(record)),
             Err(err) => children.push(ChildOutcome::Errored {
                 member: spec.member_id.clone(),
-                error: err.to_string(),
+                error: redactor.redact(&err.to_string()).text,
             }),
         }
     }
@@ -272,9 +280,13 @@ mod tests {
         fn models(&self) -> &[String] {
             &[]
         }
-        async fn complete(&self, _req: ChatRequest, _key: &Secret) -> Result<ChatResponse> {
+        async fn complete(&self, _req: ChatRequest, key: &Secret) -> Result<ChatResponse> {
             if self.fail {
-                return Err(HxError::Provider("upstream returned HTTP 500".to_string()));
+                // Simulate a provider that echoes the key it was given in its error body.
+                return Err(HxError::Provider(format!(
+                    "upstream returned HTTP 500 (key: {})",
+                    key.expose()
+                )));
             }
             Ok(ChatResponse {
                 message: Message::assistant("done"),
@@ -492,6 +504,53 @@ mod tests {
         assert_eq!(
             run_fan_out(&mut sp, s.id(), &["p1"]).await,
             Err(FanOutError::Draw(hx_core::pool::DrawError::Empty))
+        );
+    }
+
+    /// A dead member's error is redacted before it is returned on `ChildOutcome::Errored`: the
+    /// provider can echo a recognisable credential (an `sk-` key) in its body, and that must
+    /// never become a string a client reads.
+    ///
+    /// The boundary here is honest: the fanout does not hold the resolved secret (only `Spawner` does),
+    /// so it applies the shared [`Redactor`]'s *pattern* pass, which masks recognisable credential
+    /// shapes. Opaque values with no shape are the spawner's separate job — it registers the resolved key
+    /// as a literal when it writes the stored death reason.
+    #[tokio::test]
+    async fn a_dead_members_error_is_redacted_at_the_fanout_boundary() {
+        // "a" fails and echoes a recognisable key; "b" succeeds.
+        let mut reg = ProviderRegistry::new();
+        reg.insert(Arc::new(ScriptedProvider::new("a").failing()));
+        reg.insert(Arc::new(ScriptedProvider::new("b")));
+        let st = store();
+        // "a"'s credential has the OpenAI `sk-` shape the pattern redactor recognises.
+        let secrets: SecretStores = {
+            let mut s = FixedSecrets::new("vault");
+            s = s.set("pool/a", "sk-abcdefghijklmnopqrstuvwxyz0123456789");
+            s = s.set("pool/b", "sentinel-b");
+            SecretStores::new().with(Arc::new(s))
+        };
+        let mut sp = Spawner::new(
+            hx_core::pool::ModelPool::new(vec![member("a"), member("b")]),
+            Arc::new(reg),
+            Arc::new(secrets),
+            st.clone(),
+        );
+        let s = session(&st);
+
+        let out = run_fan_out(&mut sp, s.id(), &["p1", "p2"])
+            .await
+            .expect("runs");
+        let errored = out
+            .children
+            .iter()
+            .find_map(|c| match c {
+                ChildOutcome::Errored { member, error } if member == "a" => Some(error.as_str()),
+                _ => None,
+            })
+            .expect("a errored");
+        assert!(
+            !errored.contains("sk-abcdefghijklmnopqrstuvwxyz0123456789"),
+            "the key 'a' was given leaked through: {errored}"
         );
     }
 }

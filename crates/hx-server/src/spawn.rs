@@ -48,7 +48,7 @@ use hx_core::ids::{ProviderId, SessionId};
 use hx_core::message::Message;
 use hx_core::pool::{member_death, DrawError, ModelPool, Param, ParamClamp};
 use hx_provider::{ChatRequest, ProviderRegistry};
-use hx_secrets::SecretStores;
+use hx_secrets::{Redactor, Secret, SecretStores};
 use hx_store::UsageRecord;
 use std::sync::Arc;
 
@@ -80,6 +80,22 @@ impl ChildSpec {
     pub fn model(&self) -> &str {
         &self.member_id
     }
+}
+
+/// Redact a failure reason before it is stored on a member or returned as a death reason.
+///
+/// A provider failure's message includes the upstream error body (see `classify_error` in
+/// `hx-provider`), and a provider can echo the very key it was given back inside that body
+/// (an auth-debugging page, a `?token=` URL, an opaque key value). That reason is written
+/// into the pool's `mark_down` health state and returned on [`ChildRecord::dead_members`], both
+/// of which a caller (and eventually an HTTP client) reads — so a credential that leaks into the
+/// body must not reach either verbatim. The key resolved for this member is registered as a literal
+/// (the defense for opaque values with no shape) and the message is run through the shared
+/// [`Redactor`]'s pattern pass as well.
+fn redact_death_reason(key: &Secret, err: &HxError) -> String {
+    let mut redactor = Redactor::new();
+    redactor.register(key.expose());
+    redactor.redact(&err.to_string()).text
 }
 
 /// The spawner that draws children from a model pool.
@@ -153,7 +169,7 @@ impl Spawner {
             Ok(response) => response,
             Err(err) => {
                 self.pool
-                    .mark_down(&spec.member_id, err.to_string(), Utc::now());
+                    .mark_down(&spec.member_id, redact_death_reason(&key, &err), Utc::now());
                 return Err(err);
             }
         };
@@ -276,9 +292,12 @@ impl Spawner {
                     }
                     // The member died: mark it down (shared pool health, so later draws skip it) and,
                     // if the pool still has a healthy member, re-draw and continue.
-                    self.pool
-                        .mark_down(&spec.member_id, err.to_string(), Utc::now());
-                    dead_members.push((spec.member_id.clone(), err.to_string()));
+                    self.pool.mark_down(
+                        &spec.member_id,
+                        redact_death_reason(&key, &err),
+                        Utc::now(),
+                    );
+                    dead_members.push((spec.member_id.clone(), redact_death_reason(&key, &err)));
                     // Re-draw onto a healthy member. AllDown / Empty means every member has been tried
                     // once — the bound — so re-use the pool's own error rather than a second type.
                     spec = match self.build_spec(requested) {
@@ -373,6 +392,11 @@ mod tests {
         Die,
         /// A refused request — the child's fault, deterministic across every member.
         Reject,
+        /// A policy denial — the same decision on every member, so it must not re-route.
+        Denied,
+        /// A secret-resolution failure reported by the provider/client — a deployment fact,
+        /// not this member's health, so it must not re-route.
+        Secret,
     }
 
     /// A provider that answers without a network. The id is the member it stands in for.
@@ -512,7 +536,12 @@ mod tests {
             });
             match self.err {
                 ScriptedErr::Die => {
-                    return Err(HxError::Provider("upstream returned HTTP 500".to_string()))
+                    // Simulate a provider that echoes the very key it was given back in its error
+                    // body — the leak `redact_death_reason` is there to catch.
+                    return Err(HxError::Provider(format!(
+                        "upstream returned HTTP 500 (key: {})",
+                        key.expose()
+                    )));
                 }
                 ScriptedErr::Reject => {
                     return Err(HxError::ProviderRejected {
@@ -520,6 +549,16 @@ mod tests {
                         reason: "the request was rejected (HTTP 400): unknown parameter"
                             .to_string(),
                     })
+                }
+                ScriptedErr::Denied => {
+                    return Err(HxError::Denied(
+                        "writes outside the workspace are not allowed".to_string(),
+                    ))
+                }
+                ScriptedErr::Secret => {
+                    return Err(HxError::Secret(
+                        "no store could resolve the credential reference".to_string(),
+                    ))
                 }
                 ScriptedErr::None => {}
             }
@@ -1011,7 +1050,7 @@ mod tests {
         assert_eq!(spec.model(), "b");
     }
 
-    /// No providers registered for the drawn member is a configuration fact (NoRoute), not a member death:
+    /// A missing provider route is a configuration fact (NoRoute), not a member death:
     /// it must not re-route and must not bench.
     #[tokio::test]
     async fn a_missing_provider_route_is_not_a_member_death_and_does_not_reroute() {
@@ -1034,6 +1073,165 @@ mod tests {
             pen.pool.members[0].health,
             MemberHealth::Healthy,
             "a missing route is not a member death"
+        );
+    }
+
+    /// A policy denial is the same decision on every member, so it must not re-route (one denial
+    /// would become one per member) and must not bench the member that never saw the bad request.
+    #[tokio::test]
+    async fn a_policy_denial_does_not_reroute_and_does_not_bench_the_member() {
+        let st = store();
+        let mut pen = Spawner::new(
+            ModelPool::new(vec![member("a", &[]), member("b", &[])]),
+            scripted_registry(&[("a", ScriptedErr::Denied), ("b", ScriptedErr::None)]),
+            scripted_secrets(&["a", "b"]),
+            st.clone(),
+        );
+        let s = session(&st);
+        let err = pen
+            .run_lane(s.id(), "hi", &[])
+            .await
+            .expect_err("a denial is not a death, so the run returns it directly");
+        assert!(matches!(err, HxError::Denied(_)), "{err:?}");
+        // a stayed healthy: a policy denial benches nothing.
+        assert_eq!(
+            pen.pool.members[0].health,
+            MemberHealth::Healthy,
+            "a policy denial must not bench the member"
+        );
+    }
+
+    /// A secret-resolution failure reported by the provider is a deployment fact, not this member's
+    /// health: it must not re-route and must not bench.
+    #[tokio::test]
+    async fn a_secret_failure_does_not_reroute_and_does_not_bench_the_member() {
+        let st = store();
+        let mut pen = Spawner::new(
+            ModelPool::new(vec![member("a", &[]), member("b", &[])]),
+            scripted_registry(&[("a", ScriptedErr::Secret), ("b", ScriptedErr::None)]),
+            scripted_secrets(&["a", "b"]),
+            st.clone(),
+        );
+        let s = session(&st);
+        let err = pen
+            .run_lane(s.id(), "hi", &[])
+            .await
+            .expect_err("a secret failure is not a death, so the run returns it directly");
+        assert!(matches!(err, HxError::Secret(_)), "{err:?}");
+        assert_eq!(
+            pen.pool.members[0].health,
+            MemberHealth::Healthy,
+            "a secret failure must not bench the member"
+        );
+    }
+
+    /// A leaked credential inside a dead member's failure reason is masked before it is stored on the
+    /// pool and returned on the record — the provider can echo the very key it was given in its error body.
+    #[tokio::test]
+    async fn a_dead_members_reason_has_a_leaked_key_masked() {
+        let st = store();
+        // The sentinel is a *patternless* opaque value: it is caught only because the spawner
+        // registers the resolved key as a literal before redacting the reason.
+        let mut secrets = FixedSecrets::new("vault");
+        secrets = secrets
+            .set("pool/a", "opaque-credential-value-that-leaks")
+            .set("pool/b", "sentinel-b");
+        let secrets = Arc::new(SecretStores::new().with(Arc::new(secrets)));
+        let mut pen = Spawner::new(
+            ModelPool::new(vec![member("a", &[]), member("b", &[])]),
+            scripted_registry(&[("a", ScriptedErr::Die), ("b", ScriptedErr::None)]),
+            secrets,
+            st.clone(),
+        );
+        let s = session(&st);
+        let rec = pen
+            .run_lane(s.id(), "hi", &[])
+            .await
+            .expect("b still runs after a dies");
+        // a died; its reason must not carry the credential "a" was given.
+        assert_eq!(rec.dead_members.len(), 1);
+        let (member, reason) = &rec.dead_members[0];
+        assert_eq!(member, "a");
+        assert!(
+            !reason.contains("opaque-credential-value-that-leaks"),
+            "the leaked key reached the record: {reason}"
+        );
+        // The pool's stored reason is the same masked one.
+        match &pen.pool.members[0].health {
+            MemberHealth::Down { reason, .. } => {
+                assert!(
+                    !reason.contains("opaque-credential-value-that-leaks"),
+                    "the leaked key reached pool health: {reason}"
+                );
+            }
+            other => panic!("a must be down, got {other:?}"),
+        }
+    }
+
+    /// A returned `ChildRecord`'s `Debug` must not carry the resolved credential value — only its
+    /// reference — so a log line or an error trace never prints a live key.
+    #[tokio::test]
+    async fn a_child_records_debug_never_carries_the_resolved_credential() {
+        let (reg, _provider) = registry_and_provider("b");
+        let st = store();
+        let mut pen = Spawner::new(
+            ModelPool::new(vec![member("b", &[])]),
+            reg,
+            secrets_for("b"),
+            st.clone(),
+        );
+        let spec = pen.build_spec(&[]).expect("draws");
+        let s = session(&st);
+        let rec = pen.run_child(&spec, s.id(), "hi").await.expect("runs");
+        let debug = format!("{rec:?}");
+        assert!(
+            !debug.contains("sentinel"),
+            "the record's Debug leaked the credential value: {debug}"
+        );
+        assert!(
+            debug.contains("vault:pool/b"),
+            "the reference is what the record names: {debug}"
+        );
+    }
+
+    /// Credential isolation survives a re-route: when member a dies and the lane re-draws onto b,
+    /// b is paid with b's own credential value, never a's.
+    #[tokio::test]
+    async fn a_rerouted_member_is_paid_with_its_own_credential_not_the_dead_members() {
+        // Capture each provider so the *value* each was handed can be read back.
+        let provider_a = ScriptedProvider::new("a").failing();
+        let provider_b = ScriptedProvider::new("b");
+        let mut reg = ProviderRegistry::new();
+        reg.insert(provider_a.clone());
+        reg.insert(provider_b.clone());
+        let mut secrets = FixedSecrets::new("vault");
+        secrets = secrets
+            .set("pool/a", "secret-for-a")
+            .set("pool/b", "secret-for-b");
+        let secrets = Arc::new(SecretStores::new().with(Arc::new(secrets)));
+        let st = store();
+        let mut pen = Spawner::new(
+            ModelPool::new(vec![member("a", &[]), member("b", &[])]),
+            Arc::new(reg),
+            secrets,
+            st.clone(),
+        );
+        let s = session(&st);
+        pen.run_lane(s.id(), "hi", &[])
+            .await
+            .expect("re-routes to b");
+
+        // b (which finished) was handed b's own value, not a's — one member's credential never pays
+        // for another's work.
+        let b_seen = provider_b.seen();
+        assert_eq!(b_seen.len(), 1, "b was called exactly once");
+        assert_eq!(
+            b_seen[0].credential, "secret-for-b",
+            "the finishing member is paid with its own credential"
+        );
+        assert_ne!(
+            b_seen[0].credential, "secret-for-a",
+            "one member's credential must never pay for another member's call"
         );
     }
 }
