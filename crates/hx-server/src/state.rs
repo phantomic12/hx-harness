@@ -251,6 +251,12 @@ impl AppState {
         // resolved is a **startup failure** — a webhook route with no verifiable token would push into the
         // harness from anyone who guesses a URL, which is the exposure the per-connector token exists to
         // close. See `crate::webhook`.
+        //
+        // WHY the driver is built and retained here rather than just registering the sender: `register`
+        // hands back the receiver, and a receiver dropped at the end of this loop closes the channel —
+        // after which every `POST` is a `409` against a connector that is configured and looks healthy.
+        // Building the `WebhookConnector` from the receiver and retaining it in the registry keeps the
+        // channel open for the daemon's lifetime and gives the runtime a ready driver to read from.
         let mut webhooks = crate::webhook::WebhookRegistry::default();
         for (id, connector) in &config.connectors {
             if connector.kind != hx_core::config::ConnectorKind::Webhook {
@@ -267,9 +273,22 @@ impl AppState {
                     "webhook connector '{id}' references a token that cannot be resolved: {err}"
                 ))
             })?;
-            webhooks.register(
-                &hx_core::ids::ConnectorId::from(id.clone()),
+            let connector_id = hx_core::ids::ConnectorId::from(id.clone());
+            let (_sender, receiver) = webhooks.register_with_capacity(
+                &connector_id,
                 hx_core::api_auth::ApiToken::new(secret.expose()),
+                connector
+                    .queue_capacity
+                    .unwrap_or(crate::webhook::DEFAULT_WEBHOOK_QUEUE_CAPACITY),
+            );
+            webhooks.retain_driver(
+                &connector_id.to_string(),
+                hx_gateway::webhook::WebhookConnector::new(
+                    connector_id,
+                    connector.outbound_url.clone(),
+                    client.clone(),
+                    receiver,
+                ),
             );
         }
 
@@ -697,6 +716,10 @@ impl AppState {
             providers_configured: self.config.providers.len(),
             secret_stores: self.secret_stores(),
             sessions,
+            // WHY here: a webhook queue that only grows is a connector nobody drains, and the route
+            // answers `429` while the status page says everything is fine unless the depths are in
+            // the same snapshot. Depth beside capacity tells "busy" from "stuck".
+            webhook_queues: self.webhooks.queue_depths(),
         }
     }
 }
@@ -762,6 +785,9 @@ pub struct StatusReport {
     pub search_backends: Vec<String>,
     pub sandboxes: SandboxSummary,
     pub hosts: Vec<HostSummary>,
+    /// One depth-and-bound per webhook connector, sorted by id. Empty when no webhook connector is
+    /// configured — which is the common case, and must render as `[]` rather than `null`.
+    pub webhook_queues: Vec<crate::webhook::WebhookQueueDepth>,
 }
 
 // ---------------------------------------------------------------------------
