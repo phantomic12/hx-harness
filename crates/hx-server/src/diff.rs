@@ -171,15 +171,117 @@ fn whole_line_ops(a: &[&str], b: &[&str]) -> Vec<Op> {
 /// Context lines are already on disk — masking them would hide a secret sitting in the file regardless — while the
 /// added lines are new content under review, the place a freshly-introduced token would pass through. Both content
 /// kinds go through the shared redactor via this one helper so the route applies it in exactly one place.
+///
+/// The content is redacted in **runs** rather than one line at a time: a credential split across two adjacent
+/// lines (`sk-` ending one line and the rest of it starting the next) would defeat a per-line pass, because
+/// neither line alone carries the full `sk-…{16,}` shape the redactor's pattern matches. Consecutive Added
+/// (and consecutive Removed) lines are joined, redacted, and split back so a stray line break cannot smuggle a
+/// token past redaction.
 pub fn redact_diff(lines: &[DiffLine], redactor: &Redactor) -> Vec<DiffLine> {
-    lines
-        .iter()
-        .map(|line| match line {
-            DiffLine::Added(t) => DiffLine::Added(redactor.redact(t).text),
-            DiffLine::Removed(t) => DiffLine::Removed(redactor.redact(t).text),
-            DiffLine::Context(t) => DiffLine::Context(t.clone()),
-        })
-        .collect()
+    let mut out = Vec::with_capacity(lines.len());
+    let mut run: Vec<String> = Vec::new();
+    let mut run_kind = None;
+
+    for line in lines {
+        let (kind, text) = match line {
+            DiffLine::Added(t) => (Some(DiffLineKind::Added), t.as_str()),
+            DiffLine::Removed(t) => (Some(DiffLineKind::Removed), t.as_str()),
+            DiffLine::Context(t) => (None, t.as_str()),
+        };
+        match kind {
+            Some(k) if run_kind == Some(k) => run.push(text.to_string()),
+            Some(k) => {
+                flush_run(&mut run, run_kind, redactor, &mut out);
+                run_kind = Some(k);
+                run.push(text.to_string());
+            }
+            None => {
+                flush_run(&mut run, run_kind, redactor, &mut out);
+                run_kind = None;
+                out.push(DiffLine::Context(text.to_string()));
+            }
+        }
+    }
+    flush_run(&mut run, run_kind, redactor, &mut out);
+    out
+}
+
+fn flush_run(
+    run: &mut Vec<String>,
+    kind: Option<DiffLineKind>,
+    redactor: &Redactor,
+    out: &mut Vec<DiffLine>,
+) {
+    if run.is_empty() {
+        return;
+    }
+    let kind = kind.expect("a non-empty run has a kind");
+    // Content is redacted in pairs rather than one line at a time. The shared redactor's token
+    // patterns need a run of `[A-Za-z0-9_-]{16,}` to match, and a credential split across two
+    // lines (`sk-` ending one line, the rest starting the next) would defeat a per-line pass because
+    // neither line alone carries enough contiguous shape. The pair pass concatenates each adjacent pair so the
+    // pattern can see through the line boundary and mask the crossing token, then redistributes the line
+    // boundary. Pairs overlap by one line, so a token running across two or more lines is caught wherever
+    // it straddles.
+    for i in 0..run.len() {
+        let text = if i + 1 < run.len() {
+            let (a, b) = redact_pair(&run[i], &run[i + 1], redactor);
+            run[i + 1] = b;
+            a
+        } else {
+            redactor.redact(&run[i]).text
+        };
+        out.push(match kind {
+            DiffLineKind::Added => DiffLine::Added(text),
+            DiffLineKind::Removed => DiffLine::Removed(text),
+        });
+    }
+}
+
+/// Redact a token that straddles the boundary between two consecutive same-kind lines.
+///
+/// `a` is the anchor line and `b` the following line. If a credential like `sk-` ends `a` and its
+/// body continues at the start of `b`, neither redacts on its own: the shared pattern needs 16+ contiguous
+/// `[A-Za-z0-9_-]` characters, and the line break breaks the run. Concatenating the pair lets the pattern
+/// see through the boundary and mask the crossing token. Returns the redacted `a` (with the marker, if the
+/// token started there) and the redacted/following `b`.
+fn redact_pair(a: &str, b: &str, redactor: &Redactor) -> (String, String) {
+    let a_before = redactor.redact(a).text;
+    if a_before != a {
+        // `a` already redacts on its own; `b` is handled when it becomes the anchor. Nothing to bridge.
+        return (a_before, b.to_string());
+    }
+    let pair = format!("{a}{b}");
+    let pair_redacted = redactor.redact(&pair).text;
+    if pair_redacted == pair {
+        // No token anywhere in the pair beyond what `a` already lacked.
+        return (a.to_string(), b.to_string());
+    }
+    const MARKER: &str = "[REDACTED:";
+    match pair_redacted.find(MARKER) {
+        Some(p) if p >= a.len() => {
+            // The only marker lies entirely within `b`'s region (a token wholly in `b`, not crossing).
+            // Leave `a` alone; `b` redacts when it becomes the anchor.
+            (a.to_string(), b.to_string())
+        }
+        Some(p) => {
+            // A token crosses the boundary: the marker starts inside `a`. Text before it belongs to `a`,
+            // the marker to `a`, and text after it to `b` (whose leading token-body was masked).
+            let end = match pair_redacted[p..].find(']') {
+                Some(close) => p + close + 1,
+                None => pair_redacted.len(),
+            };
+            let (ra, rb) = pair_redacted.split_at(end);
+            (ra.to_string(), rb.to_string())
+        }
+        None => (pair_redacted, String::new()),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiffLineKind {
+    Added,
+    Removed,
 }
 
 #[cfg(test)]
@@ -268,5 +370,104 @@ mod tests {
             t, token,
             "an unregistered patternless token passes through, matching the shared redactor"
         );
+    }
+
+    #[test]
+    fn a_provider_key_split_across_two_added_lines_is_masked() {
+        // A per-line redaction pass would miss a credential broken across a line boundary: `sk-` ends the
+        // first line and the rest of the token starts the next, so neither line alone carries the
+        // `sk-…{16,}` shape the shared redactor's pattern matches. The run-joined pass must catch it.
+        let id = "A".repeat(12);
+        let rest = "B".repeat(12);
+        let token = format!("sk-{id}{rest}");
+        let lines = vec![
+            DiffLine::Added(format!("api_key = \"sk-{id}")),
+            DiffLine::Added(format!("{rest}\"")),
+        ];
+        let out = redact_diff(&lines, &Redactor::new());
+        let joined_added: String = out
+            .iter()
+            .filter_map(|l| match l {
+                DiffLine::Added(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !joined_added.contains(&token),
+            "split token leaked: {joined_added}"
+        );
+        assert!(joined_added.contains("[REDACTED:"), "{joined_added}");
+    }
+
+    #[test]
+    fn a_provider_key_split_across_two_removed_lines_is_masked() {
+        let id = "A".repeat(12);
+        let rest = "B".repeat(12);
+        let token = format!("sk-{id}{rest}");
+        let lines = vec![
+            DiffLine::Removed(format!("key=\"sk-{id}")),
+            DiffLine::Removed(format!("{rest}\"")),
+        ];
+        let out = redact_diff(&lines, &Redactor::new());
+        let joined_removed: String = out
+            .iter()
+            .filter_map(|l| match l {
+                DiffLine::Removed(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !joined_removed.contains(&token),
+            "split removed token leaked: {joined_removed}"
+        );
+        assert!(joined_removed.contains("[REDACTED:"), "{joined_removed}");
+    }
+
+    #[test]
+    fn a_token_wholly_in_the_second_line_does_not_disturb_the_first() {
+        // A credential sitting entirely in `b` of a pair must not pull `b`'s marker (or text) back
+        // into `a`. The pair pass leaves `a` clean and lets `b` redacts when it becomes the anchor.
+        let id = "A".repeat(12);
+        let lines = vec![
+            DiffLine::Added("prefix".to_string()),
+            DiffLine::Added(format!("key = sk-{id}{id}")),
+        ];
+        let out = redact_diff(&lines, &Redactor::new());
+        assert_eq!(
+            out[0],
+            DiffLine::Added("prefix".to_string()),
+            "the first line must be untouched"
+        );
+        assert!(
+            matches!(&out[1], DiffLine::Added(t) if t.contains("[REDACTED:") && !t.contains(&format!("sk-{id}{id}"))),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_three_line_run_bridges_an_interior_boundary() {
+        // A token split across the second and third lines of a run is still caught by the overlapping
+        // pair pass: lines 2 and 3 are a pair even though line 1 is clean.
+        let a = "A".repeat(12);
+        let b = "B".repeat(12);
+        let token = format!("sk-{a}{b}");
+        let lines = vec![
+            DiffLine::Added("first".to_string()),
+            DiffLine::Added(format!("sk-{a}")),
+            DiffLine::Added(b),
+        ];
+        let out = redact_diff(&lines, &Redactor::new());
+        let joined: String = out
+            .iter()
+            .filter_map(|l| match l {
+                DiffLine::Added(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains(&token), "split token leaked: {joined}");
+        assert!(joined.contains("[REDACTED:"), "{joined}");
     }
 }
