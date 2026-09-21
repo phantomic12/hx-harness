@@ -418,6 +418,7 @@ mod tests {
             workspace_path: "/workspace".into(),
             user: None,
             env: Vec::new(),
+            runtime: None,
         }
     }
 

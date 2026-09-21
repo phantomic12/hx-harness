@@ -20,9 +20,15 @@ tracing.workspace = true
 chrono.workspace = true
 bollard.workspace = true
 futures.workspace = true
+hyperlocal.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+http.workspace = true
+hyper.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+axum.workspace = true
 # The live remote suite (`tests/remote_live.rs`) drives `SshHost` against a real host and
 # `SandboxSpec`/`RemoteSandboxRuntime` in one process, so the test crate needs both crates.
 # This is a `[dev-dependencies]` only — it never reaches the published library, which is exactly

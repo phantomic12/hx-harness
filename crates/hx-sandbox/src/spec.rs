@@ -192,6 +192,14 @@ pub struct SandboxSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     pub env: Vec<(String, String)>,
+    /// The container runtime to prefer, when the profile names one.
+    ///
+    /// The isolation ladder is L1 → L2 (gVisor `runsc`) → L3 (Firecracker). L3 defaults to
+    /// `runsc` (VM-backed, via Docker's runtime field) so existing behaviour is unchanged; setting this to
+    /// `"firecracker"` selects the [`crate::FirecrackerRuntime`] instead, which runs the sandbox in
+    /// its own guest kernel under KVM. `None` means the level's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
 }
 
 impl SandboxSpec {
@@ -233,6 +241,7 @@ impl SandboxSpec {
             workspace_path: DEFAULT_WORKSPACE_PATH.to_string(),
             user: None,
             env: Vec::new(),
+            runtime: None,
         }
     }
 
@@ -558,6 +567,7 @@ mod tests {
             workspace_path: DEFAULT_WORKSPACE_PATH.into(),
             user: None,
             env: Vec::new(),
+            runtime: None,
         }
     }
 

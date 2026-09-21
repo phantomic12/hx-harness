@@ -92,6 +92,7 @@ fn spec(live: &Live, isolation: IsolationLevel, ttl_secs: u64, pids_max: i64) ->
         // the write below work on a host whose uid is not 1000 (a CI runner, for one).
         user: None,
         env: Vec::new(),
+        runtime: None,
     }
 }
 

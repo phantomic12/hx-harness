@@ -162,6 +162,16 @@ through a rendered page.
 
 - `bollard` sandbox lifecycle: create/exec/stop/destroy, cgroup v2 limits, volume quotas
 - Isolation tiers: rootless podman (L1) → gVisor `runsc` (L2) → Firecracker (L3)
+- ✅ **Firecracker runtime** (`crates/hx-sandbox/src/firecracker.rs`) — a `SandboxRuntime` that
+  spawns `firecracker --api-sock` and drives the microVM HTTP API over the Unix socket: boot source,
+  root (read-only) and workspace (writable) drives, network-off (no NIC is ever PUT), a vsock side
+  channel for `exec`, and machine config from the spec. `available()` checks for the binary and
+  `/dev/kvm`. `exec` runs over the vsock through an `ExecChannel` seam; the default refuses loudly
+  rather than claim a command ran that did not. A profile selects it via `runtime = "firecracker"`
+  (a new `SandboxSpec.runtime` override); `runsc` stays the default L3 so existing behaviour is
+  unchanged, and `firecracker_manager(...)` is the `docker_manager` analogue. Hermetically verified in
+  `tests/firecracker_mock.rs` against an axum mock of the API on a temp Unix socket (exact PUT order
+  and payload posture); a real microVM is exercised only by the `#[ignore]`d live test on a KVM host.
 - Default-deny egress with an allowlist; per-sandbox TTL and deterministic teardown
 - Capability tokens wired into the policy engine. Approval and capability are two independent
   checks on one path: the level decides whether to *ask*, the token decides whether "yes" is

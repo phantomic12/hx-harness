@@ -853,6 +853,7 @@ mod tests {
             workspace_path: DEFAULT_WORKSPACE_PATH.into(),
             user: None,
             env: vec![("RUST_LOG".into(), "info".into())],
+            runtime: None,
         }
     }
 
