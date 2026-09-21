@@ -716,7 +716,16 @@ promise about how it is used.
     cosign**, so a user can verify a release with their own cosign against the public transparency log,
     independent of GitHub's attestation store. `install.sh` verifies `SHA256SUMS.sig` when cosign is
     present (checksum-only with a warning otherwise, `COSIGN_SKIP=1` to skip), and
-    `docs/code-signing.md` documents the expected identity and issuer. The auto-update half landed
+    `docs/code-signing.md` documents the expected identity and issuer. The install half
+    (`m9-release-verify`): `install.sh` accepts `HX_RELEASE_BASE_URL` (a local directory
+    path or `file://` URL stands in for the GitHub release page, copied not
+    downloaded) and a `--prefix` flag, and `scripts/verify-release.sh` proves the
+    release installs — good `dist/` lands both binaries with the expected `hx
+    --version`, a byte-flipped archive is rejected, and `COSIGN_SKIP=1` still
+    rejects on the checksum alone. `release.yml` runs it as `verify-install`
+    (with cosign installed, so the signature path is exercised) on tag pushes
+    *and* on `workflow_dispatch` dry runs. What it cannot prove is a real
+    platform install — only the runner's own target is exercised. The auto-update half landed
     (`m9-auto-update`): `hxd` gained an **opt-in, non-intrusive** update checker. It is **off by
     default** (`update.enabled: false`) — a daemon upgrading onto the code makes no request and spawns no
     task until an operator opts in. When enabled it polls a configured releases feed (`update.url`, default the
