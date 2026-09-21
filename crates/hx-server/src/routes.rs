@@ -902,20 +902,15 @@ fn default_fanout_pool() -> String {
     "interactive".to_string()
 }
 
-/// `POST /v1/fanout` — run N child model calls, one per distinct pool member, one at a time.
+/// `POST /v1/fanout` — run N child model calls, one per distinct pool member, concurrently.
 ///
 /// The M8 exit criterion as an HTTP surface: every child is allocated a spec on a *distinct*
-/// healthy member before any runs, a short pool fails loudly (no child runs), and a member that
+/// healthy member before any runs, the children then run **concurrently** (bounded by the
+/// configured `agent.fanout_max_parallel`), a short pool fails loudly (no child runs), and a member that
 /// dies mid-fan-out fails only its own child while the others complete. Each completed child's
 /// response names the member it ran on and its recorded usage; a dying member's error is redacted
 /// at the fanout boundary with the member's own credential registered as a literal (see
 /// `crate::spawn::Spawner::redact_child_error`).
-///
-/// The children run **one at a time**: `run_fan_out` awaits each `run_child` in a loop. This
-/// comment used to call them "N concurrent child model calls", which was never true of the code —
-/// `ROADMAP.md`'s M8 section says sequential, and `a_fan_out_runs_its_children_one_at_a_time`
-/// in `tests/fanout_merged.rs` pins it. Do not re-word this back without also making the loop
-/// concurrent.
 ///
 /// The `Spawner` is built per request from `Config` plus the state's providers, secret stores
 /// and store. This is the same wiring `AppState::build` uses for the model path, and no new
@@ -1005,19 +1000,22 @@ async fn fanout(
 
     let prompts: Vec<&str> = body.children.iter().map(|c| c.prompt.as_str()).collect();
 
-    let outcome = crate::fanout::run_fan_out(&mut spawner, &session, &prompts)
-        .await
-        .map_err(|e| {
-            let status = match &e {
-                // A shortage is the client's to fix (run fewer, retry later) — client error.
-                crate::fanout::FanOutError::NotEnoughMembers { .. } => {
-                    StatusCode::UNPROCESSABLE_ENTITY
-                }
-                // An all-down/empty pool is a server-side capability problem.
-                crate::fanout::FanOutError::Draw(_) => StatusCode::SERVICE_UNAVAILABLE,
-            };
-            ApiError::new(status, e.to_string())
-        })?;
+    let outcome = crate::fanout::run_fan_out(
+        &mut spawner,
+        &session,
+        &prompts,
+        state.config.agent.fanout_max_parallel,
+    )
+    .await
+    .map_err(|e| {
+        let status = match &e {
+            // A shortage is the client's to fix (run fewer, retry later) — client error.
+            crate::fanout::FanOutError::NotEnoughMembers { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            // An all-down/empty pool is a server-side capability problem.
+            crate::fanout::FanOutError::Draw(_) => StatusCode::SERVICE_UNAVAILABLE,
+        };
+        ApiError::new(status, e.to_string())
+    })?;
 
     Ok(Json(outcome))
 }

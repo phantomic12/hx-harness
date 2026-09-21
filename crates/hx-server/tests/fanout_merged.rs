@@ -13,7 +13,8 @@
 //! - token accounting: does the total equal the sum of the children;
 //! - the response shape the web pane reads: are `members`/`children` index-aligned;
 //! - oversized and malformed bodies: a sentence, never a 500 with a debug string;
-//! - concurrency: the route's comment says "concurrent", the module that runs the children does not.
+//! - concurrency: the children overlap (bounded by `agent.fanout_max_parallel`), and the
+//!   outcomes come back in request order.
 //!
 //! Only the provider call is a script; the `AppState`, the router, the spawner the route builds, the
 //! model pool from `Config`, the fan-out module and a real SQLite session store on disk are real.
@@ -1030,15 +1031,14 @@ async fn an_oversized_children_body_is_refused_without_being_run() {
     );
 }
 
-/// The fan-out runs its children **one at a time**. The route's doc comment calls them "N concurrent
-/// child model calls"; `run_fan_out` awaits each `run_child` in a plain loop, and `ROADMAP.md` says
-/// so ("the fan-out runs the children it allocates sequentially"). Two of those three cannot be
-/// right, and the code is the one with a test.
+/// The fan-out runs its children **concurrently**, bounded by `agent.fanout_max_parallel`.
+/// `run_fan_out` drives the N allocated lanes over a `FuturesUnordered` pool behind a semaphore,
+/// and restores request order through indexed slots on the way out.
 ///
-/// The scripted provider yields once mid-call, so a caller that overlapped two children would leave
-/// two calls in flight at once; this asserts the peak stays at one.
+/// The scripted provider yields once mid-call, so overlapping lanes leave more than one call
+/// in flight at once; this asserts the peak reaches all three.
 #[tokio::test]
-async fn a_fan_out_runs_its_children_one_at_a_time() {
+async fn a_fan_out_runs_its_children_concurrently() {
     let in_flight = Arc::new(InFlight::default());
     let (reg, handles) = registry_with_handles(
         &[
@@ -1102,8 +1102,8 @@ async fn a_fan_out_runs_its_children_one_at_a_time() {
     assert_eq!(status, StatusCode::OK, "{out}");
     assert_eq!(
         in_flight.peak(),
-        1,
-        "the fan-out must run its children one at a time: a peak of {} means they overlapped",
+        3,
+        "the fan-out must overlap its children: a peak of {} means they ran one at a time",
         in_flight.peak()
     );
 }

@@ -586,11 +586,8 @@ mod tests {
         });
 
         let wait = Duration::from_secs(2);
-        let approver = PhoneApprover::new(
-            format!("http://{addr}/push"),
-            "https://daemon".into(),
-            wait,
-        );
+        let approver =
+            PhoneApprover::new(format!("http://{addr}/push"), "https://daemon".into(), wait);
         let action = hx_core::approval::ActionRequest::tool(
             "shell",
             "git push",
@@ -599,7 +596,9 @@ mod tests {
         );
 
         let started = tokio::time::Instant::now();
-        let decision = approver.decide(&request("git push", RiskClass::External), &action).await;
+        let decision = approver
+            .decide(&request("git push", RiskClass::External), &action)
+            .await;
         let elapsed = started.elapsed();
 
         assert_eq!(
@@ -626,9 +625,9 @@ mod tests {
 
         let sentinel = "PUSH-URL-SENTINEL-9f3c2a";
         let url = format!("http://127.0.0.1:{closed_port}/push?token={sentinel}");
-        let err = post_payload(&url, &payload_for_test()).await.expect_err(
-            "a POST to a closed port must fail so the error can be inspected",
-        );
+        let err = post_payload(&url, &payload_for_test())
+            .await
+            .expect_err("a POST to a closed port must fail so the error can be inspected");
         assert!(
             !err.contains(sentinel),
             "push error leaked the push URL query: {err}"

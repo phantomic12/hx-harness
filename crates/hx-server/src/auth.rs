@@ -132,10 +132,11 @@ pub async fn require_bearer(
         // bind without one. The check that makes that true is at startup, not here, which is why
         // this arm can be a pass-through rather than a second refusal. The WebSocket Origin check
         // below still runs: cross-origin protection does not depend on a token being set.
-        if is_websocket_route(&path) && is_websocket_upgrade(request.headers()) {
-            if !ws_origin_allowed(request.headers(), host_of(request.headers())) {
-                return forbidden_cross_origin();
-            }
+        if is_websocket_route(&path)
+            && is_websocket_upgrade(request.headers())
+            && !ws_origin_allowed(request.headers(), host_of(request.headers()))
+        {
+            return forbidden_cross_origin();
         }
         return next.run(request).await;
     };
@@ -153,10 +154,11 @@ pub async fn require_bearer(
 
     // Bearer auth passed, but a browser page from another site presenting a stolen token must
     // still not be able to open a shell. See `ws_origin_allowed`.
-    if is_websocket_route(&path) && is_websocket_upgrade(request.headers()) {
-        if !ws_origin_allowed(request.headers(), host_of(request.headers())) {
-            return forbidden_cross_origin();
-        }
+    if is_websocket_route(&path)
+        && is_websocket_upgrade(request.headers())
+        && !ws_origin_allowed(request.headers(), host_of(request.headers()))
+    {
+        return forbidden_cross_origin();
     }
     next.run(request).await
 }
@@ -574,10 +576,7 @@ mod tests {
     #[test]
     fn a_same_origin_handshake_is_allowed() {
         assert!(ws_origin_allowed(
-            &origin_headers(
-                Some("http://127.0.0.1:7717"),
-                Some("127.0.0.1:7717")
-            ),
+            &origin_headers(Some("http://127.0.0.1:7717"), Some("127.0.0.1:7717")),
             Some("127.0.0.1:7717")
         ));
         // Same host, different port: the daemon serves the page and the socket from one port in
@@ -624,10 +623,7 @@ mod tests {
             ("https://evil.example", "evil.example.attacker.com"),
         ] {
             assert!(
-                !ws_origin_allowed(
-                    &origin_headers(Some(origin), Some(host)),
-                    Some(host)
-                ),
+                !ws_origin_allowed(&origin_headers(Some(origin), Some(host)), Some(host)),
                 "origin {origin:?} against host {host:?} must be rejected"
             );
         }

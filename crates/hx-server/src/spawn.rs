@@ -47,7 +47,7 @@ use hx_core::error::{HxError, Result};
 use hx_core::ids::{ProviderId, SessionId};
 use hx_core::message::Message;
 use hx_core::pool::{member_death, DrawError, ModelPool, Param, ParamClamp};
-use hx_provider::{ChatRequest, ChatResponse, ProviderRegistry};
+use hx_provider::{ChatRequest, ChatResponse, Provider, ProviderRegistry};
 use hx_secrets::{Redactor, Secret, SecretStores};
 use hx_store::UsageRecord;
 use serde::Serialize;
@@ -155,6 +155,109 @@ fn final_answer(message: &Message, key: &Secret) -> String {
     redactor.redact(&bounded).text
 }
 
+/// What one prepared child's run produced: either its record, or its member's death.
+///
+/// `Failed` carries **both** redactions' inputs: `reason` is the death reason already redacted
+/// with the resolved key as a registered literal (what `mark_down` stores), and `error` is the
+/// raw provider error for the caller to redact at its own boundary (what the fan-out reports
+/// through [`Spawner::redact_child_error`]).
+/// A store-write failure is not a member death, so it is a `Result::Err` instead — no member is
+/// benched for it, exactly as `run_child`'s `?` behaved.
+pub enum PreparedOutcome {
+    /// The child completed. Carries the same [`ChildRecord`] `run_child` would have returned.
+    /// Boxed for the same reason [`crate::fanout::ChildOutcome`] boxes it.
+    Ran(Box<ChildRecord>),
+    /// The provider call failed. `member` is the member the child was drawn to run on.
+    Failed {
+        member: String,
+        reason: String,
+        error: HxError,
+    },
+}
+
+/// One allocated child with everything its run needs, owned rather than borrowed.
+///
+/// Built by [`Spawner::prepare_child`]; run with [`PreparedChild::run`].
+pub struct PreparedChild {
+    provider: Arc<dyn Provider>,
+    key: Secret,
+    spec: ChildSpec,
+    store: Arc<hx_store::Store>,
+    child_timeout: Duration,
+}
+
+impl PreparedChild {
+    /// Make the child's one provider call and record its usage — shareably.
+    ///
+    /// This is the `&mut`-free middle of [`Spawner::run_child`]: the same clamped-parameter
+    /// request, the same child deadline, the same record with its bounded redacted answer.
+    /// The pool-health write is the caller's job ([`Spawner::mark_down`]), applied after the
+    /// concurrent join.
+    pub async fn run(self, session: &SessionId, prompt: &str) -> Result<PreparedOutcome> {
+        let request = apply_params(
+            ChatRequest::new(self.spec.model(), vec![Message::user(prompt)]),
+            &self.spec.params,
+        );
+        let response =
+            match complete_with_deadline(&*self.provider, request, &self.key, self.child_timeout)
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    return Ok(PreparedOutcome::Failed {
+                        member: self.spec.member_id.clone(),
+                        reason: redact_death_reason(&self.key, &err),
+                        error: err,
+                    });
+                }
+            };
+
+        let usage = response.usage;
+        let record = UsageRecord::new(
+            self.spec.provider.clone(),
+            self.spec.credential.clone(),
+            self.spec.model(),
+            usage.input_tokens,
+            usage.output_tokens,
+        )
+        .cached(usage.cached_input_tokens)
+        .reasoning(usage.reasoning_tokens);
+        self.store.record_usage(session, &record, Utc::now())?;
+
+        Ok(PreparedOutcome::Ran(Box::new(ChildRecord {
+            model: self.spec.model().to_string(),
+            credential: self.spec.credential.clone(),
+            clamps: self.spec.clamps.clone(),
+            usage: record,
+            base_url: self.spec.base_url.clone(),
+            dead_members: Vec::new(),
+            answer: final_answer(&response.message, &self.key),
+        })))
+    }
+}
+
+/// One provider call under a child deadline.
+///
+/// WHY here and not in the adapters: the adapters bound only their own HTTP path, while the
+/// spawner is the layer that decides what a stalled member *means*. A call that outlives the
+/// deadline is reported as [`HxError::Provider`] — the same variant the adapters use for a
+/// wire timeout — so [`member_death`] classifies it as a death: the member is marked down and
+/// its siblings still run. A bare `Elapsed` would bypass that rule and read as an internal
+/// spawner fault instead of a dead member.
+async fn complete_with_deadline(
+    provider: &dyn Provider,
+    request: ChatRequest,
+    key: &Secret,
+    deadline: Duration,
+) -> Result<ChatResponse> {
+    match tokio::time::timeout(deadline, provider.complete(request, key)).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err(HxError::Provider(format!(
+            "the provider call timed out after {deadline:?}: the member never answered"
+        ))),
+    }
+}
+
 /// The spawner that draws children from a model pool.
 ///
 /// Owns the pool (and its health state), and the provider resolution, secret resolution and store it
@@ -229,6 +332,34 @@ impl Spawner {
         session: &SessionId,
         prompt: &str,
     ) -> Result<ChildRecord> {
+        // One implementation of "one provider call, recorded": prepare the shareable work, run
+        // it, then apply the pool-health write. The fan-out (`crate::fanout`) runs the middle
+        // step concurrently across children and applies the write serially after the join; doing
+        // it here keeps the two paths from drifting apart.
+        let prepared = self.prepare_child(spec)?;
+        match prepared.run(session, prompt).await? {
+            PreparedOutcome::Ran(record) => Ok(*record),
+            PreparedOutcome::Failed {
+                member,
+                reason,
+                error,
+            } => {
+                self.mark_down(&member, reason);
+                Err(error)
+            }
+        }
+    }
+
+    /// Split one allocated child into an owned unit of work that can run without `&mut self`.
+    ///
+    /// Resolving the provider and the credential is read-only (both registries sit behind `Arc`),
+    /// so this takes `&self`. The returned [`PreparedChild::run`] does the provider call under
+    /// the child deadline and the usage record — both shareable — but deliberately **not** the
+    /// pool-health write: `mark_down` needs `&mut`, so the caller applies [`Spawner::mark_down`]
+    /// with the [`PreparedOutcome`]'s reason afterwards. A resolve failure is returned as-is
+    /// (that child's own error, exactly as `run_child`'s pre-call `?` did — no member is benched
+    /// for a request that never ran).
+    pub fn prepare_child(&self, spec: &ChildSpec) -> Result<PreparedChild> {
         let provider = self
             .providers
             .resolve(&ProviderId::from(spec.provider.clone()), spec.model())
@@ -237,41 +368,21 @@ impl Spawner {
             .secrets
             .resolve_str(&spec.credential)
             .map_err(|err| hx_core::error::HxError::Secret(err.to_string()))?;
-
-        let request = apply_params(
-            ChatRequest::new(spec.model(), vec![Message::user(prompt)]),
-            &spec.params,
-        );
-        let response = match self.complete_with_deadline(&*provider, request, &key).await {
-            Ok(response) => response,
-            Err(err) => {
-                self.pool
-                    .mark_down(&spec.member_id, redact_death_reason(&key, &err), Utc::now());
-                return Err(err);
-            }
-        };
-
-        let usage = response.usage;
-        let record = UsageRecord::new(
-            spec.provider.clone(),
-            spec.credential.clone(),
-            spec.model(),
-            usage.input_tokens,
-            usage.output_tokens,
-        )
-        .cached(usage.cached_input_tokens)
-        .reasoning(usage.reasoning_tokens);
-        self.store.record_usage(session, &record, Utc::now())?;
-
-        Ok(ChildRecord {
-            model: spec.model().to_string(),
-            credential: spec.credential.clone(),
-            clamps: spec.clamps.clone(),
-            usage: record,
-            base_url: spec.base_url.clone(),
-            dead_members: Vec::new(),
-            answer: final_answer(&response.message, &key),
+        Ok(PreparedChild {
+            provider,
+            key,
+            spec: spec.clone(),
+            store: Arc::clone(&self.store),
+            child_timeout: self.child_timeout,
         })
+    }
+
+    /// Bench a member with a reason, timestamped now.
+    ///
+    /// This is the pool-health half of a failed child run, exposed so the fan-out can apply it
+    /// serially after its concurrent join. Same write `run_child` always did, same clock.
+    pub fn mark_down(&mut self, member: &str, reason: String) {
+        self.pool.mark_down(member, reason, Utc::now());
     }
 
     /// One provider call under the spawner's child deadline.
@@ -288,14 +399,7 @@ impl Spawner {
         request: ChatRequest,
         key: &Secret,
     ) -> Result<ChatResponse> {
-        let deadline = self.child_timeout;
-        match tokio::time::timeout(deadline, provider.complete(request, key)).await {
-            Ok(outcome) => outcome,
-            Err(_) => Err(HxError::Provider(format!(
-                "the provider call timed out after {:?}: the member never answered",
-                deadline
-            ))),
-        }
+        complete_with_deadline(provider, request, key, self.child_timeout).await
     }
 
     /// Redact a child's failure reason for a **caller** — registering the member's own resolved
