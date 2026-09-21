@@ -36,6 +36,21 @@
 //! A denied target answers `403 Forbidden` and closes. It does not time out and it does not
 //! accidentally get forwarded, because the forward happens *only* after the allowlist check passes.
 //!
+//! ## The address it binds
+//!
+//! In production the listen address is `0.0.0.0:3128`, and it is fixed: it has to stay in step with
+//! `hx_sandbox::egress::PROXY_PORT`, because that port is what the sandbox's `HTTP_PROXY` names, and
+//! a mismatch leaves the sandbox pointing at nothing.
+//!
+//! `HX_EGRESS_LISTEN` can move it, and exists for exactly one caller: the live integration test
+//! (`crates/hx-sandbox/tests/egress_live.rs`) starts *this* compiled binary as a child process and
+//! needs it on a free loopback port rather than on a fixed one — the same reason no test here binds
+//! a hard-coded port. It can also be given port `0`, in which case the line this process prints on
+//! startup names the port the kernel actually handed out, so the test never has to guess one. The
+//! daemon never sets the variable, so a sandbox's sidecar still binds 3128. A value that cannot be
+//! parsed or bound is refused at startup rather than quietly falling back to the default: a proxy
+//! listening somewhere other than where it was told to listen is one the sandbox cannot find.
+//!
 //! ## Defence in depth: the proxy will not dial an address either
 //!
 //! The validator (`SandboxSpec::validate`, in `crate::spec` of the library) refuses an allowlist
@@ -57,6 +72,8 @@ use std::net::{IpAddr, TcpListener, TcpStream};
 use std::thread;
 
 const LISTEN_ADDR: &str = "0.0.0.0:3128";
+/// Overrides [`LISTEN_ADDR`] for the live test; the daemon never sets it (see the module doc).
+const LISTEN_ENV: &str = "HX_EGRESS_LISTEN";
 
 const USAGE: &str = "\
 hx-egress-proxy — the allowlist-enforcing egress proxy for a sandbox.
@@ -69,13 +86,19 @@ Environment:
   HX_EGRESS_ALLOW   comma-separated entries, each a `host`, `*.domain`, a raw IP,
                     or a CIDR (e.g. `crates.io,*.crates.io,10.0.0.0/8`).
                     Absent or empty means nothing is allowed, which is the fail-closed default.
+  HX_EGRESS_LISTEN  the address to bind (default `0.0.0.0:3128`). The daemon does
+                    not set this; it exists so the live integration test can run
+                    this binary on a free loopback port. Port `0` asks the kernel
+                    for one, which the startup line then reports.
 
 Options:
   -h, --help        print this and exit
   -V, --version     print the version and exit
 
-It takes no other arguments: the listen address is fixed, because the network
-it must sit on is the whole reason it exists.
+It takes no other arguments: in production the listen address is
+`0.0.0.0:3128`, because the network it must sit on is the whole reason it
+exists (`HX_EGRESS_LISTEN` is the one exception, and nothing in production sets
+it).
 ";
 
 /// Run the proxy until killed. The caller (the sidecar's entrypoint) is the supervisor.
@@ -109,8 +132,23 @@ fn main() {
 
     let allow = parse_allowlist(env::var("HX_EGRESS_ALLOW").unwrap_or_default());
 
-    let listener = TcpListener::bind(LISTEN_ADDR).expect("proxy must bind the internal port");
-    eprintln!("egress proxy listening on {LISTEN_ADDR}");
+    // The production address unless a caller (the live test) asked for another one. Refused, not
+    // fallen back from: a proxy that binds somewhere other than where it was told is invisible to
+    // the `HTTP_PROXY` that names it, which reads as a sandbox with no egress at all.
+    let listen = env::var(LISTEN_ENV).unwrap_or_else(|_| LISTEN_ADDR.to_string());
+    let listener = match TcpListener::bind(&listen) {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("hx-egress-proxy: cannot bind {listen:?} from {LISTEN_ENV}: {e}");
+            std::process::exit(3);
+        }
+    };
+    // The *bound* address, not the requested one: with port `0` the kernel picks the port, and the
+    // live test reads its port from this line rather than guessing one that might already be taken.
+    let bound = listener
+        .local_addr()
+        .expect("a bound listener has a local address");
+    eprintln!("egress proxy listening on {bound}");
 
     for stream in listener.incoming() {
         let stream = match stream {

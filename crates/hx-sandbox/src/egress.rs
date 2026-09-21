@@ -88,6 +88,9 @@ pub use policy::EgressRule;
 /// 3128 is the conventional proxy port, and it has to stay in step with the proxy binary's
 /// `LISTEN_ADDR`. A mismatch would leave the sandbox holding a proxy variable that points at nothing,
 /// which surfaces inside the sandbox as a connection error rather than as anything naming the cause.
+/// (The binary also honours `HX_EGRESS_LISTEN`; the daemon never sets it — it exists so the live
+/// integration test can run the binary on a free loopback port — so what this constant tracks is the
+/// proxy's *default* address, which is what a sidecar binds.)
 pub const PROXY_PORT: u16 = 3128;
 /// The name the sidecar is known by on the internal network — a fixed, non-colliding alias the
 /// sandbox can resolve without knowing the sidecar's generated container id.

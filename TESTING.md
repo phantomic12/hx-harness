@@ -1543,6 +1543,15 @@ HX_SSH_TEST_HOST=<host> HX_SSH_TEST_USER=<user> HX_SSH_TEST_KEY=~/.ssh/id_ed2551
   work), and the `hxd` reaper loop and `axum::serve` under load. **The vault opened in a new process
   used to be on this list**: it is now six hermetic tests in `crates/hx-secrets/tests/vault_process.rs`,
   run in ordinary CI. **Egress by CIDR or raw IP left this list too**: an IP/CIDR allowlist is now
-  enforced by resolving the `CONNECT` target and testing its address, and the matching is hermetic
-  unit/integration tests in `crates/hx-sandbox` (`egress/policy.rs`, `tests/egress_policy.rs`, and the
-  proxy binary's own tests over real loopback sockets).
+  enforced by resolving the `CONNECT` target and testing its address, with the matching pinned
+  hermetically in `crates/hx-sandbox` (`egress/policy.rs`, `tests/egress_policy.rs`) and **live** in
+  `tests/egress_live.rs`, which runs in the ordinary gate: it starts the compiled `hx-egress-proxy`
+  binary as a child process on a kernel-chosen loopback port and proves over real sockets that a
+  `CONNECT` to an address inside `127.0.0.0/8` is relayed — a byte written by the client arrives at a
+  target and the target's answer arrives back — while an address outside the allowlist is answered
+  `403` and the child logs `egress DENIED <target>`. The refusal half asserts more than the status
+  line: the target is a listener of this test's own that **counts what it accepts**, and that counter
+  is shown to move by a control connection through the same listener, so "no connection reached it"
+  is an observation. The suite is proven able to fail two ways: loosening the policy to contain the
+  refused address (the refused target is then answered `200`), and dialing *before* the allowlist
+  check in the proxy (the `403` still arrives, but the target's counter goes to 1).
