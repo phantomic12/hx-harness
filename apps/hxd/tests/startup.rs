@@ -276,3 +276,116 @@ async fn a_non_loopback_bind_with_a_token_starts_and_serves() {
         let _ = child.wait().await;
     }
 }
+
+/// Write a minimal configuration for `hxd` with the update checker **enabled** and pointed at
+/// `update_url`, checking every `interval_secs` seconds.
+fn write_update_config(dir: &Path, update_url: &str, interval_secs: u64) -> PathBuf {
+    let data_dir = dir.join("data");
+    std::fs::create_dir_all(&data_dir).expect("create data dir");
+
+    let yaml = format!(
+        r#"daemon:
+  data_dir: "{}"
+update:
+  enabled: true
+  url: "{}"
+  interval_secs: {}
+providers:
+  local:
+    kind: ollama
+    base_url: http://127.0.0.1:9
+    models: ["dead-model"]
+    credentials:
+      - id: local-1
+        secret: "env:HX_TEST_KEY_NOT_SET"
+pools:
+  interactive:
+    members: ["local/dead-model"]
+roles:
+  builder: interactive
+search:
+  backends: []
+"#,
+        data_dir.display(),
+        update_url,
+        interval_secs
+    );
+
+    let config_path = dir.join("hx.yaml");
+    std::fs::write(&config_path, yaml).expect("write config");
+    config_path
+}
+
+/// A hermetic update check over the real binary and a real loopback server.
+///
+/// This is the whole opt-in flow, end to end: an operator enables `update`, the mock server
+/// returns a newer release than the running build, and the daemon logs a single `info!` line
+/// naming the new version and the install command — without downloading or restarting anything. The
+/// interval is one second (not a wall-clock sleep: we bound the whole wait with `timeout` and
+/// assert the update line arrives, which a broken checker never produces).
+#[tokio::test]
+async fn an_enabled_update_checker_reports_a_newer_release_from_a_loopback_feed() {
+    use tokio::io::AsyncBufReadExt;
+
+    let temp = TempDir::new().expect("temp dir");
+    let port = free_port();
+    let update_url = format!("http://127.0.0.1:{port}/releases/latest");
+
+    // A tiny axum mock serving a GitHub-style release payload whose tag_name is newer than any
+    // CARGO_PKG_VERSION this binary could carry.
+    let mock_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let app = axum::Router::new().route(
+        "/releases/latest",
+        axum::routing::get(|| async {
+            axum::response::Json(serde_json::json!({
+                "tag_name": "v99.0.0",
+                "html_url": "https://github.com/phantomic12/hx-harness/releases/tag/v99.0.0"
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(mock_addr).await.expect("bind mock");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let config_path = write_update_config(temp.path(), &update_url, 1);
+
+    let mut cmd = Command::new(HXD);
+    cmd.args(["--config", config_path.to_str().unwrap(), "--bind", "127.0.0.1:0"]);
+    cmd.env_remove("HX_API_TOKEN");
+    cmd.env_remove("HX_BIND");
+    cmd.env_remove("HX_CONFIG");
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let mut child = cmd.spawn().expect("failed to spawn hxd");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut reader = BufReader::new(stdout).lines();
+
+    // Bounded wait for the update line — no sleeps. The first check happens one interval (1s)
+    // after startup, so this is a real wait for a real log line, guarded by a timeout.
+    let found = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Ok(Some(line)) = reader.next_line().await {
+            if line.contains("a newer version is available") {
+                return line;
+            }
+        }
+        String::new()
+    })
+    .await;
+
+    // Kill the child regardless of what happened.
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+
+    let line = found.expect("hxd must log the newer-version line within the timeout");
+    assert!(
+        line.contains("v99.0.0"),
+        "the log line must name the new version: {line}"
+    );
+    assert!(
+        line.contains("install.sh"),
+        "the log line must carry the install command: {line}"
+    );
+}
