@@ -971,7 +971,7 @@ the failure is silent:
 | **Egress filtering by CIDR or raw IP** | A hostname / `*.domain` allowlist **is** enforced, on both the near and the far host (internal network with no *default* route + `hx-egress-proxy` sidecar). What has no implementation is *matching* a CIDR or a raw IP against an unresolved `CONNECT` target, so such an entry — and anything address-shaped in the `inet_aton` grammar — is *refused* rather than pretended (`SpecError::EgressNotEnforced`) | Medium — a `network: true` profile with no allowlist at all is still unrestricted |
 | DuckDuckGo keyless scraping — the *success* path | Every attempt from a plain HTTP client is answered with an `anomaly` challenge: a TLS-fingerprint wall, not a markup change. The failure path is verified live; the success path needs a browser-fingerprint client (M6) | Medium — search silently loses a source, but `SearchReport` names it |
 | `hxd` reaper loop, `axum::serve` under load | Manual only | Low |
-| **`hx-mcp` against a real third-party MCP server over streamable-HTTP** | The **stdio** half of the canary has now been run against a real server (see *The live MCP canary* below). The streamable-HTTP half (`HX_MCP_LIVE_URL`) has **never been run**: there is no third-party endpoint configured for this environment, and the HTTP suite's happy path uses `rmcp`'s own server, which this project also built. So the HTTP session header, SSE framing and `Last-Event-ID` resume are verified against an implementation we did not write but *did* choose, and not against a third party | Medium — a `rmcp` behaviour we have misread would pass every test here and fail on first contact. `rmcp` is the mitigation, and it is not under test |
+| **`hx-mcp` against a real third-party MCP server over streamable-HTTP** | Now **run** against the real `secure-filesystem-server` 0.2.0, exposed over streamable HTTP by the `supergateway` HTTP-to-stdio bridge, plus against the crate's own server over a real loopback socket (see *The live MCP canary* below). The HTTP session header, SSE framing and `Last-Event-ID` resume are now verified against a server nobody here wrote. **No defect was found.** Still unproven: the canary calls one tool with `{}`, so tool *arguments* are not round-tripped | Low — a `rmcp` behaviour we have misread would fail on first contact. `rmcp` is the mitigation, and the canary now pins the real path |
 
 *The vault written to disk and reopened in a new process* was the fourth row here. It is now in
 tier A above: `crates/hx-secrets/tests/vault_process.rs`, six tests, hermetic, in CI on all three
@@ -1177,10 +1177,55 @@ that cannot fail is not evidence, and this one can.
 
 **What is still not covered by this run.** The canary calls one tool with `{}` — the call that needs no
 knowledge of the schema — so the round-trip is proven and the *arguments* are not; a tool that takes a
-path is exercised by `tests/stdio.rs` against the double, not here. And the streamable-HTTP canary
-(`HX_MCP_LIVE_URL`) is still unrun: there is no third-party endpoint available in this environment, and
-the HTTP suite's happy path drives `rmcp`'s own server, which this project also built. That is the
-remaining Tier C row.
+path is exercised by `tests/stdio.rs` against the double, not here.
+
+### The streamable-HTTP half, against a real server (2026-09-20, recorded)
+
+The canary's streamable-HTTP test, `HX_MCP_LIVE_URL`, was unrun and is now closed. It was run
+**unmodified** against two real endpoints.
+
+*First, the crate's own server over a real loopback socket* (`hx-mcp-server --http
+127.0.0.1:18790`, no token):
+
+```console
+$ HX_MCP_LIVE_URL=http://127.0.0.1:18790/mcp \
+  cargo test -p hx-mcp --test mcp_live -- --ignored --nocapture \
+      a_real_streamable_http_endpoint_is_reached_and_its_tools_are_published
+test a_real_streamable_http_endpoint_is_reached_and_its_tools_are_published ... ok
+test result: ok. 1 passed; … finished in 0.03s
+```
+
+The client completed a real `initialize` + `tools/list` handshake over the wire, published the server's
+six tools namespaced under `live__`, and round-tripped a real `tools/call` as a `ToolOutcome`.
+
+*Then, a real third-party server.* The real `@modelcontextprotocol/server-filesystem`
+(`secure-filesystem-server` 0.2.0 — the same package the stdio half used) was exposed over
+streamable HTTP by the `supergateway` HTTP-to-stdio bridge (`--outputTransport streamableHttp`,
+`--protocolVersion 2025-06-18`), and the same unmodified canary reached it:
+
+```console
+$ HX_MCP_LIVE_URL=http://127.0.0.1:18791/mcp \
+  cargo test -p hx-mcp --test mcp_live -- --ignored --nocapture \
+      a_real_streamable_http_endpoint_is_reached_and_its_tools_are_published
+test a_real_streamable_http_endpoint_is_reached_and_its_tools_are_published ... ok
+test result: ok. 1 passed; … finished in 1.20s
+```
+
+The handshake (session header, SSE framing, `Last-Event-ID`) that the suite had only ever verified
+against a server this project also wrote and chose now holds against a server nobody here wrote. **No defect
+was found** — nothing in `crates/hx-mcp/src/http.rs`, `host.rs` or `conn.rs` was changed.
+
+**The check that the canary can fail.** Pointed at an endpoint that is not there:
+
+```console
+$ HX_MCP_LIVE_URL=http://127.0.0.1:1/mcp cargo test … --ignored
+thread 'a_real_streamable_http_endpoint_is_reached_and_its_tools_are_published' panicked at mcp_live.rs:244:
+a real endpoint must come up: Down { reason: "the handshake failed: Send message error …", retrying: true }
+```
+
+It fails on the assertion it is supposed to fail on, so the pass is evidence rather than a canary that
+cannot fail. *Still unproven:* the canary calls one tool with `{}`, so tool *arguments* are not
+round-tripped over HTTP either.
 
 ## Tier C — a real model through the daemon (manual, recorded)
 
