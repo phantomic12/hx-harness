@@ -197,6 +197,29 @@ impl Spawner {
         })
     }
 
+    /// Redact a child's failure reason for a **caller** — registering the member's own resolved
+    /// credential as a literal first, exactly as [`redact_death_reason`] does for the stored death
+    /// reason.
+    ///
+    /// [`Self::run_child`] returns the raw [`HxError`], whose provider variants carry the upstream
+    /// body. A caller that renders that error into a response — the fan-out route does — would then
+    /// hand a client whichever credential the provider echoed back (an auth-debugging page, a
+    /// `?token=` URL). The shared [`Redactor`]'s pattern pass masks the recognisable shapes
+    /// (`sk-…`, `ghp_…`), but an **opaque** value with no shape is caught only by the registered
+    /// literal, which is why this goes through [`redact_death_reason`] rather than a bare
+    /// `Redactor::new()`. A credential that will not resolve never reached the provider, so the
+    /// pattern pass alone is all that is needed there.
+    ///
+    /// The fan-out lane's finding: `run_fan_out` used to apply the pattern pass alone, and a
+    /// patternless credential echoed by a dying member reached the HTTP response verbatim
+    /// (`tests/fanout_merged.rs`).
+    pub fn redact_child_error(&self, spec: &ChildSpec, err: &HxError) -> String {
+        match self.secrets.resolve_str(&spec.credential) {
+            Ok(key) => redact_death_reason(&key, err),
+            Err(_) => Redactor::new().redact(&err.to_string()).text,
+        }
+    }
+
     /// Run a child that **re-routes on member death** and continues, rather than failing the lane.
     ///
     /// This is the half of M8 this module previously named out of scope ("needs running children").

@@ -57,7 +57,6 @@
 
 use crate::spawn::{ChildRecord, Spawner};
 use hx_core::ids::SessionId;
-use hx_secrets::Redactor;
 use serde::Serialize;
 use std::collections::BTreeSet;
 
@@ -178,19 +177,20 @@ pub async fn run_fan_out(
 
     // Phase 2 — run every allocated child, regardless of how its siblings fare.
     //
-    // The error string is redacted at this boundary before it is handed to a caller (and
-    // eventually rendered as client JSON): `run_child` returns the raw `HxError`, whose provider
-    // variants carry the upstream body — which can echo a key or a `?token=` URL. The shared
-    // `Redactor`'s pattern pass masks the recognisable shapes; opaque values are the separate
-    // duty of `Spawner`'s registered-literal pass on the stored death reason.
-    let redactor = Redactor::new();
+    // The error string is redacted *by the spawner* before it is handed to a caller (and eventually
+    // rendered as client JSON): `run_child` returns the raw `HxError`, whose provider variants carry
+    // the upstream body — which can echo a key or a `?token=` URL. `Spawner::redact_child_error`
+    // registers the member's own resolved credential as a **literal** and then applies the shared
+    // `Redactor`'s pattern pass, which is the only pass that catches an opaque value with no
+    // recognisable shape. (This lane's finding: the fan-out used to apply the pattern pass *alone*,
+    // and a patternless credential echoed by a dying member reached the HTTP response verbatim.)
     let mut children = Vec::with_capacity(wanted);
     for spec in &specs {
         match spawner.run_child(spec, session, "fan-out child").await {
             Ok(record) => children.push(ChildOutcome::Ran(record)),
             Err(err) => children.push(ChildOutcome::Errored {
                 member: spec.member_id.clone(),
-                error: redactor.redact(&err.to_string()).text,
+                error: spawner.redact_child_error(spec, &err),
             }),
         }
     }
@@ -508,14 +508,68 @@ mod tests {
         );
     }
 
+    /// An **opaque** credential — no `sk-`/`ghp_` shape for the pattern pass to catch — that a dying
+    /// member echoes back in its error body must still not reach `ChildOutcome::Errored`.
+    ///
+    /// The pattern pass alone cannot do this: the value has no shape to recognise. It is caught only
+    /// because the fanout asks `Spawner::redact_child_error`, which registers the member's own
+    /// resolved credential as a literal first. This test is what made the defect visible; the
+    /// HTTP-level version is `a_dead_member_that_echoes_an_opaque_credential_does_not_leak_it_to_the_client`
+    /// in `tests/fanout_merged.rs`.
+    #[tokio::test]
+    async fn a_dead_members_opaque_credential_is_masked_at_the_fanout_boundary() {
+        const OPAQUE: &str = "opaque-fanout-unit-sentinel-4b1c2d";
+        let mut reg = ProviderRegistry::new();
+        reg.insert(Arc::new(ScriptedProvider::new("a").failing()));
+        reg.insert(Arc::new(ScriptedProvider::new("b")));
+        let st = store();
+        let secrets: SecretStores = {
+            let mut s = FixedSecrets::new("vault");
+            s = s.set("pool/a", OPAQUE);
+            s = s.set("pool/b", "sentinel-b");
+            SecretStores::new().with(Arc::new(s))
+        };
+        let mut sp = Spawner::new(
+            hx_core::pool::ModelPool::new(vec![member("a"), member("b")]),
+            Arc::new(reg),
+            Arc::new(secrets),
+            st.clone(),
+        );
+        let s = session(&st);
+
+        let out = run_fan_out(&mut sp, s.id(), &["p1", "p2"])
+            .await
+            .expect("runs");
+        let errored = out
+            .children
+            .iter()
+            .find_map(|c| match c {
+                ChildOutcome::Errored { member, error } if member == "a" => Some(error.as_str()),
+                _ => None,
+            })
+            .expect("a errored");
+        assert!(
+            !errored.contains(OPAQUE),
+            "a patternless credential echoed by the dying member reached the outcome: {errored}"
+        );
+        // The positive control: the error still says *why* the child failed, so redaction has not
+        // simply emptied the message — a test that only checked for the absence of a string would
+        // pass against a redactor that returned "".
+        assert!(
+            errored.contains("500"),
+            "the reason survives redaction: {errored}"
+        );
+    }
+
     /// A dead member's error is redacted before it is returned on `ChildOutcome::Errored`: the
     /// provider can echo a recognisable credential (an `sk-` key) in its body, and that must
     /// never become a string a client reads.
     ///
-    /// The boundary here is honest: the fanout does not hold the resolved secret (only `Spawner` does),
-    /// so it applies the shared [`Redactor`]'s *pattern* pass, which masks recognisable credential
-    /// shapes. Opaque values with no shape are the spawner's separate job — it registers the resolved key
-    /// as a literal when it writes the stored death reason.
+    /// The redaction is the spawner's (`Spawner::redact_child_error`): the fanout does not hold the
+    /// resolved secret, only `Spawner` does — so the fanout asks it to redact, and that path registers
+    /// the member's own resolved key as a **literal** before applying the shared [`Redactor`]'s pattern
+    /// pass. The pattern pass alone was this module's original claim, and it is not enough; the test
+    /// above is the one that shows it.
     #[tokio::test]
     async fn a_dead_members_error_is_redacted_at_the_fanout_boundary() {
         // "a" fails and echoes a recognisable key; "b" succeeds.

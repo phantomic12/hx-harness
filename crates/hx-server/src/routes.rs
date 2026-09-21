@@ -100,9 +100,9 @@ pub fn app(state: Arc<AppState>) -> Router {
         // The diff/review pane's data source. A diff of file changes is owned by the daemon (it is
         // the only thing that can read the file), so the pane asks for it here rather than inventing it.
         .route("/v1/diff", post(diff_file))
-        // The M8 fan-out surface: N concurrent child model calls across N distinct pool members,
-        // answered per child. This is the first production caller of the spawner that draws from the
-        // model pool (see `crate::fanout`). It is gated by the same bearer token as everything
+        // The M8 fan-out surface: N child model calls across N distinct pool members, run one at a
+        // time, answered per child. This is the first production caller of the spawner that draws from
+        // the model pool (see `crate::fanout`). It is gated by the same bearer token as everything
         // else on this router.
         .route("/v1/fanout", post(fanout))
         .with_state(state)
@@ -833,7 +833,14 @@ pub struct FanOutChild {
 ///
 /// `children` is the list of child calls. The returned outcome has one result per child, in
 /// request order. Every child in a fan-out runs against **one** caller session (the first
-/// child's), which is the single-session contract of `crate::fanout::run_fan_out`.
+/// child's), which is the single-session contract of `crate::fanout::run_fan_out`; the other
+/// children's `session` fields are accepted for shape and ignored, which
+/// `tests/fanout_merged.rs` pins.
+///
+/// Refused before anything runs: an empty `children` array (400), a child whose prompt is blank
+/// (400 — the built-in web client refuses the same row, and a blank prompt is a model call that
+/// buys nothing), and the session the children will be recorded under when it does not exist (404).
+/// A refusal spends no provider call and writes nothing.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct FanOutBody {
     pub children: Vec<FanOutChild>,
@@ -847,13 +854,20 @@ fn default_fanout_pool() -> String {
     "interactive".to_string()
 }
 
-/// `POST /v1/fanout` — run N child model calls across N distinct pool members.
+/// `POST /v1/fanout` — run N child model calls, one per distinct pool member, one at a time.
 ///
 /// The M8 exit criterion as an HTTP surface: every child is allocated a spec on a *distinct*
 /// healthy member before any runs, a short pool fails loudly (no child runs), and a member that
 /// dies mid-fan-out fails only its own child while the others complete. Each completed child's
-/// response names the member it ran on and its recorded usage; a dying member's error is already
-/// redacted at the fanout boundary (see `crate::fanout`).
+/// response names the member it ran on and its recorded usage; a dying member's error is redacted
+/// at the fanout boundary with the member's own credential registered as a literal (see
+/// `crate::spawn::Spawner::redact_child_error`).
+///
+/// The children run **one at a time**: `run_fan_out` awaits each `run_child` in a loop. This
+/// comment used to call them "N concurrent child model calls", which was never true of the code —
+/// `ROADMAP.md`'s M8 section says sequential, and `a_fan_out_runs_its_children_one_at_a_time`
+/// in `tests/fanout_merged.rs` pins it. Do not re-word this back without also making the loop
+/// concurrent.
 ///
 /// The `Spawner` is built per request from `Config` plus the state's providers, secret stores
 /// and store. This is the same wiring `AppState::build` uses for the model path, and no new
@@ -871,9 +885,38 @@ async fn fanout(
         ));
     }
 
+    // A child with nothing to ask is a provider call that buys nothing, and the built-in web client
+    // refuses exactly that row before sending it (`each row needs both a session and a prompt`). The
+    // route used to accept it and spend the call, so the two surfaces disagreed; it now names the
+    // child and refuses. Whitespace counts as blank for the same reason.
+    for (index, child) in body.children.iter().enumerate() {
+        if child.prompt.trim().is_empty() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "child {} has an empty prompt: a fan-out child needs something to ask",
+                    index + 1
+                ),
+            ));
+        }
+    }
+
     // `run_fan_out` runs every child against a single caller session; the first child's is
     // that session. This is the primitive's documented contract, not a guess.
     let session = hx_core::ids::SessionId::from_raw(body.children[0].session.clone());
+
+    // The session must already exist — every child's usage is recorded under it, and `hx fan`'s help
+    // says so. Without this check the fan-out made the provider call first and failed afterwards
+    // inside `Store::record_usage` (`touch` refuses a session that is not there), reporting that as
+    // an *errored child* in a 200: a model call paid for, nothing in the audit chain, and an
+    // internal store message rendered as the child's failure.
+    state.store.record(&session).map_err(|err| match err {
+        hx_core::error::HxError::NotFound(_) => ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("no such session: {}", session.as_str()),
+        ),
+        other => ApiError::from(other),
+    })?;
 
     // `default_pool` carries the configured default, which may be empty/absent; fall back to a
     // sensible name when it is. The pool the fan-out draws from is built per request from
