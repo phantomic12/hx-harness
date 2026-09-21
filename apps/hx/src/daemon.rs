@@ -210,6 +210,21 @@ pub async fn chat_stream(
     })
 }
 
+/// The daemon's own status snapshot.
+///
+/// The whole document rather than a subset: `hx doctor` decides what a healthy deployment looks
+/// like from it, and a client that re-summarised the daemon's state would be a second opinion about
+/// what is running. `/v1/status` is the same document `hxd --check` prints.
+pub async fn status(client: &reqwest::Client, base: &str) -> anyhow::Result<Value> {
+    let (_, report) = send(
+        client.get(format!("{base}/v1/status")),
+        base,
+        "reading the daemon's status",
+    )
+    .await?;
+    Ok(report)
+}
+
 /// Whether a session's stored trail still matches its recorded digests.
 pub async fn audit(client: &reqwest::Client, base: &str, id: &str) -> anyhow::Result<Value> {
     let (_, report) = send(

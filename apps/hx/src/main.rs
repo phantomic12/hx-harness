@@ -10,6 +10,7 @@
 
 mod commands;
 mod daemon;
+mod doctor;
 mod stream;
 
 use anyhow::{Context, Result};
@@ -17,7 +18,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use hx_core::config::Config;
 use hx_provider::ModelRouter;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -172,8 +173,27 @@ enum Command {
         workspace: Option<String>,
     },
 
-    /// Check the configuration and the environment.
-    Doctor,
+    /// Check the daemon's real state and report it, one line per check.
+    ///
+    /// Reads the *running* daemon (`/v1/status`), so it answers "is a pool member down", "did the
+    /// daemon build the search backends", "can the credentials it was configured with resolve" —
+    /// questions the config file cannot answer about itself. A check that cannot be run is reported
+    /// as `FAIL` with the reason, never skipped, so a report that could not look does not read as a
+    /// healthy deployment. Exits non-zero only when something FAILs; `hxd --check` is the
+    /// config-only question.
+    Doctor {
+        /// Print the checks as a JSON document instead of lines.
+        #[arg(long)]
+        json: bool,
+
+        /// The address the daemon binds, for the API-token check.
+        ///
+        /// Defaults to `HX_BIND`, then to `daemon.http_addr`. Which one was used is printed with the
+        /// check, because `hxd`'s own default bind is `127.0.0.1:7717` — an operator who has set
+        /// only one of the two settings needs to know which address was judged.
+        #[arg(long)]
+        bind: Option<String>,
+    },
 
     /// Show the configured hosts.
     Hosts,
@@ -243,15 +263,19 @@ enum SandboxCommand {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let raw = std::fs::read_to_string(&cli.config).with_context(|| {
-        format!(
-            "could not read the config file {}. Pass --config, or set HX_CONFIG.",
-            cli.config.display()
-        )
-    })?;
-
-    let config = Config::from_yaml(&raw)
-        .with_context(|| format!("{} is not a valid hx config", cli.config.display()))?;
+    // A config that will not load is a *reportable* state for the doctor and a dead end for every
+    // other command, so the doctor is given the chance to report it before the failure propagates:
+    // "the config does not parse" is one of the checks, and a doctor that died before printing it
+    // would be useless in exactly the case it exists for.
+    let config = match load_config(&cli.config) {
+        Ok(config) => config,
+        Err(err) => {
+            if let Command::Doctor { json, bind } = &cli.command {
+                run_doctor(&cli.config, cli.daemon.as_deref(), bind.as_deref(), *json).await;
+            }
+            return Err(err);
+        }
+    };
 
     match cli.command {
         Command::Chat {
@@ -434,10 +458,8 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string(&reply).unwrap_or_default());
         }
 
-        Command::Doctor => {
-            let mut checks = commands::static_checks(&config);
-            checks.push(commands::docker_check().await);
-            print!("{}", commands::render_doctor(&checks));
+        Command::Doctor { json, bind } => {
+            run_doctor(&cli.config, cli.daemon.as_deref(), bind.as_deref(), json).await;
         }
 
         Command::Hosts => print!("{}", commands::render_hosts(&config)),
@@ -500,4 +522,32 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Read and parse the configuration, or say which of the two failed.
+///
+/// `Config` denies unknown fields precisely so a typo surfaces here rather than as a silently
+/// ignored setting, so both failures are named with the file and the parser's own message.
+fn load_config(path: &Path) -> Result<Config> {
+    let raw = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "could not read the config file {}. Pass --config, or set HX_CONFIG.",
+            path.display()
+        )
+    })?;
+
+    Config::from_yaml(&raw).with_context(|| format!("{} is not a valid hx config", path.display()))
+}
+
+/// Gather, decide, print, and exit with the report's own code.
+///
+/// The one place the doctor is run from, called both when the config loaded and when it did not, so
+/// a broken config is reported by the same code path as a healthy one. It never returns: the exit
+/// code *is* the report's verdict, which is what lets a script gate on `hx doctor` without parsing
+/// its prose.
+async fn run_doctor(config: &Path, daemon: Option<&str>, bind: Option<&str>, json: bool) -> ! {
+    let facts = doctor::gather(config, daemon, bind).await;
+    let report = doctor::diagnose(&facts, Utc::now());
+    print!("{}", report.render(json));
+    std::process::exit(report.exit_code());
 }
