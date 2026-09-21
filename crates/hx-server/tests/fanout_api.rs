@@ -429,3 +429,88 @@ async fn an_empty_fan_out_is_refused_as_bad_request() {
     let (status, out) = post_fanout(state, serde_json::to_value(&body).unwrap()).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{out}");
 }
+
+/// A provider that rendezvous with its sibling on a barrier before answering: both children
+/// must be inside `complete` at the same time for either to return.
+struct BarrierProvider {
+    id: ProviderId,
+    barrier: Arc<tokio::sync::Barrier>,
+}
+
+#[async_trait]
+impl Provider for BarrierProvider {
+    fn id(&self) -> &ProviderId {
+        &self.id
+    }
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Openai
+    }
+    fn models(&self) -> &[String] {
+        &[]
+    }
+    async fn complete(&self, _req: ChatRequest, _key: &Secret) -> Result<ChatResponse> {
+        self.barrier.wait().await;
+        Ok(ChatResponse {
+            message: Message::assistant("done"),
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            },
+            finish: FinishReason::Stop,
+            model: self.id.to_string(),
+            raw: None,
+        })
+    }
+}
+
+/// Two children whose providers rendezvous on a barrier complete over HTTP: sequential execution
+/// would deadlock at the barrier and the timeout would fire, so a 200 with both children `Ran`
+/// proves the route runs the fan-out's lanes concurrently, not one after another.
+#[tokio::test]
+async fn two_children_over_http_run_concurrently() {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let mut reg = ProviderRegistry::new();
+    for id in ["a", "b"] {
+        reg.insert(Arc::new(BarrierProvider {
+            id: ProviderId::from(id),
+            barrier: Arc::clone(&barrier),
+        }));
+    }
+    let state = harness(
+        ModelPool::new(vec![member("a"), member("b")]),
+        Arc::new(reg),
+        secrets_for(&["a", "b"]),
+    )
+    .await;
+    let sid = session(&state.store).as_str().to_string();
+
+    let body = FanOutBody {
+        children: vec![
+            FanOutChild {
+                session: sid.clone(),
+                prompt: "p1".to_string(),
+            },
+            FanOutChild {
+                session: sid,
+                prompt: "p2".to_string(),
+            },
+        ],
+    };
+
+    let (status, out) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        post_fanout(state, serde_json::to_value(&body).unwrap()),
+    )
+    .await
+    .expect("both lanes must reach the barrier before the timeout");
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let children = out["children"].as_array().unwrap();
+    assert_eq!(children.len(), 2);
+    for child in children {
+        assert!(
+            child["Ran"].is_object(),
+            "both barrier children completed: {child}"
+        );
+    }
+}

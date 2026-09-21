@@ -274,8 +274,7 @@ impl Spawner {
     /// This is the pool-health half of a failed child run, exposed so the fan-out can apply it
     /// serially after its concurrent join. Same write `run_child` always did, same clock.
     pub fn mark_down(&mut self, member: &str, reason: String) {
-        self.pool
-            .mark_down(member, reason, Utc::now());
+        self.pool.mark_down(member, reason, Utc::now());
     }
 
     /// Run a child that **re-routes on member death** and continues, rather than failing the lane.
