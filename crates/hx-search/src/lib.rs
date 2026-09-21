@@ -50,9 +50,11 @@ pub use extract::{
     Rung, MAIN_SHARE, MIN_MAIN_CHARS,
 };
 pub use research::{
-    research, BackendOutcome, BrowserFetcher, Citation, Fetcher, HttpFetcher, ResearchReport,
-    ResearchRequest, ResearchTask, DEFAULT_FETCH_CONCURRENCY, DEFAULT_FETCH_TIMEOUT,
-    DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_SOURCES, DEFAULT_SNIPPET_MAX_CHARS,
+    browser_available, default_pool_root, research, research_with_fetch_mode, select_fetcher,
+    BackendOutcome, BrowserFetcher, Citation, FetchMode, FetchRouteError, FetchSelection, Fetcher,
+    HttpFetcher, ResearchReport, ResearchRequest, ResearchTask, SelectedFetcher,
+    DEFAULT_FETCH_CONCURRENCY, DEFAULT_FETCH_TIMEOUT, DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_SOURCES,
+    DEFAULT_SNIPPET_MAX_CHARS,
 };
 pub use types::{
     canonicalize_url, fuse, host_matches, FusedResult, Recency, SearchQuery, SearchResult, RRF_K,

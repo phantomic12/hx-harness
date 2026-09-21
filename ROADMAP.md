@@ -551,9 +551,19 @@ command with a button, receive a cron digest in a separate pinned thread.
     `Fetcher` — the caller the rung exists for — so research extraction and citation can run over
     rendered HTML. The caller honours the rung's guarantees (admission still runs, a refusal surfaces
     as `SearchError::Refused` not an empty body, the body cap and a caller-side timeout also apply,
-    and no browser child leaks on drop or timeout). It is exported from `hx-search` but no running
-    `hx-server` route selects it yet; until one does, a research task reaches the browser only when it is
-    constructed with a `BrowserFetcher`.
+    and no browser child leaks on drop or timeout). **It is now selected by a running path**: the
+    research path's fetch step (`select_fetcher` and `research_with_fetch_mode`, same file) chooses
+    `BrowserFetcher` for the `Auto` mode (plain HTTP first, escalating to Chromium for a page a plain
+    fetch cannot read) and for an explicit `Browser` mode, and `HttpFetcher` otherwise. The fallback
+    cannot lie: when no browser is installed on the host (it is **not** on the remote build host),
+    `Auto` degrades to the plain fetch and says so, while an explicit `Browser` request **fails** rather
+    than silently returning a page fetched the wrong way; a browser that runs but cannot fetch still surfaces
+    as `SearchError::Refused`, never an empty body. Launching a browser is deliberate and documented — a
+    caller selects `Browser` or `Auto`, and the `may_launch_browser` flag records which modes may
+    launch one; an ordinary `Http` fetch never becomes a browser launch. No `hx-server` route or tool
+    yet drives a research run through this selector (research is still invoked only by tests and by code that
+    hand-constructs a `Fetcher`), so a call that reaches the browser today must go through
+    `research_with_fetch_mode` with `Auto` or `Browser`; that is the one remaining unwired seam.
 - Search: SearXNG, DDG, Mojeek, Marginalia, Brave, Google PSE, Wikipedia, plus the
   extraction ladder and URL/ETag caching
   - ◐ **The extraction ladder.** `crates/hx-search/src/extract.rs` is a hand-rolled ladder — plain
