@@ -1,0 +1,83 @@
+name: Matrix
+
+# Compile-check every release cross-target on every PR, not only on a tagged release.
+# release.yml builds these five targets but only runs on tags; a lockfile or `#[cfg]` change
+# could silently break one of them and nobody would know until the next release. This job runs
+# `cargo check --workspace --all-targets --locked` for each of the five on every push/PR so a
+# breakout fails loudly on the branch, while it is still cheap to fix.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to a PR makes the previous run obsolete. Cancel it rather than paying for
+# a result nobody will read.
+concurrency:
+  group: matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts are worthless in CI (every run starts cold) and cost cache space.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check:
+    name: check ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One target failing must not hide whether the others pass.
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: musl static binaries. `cross` supplies the musl toolchain (and cmake, which
+          # aws-lc-sys needs to build its C sources) in a container, matching release.yml.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+          # macOS: an arm64 runner's rustc can target both macOS architectures, and `cargo check`
+          # never links, so no cross-linker is needed.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          # Windows: MSVC toolchain, which is what users expect to run.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: matrix-${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      # `--locked`: the PR must compile against exactly the locked dependency set, and `--all-targets`
+      # makes a compile error hiding in test or example code fail the PR too. `cargo check` never
+      # links, so the Apple and Windows targets need no cross-linker here.
+      - name: Check (cross)
+        if: matrix.use_cross
+        shell: bash
+        run: cross check --workspace --all-targets --locked --target ${{ matrix.target }}
+
+      - name: Check (native toolchain)
+        if: ${{ !matrix.use_cross }}
+        shell: bash
+        run: cargo check --workspace --all-targets --locked --target ${{ matrix.target }}

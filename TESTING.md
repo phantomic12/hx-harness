@@ -1420,6 +1420,27 @@ was widened to match `token` alone). Treating a cancelled dialog as an error, ac
 just a valid directory), swallowing an unavailable dialog, and dropping the `is_dir` workspace-root check each
 turned its specific test red.
 
+## The CI tiers
+
+Every branch that touches Rust or CI is gated on the same five tiers plus the cross-target
+check matrix. `.github/workflows/ci.yml` runs the first five on every push/PR to `main`:
+
+1. **fmt** — `cargo fmt --all --check` (ubuntu).
+2. **clippy** — `cargo clippy --workspace --all-targets --locked -- -D warnings`, so a warning
+   in a test fails CI (ubuntu).
+3. **deny** — `cargo deny check`: advisories, licenses, provenance (ubuntu).
+4. **unit tests** — `cargo test --workspace --locked` on all three native runners
+   (ubuntu, macOS, windows).
+5. **MSRV** — `cargo check --workspace --all-targets --locked` on the `rust-version` from
+   `Cargo.toml`, so a claimed floor that no toolchain can build fails the branch (ubuntu).
+6. **Cross-target check matrix** — `.github/workflows/matrix.yml` runs
+   `cargo check --workspace --all-targets --locked` for each of the five targets `release.yml`
+   actually ships, on every PR (linux `x86_64`/`aarch64` musl via `cross`, plus
+   `x86_64`/`aarch64` apple-darwin and `x86_64` windows-msvc on their own runners).
+   `cargo check` never links, so the Apple and Windows targets need no cross-linker, and the
+   musl targets reuse the same `cross` container `release.yml` builds with. This is the gate that
+   proves a lockfile or `#[cfg]` change has not silently broken a release target between tags.
+
 ## Running the suite
 
 ```bash
