@@ -298,17 +298,31 @@ async fn the_browser_child_process_is_reaped_after_a_transport_failure() {
 
 #[tokio::test]
 async fn the_browser_child_process_is_reaped_when_the_fetch_times_out() {
-    // Stub accepts connection and hangs forever
+    // Stub accepts connection and hangs forever.
     let stub = Stub::hanging().await;
 
     let rung = ChromiumRung::with_admission(Admission::AllowLocal).expect("rung");
     let (_temp, session_profile) = profile("reap-timeout");
     let mut request = request_for(&stub.url("/hang"), Admission::AllowLocal, session_profile);
-    request.timeout = Duration::from_millis(800);
+    // Must be at least the startup cap (BROWSER_STARTUP_TIMEOUT) so launching Chromium is never
+    // the thing that runs out of time: `fetch` budgets startup with `min(request.timeout, 5s)`, so
+    // an 800ms request timeout made the whole test hostage to whether Chromium happened to start fast enough.
+    // At 5s the startup budget is the full cap and the hanging target alone forces the fetch-timeout path.
+    request.timeout = Duration::from_secs(5);
 
     let err = rung.fetch(&request).await.expect_err("timeout");
     assert!(matches!(err, FetchError::Transport { .. }), "{err:?}");
-    assert!(err.to_string().contains("did not answer"));
+    // The rung reports a timeout across several messages ("did not answer within Ns" from the outer budget,
+    // or "timed out waiting for …" from the CDP driver's own loop, or "did not write DevToolsActivePort
+    // within startup budget"). Which one wins is a scheduling race; all of them are the timeout family. What the
+    // test must assert is that this is a timeout, not a refusal, an admission block, or a served empty page.
+    let reason = err.to_string();
+    assert!(
+        reason.contains("did not answer")
+            || reason.contains("timed out")
+            || reason.contains("within startup budget"),
+        "the timeout must surface as a timeout-family transport error, got: {reason}"
+    );
 
     let pid = rung.last_pid().expect("browser pid");
     assert!(

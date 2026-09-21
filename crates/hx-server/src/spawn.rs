@@ -353,11 +353,128 @@ mod tests {
         }
     }
 
-    fn provider_registry_for(member_id: &str) -> Arc<ProviderRegistry> {
+    /// One provider call, as the provider saw it.
+    ///
+    /// Recorded so a test can ask what the call actually carried: the model string, the credential
+    /// *value* that was resolved for it, and the request as the wire would see it.
+    #[derive(Clone, Debug)]
+    struct Seen {
+        model: String,
+        credential: String,
+        request: String,
+    }
+
+    /// The scripted answer a provider returns instead of a success.
+    #[derive(Clone, Copy)]
+    enum ScriptedErr {
+        /// Answer normally.
+        None,
+        /// A 5xx — the member itself failed, a death the re-route acts on.
+        Die,
+        /// A refused request — the child's fault, deterministic across every member.
+        Reject,
+    }
+
+    /// A provider that answers without a network. The id is the member it stands in for.
+    ///
+    /// `err` scripts *how* the member answers when it does not succeed, so tests can distinguish a
+    /// member death (a 5xx — worth re-routing) from a request the member refused (a 400 — not).
+    struct ScriptedProvider {
+        id: ProviderId,
+        err: ScriptedErr,
+        /// The model the upstream *echoes back*. `None` means the member's own id, which is the
+        /// trap: a fixture whose echo is the id cannot tell a record that took its model from the
+        /// drawn member from one that took it from the response.
+        echoes: Option<String>,
+        seen: std::sync::Mutex<Vec<Seen>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(id: &str) -> Arc<Self> {
+            Arc::new(Self {
+                id: ProviderId::from(id),
+                err: ScriptedErr::None,
+                echoes: None,
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn failing(self: &Arc<Self>) -> Arc<Self> {
+            Arc::new(Self {
+                id: self.id.clone(),
+                err: ScriptedErr::Die,
+                echoes: self.echoes.clone(),
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        /// A refused request — the child's fault, deterministic across every member.
+        fn rejecting(self: &Arc<Self>) -> Arc<Self> {
+            Arc::new(Self {
+                id: self.id.clone(),
+                err: ScriptedErr::Reject,
+                echoes: self.echoes.clone(),
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        /// The upstream names a different model than the pool member's id.
+        fn echoing(self: &Arc<Self>, model: &str) -> Arc<Self> {
+            Arc::new(Self {
+                id: self.id.clone(),
+                err: self.err,
+                echoes: Some(model.to_string()),
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.seen.lock().expect("the seen lock").len()
+        }
+
+        fn seen(&self) -> Vec<Seen> {
+            self.seen.lock().expect("the seen lock").clone()
+        }
+    }
+
+    /// A registry holding one scripted provider for `member_id`, plus the provider itself so a test
+    /// can read back what it was handed.
+    fn registry_and_provider(member_id: &str) -> (Arc<ProviderRegistry>, Arc<ScriptedProvider>) {
+        let provider = ScriptedProvider::new(member_id);
         let mut reg = ProviderRegistry::new();
-        let p = ScriptedProvider::new(member_id);
-        reg.insert(Arc::new(p));
-        Arc::new(reg)
+        reg.insert(provider.clone());
+        (Arc::new(reg), provider)
+    }
+
+    fn provider_registry_for(member_id: &str) -> Arc<ProviderRegistry> {
+        registry_and_provider(member_id).0
+    }
+
+    /// The usage rows the store actually wrote, read back out of the database file rather than out of
+    /// the record this module returns: `(provider, credential, model)`, in write order.
+    ///
+    /// A store's own reader cannot answer this — `Totals` has no model — and the durable row is the
+    /// claim ("the recorded `UsageRecord`'s model is the drawn member"), so it is read the way a
+    /// later auditor would.
+    fn durable_usage_rows(
+        store: &hx_store::Store,
+        session: &SessionId,
+    ) -> Vec<(String, String, String)> {
+        let path = store
+            .path()
+            .expect("a store opened on a path knows its path");
+        let conn = rusqlite::Connection::open(path).expect("the store file opens");
+        let mut stmt = conn
+            .prepare(
+                "SELECT provider, credential, model FROM usage WHERE session_id = ?1 ORDER BY id",
+            )
+            .expect("the usage query prepares");
+        stmt.query_map([session.as_str()], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .expect("the usage query runs")
+        .map(|row| row.expect("a usage row"))
+        .collect()
     }
 
     fn secrets_for(id: &str) -> Arc<SecretStores> {
@@ -380,41 +497,6 @@ mod tests {
         store.load(&rec.id).expect("session loads")
     }
 
-    /// A provider that answers without a network. The id is the member it stands in for.
-    ///
-    /// `err` scripts *how* the member answers when it does not succeed, so tests can distinguish a
-    /// member death (a 5xx — worth re-routing) from a request the member refused (a 400 — not).
-    struct ScriptedProvider {
-        id: ProviderId,
-        err: ScriptedErr,
-    }
-
-    /// The scripted answer a provider returns instead of a success.
-    #[derive(Clone, Copy)]
-    enum ScriptedErr {
-        /// Answer normally.
-        None,
-        /// A 5xx — the member itself failed, a death the re-route acts on.
-        Die,
-        /// A refused request — the child's fault, deterministic across every member.
-        Reject,
-    }
-
-    impl ScriptedProvider {
-        fn new(id: &str) -> Self {
-            Self {
-                id: ProviderId::from(id),
-                err: ScriptedErr::None,
-            }
-        }
-        fn failing(self) -> Self {
-            Self {
-                err: ScriptedErr::Die,
-                ..self
-            }
-        }
-    }
-
     #[async_trait]
     impl Provider for ScriptedProvider {
         fn id(&self) -> &ProviderId {
@@ -428,9 +510,16 @@ mod tests {
         }
         async fn complete(
             &self,
-            _req: ChatRequest,
-            _key: &hx_secrets::Secret,
+            req: ChatRequest,
+            key: &hx_secrets::Secret,
         ) -> Result<hx_provider::ChatResponse> {
+            self.seen.lock().expect("the seen lock").push(Seen {
+                model: req.model.clone(),
+                // Named `expose` so the call site is greppable: this is a test double reading the
+                // credential it was handed, which is the only way to see *which* member paid.
+                credential: key.expose().to_string(),
+                request: format!("{req:?}"),
+            });
             match self.err {
                 ScriptedErr::Die => {
                     return Err(HxError::Provider("upstream returned HTTP 500".to_string()))
@@ -453,7 +542,7 @@ mod tests {
                 message: hx_core::message::Message::assistant("done"),
                 usage,
                 finish: hx_provider::FinishReason::Stop,
-                model: self.id.to_string(),
+                model: self.echoes.clone().unwrap_or_else(|| self.id.to_string()),
                 raw: None,
             })
         }
@@ -516,8 +605,8 @@ mod tests {
     async fn a_failed_member_marks_down_and_the_next_spec_draws_a_healthy_one() {
         // The registry resolves a member's id to its own provider; a is scripted to fail.
         let mut reg = ProviderRegistry::new();
-        reg.insert(Arc::new(ScriptedProvider::new("a").failing()));
-        reg.insert(Arc::new(ScriptedProvider::new("b")));
+        reg.insert(ScriptedProvider::new("a").failing());
+        reg.insert(ScriptedProvider::new("b"));
         let mut secrets = FixedSecrets::new("vault").set("pool/a", "sentinel-a");
         secrets = secrets.set("pool/b", "sentinel-b");
         let secrets = Arc::new(SecretStores::new().with(Arc::new(secrets)));
@@ -567,7 +656,208 @@ mod tests {
         let rec = pen.run_child(&spec, s.id(), "hi").await.expect("runs");
         assert_eq!(rec.usage.model, "b");
         assert_eq!(rec.model, "b");
-        assert_eq!(s.record.id.as_str(), s.id().as_str());
+        // Read back out of the database, not out of the record this module just handed us: the claim
+        // is about what was *recorded*, and a returned record agreeing with itself proves nothing.
+        // (This assertion replaced `assert_eq!(s.record.id.as_str(), s.id().as_str())`, which
+        // compared a value to the value it was built from and therefore could not fail.)
+        assert_eq!(
+            durable_usage_rows(&st, s.id()),
+            vec![("b".to_string(), "vault:pool/b".to_string(), "b".to_string())],
+            "the durable row names the drawn member and the reference that paid"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_child_makes_exactly_one_provider_call() {
+        // "one provider call" is a claim in the module doc, and a hidden retry would spend a second
+        // call's money while recording one row.
+        let (reg, provider) = registry_and_provider("b");
+        let st = store();
+        let mut pen = Spawner::new(
+            ModelPool::new(vec![member("b", &[])]),
+            reg,
+            secrets_for("b"),
+            st.clone(),
+        );
+        let spec = pen.build_spec(&[]).expect("draws");
+        let s = session(&st);
+        pen.run_child(&spec, s.id(), "hi").await.expect("runs");
+
+        assert_eq!(provider.calls(), 1, "one child is one provider call");
+        assert_eq!(
+            provider.seen()[0].model,
+            "b",
+            "and the request asked the drawn member's provider for the drawn member's model"
+        );
+        assert_eq!(
+            st.totals(s.id()).expect("totals read").provider_calls,
+            1,
+            "and exactly one row for it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_call_leaves_the_member_healthy() {
+        // A single-member pool on purpose. With two healthy members the round-robin hands out the
+        // other one whether or not the first was marked down, so a two-member fixture cannot see a
+        // success that wrongly marks its member down — this one can: the pool would be all-down.
+        let (reg, _provider) = registry_and_provider("only");
+        let st = store();
+        let mut pen = Spawner::new(
+            ModelPool::new(vec![member("only", &[])]),
+            reg,
+            secrets_for("only"),
+            st.clone(),
+        );
+        let spec = pen.build_spec(&[]).expect("draws");
+        let s = session(&st);
+        pen.run_child(&spec, s.id(), "hi").await.expect("runs");
+
+        let next = pen
+            .build_spec(&[])
+            .expect("a member that answered must still be drawable");
+        assert_eq!(next.model(), "only");
+    }
+
+    #[tokio::test]
+    async fn two_spawns_in_a_row_draw_two_different_healthy_members() {
+        // `build_spec` must go through the pool's own draw, not pick the first healthy member: the
+        // cursor is what spreads children across a pool, and a first-healthy pick is invisible to
+        // every other test in this module.
+        let mut pen = Spawner::new(
+            ModelPool::new(vec![member("a", &[]), member("b", &[])]),
+            provider_registry_for("a"),
+            secrets_for("a"),
+            store(),
+        );
+        assert_eq!(pen.build_spec(&[]).expect("draws").model(), "a");
+        assert_eq!(
+            pen.build_spec(&[]).expect("draws").model(),
+            "b",
+            "the second draw is the next healthy member, not the first one again"
+        );
+        assert_eq!(
+            pen.build_spec(&[]).expect("draws").model(),
+            "a",
+            "and it cycles"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_recorded_model_is_the_drawn_member_even_when_the_upstream_names_another_model() {
+        // A real provider answers with the checkpoint it ran, which is not the pool member's id.
+        // This is the only fixture that can tell a record built from the drawn member from one built
+        // from the response.
+        let provider = ScriptedProvider::new("b").echoing("upstream-2026-01-01");
+        let mut reg = ProviderRegistry::new();
+        reg.insert(provider.clone());
+        let st = store();
+        let mut pen = Spawner::new(
+            ModelPool::new(vec![member("b", &[])]),
+            Arc::new(reg),
+            secrets_for("b"),
+            st.clone(),
+        );
+        let spec = pen.build_spec(&[]).expect("draws");
+        let s = session(&st);
+        let rec = pen.run_child(&spec, s.id(), "hi").await.expect("runs");
+
+        assert_eq!(
+            rec.usage.model, "b",
+            "the drawn member is the model of record, not the upstream's name for it"
+        );
+        assert_eq!(rec.model, "b");
+        assert_eq!(
+            durable_usage_rows(&st, s.id())[0].2,
+            "b",
+            "and the durable row says the same"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_drawn_members_credential_pays_and_only_its_reference_is_recorded() {
+        // Two members, the first down, with *different* secret values: so "the drawn member's
+        // credential" is distinguishable from "the first member's", and the resolved value is
+        // distinguishable from the reference that names it.
+        let mut reg = ProviderRegistry::new();
+        reg.insert(ScriptedProvider::new("a"));
+        let provider_b = ScriptedProvider::new("b");
+        reg.insert(provider_b.clone());
+        let mut secrets = FixedSecrets::new("vault").set("pool/a", "sentinel-a");
+        secrets = secrets.set("pool/b", "sentinel-b");
+        let secrets = Arc::new(SecretStores::new().with(Arc::new(secrets)));
+
+        let mut pool = ModelPool::new(vec![member("a", &[]), member("b", &[])]);
+        pool.mark_down("a", "boom", now());
+        let st = store();
+        let mut pen = Spawner::new(pool, Arc::new(reg), secrets, st.clone());
+        let spec = pen.build_spec(&[]).expect("b is healthy");
+        assert_eq!(spec.credential, "vault:pool/b");
+
+        let s = session(&st);
+        let rec = pen.run_child(&spec, s.id(), "hi").await.expect("runs");
+
+        // The value really was resolved and really was handed over. Without this, "the value is not
+        // recorded" would pass against a spawner that resolved nothing at all.
+        let seen = provider_b.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].credential, "sentinel-b",
+            "the drawn member's secret is what paid for the call"
+        );
+        assert!(
+            !rec.credential.contains("sentinel"),
+            "the record carries the reference, not the value: {:?}",
+            rec.credential
+        );
+
+        let rows = durable_usage_rows(&st, s.id());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].1, "vault:pool/b",
+            "the durable row holds the reference, never the resolved value"
+        );
+        assert!(
+            !rows[0].1.contains("sentinel"),
+            "a usage row is not a place a live credential may land: {:?}",
+            rows[0].1
+        );
+    }
+
+    /// DEFECT (verify-spawner): the clamped parameters never reach the provider call.
+    ///
+    /// The module doc says `run_child` makes its call "with the **clamped** parameters", and that the
+    /// clamp applied at spawn "is what prevents the `HTTP 400`". It does not: `hx-provider`'s
+    /// `ChatRequest` has no field for a pool `Param`, and `run_child` fills none, so a parameter a
+    /// member would reject is never sent — and neither is one it would accept. The clamp is recorded
+    /// on the spec and on the record and stops there. Un-ignore this when `ChatRequest` grows the
+    /// field and `run_child` sets it from `spec.params`.
+    #[tokio::test]
+    #[ignore = "the clamped parameters do not reach the request: hx-provider's ChatRequest has no field for a pool Param"]
+    async fn the_clamped_parameter_reaches_the_provider_call() {
+        let (reg, provider) = registry_and_provider("strong");
+        let st = store();
+        let mut pen = Spawner::new(
+            ModelPool::new(vec![member(
+                "strong",
+                &[Param::reasoning_effort(ReasoningEffort::Low)],
+            )]),
+            reg,
+            secrets_for("strong"),
+            st.clone(),
+        );
+        let requested = [Param::reasoning_effort(ReasoningEffort::High)];
+        let spec = pen.build_spec(&requested).expect("clamped, not failed");
+        let s = session(&st);
+        pen.run_child(&spec, s.id(), "hi").await.expect("runs");
+
+        let seen = provider.seen();
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0].request.contains("reasoning_effort"),
+            "the clamped parameter must reach the request the provider is handed: {}",
+            seen[0].request
+        );
     }
 
     #[tokio::test]
@@ -621,6 +911,8 @@ mod tests {
             reg.insert(Arc::new(ScriptedProvider {
                 id: ProviderId::from(id),
                 err,
+                echoes: None,
+                seen: std::sync::Mutex::new(Vec::new()),
             }));
         }
         Arc::new(reg)
