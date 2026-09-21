@@ -666,7 +666,8 @@ promise about how it is used.
   - ✅ **Desktop: system tray, global hotkey, OS notifications** — landed. The tray menu is a pure
     `TRAY_MENU`/`action_for` pair so a renamed or dropped item fails a test; a refused hotkey binding
     surfaces as `Refused` rather than being swallowed; the approval notification names the tool and the
-    session and redacts token-shaped values and paths outside the workspace. Each degrades to a working
+    session and redacts token-shaped values — including one hidden inside a URL's `?token=` or a `key=value`
+    pair — and paths outside the workspace. Each degrades to a working
     window with a warning rather than failing to start. **Native file pickers are not landed**, and the
     tray icon, a live hotkey binding and a raised notification are not exercised headlessly — each
     module's doc says so.

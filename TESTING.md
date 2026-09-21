@@ -1324,13 +1324,15 @@ and a display server, which CI does not have — so what is tested, headlessly, 
   binding as a warning and still lets the window start. A real compositor binding is not exercised.
 - **Approval notification body** (`src/notification.rs`): `build_approval_notification` names the tool and
   the session, and **never leaks a token or a path outside the workspace** — the summary is redacted
-  per-token by shape (a ≥16-char all-alphanumeric token, or an absolute path that is not under the
-  workspace root). An unknown session is labeled, not omitted. Raising the actual notification (the plugin call)
-  is not exercised.
+  per-token by shape (a ≥16-alphanumeric token made only of alphanumerics plus `-`/`_`/`.`, or an
+  absolute path that is not under the workspace root), including a token hidden inside a URL's `?token=` or a
+  `key=value` pair, where the value is masked while the URL/key structure stays visible. An unknown session is
+  labeled, not omitted. Raising the actual notification (the plugin call) is not exercised.
 
 Each assertion was proven to fail by mutating the production code: removing the tray `toggle-window` mapping,
-swallowing a refused hotkey as `Registered`, dropping the token redaction, dropping the path-outside check, and
-omitting the unknown-session label each turned its specific test red.
+swallowing a refused hotkey as `Registered`, dropping the token redaction, dropping the path-outside check, the
+URL-`?token=`/`key=value` embedded-token masking (reverting `mask_embedded` put the token back in the body),
+and omitting the unknown-session label each turned its specific test red.
 
 ## Running the suite
 
