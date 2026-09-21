@@ -105,6 +105,14 @@ impl UntrustedPage {
     pub fn is_empty(&self) -> bool {
         self.body.is_empty()
     }
+
+    /// The declared `Content-Type` of the page, as the rung recorded it.
+    ///
+    /// Used by a caller (e.g. `hx-search`'s browser-backed `Fetcher`) so the page is
+    /// labelled the way the origin served it. Never a credential, and safe to display.
+    pub fn content_type(&self) -> &str {
+        &self.content_type
+    }
 }
 
 impl std::fmt::Debug for UntrustedPage {
