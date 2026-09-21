@@ -108,6 +108,7 @@ pub struct HttpFetcher {
     timeout: Duration,
     max_body_bytes: usize,
     cache: Option<Arc<UrlCache>>,
+    admission: Admission,
 }
 
 impl std::fmt::Debug for HttpFetcher {
@@ -127,7 +128,15 @@ impl HttpFetcher {
             timeout: DEFAULT_FETCH_TIMEOUT,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             cache: None,
+            admission: Admission::default(),
         }
+    }
+
+    /// The same **named** admission hatch [`BrowserFetcher::with_admission`] documents, so a
+    /// caller that widens the browser fetch can widen this one identically.
+    pub fn with_admission(mut self, admission: Admission) -> Self {
+        self.admission = admission;
+        self
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -155,7 +164,7 @@ impl HttpFetcher {
 impl Fetcher for HttpFetcher {
     async fn fetch(&self, url: &str) -> Result<Option<FetchedPage>, SearchError> {
         if let Some(cache) = &self.cache {
-            let outcome = match tokio::time::timeout(self.timeout, cache.fetch(&self.client, url))
+            let outcome = match tokio::time::timeout(self.timeout, cache.fetch(url, self.admission))
                 .await
             {
                 Ok(Ok(outcome)) => outcome,

@@ -81,11 +81,14 @@
 
 use crate::backend::SearchError;
 use futures::StreamExt as _;
+use hx_browser::{Admission, BlockReason, PinnedTarget, SystemResolver, TargetRefusal, TargetUrl};
 use reqwest::header::{
-    CACHE_CONTROL, DATE, ETAG, EXPIRES, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED,
+    CACHE_CONTROL, DATE, ETAG, EXPIRES, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION,
 };
+use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -329,84 +332,129 @@ impl UrlCache {
     /// The one thing that is never done is returning a body the origin did not send.
     pub async fn fetch(
         &self,
-        client: &reqwest::Client,
         url: &str,
+        admission: Admission,
     ) -> Result<CacheOutcome, SearchError> {
+        // Admission first: a refused target neither reads the cache nor touches the network.
+        // The entry stays filed under the ORIGINAL url — a redirect chain stores its final
+        // body under the URL the caller asked for.
+        let mut current = admit_initial(admission, url).await?;
         let key = cache_key(url);
         let stored = self.load(&key);
 
-        let mut request = client.get(url);
         if let Some(entry) = &stored {
             if self.is_fresh(entry) {
                 return Ok(CacheOutcome::Fresh(entry.body.clone()));
             }
-            // Revalidate against whatever the origin gave us last time. Both validators go out
-            // when both are known: a server that only understands `Last-Modified` would otherwise
-            // re-send the whole body, which is the cost this cache exists to avoid.
-            if let Some(etag) = &entry.etag {
-                request = request.header(IF_NONE_MATCH, etag);
+        }
+        // Revalidate against whatever the origin gave us last time. Both validators go out
+        // when both are known: a server that only understands `Last-Modified` would otherwise
+        // re-send the whole body, which is the cost this cache exists to avoid. Sent on the
+        // first hop only: a redirect answers for a different resource, which a validator for
+        // this URL says nothing about.
+        let etag = stored.as_ref().and_then(|entry| entry.etag.clone());
+        let last_modified = stored
+            .as_ref()
+            .and_then(|entry| entry.last_modified.clone());
+
+        let mut hops = 0usize;
+        loop {
+            let client = hop_client(&current)?;
+            let mut request = client.get(current.target().request_url());
+            if hops == 0 {
+                if let Some(etag) = &etag {
+                    request = request.header(IF_NONE_MATCH, etag);
+                }
+                if let Some(last_modified) = &last_modified {
+                    request = request.header(IF_MODIFIED_SINCE, last_modified);
+                }
             }
-            if let Some(last_modified) = &entry.last_modified {
-                request = request.header(IF_MODIFIED_SINCE, last_modified);
+
+            let response = request.send().await.map_err(transport_error)?;
+            let status = response.status();
+
+            if is_followable_status(status) {
+                if hops >= MAX_REDIRECTS {
+                    return Err(SearchError::Http {
+                        status: status.as_u16(),
+                    });
+                }
+                let location = response.headers().get(LOCATION).ok_or(SearchError::Http {
+                    status: status.as_u16(),
+                })?;
+                let location = location
+                    .to_str()
+                    .map_err(|_| SearchError::Http {
+                        status: status.as_u16(),
+                    })?
+                    .to_string();
+                // Admitted before the next send, so nothing connects to an unadmitted hop.
+                current = admit_redirect_from(admission, &current, &location).await?;
+                hops += 1;
+                continue;
             }
-        }
 
-        let response = request.send().await.map_err(transport_error)?;
-        let status = response.status();
+            if status == reqwest::StatusCode::NOT_MODIFIED {
+                if hops > 0 {
+                    // Conditionals only left on the first hop, so a 304 past one answers a
+                    // question nobody asked this resource — an HTTP error, not a revalidation.
+                    return Err(SearchError::Http {
+                        status: status.as_u16(),
+                    });
+                }
+                return Ok(match &stored {
+                    Some(entry) => CacheOutcome::Revalidated(entry.body.clone()),
+                    // The origin says "unchanged" about a document we have never held. There is
+                    // nothing to reuse and nothing was sent, so this is a miss and is reported as one.
+                    None => CacheOutcome::Miss304,
+                });
+            }
 
-        if status == reqwest::StatusCode::NOT_MODIFIED {
-            return Ok(match stored {
-                Some(entry) => CacheOutcome::Revalidated(entry.body),
-                // The origin says "unchanged" about a document we have never held. There is
-                // nothing to reuse and nothing was sent, so this is a miss and is reported as one.
-                None => CacheOutcome::Miss304,
+            if !status.is_success() {
+                return Err(SearchError::Http {
+                    status: status.as_u16(),
+                });
+            }
+
+            // Read the headers into owned values before the body consumes the response.
+            let etag = header_string(response.headers(), ETAG);
+            let last_modified = header_string(response.headers(), LAST_MODIFIED);
+            let cache_control = header_string(response.headers(), CACHE_CONTROL);
+            let date = header_string(response.headers(), DATE);
+            let expires = header_string(response.headers(), EXPIRES);
+            let now = self.clock.now_secs();
+
+            // Bounded read: an over-cap body aborts mid-stream and is never assembled, so a hostile
+            // page cannot force an arbitrarily large allocation behind a missing or dishonest
+            // `Content-Length`.
+            let Some(body) = read_bounded_text(response, self.max_body_bytes)
+                .await
+                .map_err(transport_error)?
+            else {
+                // Over the cap: store nothing, and drop whatever was filed for the key — the copy
+                // that was there is now known to be superseded by a response the cache refused to
+                // keep. No body is returned: there is no bounded value to hand over that would still
+                // be what the origin said.
+                self.remove(&key);
+                return Ok(CacheOutcome::TooLarge);
+            };
+
+            self.store(&Entry {
+                key,
+                etag,
+                last_modified,
+                stored_at: now,
+                max_age: lifetime_secs(
+                    cache_control.as_deref(),
+                    date.as_deref(),
+                    expires.as_deref(),
+                    now,
+                ),
+                body: body.clone(),
             });
+
+            return Ok(CacheOutcome::Fetched(body));
         }
-
-        if !status.is_success() {
-            return Err(SearchError::Http {
-                status: status.as_u16(),
-            });
-        }
-
-        // Read the headers into owned values before the body consumes the response.
-        let etag = header_string(response.headers(), ETAG);
-        let last_modified = header_string(response.headers(), LAST_MODIFIED);
-        let cache_control = header_string(response.headers(), CACHE_CONTROL);
-        let date = header_string(response.headers(), DATE);
-        let expires = header_string(response.headers(), EXPIRES);
-        let now = self.clock.now_secs();
-
-        // Bounded read: an over-cap body aborts mid-stream and is never assembled, so a hostile
-        // page cannot force an arbitrarily large allocation behind a missing or dishonest
-        // `Content-Length`.
-        let Some(body) = read_bounded_text(response, self.max_body_bytes)
-            .await
-            .map_err(transport_error)?
-        else {
-            // Over the cap: store nothing, and drop whatever was filed for the key — the copy
-            // that was there is now known to be superseded by a response the cache refused to
-            // keep. No body is returned: there is no bounded value to hand over that would still
-            // be what the origin said.
-            self.remove(&key);
-            return Ok(CacheOutcome::TooLarge);
-        };
-
-        self.store(&Entry {
-            key,
-            etag,
-            last_modified,
-            stored_at: now,
-            max_age: lifetime_secs(
-                cache_control.as_deref(),
-                date.as_deref(),
-                expires.as_deref(),
-                now,
-            ),
-            body: body.clone(),
-        });
-
-        Ok(CacheOutcome::Fetched(body))
     }
 
     /// Whether the entry may be reused without asking the origin.
@@ -744,6 +792,106 @@ pub(crate) async fn read_bounded_text(
 /// in the transport error.
 fn transport_error(err: reqwest::Error) -> SearchError {
     SearchError::Transport(err.without_url())
+}
+
+/// How many redirects one fetch follows before giving up.
+///
+/// Five is the number browsers converged on and the number a redirect loop is usually caught
+/// by. It bounds hops, not destinations: every hop is admitted before anything connects to it.
+pub(crate) const MAX_REDIRECTS: usize = 5;
+
+/// Whether this status carries a `Location` to follow.
+///
+/// Deliberately not `is_redirection()`: `304 Not Modified` carries no `Location` and means
+/// *use your cache*, and treating it as a redirect would misreport a missing `Location` as a
+/// malformed response instead of as the 304 it is.
+pub(crate) fn is_followable_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
+}
+
+/// Admit the initial fetch target: parse, judge, resolve once, and judge every address.
+///
+/// A refusal is a [`SearchError::Refused`] carrying only the redacted form — never a URL that
+/// can hold a `?token=` credential — so it is safe for a report the model reads.
+pub(crate) async fn admit_initial(
+    admission: Admission,
+    url: &str,
+) -> Result<PinnedTarget, SearchError> {
+    let url = url.to_string();
+    tokio::task::spawn_blocking(move || TargetUrl::pin_with(admission, &url, &SystemResolver))
+        .await
+        .map_err(|_| SearchError::Refused {
+            reason: "the admission task did not complete".to_string(),
+        })?
+        .map_err(admission_refusal)
+}
+
+/// Admit a redirect `location` seen on `from` and pin the result — before anything connects.
+///
+/// The `Location` is resolved against the page that produced it before admission runs, so
+/// admission judges the destination, never the spelling the page used. A private destination
+/// is relabeled from "private host" to "redirected": only the second means the page's own
+/// author chose the destination.
+pub(crate) async fn admit_redirect_from(
+    admission: Admission,
+    from: &PinnedTarget,
+    location: &str,
+) -> Result<PinnedTarget, SearchError> {
+    let from = from.clone();
+    let location = location.to_string();
+    tokio::task::spawn_blocking(move || {
+        from.target()
+            .pin_redirect(admission, &location, &SystemResolver)
+    })
+    .await
+    .map_err(|_| SearchError::Refused {
+        reason: "the admission task did not complete".to_string(),
+    })?
+    .map_err(|refusal| admission_refusal(redirect_refusal(refusal)))
+}
+
+fn admission_refusal(refusal: TargetRefusal) -> SearchError {
+    SearchError::Refused {
+        reason: refusal.to_string(),
+    }
+}
+
+/// Say *redirected* rather than *private host*: "the target is on the local network" and "the
+/// page redirected us onto the local network" read almost the same and are not the same thing.
+/// A scheme or malformed refusal keeps its own wording, which is already exact.
+fn redirect_refusal(refusal: TargetRefusal) -> TargetRefusal {
+    let reason = match refusal.reason {
+        BlockReason::PrivateHost { host, reason } => BlockReason::Redirected { host, reason },
+        other => other,
+    };
+    TargetRefusal {
+        reason,
+        display: refusal.display,
+    }
+}
+
+/// The client one admitted hop is sent through.
+///
+/// `Policy::none` is load-bearing: with the default policy `reqwest` follows the redirect
+/// itself and the next URL is connected to before admission can judge it. An IP literal goes
+/// over a plain client — the literal *is* the address, so there is nothing to rebind — while
+/// a hostname hop pins the connection to exactly the addresses admission approved, which is
+/// what closes the check-then-connect (rebinding) gap.
+pub(crate) fn hop_client(pinned: &PinnedTarget) -> Result<reqwest::Client, SearchError> {
+    let mut builder = reqwest::Client::builder().redirect(Policy::none());
+    if !pinned.pinned_addrs().is_empty() {
+        // `pinned_addrs` is non-empty only for hostnames, so the name is there.
+        let host = pinned.target().dns_name().unwrap_or_default();
+        // Port 0 takes the conventional port for the scheme; an explicit port in the URL
+        // always wins over the override, so pinning never changes where the URL points.
+        let addrs: Vec<SocketAddr> = pinned
+            .pinned_addrs()
+            .iter()
+            .map(|ip| SocketAddr::new(*ip, 0))
+            .collect();
+        builder = builder.resolve_to_addrs(&host, &addrs);
+    }
+    builder.build().map_err(transport_error)
 }
 
 #[cfg(test)]
@@ -1126,10 +1274,10 @@ mod tests {
         let cache = UrlCache::new(&dir, 8, 4096);
         let url = origin.url("/page");
 
-        let first = cache.fetch(&client(), &url).await.unwrap();
+        let first = cache.fetch(&url, Admission::AllowLocal).await.unwrap();
         assert_eq!(first, CacheOutcome::Fetched("first".to_string()));
 
-        let second = cache.fetch(&client(), &url).await.unwrap();
+        let second = cache.fetch(&url, Admission::AllowLocal).await.unwrap();
         assert_eq!(second, CacheOutcome::Revalidated("first".to_string()));
 
         let heads = origin.request_heads();
@@ -1160,8 +1308,8 @@ mod tests {
         let cache = UrlCache::new(&dir, 8, 4096);
         let url = origin.url("/page");
 
-        cache.fetch(&client(), &url).await.unwrap();
-        let second = cache.fetch(&client(), &url).await.unwrap();
+        cache.fetch(&url, Admission::AllowLocal).await.unwrap();
+        let second = cache.fetch(&url, Admission::AllowLocal).await.unwrap();
         assert_eq!(second, CacheOutcome::Revalidated("first".to_string()));
 
         let heads = origin.request_heads();
@@ -1185,8 +1333,8 @@ mod tests {
         let cache = UrlCache::new(&dir, 8, 4096);
         let url = origin.url("/page");
 
-        cache.fetch(&client(), &url).await.unwrap();
-        let second = cache.fetch(&client(), &url).await.unwrap();
+        cache.fetch(&url, Admission::AllowLocal).await.unwrap();
+        let second = cache.fetch(&url, Admission::AllowLocal).await.unwrap();
 
         assert_eq!(second, CacheOutcome::Revalidated("first".to_string()));
         assert_eq!(
@@ -1208,7 +1356,7 @@ mod tests {
         let cache = UrlCache::new(&dir, 8, 4096);
         let url = origin.url("/page");
 
-        let outcome = cache.fetch(&client(), &url).await.unwrap();
+        let outcome = cache.fetch(&url, Admission::AllowLocal).await.unwrap();
 
         assert_eq!(outcome, CacheOutcome::Miss304);
         assert_eq!(
@@ -1241,8 +1389,8 @@ mod tests {
         let cache = UrlCache::new(&dir, 8, 4096);
         let url = origin.url("/page");
 
-        let first = cache.fetch(&client(), &url).await.unwrap();
-        let second = cache.fetch(&client(), &url).await.unwrap();
+        let first = cache.fetch(&url, Admission::AllowLocal).await.unwrap();
+        let second = cache.fetch(&url, Admission::AllowLocal).await.unwrap();
 
         assert_eq!(first, CacheOutcome::Fetched("first".to_string()));
         assert_eq!(second, CacheOutcome::Fetched("second".to_string()));
@@ -1274,12 +1422,12 @@ mod tests {
         let cache = UrlCache::with_clock(&dir, 8, 4096, Arc::new(clock.clone()));
         let url = origin.url("/page");
 
-        let first = cache.fetch(&client(), &url).await.unwrap();
+        let first = cache.fetch(&url, Admission::AllowLocal).await.unwrap();
         assert_eq!(first, CacheOutcome::Fetched("first".to_string()));
 
         clock.advance(10);
 
-        let second = cache.fetch(&client(), &url).await.unwrap();
+        let second = cache.fetch(&url, Admission::AllowLocal).await.unwrap();
         assert_eq!(second, CacheOutcome::Fresh("first".to_string()));
         assert!(!second.made_a_request());
         assert_eq!(
@@ -1307,11 +1455,11 @@ mod tests {
         let cache = UrlCache::with_clock(&dir, 8, 4096, Arc::new(clock.clone()));
         let url = origin.url("/page");
 
-        cache.fetch(&client(), &url).await.unwrap();
+        cache.fetch(&url, Admission::AllowLocal).await.unwrap();
 
         clock.advance(61);
 
-        let second = cache.fetch(&client(), &url).await.unwrap();
+        let second = cache.fetch(&url, Admission::AllowLocal).await.unwrap();
         assert_eq!(
             second,
             CacheOutcome::Revalidated("first".to_string()),
@@ -1347,10 +1495,10 @@ mod tests {
         let url_a = origin.url("/page?token=A");
         let url_b = origin.url("/page?token=B");
 
-        let first = cache.fetch(&client(), &url_a).await.unwrap();
+        let first = cache.fetch(&url_a, Admission::AllowLocal).await.unwrap();
         assert_eq!(first, CacheOutcome::Fetched("body-for-A".to_string()));
 
-        let second = cache.fetch(&client(), &url_b).await.unwrap();
+        let second = cache.fetch(&url_b, Admission::AllowLocal).await.unwrap();
         assert_eq!(
             second,
             CacheOutcome::Fetched("body-for-B".to_string()),
@@ -1358,7 +1506,7 @@ mod tests {
         );
         assert_eq!(origin.connection_count(), 2);
 
-        let again = cache.fetch(&client(), &url_a).await.unwrap();
+        let again = cache.fetch(&url_a, Admission::AllowLocal).await.unwrap();
         assert_eq!(again, CacheOutcome::Fresh("body-for-A".to_string()));
         assert_eq!(origin.connection_count(), 2);
 
@@ -1392,11 +1540,11 @@ mod tests {
         let middle = origin.url("/middle");
         let newest = origin.url("/newest");
 
-        cache.fetch(&client(), &oldest).await.unwrap();
+        cache.fetch(&oldest, Admission::AllowLocal).await.unwrap();
         clock.advance(10);
-        cache.fetch(&client(), &middle).await.unwrap();
+        cache.fetch(&middle, Admission::AllowLocal).await.unwrap();
         clock.advance(10);
-        cache.fetch(&client(), &newest).await.unwrap();
+        cache.fetch(&newest, Admission::AllowLocal).await.unwrap();
 
         assert!(
             !cache.contains(&oldest),
@@ -1425,7 +1573,7 @@ mod tests {
         let cache = UrlCache::new(&dir, 8, 100);
         let url = origin.url("/page");
 
-        let outcome = cache.fetch(&client(), &url).await.unwrap();
+        let outcome = cache.fetch(&url, Admission::AllowLocal).await.unwrap();
 
         assert_eq!(outcome, CacheOutcome::TooLarge);
         assert_eq!(
@@ -1445,7 +1593,7 @@ mod tests {
         );
 
         // And a second fetch proves it: with nothing filed, the origin is asked again.
-        let again = cache.fetch(&client(), &url).await.unwrap();
+        let again = cache.fetch(&url, Admission::AllowLocal).await.unwrap();
         assert_eq!(again, CacheOutcome::TooLarge);
         assert_eq!(origin.connection_count(), 2);
 
@@ -1463,7 +1611,7 @@ mod tests {
         let cache = UrlCache::new(&dir, 8, 1024);
         let url = origin.url("/stream");
 
-        let outcome = cache.fetch(&client(), &url).await.unwrap();
+        let outcome = cache.fetch(&url, Admission::AllowLocal).await.unwrap();
 
         assert_eq!(outcome, CacheOutcome::TooLarge);
         assert_eq!(outcome.body(), None);
@@ -1491,7 +1639,7 @@ mod tests {
         let cache = UrlCache::new(&dir, 8, 1024);
         let url = origin.url("/stream");
 
-        let outcome = cache.fetch(&client(), &url).await.unwrap();
+        let outcome = cache.fetch(&url, Admission::AllowLocal).await.unwrap();
 
         assert_eq!(outcome, CacheOutcome::Fetched(body.clone()));
         assert!(cache.contains(&url));
@@ -1527,7 +1675,7 @@ mod tests {
             "the key is what becomes a filename and a log field: {key}"
         );
 
-        cache.fetch(&client(), &url).await.unwrap();
+        cache.fetch(&url, Admission::AllowLocal).await.unwrap();
 
         let names = entry_file_names(&dir);
         assert_eq!(
@@ -1589,7 +1737,7 @@ mod tests {
         );
 
         let err = cache
-            .fetch(&client(), &url)
+            .fetch(&url, Admission::AllowLocal)
             .await
             .expect_err("fetch must fail");
         let display = err.to_string();
@@ -1627,7 +1775,7 @@ mod tests {
         let url = format!("http://{addr}/page");
 
         let err = cache
-            .fetch(&client(), &url)
+            .fetch(&url, Admission::AllowLocal)
             .await
             .expect_err("fetch must fail");
         let display = err.to_string();
@@ -1680,7 +1828,7 @@ mod tests {
         assert!(cache.contains(url));
 
         // A fetch while fresh returns the body directly with no network request.
-        let outcome = cache.fetch(&client(), url).await.unwrap();
+        let outcome = cache.fetch(url, Admission::AllowLocal).await.unwrap();
         assert_eq!(
             outcome,
             CacheOutcome::Fresh("legacy cached body".to_string())
@@ -1708,7 +1856,7 @@ mod tests {
         std::fs::write(cache.entry_path(&key), b"{ this is not an entry").unwrap();
         assert!(!cache.contains(&url));
 
-        let outcome = cache.fetch(&client(), &url).await.unwrap();
+        let outcome = cache.fetch(&url, Admission::AllowLocal).await.unwrap();
         assert_eq!(outcome, CacheOutcome::Fetched("fetched anyway".to_string()));
 
         origin.assert_fully_scripted();
@@ -1824,5 +1972,98 @@ mod tests {
         assert_eq!(parse_http_date("Sun, 06 Nov 1994 25:49:37 GMT"), None);
 
         assert_eq!(lifetime_secs(None, None, Some("not a date"), 0), None);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // SSRF admission (#51)
+    // ---------------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_default_policy_refuses_a_loopback_target_before_connecting() {
+        // A private/loopback destination is not public internet: admission runs before the cache
+        // touches the socket, so a strict policy must refuse without the origin even hearing a byte.
+        let origin = Origin::serve(vec![Reply::plain("never")]).await;
+        let dir = temp_dir("ssrf-refuse-initial");
+        let cache = UrlCache::new(&dir, 8, 4096);
+
+        match cache
+            .fetch(&origin.url("/private"), Admission::default())
+            .await
+        {
+            Err(SearchError::Refused { reason }) => {
+                assert!(
+                    reason.contains("loopback"),
+                    "reason should name the private address: {reason}"
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        // No request should ever have reached the loopback origin.
+        assert_eq!(origin.connection_count(), 0);
+        origin.assert_fully_scripted();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_redirect_onto_loopback_is_refused_as_a_redirect_not_followed() {
+        // A page that the caller reached may still point onward at private space; the redirected
+        // destination is admitted per-hop and refused, labelled "redirected" rather than "private host".
+        // We admit the origin under AllowLocal (the page was reachable), then run the *redirect*
+        // through the strict default policy against a private destination and expect a refusal that names it
+        // a redirect.
+        let from = admit_initial(Admission::AllowLocal, "http://127.0.0.1:9/page")
+            .await
+            .unwrap();
+        match admit_redirect_from(Admission::default(), &from, "http://127.0.0.1:1/steal").await {
+            Err(SearchError::Refused { reason }) => {
+                assert!(
+                    reason.contains("redirect"),
+                    "reason should be labelled as a redirect refusal: {reason}"
+                );
+            }
+            other => panic!("expected a redirect refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_loop_is_cut_off_after_max_redirects() {
+        // Two URLs that keep redirecting into each other must not spin forever: the hop counter
+        // caps the chain. The loop is on loopback addresses that a strict policy would refuse, so we
+        // use AllowLocal to reach the loop, then assert the fetch terminates (returns) rather than
+        // hanging, and that it never follows more than the redirect budget.
+        let origin = Origin::serve(vec![
+            Reply {
+                status: 302,
+                headers: vec![("location".to_string(), "/b".to_string())],
+                body: String::new(),
+                chunked: false,
+            },
+            Reply {
+                status: 302,
+                headers: vec![("location".to_string(), "/a".to_string())],
+                body: String::new(),
+                chunked: false,
+            },
+        ])
+        .await;
+        let dir = temp_dir("ssrf-loop");
+        let cache = UrlCache::new(&dir, 8, 4096);
+
+        // Whatever the outcome, the fetch must return — a redirect loop that never terminated would
+        // hang the test (and the harness). The loop also must not exceed the hop budget+1.
+        let _ = cache.fetch(&origin.url("/a"), Admission::AllowLocal).await;
+
+        let heads = origin.connection_count();
+        assert!(
+            heads <= MAX_REDIRECTS + 1,
+            "redirect loop exceeded the hop budget: {heads} connections"
+        );
+        assert!(
+            heads >= 2,
+            "loop should have been followed at least once: {heads}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
