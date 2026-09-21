@@ -813,12 +813,14 @@ is a 400; one upstream can take down every lane because all children share the m
 fan-out module and `run_lane` here remove the three ceilings: clamping, the shared-model property (members carry
 their own endpoint, credential, parameters and health), the per-child model + cost in the audit chain, the fan-out
 of N children across N distinct members, and the re-route of a running child onto a healthy member when its member
-dies. What still is **not** built is a full subagent runtime: nothing in this repository yet spawns **N concurrent
-lanes** as a fan-out and drives them to a result — `run_lane` is a single prompt run that re-draws on death, and
-the fan-out runs the children it allocates sequentially (a dead child stops its own lane and the rest continue).
+dies. What still is **not** built is a full subagent runtime: the fan-out runs **N concurrent
+lanes** across N members (bounded by `agent.fanout_max_parallel`, default 4), but nothing in this
+repository yet drives those lanes through an agent loop to a result — `run_lane` is a single prompt
+run that re-draws on death, and a dead child fails only its own lane while the rest continue.
 
-**Exit criteria**: ✅ **a fan-out of N lanes runs across N members of a pool, each lane's model recorded in the
-audit chain** — met by the fan-out module (`crates/hx-server/src/fanout.rs`), tested over a scripted pool and a
+**Exit criteria**: ✅ **a fan-out of N lanes runs concurrently across N members of a pool, each lane's model recorded in the
+audit chain** — met by the fan-out module (`crates/hx-server/src/fanout.rs`): N lanes in flight over a bounded pool
+(`agent.fanout_max_parallel`, default 4), outcomes in request order, tested over a scripted pool and a
 scripted provider with each assertion proven to fail by a mutation; **killing one member's upstream mid-run
 re-routes** — **met** for a single running child (`Spawner::run_lane` re-draws onto a healthy member, bounded by
 the pool's `AllDown`, with both the dying and the finishing member recorded, no operator action and no stall); a

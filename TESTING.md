@@ -566,15 +566,26 @@ test):
 ## The M8 fan-out: N children across N distinct members (B — unit-tested)
 
 `crates/hx-server/src/fanout.rs` is the exit criterion made real: a fan-out of **N children across N
-distinct** members of one pool. It *consumes* the spawner's public API (`build_spec` + `run_child`) and
-does not touch `spawn.rs` (the sibling `feat/m8-reroute` lane owns that file). It runs in **two phases**:
-allocate all N specs up front and reject a short pool (fewer than N distinct healthy members) *before any child
-runs; then run every allocated child, so a member that dies mid-fan-out fails only its own child while the others
-complete. Each completed child's `ChildRecord` names the member it drew and its usage, so "which model did which
+distinct** members of one pool, run **concurrently**. It runs in **two phases**: allocate all N specs
+up front and reject a short pool (fewer than N distinct healthy members) *before any child runs*;
+then run every allocated child as N lanes in flight over a `FuturesUnordered` pool bounded by one
+`Semaphore` of `max_parallel` permits (config `agent.fanout_max_parallel`, default 4; `0` clamps to
+`1`), collecting outcomes by child index so the result stays in request order no matter who finishes
+first. A member that dies mid-fan-out fails only its own child while the others complete. Each
+completed child's `ChildRecord` names the member it drew and its usage, so "which model did which
 work" is answerable per child. **Policy choice: a short pool fails loudly** (`FanOutError::NotEnoughMembers`
 naming wanted vs distinct) rather than silently running two children on one member or queueing behind an unbounded wait —
 running on fewer would degrade the criterion's "N members, not N copies" guarantee, and the caller decides what to do
 with a reported shortage. Tested over a **scripted pool and a scripted provider, no network**.
+
+Concurrency needed one additive split in `spawn.rs` (whose `run_lane` the sibling `feat/m8-reroute`
+lane owns, so nothing there was reworded or re-behavioured): `Spawner::prepare_child` resolves
+provider + credential read-only into an owned `PreparedChild`, whose `run` does the provider call and
+the usage record shareably, and `Spawner::mark_down` applies the pool-health write serially after the
+join. `run_child` is now the same three steps in sequence — one implementation, not two — and every
+pre-existing spawn test passes unchanged, which is what proves the split preserved behavior. The
+serial `mark_down` after the join is equivalent to the old loop because allocation already finished:
+no draw happens mid-execution, so nothing observes the timing of the write.
 
 | Test | The fan-out rule it pins |
 |---|---|
@@ -585,6 +596,11 @@ with a reported shortage. Tested over a **scripted pool and a scripted provider,
 | `an_all_down_pool_fails_at_allocation_with_the_pools_error` | An all-down pool fails at allocation with the spawner's own `DrawError::AllDown`, naming both members |
 | `an_empty_pool_fails_at_allocation` | An empty pool fails at allocation with `DrawError::Empty` |
 | `a_dead_members_error_is_redacted_at_the_fanout_boundary` | A failing child that echoes a recognisable key (`sk-`) in its body has that key **masked** on the `ChildOutcome::Errored` string before a caller (or client) reads it — the fanout's pattern-pass redaction at its boundary |
+| `two_children_meet_on_a_barrier_so_they_run_concurrently` | Concurrency proof: two providers rendezvous on a `Barrier(2)` — sequential execution would leave the first waiting forever and the 5s timeout would fire |
+| `two_slow_children_overlap_in_time` | Overlap proof: two children sleeping 200ms each finish under a 350ms bound (a tokio sleep never fires early, so a sequential run takes ≥400ms and can never pass; a slow+fast pair would prove nothing at ~200ms either way) |
+| `children_report_in_request_order_when_the_second_finishes_first` | Stable order without sleeps: a `Notify`-gated pair finishes b-then-a deterministically, but outcomes still report a-then-b (sequential execution would hang at the gate, so the timeout is a second concurrency proof) |
+| `a_max_parallel_of_one_still_runs_every_child_in_order` | The knob's floor: `Some(1)` serialises the lanes and still runs every child in order on distinct members |
+| `two_children_over_http_run_concurrently` (`hx-server/tests/fanout_api.rs`) | The barrier proof over the real HTTP surface: a 200 with both children `Ran` means the route runs the lanes concurrently |
 
 **Every assertion was proven to fail by a mutation, then reverted** (each reddening ran against the specific
 test):
@@ -593,6 +609,7 @@ test):
 |---|---|
 | The short-pool check disabled (always pass) | `a_short_pool_is_reported_honestly_and_runs_nothing` (3 children silently run across 2 members — the criterion is silently broken) |
 | The execution loop aborts (returns `Err`) on the first child's failure instead of continuing | `a_dead_member_mid_fan_out_does_not_kill_the_others` |
+| The concurrency reverted to serial (semaphore bound forced to 1) | `two_children_meet_on_a_barrier_so_they_run_concurrently` (timeout: the first lane waits at the barrier forever), `two_slow_children_overlap_in_time` (≥400ms against the 350ms bound), and `children_report_in_request_order_when_the_second_finishes_first` (timeout: child 0 waits for a release child 1 never sends) — run together, all three red, then the probe reverted |
 
 One honest boundary, stated rather than papered over: `a_fan_out_of_n_requests_reaches_n_distinct_members`
 stays green when the short-pool check is disabled, because with exactly N healthy members the pool's own round-robin
