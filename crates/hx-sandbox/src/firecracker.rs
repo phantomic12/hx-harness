@@ -195,10 +195,33 @@ fn is_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// How `stop` kills the owned microVM process.
+///
+/// WHY the seam: `tokio::process::Child` is concrete, and real process semantics cannot
+/// deterministically script a kill or wait failure (on Linux, killing an already-reaped pid
+/// succeeds). This trait lets the hermetic suite drive `stop`'s failure paths with a fake
+/// child instead of racing the process table.
+#[async_trait]
+trait ChildHandle: Send {
+    async fn kill(&mut self) -> std::io::Result<()>;
+    async fn wait(&mut self) -> std::io::Result<()>;
+}
+
+#[async_trait]
+impl ChildHandle for Child {
+    async fn kill(&mut self) -> std::io::Result<()> {
+        tokio::process::Child::kill(self).await
+    }
+
+    async fn wait(&mut self) -> std::io::Result<()> {
+        tokio::process::Child::wait(self).await.map(|_| ())
+    }
+}
+
 /// One live (or stopped-but-not-removed) microVM: everything `exec` and `remove` need to find it.
 struct VmInfo {
     /// The owned process; `None` after `stop` (killing it is how the microVM stops).
-    child: Option<Child>,
+    child: Option<Box<dyn ChildHandle>>,
     /// The unique guest CID this microVM's vsock was configured with.
     cid: u32,
     /// The staging dir: socket, workspace image, vsock socket.
@@ -502,7 +525,7 @@ impl SandboxRuntime for FirecrackerRuntime {
             .insert(
                 runtime_id.clone(),
                 VmInfo {
-                    child: Some(child),
+                    child: Some(Box::new(child)),
                     cid,
                     dir: dir.clone(),
                     image: image_path.clone(),
@@ -613,25 +636,74 @@ impl SandboxRuntime for FirecrackerRuntime {
         // Firecracker has no graceful-stop API; killing the process is how a microVM stops. The
         // microVM's identity (CID, workspace mapping) is retained until `remove` — a stopped VM
         // still owns its CID, so nothing else can take it while the VM exists.
+        //
+        // Stopping an unknown or already-stopped VM is a no-op: both mean there is no process
+        // to kill, so a repeated `stop` (a retry, or a destroy racing a reap) succeeds.
         let child = {
             let mut state = self.state.lock().expect("firecracker state lock");
-            state
-                .vms
-                .get_mut(runtime_id)
-                .and_then(|info| info.child.take())
+            match state.vms.get_mut(runtime_id) {
+                Some(info) => info.child.take(),
+                None => None,
+            }
         };
-        if let Some(mut child) = child {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+        let Some(mut child) = child else {
+            return Ok(());
+        };
+        // A failed kill or wait leaves the child handle back in the map: dropping it here would
+        // untrack a process that may still be alive (or unreaped), handing its CID to a new
+        // microVM while the old one lingers. Keeping it tracked makes the retry possible.
+        if let Err(e) = child.kill().await {
+            let mut state = self.state.lock().expect("firecracker state lock");
+            if let Some(info) = state.vms.get_mut(runtime_id) {
+                info.child = Some(child);
+            }
+            return Err(HxError::Sandbox(format!(
+                "could not stop firecracker microVM {runtime_id}: kill failed: {e}"
+            )));
+        }
+        if let Err(e) = child.wait().await {
+            let mut state = self.state.lock().expect("firecracker state lock");
+            if let Some(info) = state.vms.get_mut(runtime_id) {
+                info.child = Some(child);
+            }
+            return Err(HxError::Sandbox(format!(
+                "could not stop firecracker microVM {runtime_id}: wait failed: {e}"
+            )));
         }
         Ok(())
     }
 
     async fn remove(&self, runtime_id: &str) -> Result<()> {
-        // Dropping the identity releases the CID back to the pool; then remove the staging
-        // directory (idempotent — removing an unknown or already-removed VM is fine).
-        self.release_cid(runtime_id);
-        let _ = std::fs::remove_dir_all(self.dir_for(runtime_id));
+        // The staging directory goes first; the identity (and its CID) is released only once
+        // the directory is gone. Releasing first would let a new microVM reuse the CID while
+        // the old VM's directory still sits on disk — and an untracked VM can never be
+        // retried, so a failed cleanup would leak silently. A missing directory means there
+        // is nothing to clean (already removed), so removing an unknown or already-removed
+        // VM succeeds.
+        let dir = {
+            let state = self.state.lock().expect("firecracker state lock");
+            match state.vms.get(runtime_id) {
+                Some(info) => info.dir.clone(),
+                None => self.dir_for(runtime_id),
+            }
+        };
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(HxError::Sandbox(format!(
+                    "could not remove firecracker microVM dir {}: {e}",
+                    dir.display()
+                )));
+            }
+        }
+        // Dropping the child handle kills a still-running process (`kill_on_drop`); the
+        // directory above is already gone, so this VM cannot leak disk either way. The CID
+        // returns to the pool only here, on success.
+        let mut state = self.state.lock().expect("firecracker state lock");
+        if let Some(info) = state.vms.remove(runtime_id) {
+            state.free_cids.push(info.cid);
+        }
         Ok(())
     }
 
@@ -711,5 +783,286 @@ mod tests {
             MAX_WORKSPACE_IMAGE_BYTES,
             "an absurd ceiling saturates instead of overflowing"
         );
+    }
+
+    /// A tracked microVM for stop/remove tests: a stand-in child (a fake or a real process,
+    /// never a firecracker binary) plus a staging dir, inserted directly into the state map.
+    fn track_test_vm(
+        rt: &FirecrackerRuntime,
+        runtime_id: &str,
+        child: Option<Box<dyn ChildHandle>>,
+        dir: PathBuf,
+    ) {
+        rt.state
+            .lock()
+            .expect("firecracker state lock")
+            .vms
+            .insert(
+                runtime_id.to_string(),
+                VmInfo {
+                    child,
+                    cid: CID_FIRST,
+                    dir,
+                    image: PathBuf::from("/tmp/test-workspace.ext4"),
+                    host_workspace: "/tmp/host-work".to_string(),
+                    guest_workspace: "/workspace".to_string(),
+                },
+            );
+    }
+
+    /// A fake owned process with scripted kill/wait outcomes, standing in for the
+    /// `firecracker` binary `stop` would kill. Real process semantics cannot fail a kill
+    /// on demand, so the failure paths need this instead of a live child.
+    struct FakeChild {
+        kill_err: Option<String>,
+        wait_err: Option<String>,
+    }
+
+    impl FakeChild {
+        fn failing_at_kill() -> Self {
+            Self {
+                kill_err: Some("permission denied".to_string()),
+                wait_err: None,
+            }
+        }
+
+        fn failing_at_wait() -> Self {
+            Self {
+                kill_err: None,
+                wait_err: Some("no child processes".to_string()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ChildHandle for FakeChild {
+        async fn kill(&mut self) -> std::io::Result<()> {
+            match &self.kill_err {
+                Some(msg) => Err(std::io::Error::other(msg.clone())),
+                None => Ok(()),
+            }
+        }
+
+        async fn wait(&mut self) -> std::io::Result<()> {
+            match &self.wait_err {
+                Some(msg) => Err(std::io::Error::other(msg.clone())),
+                None => Ok(()),
+            }
+        }
+    }
+
+    fn test_scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hx-firecracker-r76-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn child_still_tracked(rt: &FirecrackerRuntime, runtime_id: &str) -> bool {
+        rt.state
+            .lock()
+            .expect("firecracker state lock")
+            .vms
+            .get(runtime_id)
+            .is_some_and(|info| info.child.is_some())
+    }
+
+    #[tokio::test]
+    async fn stop_reports_kill_failure_and_keeps_vm_tracked() {
+        let rt =
+            FirecrackerRuntime::new("/tmp/fc".into(), "/tmp/kernel".into(), "/tmp/rootfs".into());
+        let dir = test_scratch_dir("stop-fail");
+        let runtime_id = "stop-fail-vm";
+        track_test_vm(
+            &rt,
+            runtime_id,
+            Some(Box::new(FakeChild::failing_at_kill())),
+            dir.clone(),
+        );
+
+        let err = rt
+            .stop(runtime_id, 0)
+            .await
+            .expect_err("stop must report the kill failure");
+        assert!(
+            err.to_string().contains("kill failed"),
+            "unexpected error: {err}"
+        );
+        // The failed cleanup remains tracked: the child handle is back in the map and the
+        // CID is still reserved, so a retry (or a later remove) can find the VM.
+        assert!(
+            child_still_tracked(&rt, runtime_id),
+            "failed stop must keep the child handle tracked"
+        );
+        assert_eq!(
+            rt.vm_cid(runtime_id),
+            Some(CID_FIRST),
+            "failed stop must keep the CID reserved"
+        );
+
+        // The retry sees the same failure rather than silently succeeding or losing the VM.
+        assert!(
+            rt.stop(runtime_id, 0).await.is_err(),
+            "retrying a failed stop must fail again, not report success"
+        );
+        assert!(
+            child_still_tracked(&rt, runtime_id),
+            "retry must still keep the VM tracked"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stop_reports_wait_failure_and_keeps_vm_tracked() {
+        let rt =
+            FirecrackerRuntime::new("/tmp/fc".into(), "/tmp/kernel".into(), "/tmp/rootfs".into());
+        let dir = test_scratch_dir("stop-wait-fail");
+        let runtime_id = "stop-wait-fail-vm";
+        track_test_vm(
+            &rt,
+            runtime_id,
+            Some(Box::new(FakeChild::failing_at_wait())),
+            dir.clone(),
+        );
+
+        let err = rt
+            .stop(runtime_id, 0)
+            .await
+            .expect_err("stop must report the wait failure");
+        assert!(
+            err.to_string().contains("wait failed"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            child_still_tracked(&rt, runtime_id),
+            "failed stop must keep the child handle tracked"
+        );
+        assert_eq!(
+            rt.vm_cid(runtime_id),
+            Some(CID_FIRST),
+            "failed stop must keep the CID reserved"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stop_kills_a_live_child_but_keeps_the_identity_until_remove() {
+        let rt =
+            FirecrackerRuntime::new("/tmp/fc".into(), "/tmp/kernel".into(), "/tmp/rootfs".into());
+        let dir = test_scratch_dir("stop-live");
+        let runtime_id = "stop-live-vm";
+        // A real (long-lived, harmless) process through the production `Child` impl, proving
+        // the seam forwards kill/wait to the actual process.
+        let live = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("stand-in sleep");
+        track_test_vm(&rt, runtime_id, Some(Box::new(live)), dir.clone());
+
+        rt.stop(runtime_id, 0).await.expect("live stop succeeds");
+        // The process is gone but the microVM's identity (CID, workspace mapping) is retained
+        // until `remove` — a stopped VM still owns its CID.
+        assert_eq!(
+            rt.vm_cid(runtime_id),
+            Some(CID_FIRST),
+            "stopped VM keeps its CID until remove"
+        );
+        assert!(
+            !child_still_tracked(&rt, runtime_id),
+            "stopped VM has no process left to kill"
+        );
+        rt.remove(runtime_id)
+            .await
+            .expect("remove after stop succeeds");
+        assert_eq!(rt.vm_cid(runtime_id), None, "remove releases the CID");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stop_is_idempotent_for_unknown_and_stopped_vms() {
+        let rt =
+            FirecrackerRuntime::new("/tmp/fc".into(), "/tmp/kernel".into(), "/tmp/rootfs".into());
+        // Unknown: nothing to kill, so stopping succeeds (a destroy racing a reap retries).
+        rt.stop("no-such-vm", 10).await.expect("unknown stop is Ok");
+
+        // Already stopped (child taken by a previous stop): still tracked, still Ok.
+        let dir = test_scratch_dir("stop-idempotent");
+        track_test_vm(&rt, "stopped-vm", None, dir.clone());
+        rt.stop("stopped-vm", 10)
+            .await
+            .expect("stopped stop is Ok");
+        assert_eq!(
+            rt.vm_cid("stopped-vm"),
+            Some(CID_FIRST),
+            "stopping a stopped VM must keep its CID reserved until remove"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn remove_reports_dir_failure_and_keeps_cid_reserved() {
+        let rt =
+            FirecrackerRuntime::new("/tmp/fc".into(), "/tmp/kernel".into(), "/tmp/rootfs".into());
+        let scratch = test_scratch_dir("remove-fail");
+        // Point the VM's dir at a regular file: `remove_dir_all` on a non-directory fails,
+        // deterministically standing in for an undeletable staging dir.
+        let blocker = scratch.join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("blocker file");
+        track_test_vm(&rt, "remove-fail-vm", None, blocker.clone());
+
+        let err = rt
+            .remove("remove-fail-vm")
+            .await
+            .expect_err("remove must report the filesystem failure");
+        assert!(
+            err.to_string().contains("could not remove"),
+            "unexpected error: {err}"
+        );
+        // The failed cleanup remains tracked: the CID stays reserved so no new microVM can
+        // reuse the identity while the old staging dir still exists.
+        assert_eq!(
+            rt.vm_cid("remove-fail-vm"),
+            Some(CID_FIRST),
+            "failed remove must keep the CID reserved"
+        );
+
+        // Clearing the blocker makes the idempotent retry succeed and releases the CID.
+        std::fs::remove_file(&blocker).expect("clear blocker");
+        std::fs::create_dir_all(&blocker).expect("dir in place of blocker");
+        rt.remove("remove-fail-vm")
+            .await
+            .expect("retry after fixing the dir succeeds");
+        assert_eq!(
+            rt.vm_cid("remove-fail-vm"),
+            None,
+            "successful remove releases the CID"
+        );
+        // The freed CID returns to the pool rather than being lost.
+        assert!(
+            rt.state
+                .lock()
+                .expect("firecracker state lock")
+                .free_cids
+                .contains(&CID_FIRST),
+            "removed VM's CID must be recyclable"
+        );
+        // Removing again (already removed) is a no-op success.
+        rt.remove("remove-fail-vm")
+            .await
+            .expect("second remove is Ok");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[tokio::test]
+    async fn remove_unknown_vm_with_no_dir_succeeds() {
+        let rt =
+            FirecrackerRuntime::new("/tmp/fc".into(), "/tmp/kernel".into(), "/tmp/rootfs".into());
+        rt.remove("never-existed/api.sock")
+            .await
+            .expect("removing an unknown VM with no leftover dir is Ok");
     }
 }
