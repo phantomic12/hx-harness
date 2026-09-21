@@ -19,6 +19,17 @@
 //! **every hop before anything connects to it**. The guard is not a check on the response; it is a
 //! check that runs before the request that would use the redirect target exists.
 //!
+//! ## The hostname behind the URL is resolved once and pinned
+//!
+//! Admitting the URL is not enough: a public-looking hostname can resolve to loopback or
+//! private space (`http://127.0.0.1.nip.io/`), and the answer can change between the check
+//! and the connect (rebinding). So every hop is resolved once through a controlled
+//! [`HostResolver`](crate::target::HostResolver) and judged — *any* non-public address
+//! refuses the hop — and a hostname hop is then sent through a client with
+//! `resolve_to_addrs` carrying exactly the approved addresses. The socket can only go where
+//! admission looked. An IP literal goes over the shared client: the literal *is* the
+//! address, judged by admission itself, with no name a rebinding could change.
+//!
 //! ## What it refuses
 //!
 //! - A wall — 403/429/503, or a 200 whose body carries a challenge marker — is a [`FetchError::Refused`],
@@ -45,12 +56,14 @@
 
 use crate::error::{FetchError, RefusalReason};
 use crate::rung::{FetchRequest, Fetcher, RungKind, UntrustedPage};
-use crate::target::{Admission, BlockReason, TargetRefusal, TargetUrl};
+use crate::target::{Admission, BlockReason, HostResolver, PinnedTarget, SystemResolver};
+use crate::target::{TargetRefusal, TargetUrl};
 use async_trait::async_trait;
 use reqwest::header::{HeaderValue, CONTENT_TYPE, COOKIE, LOCATION};
 use reqwest::redirect::Policy;
 use reqwest::StatusCode;
-use url::Url;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
 /// The `User-Agent` this rung sends.
 ///
@@ -94,6 +107,7 @@ const CHALLENGE_MARKERS: &[&str] = &[
 pub struct HttpRung {
     client: reqwest::Client,
     admission: Admission,
+    resolver: Arc<dyn HostResolver>,
 }
 
 impl HttpRung {
@@ -121,7 +135,20 @@ impl HttpRung {
                 ),
             })?;
 
-        Ok(Self { client, admission })
+        Ok(Self {
+            client,
+            admission,
+            resolver: Arc::new(SystemResolver),
+        })
+    }
+
+    /// The rung resolving hostnames through `resolver` instead of the system resolver.
+    ///
+    /// The production path is [`SystemResolver`]; this hatch exists so a test can dictate
+    /// resolutions (loopback, mixed, empty) without owning DNS.
+    pub fn with_resolver(mut self, resolver: Arc<dyn HostResolver>) -> Self {
+        self.resolver = resolver;
+        self
     }
 
     /// The policy every hop is admitted under.
@@ -129,14 +156,67 @@ impl HttpRung {
         self.admission
     }
 
+    /// Resolve the target's hostname once and judge every address, off the async runtime.
+    ///
+    /// WHY `spawn_blocking`: resolution is a blocking `getaddrinfo` call, and a rung must
+    /// never stall the runtime on DNS. A refusal arrives as [`FetchError::Blocked`], which
+    /// stops the ladder without spending a dearer rung — the same disposition a refused
+    /// literal gets.
+    async fn pin_target(&self, target: &TargetUrl) -> Result<PinnedTarget, FetchError> {
+        let rung = RungKind::Http;
+        let target = target.clone();
+        let admission = self.admission;
+        let resolver = Arc::clone(&self.resolver);
+        tokio::task::spawn_blocking(move || target.pin(admission, &*resolver))
+            .await
+            .map_err(|_| FetchError::Transport {
+                rung,
+                reason: "the admission task did not complete".to_string(),
+            })?
+            .map_err(FetchError::Blocked)
+    }
+
+    /// The client one admitted hop is sent through.
+    ///
+    /// An IP literal goes over the shared client: the literal *is* the address, so there is
+    /// nothing to rebind. A hostname hop gets a client with `resolve_to_addrs` carrying
+    /// exactly the addresses admission approved — the socket can only go where admission
+    /// looked, which is what closes the check-then-connect (rebinding) gap.
+    fn hop_client(&self, pinned: &PinnedTarget) -> Result<reqwest::Client, FetchError> {
+        if pinned.pinned_addrs().is_empty() {
+            return Ok(self.client.clone());
+        }
+        // `pinned_addrs` is non-empty only for hostnames, so the name is there.
+        let host = pinned.target().dns_name().unwrap_or_default();
+        // Port 0 takes the conventional port for the scheme; an explicit port in the URL
+        // always wins over the override, so pinning never changes where the URL points.
+        let sock_addrs: Vec<SocketAddr> = pinned
+            .pinned_addrs()
+            .iter()
+            .map(|ip| SocketAddr::new(*ip, 0))
+            .collect();
+        reqwest::Client::builder()
+            .redirect(Policy::none())
+            .user_agent(USER_AGENT)
+            .resolve_to_addrs(&host, &sock_addrs)
+            .build()
+            .map_err(|err| FetchError::Unavailable {
+                rung: RungKind::Http,
+                reason: format!(
+                    "the pinned HTTP client could not be built: {}",
+                    transport_reason(err)
+                ),
+            })
+    }
+
     /// Send one request for one already-admitted hop.
     async fn send(
         &self,
+        client: &reqwest::Client,
         url: &TargetUrl,
         request: &FetchRequest,
     ) -> Result<reqwest::Response, FetchError> {
-        let mut builder = self
-            .client
+        let mut builder = client
             .get(url.request_url().to_string())
             .timeout(request.timeout);
 
@@ -155,15 +235,17 @@ impl HttpRung {
         })
     }
 
-    /// Resolve a `Location` and admit the result — **before anything connects to it**.
+    /// Resolve a `Location`, admit the result and pin its resolution — **before anything
+    /// connects to it**.
     ///
-    /// This is the function the commit exists for. It runs between the 3xx and the request that would
-    /// follow it, so there is no window in which the redirect target has been contacted.
-    fn admit_redirect(
+    /// This is the function the redirect commit exists for, extended to hostnames: it runs
+    /// between the 3xx and the request that would follow it, so there is no window in which
+    /// the redirect target has been contacted, under any spelling of its address.
+    async fn admit_redirect(
         &self,
-        from: &TargetUrl,
+        from: &PinnedTarget,
         location: &HeaderValue,
-    ) -> Result<TargetUrl, FetchError> {
+    ) -> Result<PinnedTarget, FetchError> {
         let rung = RungKind::Http;
 
         let location = location.to_str().map_err(|_| FetchError::Transport {
@@ -171,29 +253,25 @@ impl HttpRung {
             reason: "the redirect was not a readable header value".to_string(),
         })?;
 
-        // `request_url` is the string this target was admitted from, so this parse cannot fail; it is
-        // reported rather than unwrapped, and as a transport error so the ladder stops. An internal
-        // invariant violation must not cost a browser.
-        let base = Url::parse(from.request_url()).map_err(|_| FetchError::Transport {
+        let from_target = from.target().clone();
+        let admission = self.admission;
+        let resolver = Arc::clone(&self.resolver);
+        let location = location.to_string();
+        let pinned = tokio::task::spawn_blocking(move || {
+            from_target.pin_redirect(admission, &location, &*resolver)
+        })
+        .await
+        .map_err(|_| FetchError::Transport {
             rung,
-            reason: "the admitted target could not be parsed back into a URL".to_string(),
+            reason: "the admission task did not complete".to_string(),
         })?;
 
-        // A `Location` is routinely relative, so it is resolved against the URL that produced it.
-        // `join` is the version that treats `../`, an absolute path and an absolute URL the way a
-        // browser does. `url`'s parse errors name the problem and never echo the input — which matters,
-        // because a `Location` can carry a token too.
-        let next = base.join(location).map_err(|err| FetchError::Transport {
-            rung,
-            reason: format!("the redirect could not be resolved: {err}"),
-        })?;
-
-        TargetUrl::parse_with(self.admission, next.as_str()).map_err(|refusal| {
+        pinned.map_err(|refusal| {
             FetchError::Blocked(TargetRefusal {
                 reason: relabel(refusal.reason),
                 // The sentence this variant was written for is "*the page* redirected to X", so the
                 // display names the page that sent us there rather than the target we refused.
-                display: from.redacted(),
+                display: from.target().redacted(),
             })
         })
     }
@@ -244,13 +322,16 @@ impl Fetcher for HttpRung {
 
     async fn fetch(&self, request: &FetchRequest) -> Result<UntrustedPage, FetchError> {
         let rung = RungKind::Http;
-        // The target that was actually fetched. It starts as what the caller asked for and becomes the
-        // last admitted hop, so a page reached through a redirect reports where it really came from.
-        let mut current = request.target.clone();
+        // The target that was actually fetched. It starts as the caller's requested hop,
+        // pinned *before* the first connection (so admission judged the resolution the socket
+        // will actually use) and becomes the last admitted redirect, so a page reached through
+        // a redirect reports where it really came from.
+        let mut current = self.pin_target(&request.target).await?;
         let mut hops = 0usize;
 
         loop {
-            let response = self.send(&current, request).await?;
+            let client = self.hop_client(&current)?;
+            let response = self.send(&client, current.target(), request).await?;
             let status = response.status();
 
             if is_followable(status) {
@@ -265,7 +346,7 @@ impl Fetcher for HttpRung {
                     status: status.as_u16(),
                 })?;
                 // Admitted before the next send, so nothing connects to an unadmitted hop.
-                current = self.admit_redirect(&current, location)?;
+                current = self.admit_redirect(&current, location).await?;
                 hops += 1;
                 continue;
             }
@@ -309,7 +390,7 @@ impl Fetcher for HttpRung {
             }
 
             return Ok(UntrustedPage::new(
-                current,
+                current.target().clone(),
                 status.as_u16(),
                 content_type,
                 rung,
