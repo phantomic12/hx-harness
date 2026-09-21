@@ -4,7 +4,8 @@
 //!
 //! [`crates::spawn`] gives you a **narrowest real thing**: [`Spawner::build_spec`] draws one
 //! healthy member and clamps a parameter set to it, and [`Spawner::run_child`] makes one provider
-//! call against that drawn member and records a `UsageRecord` whose `model` is the member. A single
+//! call against that drawn member and records a `UsageRecord` whose `model` is the member's
+//! declared model. A single
 //! spec is not a fan-out — and the whole point of M8 is that a fan-out runs **N children across N
 //! distinct members**, not N copies of one. That is what lives here.
 //!
@@ -42,7 +43,7 @@
 //! ## Each child's model is recorded with that child
 //!
 //! [`FanOutOutcome::children`] carries, per child in request order, the [`ChildRecord`] `run_child`
-//! produced — whose `model` is the **drawn member** and whose `usage` already landed in the store's
+//! produced — whose `model` is the **drawn member's declared model** and whose `usage` already landed in the store's
 //! audit chain. "Which model did which piece of work, and at what cost" is answerable per child from
 //! the outcome without re-deriving it.
 //!
@@ -228,6 +229,11 @@ mod tests {
     fn member(id: &str) -> PoolMember {
         PoolMember {
             id: id.to_string(),
+            // These tests pin fan-out shape, not member routing, so the provider and model stay
+            // the id and the registries keyed by id resolve unchanged. Routing with distinct
+            // names is pinned in `spawn.rs` and `hx-core`'s pool/config tests.
+            provider: id.to_string(),
+            model: id.to_string(),
             base_url: format!("https://{id}.example.test"),
             credential: format!("vault:pool/{id}"),
             accepts: Vec::new(),

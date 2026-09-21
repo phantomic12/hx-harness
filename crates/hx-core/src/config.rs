@@ -29,8 +29,8 @@ pub struct Config {
     /// Maps an agent role (`builder`, `scout`, `reviewer`) to a pool name.
     #[serde(default)]
     pub roles: IndexMap<String, String>,
-    /// M8 model pools — each names the per-child model members a future spawner draws from.
-    /// Additive: a config with no `model_pools` section still loads.
+    /// M8 model pools — each names the per-child model members the spawner draws from, routed by
+    /// their declared provider and model. Additive: a config with no `model_pools` section still loads.
     #[serde(default)]
     pub model_pools: IndexMap<String, Vec<crate::pool::ModelPoolMemberConfig>>,
     #[serde(default)]
@@ -213,16 +213,48 @@ impl Config {
 
     /// Build the M8 model pool of `name` from this config, or an error naming the pool.
     ///
-    /// Every member is a reference (never a value) and starts healthy. Nothing constructs — or draws from —
-    /// a model pool yet; this is the boundary a future spawner will call.
+    /// Every member is a reference (never a value) and starts healthy. A member whose provider is
+    /// named in this config's `providers` section must also agree with it on the endpoint: the
+    /// spawner records the member's `base_url` as the URL it contacted, so a disagreement is a
+    /// load-time error naming the member, the provider and both URLs — not a silent audit lie.
+    /// A provider the config does not name is left for resolve time (scripted registries in tests
+    /// are not in this map, and the spawner's `NoRoute` names the unknown provider there).
     pub fn model_pool(&self, name: &str) -> Result<crate::pool::ModelPool> {
         let members = self
             .model_pools
             .get(name)
             .cloned()
             .ok_or_else(|| HxError::Config(format!("model pool {name:?} not found")))?;
+        for member in &members {
+            if let Some(provider) = self.providers.get(&member.provider) {
+                if let Some(configured) = provider.base_url.as_deref() {
+                    if !same_endpoint(&member.base_url, configured) {
+                        return Err(HxError::Config(format!(
+                            "model pool {name:?} member {:?} declares base_url {:?} but its \
+                             provider {:?} is configured with {:?}; the recorded URL must be \
+                             the contacted one",
+                            member.id, member.base_url, member.provider, configured
+                        )));
+                    }
+                }
+            }
+        }
         Ok(crate::pool::ModelPool::from_config(members))
     }
+}
+
+/// Do two endpoint spellings name the same API root?
+///
+/// Trailing slashes are tolerated, and so is the Ollama `/v1`: the config names the Ollama
+/// *server* (`http://127.0.0.1:11434`) while the adapter speaks its OpenAI-compatible surface
+/// under `/v1`, so either spelling from a member that points at an Ollama provider is the same
+/// endpoint the call reaches.
+fn same_endpoint(declared: &str, configured: &str) -> bool {
+    let declared = declared.trim_end_matches('/');
+    let configured = configured.trim_end_matches('/');
+    declared == configured
+        || format!("{declared}/v1") == configured
+        || format!("{configured}/v1") == declared
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1677,6 +1709,129 @@ hosts:
             builder.members[0].credential.starts_with("vault:"),
             "a member credential is a reference, never a value"
         );
+        // The example members route by declared provider and model — ids that are neither — and
+        // each agrees with its provider on the endpoint, which is what `model_pool` enforces.
+        for member in &builder.members {
+            assert_ne!(
+                member.provider, member.id,
+                "the pool id is not the provider: {}",
+                member.id
+            );
+            assert_ne!(
+                member.model, member.id,
+                "the pool id is not the model: {}",
+                member.id
+            );
+        }
+    }
+
+    /// A member whose declared endpoint disagrees with its provider's configured URL fails at
+    /// load: the spawner records the member's URL as the contacted one, so a disagreement would
+    /// be a silent audit lie.
+    #[test]
+    fn a_member_whose_endpoint_disagrees_with_its_provider_fails_at_load() {
+        let cfg = Config::from_yaml(
+            r#"
+providers:
+  anthropic-main:
+    kind: anthropic
+    base_url: https://api.anthropic.com
+model_pools:
+  builder:
+    - id: builder-strong
+      provider: anthropic-main
+      model: claude-opus-4-7
+      base_url: https://api.someone-else.example
+      credential: "vault:anthropic/main"
+"#,
+        )
+        .expect("must parse");
+        let err = cfg.model_pool("builder").unwrap_err().to_string();
+        assert!(
+            err.contains("builder-strong") && err.contains("anthropic-main"),
+            "the error must name the member and the provider: {err}"
+        );
+        assert!(
+            err.contains("https://api.someone-else.example")
+                && err.contains("https://api.anthropic.com"),
+            "the error must show both URLs: {err}"
+        );
+    }
+
+    /// A member that agrees with its provider on the endpoint builds — the happy path the
+    /// shipped example relies on.
+    #[test]
+    fn a_member_whose_endpoint_matches_its_provider_builds() {
+        let cfg = Config::from_yaml(
+            r#"
+providers:
+  anthropic-main:
+    kind: anthropic
+    base_url: https://api.anthropic.com
+model_pools:
+  builder:
+    - id: builder-strong
+      provider: anthropic-main
+      model: claude-opus-4-7
+      base_url: https://api.anthropic.com/
+      credential: "vault:anthropic/main"
+"#,
+        )
+        .expect("must parse");
+        let pool = cfg.model_pool("builder").expect("agreement builds");
+        assert_eq!(pool.members[0].provider, "anthropic-main");
+        assert_eq!(pool.members[0].model, "claude-opus-4-7");
+    }
+
+    /// The Ollama `/v1`: the config names the server while the adapter speaks under `/v1`, so a
+    /// member pointing at an Ollama provider may declare either spelling.
+    #[test]
+    fn a_member_pointing_at_ollama_accepts_either_url_spelling() {
+        for base_url in [
+            "http://127.0.0.1:11434",
+            "http://127.0.0.1:11434/v1",
+            "http://127.0.0.1:11434/v1/",
+        ] {
+            let yaml = format!(
+                r#"
+providers:
+  local-llama:
+    kind: ollama
+    base_url: http://127.0.0.1:11434
+model_pools:
+  background:
+    - id: local
+      provider: local-llama
+      model: qwen3-32b
+      base_url: {base_url}
+      credential: "vault:local/none"
+"#
+            );
+            let cfg = Config::from_yaml(&yaml).expect("must parse");
+            cfg.model_pool("background")
+                .expect("either Ollama spelling builds");
+        }
+    }
+
+    /// A provider the config does not name is left for resolve time: programmatic registries
+    /// (scripted doubles in tests) are not in this map, and the spawner's `NoRoute` names the
+    /// unknown provider where it actually fails.
+    #[test]
+    fn a_member_whose_provider_is_not_configured_is_left_for_resolve_time() {
+        let cfg = Config::from_yaml(
+            r#"
+model_pools:
+  p:
+    - id: bare
+      provider: scripted
+      model: bare-model
+      base_url: https://bare.example.test
+      credential: vault:pool/bare
+"#,
+        )
+        .expect("must parse");
+        let pool = cfg.model_pool("p").expect("unknown provider passes load");
+        assert_eq!(pool.members[0].provider, "scripted");
     }
 
     // -- MCP servers ---------------------------------------------------------

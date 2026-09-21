@@ -18,9 +18,16 @@
 //! ## What a member is
 //!
 //! A [`PoolMember`] is the *configuration* of one model the harness could spawn a child against: an id,
-//! a base URL, a credential and the parameters it accepts. Members are configuration, so the config-side
+//! the provider that serves it, the model to ask that provider for, a base URL, a credential and the
+//! parameters it accepts. Members are configuration, so the config-side
 //! structs here (`ModelPoolMemberConfig` via [`crate::config`]) deserialize from the `hx-core` config
 //! and carry [`Default`]s so existing config files keep parsing.
+//!
+//! The id names the member **inside the pool** (draw order, health state, audit). It is deliberately
+//! *not* the provider and *not* the model: those are the separate [`PoolMember::provider`] and
+//! [`PoolMember::model`] fields, because a pool id (`builder-cheap`) is neither a registry id
+//! (`openai-cheap`) nor an upstream model name (`gpt-4o-mini`), and using it as either routes the
+//! child to an endpoint that was never declared.
 //!
 //! The credential is a **reference, never a value** — `vault:subagent/lane-builder`, `env:…`. This
 //! follows `hx-secrets`' existing reference discipline (see `credential` in `config.rs` and the MCP
@@ -136,9 +143,22 @@ pub enum MemberHealth {
 }
 
 /// One model the harness could draw a child from. Configuration plus health state.
+///
+/// The id names this member **inside the pool** — draw order, health state, audit — and nothing
+/// else. Routing uses [`PoolMember::provider`] (which adapter answers) and [`PoolMember::model`]
+/// (which model name the request carries); the id is never either, so a pool id that is neither a
+/// registry id nor an upstream model name cannot misroute a child.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolMember {
     pub id: String,
+    /// The provider registry id that serves this member — the [`ProviderId`](crate::ProviderId)
+    /// to resolve at send time, not this member's pool id.
+    pub provider: String,
+    /// The model name the request carries — an upstream model id, not this member's pool id.
+    pub model: String,
+    /// The endpoint this member was declared against. [`crate::config::Config::model_pool`] refuses a
+    /// member whose URL disagrees with its provider's configured URL, so the recorded URL is the
+    /// contacted one rather than a comment nobody checks.
     pub base_url: String,
     /// A credential **reference** (`vault:…`/`env:…`), never a value — see the module doc.
     pub credential: String,
@@ -334,12 +354,16 @@ impl ModelPool {
 /// Config-side shape of a [`PoolMember`], the deserializable half.
 ///
 /// Separate from the runtime [`PoolMember`] so that health state and the draw cursor are never part of a
-/// config document, and so `health` does not need a [`Default`]. Fields are additive (`#[serde
-/// (default)]` on `accepts`) so existing config files keep parsing.
+/// config document, and so `health` does not need a [`Default`]. `accepts` is additive (`#[serde
+/// (default)]`) so existing config files keep parsing; `provider` and `model` are required — a member
+/// with no declared route is the misrouting this shape exists to prevent, and a missing field fails
+/// loudly naming the field rather than silently reusing the pool id.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelPoolMemberConfig {
     pub id: String,
+    pub provider: String,
+    pub model: String,
     pub base_url: String,
     /// A credential **reference** (`vault:…` / `env:…`), never a value.
     pub credential: String,
@@ -351,6 +375,8 @@ impl PoolMember {
     fn from_config(c: ModelPoolMemberConfig) -> Self {
         Self {
             id: c.id,
+            provider: c.provider,
+            model: c.model,
             base_url: c.base_url,
             credential: c.credential,
             accepts: c.accepts,
@@ -370,6 +396,11 @@ mod tests {
     fn member(id: &str, accepts: &[Param]) -> PoolMember {
         PoolMember {
             id: id.to_string(),
+            // WHY distinct from `id`: a fixture whose provider and model both equal the pool id
+            // re-enacts the misrouting this fix removes (the id doubling as registry id and model
+            // name), and no assertion on such a fixture could see it.
+            provider: format!("{id}-provider"),
+            model: format!("{id}-model"),
             base_url: format!("https://{id}.example.test"),
             credential: format!("vault:pool/{id}"),
             accepts: accepts.to_vec(),
@@ -690,11 +721,15 @@ mod tests {
 model_pools:
   builder:
     - id: cheap
+      provider: openai-cheap
+      model: gpt-4o-mini
       base_url: https://cheap.example.test
       credential: vault:pool/cheap
       accepts:
         - { kind: reasoning_effort, value: low }
     - id: strong
+      provider: anthropic-main
+      model: claude-opus-4-7
       base_url: https://strong.example.test
       credential: env:STRONG_KEY
       accepts:
@@ -710,6 +745,12 @@ model_pools:
         assert_eq!(pool.members.len(), 2);
         assert_eq!(pool.members[0].id, "cheap");
         assert_eq!(pool.members[1].id, "strong");
+        // The route survives the round trip: neither the provider nor the model falls back to the
+        // pool id, which is the misrouting this shape exists to prevent.
+        assert_eq!(pool.members[0].provider, "openai-cheap");
+        assert_eq!(pool.members[0].model, "gpt-4o-mini");
+        assert_eq!(pool.members[1].provider, "anthropic-main");
+        assert_eq!(pool.members[1].model, "claude-opus-4-7");
         assert_eq!(
             pool.members[0].credential, "vault:pool/cheap",
             "the credential is a reference, verbatim"
@@ -738,7 +779,8 @@ model_pools:
         assert!(cfg.model_pools.is_empty());
     }
 
-    /// A member config is additive: every field except `id`/`base_url`/`credential` is defaulted.
+    /// A member config is additive: every field except `id`/`provider`/`model`/`base_url`/`credential`
+    /// is defaulted.
     #[test]
     fn a_member_config_with_no_accepts_parses_and_accepts_nothing() {
         let cfg = crate::config::Config::from_yaml(
@@ -746,6 +788,8 @@ model_pools:
 model_pools:
   p:
     - id: bare
+      provider: bare-provider
+      model: bare-model
       base_url: https://bare.example.test
       credential: vault:pool/bare
 "#,
@@ -753,5 +797,50 @@ model_pools:
         .expect("must parse");
         let pool = cfg.model_pool("p").unwrap();
         assert!(pool.members[0].accepts.is_empty());
+        assert_eq!(pool.members[0].provider, "bare-provider");
+        assert_eq!(pool.members[0].model, "bare-model");
+    }
+
+    /// A member with no declared route is unroutable, so it fails at parse time naming the missing
+    /// field — never by silently reusing the pool id as the provider and model at send time.
+    #[test]
+    fn a_member_config_with_no_provider_fails_loudly_at_parse() {
+        let err = crate::config::Config::from_yaml(
+            r#"
+model_pools:
+  p:
+    - id: bare
+      model: bare-model
+      base_url: https://bare.example.test
+      credential: vault:pool/bare
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("provider"),
+            "the error must name the missing route field: {err}"
+        );
+    }
+
+    /// Same for the model: a missing model name is a parse error, not a pool id sent upstream.
+    #[test]
+    fn a_member_config_with_no_model_fails_loudly_at_parse() {
+        let err = crate::config::Config::from_yaml(
+            r#"
+model_pools:
+  p:
+    - id: bare
+      provider: bare-provider
+      base_url: https://bare.example.test
+      credential: vault:pool/bare
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("model"),
+            "the error must name the missing route field: {err}"
+        );
     }
 }
