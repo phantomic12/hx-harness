@@ -17,10 +17,12 @@
 //! ## How the browser pool fits
 //!
 //! `hx-search` depends on `hx-browser` and uses it for one thing: [`BrowserFetcher`], which
-//! fetches a page through the pool's ladder — the plain HTTP rung first, escalation to real
-//! Chromium only when the site refuses. The pool is the escalation layer *for* the pages a plain
-//! fetch cannot read (full JavaScript execution, challenge solving), and the dependency is one-way and
-//! deliberate: search does not own the pool, it consumes it.
+//! fetches a page through the pool's ladder. It has two shapes, and the difference is the whole
+//! `Auto`/`Browser` distinction: `Auto` takes the plain HTTP rung first and escalates to real
+//! Chromium only when the site **refused**, while `Browser` puts no plain rung in front of the
+//! browser at all — see [`BrowserFetcher::browser_first`] and [`FetchMode`]. The pool is the layer
+//! *for* the pages a plain fetch cannot read (full JavaScript execution, challenge solving), and the
+//! dependency is one-way and deliberate: search does not own the pool, it consumes it.
 //!
 //! The bulk of extraction still happens through the in-crate [`Fetcher`] abstraction; [`HttpFetcher`]
 //! is the plain path, and [`BrowserFetcher`] is a [`Fetcher`] the same research loop can be handed.
@@ -30,7 +32,9 @@
 //! cannot lie (see [`select_fetcher`]), and records the choice for tests and honest reporting.
 //! The chromium tests that drive real Chromium run **locally** — the browser is installed on the developer
 //! host (`/usr/lib/chromium/chromium`) and not on the remote build host — and are `#[ignore]`d so
-//! they never run in the offload gate.
+//! they never run in the offload gate. `tests/browser_rung_canary.rs` is the live one: it proves the
+//! browser rung reads a page whose text only exists after JavaScript runs, and that the plain path
+//! does **not**.
 //!
 //! ## Body cap and timeout
 //!
@@ -59,7 +63,7 @@ use crate::types::{FusedResult, SearchQuery};
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
 use hx_browser::profile::PoolRoot;
-use hx_browser::{BrowserPool, Ladder as RungLadder};
+use hx_browser::{Admission, BrowserPool, Ladder as RungLadder};
 use hx_core::ids::SessionId;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -265,13 +269,30 @@ fn transport_error(err: reqwest::Error) -> SearchError {
 /// page a browser renders for one URL can never read another URL task's cookies. The session id is made
 /// from the URL's redacted form — a token in the query cannot reach a directory name.
 ///
+/// ## Two shapes, because `Auto` and `Browser` mean different things
+///
+/// [`BrowserFetcher::new`] is the **`Auto` shape**: the pool's ladder is the cheap `HttpRung` first,
+/// escalating to real Chromium only when the site *refused*. That is the ladder's cost rule, and it
+/// is why a page a plain `GET` already answered never spends a browser launch.
+///
+/// [`BrowserFetcher::browser_first`] is the **`Browser` shape**: the pool's ladder holds the
+/// `ChromiumRung` and nothing else, so every page is read by a real browser. It exists because
+/// `FetchMode::Browser`'s promise is exactly that — *a browser even for a page a plain fetch could
+/// read* — and the escalating ladder cannot keep it: a JavaScript-rendered page answers `200` with
+/// its text injected by script, a `200` ends the climb at the cheap rung, and no browser is ever
+/// launched. So `Auto` does not reach a browser for such a page and `Browser` is how a caller asks
+/// for one. `crates/hx-search/tests/browser_rung_canary.rs` is the live proof of the difference: the
+/// same page yields the JS-inserted text through a browser-first fetcher and does not yield it
+/// through the plain path.
+///
 /// ## The security properties survive the wiring
 ///
 /// The caller does **not** weaken anything the rung holds:
 /// - **Admission still runs.** A [`BrowserPool`] admits every target before any rung runs; a caller
 ///   cannot pass an unchecked target. (In fact the pool refuses loopback — including a local test
-///   stub — so the caller's decisions are driven with a browser-launching double, and only the one
-///   `#[ignore]`d live test drives real Chromium.)
+///   stub — so the caller's decisions are driven with a browser-launching double, and the live
+///   canary widens admission with the **named** [`BrowserFetcher::with_admission`] hatch rather than
+///   by loosening a default.)
 /// - **A refusal is a refusal.** The pool's [`FetchReport`] carries a [`Disposition`]: a wall, a
 ///   challenge or an admission block. This fetcher turns one into [`SearchError::Refused`] — never an
 ///   `Ok(Some(""))`, which would look to extraction exactly like a page the origin served.
@@ -283,12 +304,20 @@ fn transport_error(err: reqwest::Error) -> SearchError {
 ///
 /// ## Where the chromium tests run
 ///
-/// A real browser is at `/usr/lib/chromium/chromium` on the **developer host** and not on the
-/// remote build host, so any test of this fetcher that would touch the rung runs **locally**. The
-/// server-side tests below therefore drive the *decision* with a browser-launching double and serve all
-/// pages from a local stub — no test depends on a third-party site — and the one live run (real
-/// Chromium end to end) is `#[ignore]`d for the local host.
+/// A real browser is at `/usr/lib/chromium/chromium` on the **developer host** (bigwhite) and not on
+/// the build host (garlic-clove), so any test of this fetcher that would touch the rung runs
+/// **locally**. The server-side tests below therefore drive the *decision* with a browser-launching
+/// double and serve all pages from a local stub — no test depends on a third-party site — and the
+/// live run (real Chromium end to end, both rungs, against a local server whose page is filled in by
+/// JavaScript) is `crates/hx-search/tests/browser_rung_canary.rs`, `#[ignore]`d for the local host.
 pub struct BrowserFetcher {
+    /// The pool's profile root, kept so a shape change (`with_admission`) can rebuild the ladder
+    /// rather than leaving the rungs pointed at a policy the pool no longer holds.
+    root: PoolRoot,
+    /// The policy the pool **and** every rung were built on.
+    admission: Admission,
+    /// Whether the ladder is browser-only (`FetchMode::Browser`) or starts at the cheap rung (`Auto`).
+    browser_first: bool,
     pool: BrowserPool,
     timeout: Duration,
     max_body_bytes: usize,
@@ -298,6 +327,7 @@ impl std::fmt::Debug for BrowserFetcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BrowserFetcher")
             .field("pool", &self.pool)
+            .field("browser_first", &self.browser_first)
             .field("timeout", &self.timeout)
             .field("max_body_bytes", &self.max_body_bytes)
             .finish()
@@ -305,25 +335,38 @@ impl std::fmt::Debug for BrowserFetcher {
 }
 
 impl BrowserFetcher {
-    /// A browser-backed fetcher over `root` (the pool's profile root) with the default cap.
+    /// The `Auto` shape: a browser-backed fetcher over `root` (the pool's profile root) with the
+    /// default cap, escalating from the plain rung to Chromium only on a refusal.
     pub fn new(root: impl Into<std::path::PathBuf>) -> Result<Self, std::io::Error> {
-        let pool_root =
-            PoolRoot::new(root).map_err(|err| std::io::Error::other(err.to_string()))?;
-        let ladder = RungLadder::new(vec![
-            Arc::new(
-                hx_browser::HttpRung::new()
-                    .map_err(|_| std::io::Error::other("could not build the HTTP rung"))?,
-            ),
-            Arc::new(
-                hx_browser::ChromiumRung::new()
-                    .map_err(|_| std::io::Error::other("could not build the Chromium rung"))?,
-            ),
-        ]);
-        Ok(Self {
-            pool: BrowserPool::new(pool_root, ladder),
-            timeout: DEFAULT_FETCH_TIMEOUT,
-            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
-        })
+        Self::assemble(root, Admission::default(), false)
+    }
+
+    /// The `Browser` shape: a real Chromium for **every** page, with no plain rung in front of it.
+    ///
+    /// This is what [`FetchMode::Browser`] selects. A caller that builds it directly is opting into
+    /// a browser launch per fetched page, which is the cost the mode documents.
+    pub fn browser_first(root: impl Into<std::path::PathBuf>) -> Result<Self, std::io::Error> {
+        Self::assemble(root, Admission::default(), true)
+    }
+
+    /// Admit loopback and private targets as well, rebuilding the pool's ladder on the same policy.
+    ///
+    /// The same **named** escape hatch [`BrowserPool::with_admission`] documents, one layer up: the
+    /// hermetic suite serves its pages on `127.0.0.1`, which the default policy refuses. The rungs
+    /// are rebuilt with the pool rather than left at the old policy, because the two admissions are
+    /// independent (`BrowserPool::fetch` admits the target; a rung admits every *intercepted* request
+    /// a loaded page makes) and a pool that admits a host its rung then refuses would be a fetcher
+    /// that silently drops a page's subresources.
+    pub fn with_admission(mut self, admission: Admission) -> Result<Self, std::io::Error> {
+        let pool = Self::build_pool(&self.root, admission, self.browser_first)?;
+        self.admission = admission;
+        self.pool = pool;
+        Ok(self)
+    }
+
+    /// The pool, for a test that wants to see which rung answered.
+    pub fn pool(&self) -> &BrowserPool {
+        &self.pool
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -336,9 +379,70 @@ impl BrowserFetcher {
         self
     }
 
-    /// The pool, for a test that wants to see which rung answered.
-    pub fn pool(&self) -> &BrowserPool {
-        &self.pool
+    /// A fetcher over a caller-supplied rung, for the hermetic tests.
+    ///
+    /// Same shape as [`BrowserFetcher::new`] with a scripted rung in place of the real ladder, so a
+    /// test can drive the caller's decisions (caps, refusals, timeouts) without real Chromium.
+    #[cfg(test)]
+    pub(crate) fn over_scripted_rung(
+        root: PoolRoot,
+        rung: Arc<dyn hx_browser::rung::Fetcher>,
+        admission: Admission,
+    ) -> Self {
+        let pool = BrowserPool::new(root.clone(), RungLadder::new(vec![rung]))
+            .with_admission(admission);
+        Self {
+            root,
+            admission,
+            browser_first: false,
+            pool,
+            timeout: DEFAULT_FETCH_TIMEOUT,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+        }
+    }
+
+    fn assemble(
+        root: impl Into<std::path::PathBuf>,
+        admission: Admission,
+        browser_first: bool,
+    ) -> Result<Self, std::io::Error> {
+        let root =
+            PoolRoot::new(root).map_err(|err| std::io::Error::other(err.to_string()))?;
+        let pool = Self::build_pool(&root, admission, browser_first)?;
+        Ok(Self {
+            root,
+            admission,
+            browser_first,
+            pool,
+            timeout: DEFAULT_FETCH_TIMEOUT,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+        })
+    }
+
+    /// The pool's ladder, over **real** rungs.
+    ///
+    /// One place builds it, so `new`, `browser_first` and `with_admission` cannot drift into three
+    /// different ladders — which is what a second construction site would do to the one property
+    /// that separates `Auto` from `Browser`.
+    fn build_pool(
+        root: &PoolRoot,
+        admission: Admission,
+        browser_first: bool,
+    ) -> Result<BrowserPool, std::io::Error> {
+        let chromium = Arc::new(hx_browser::ChromiumRung::with_admission(admission).map_err(|_| {
+            std::io::Error::other("could not build the Chromium rung")
+        })?);
+
+        let ladder = if browser_first {
+            RungLadder::new(vec![chromium])
+        } else {
+            let http = Arc::new(hx_browser::HttpRung::with_admission(admission).map_err(|_| {
+                std::io::Error::other("could not build the HTTP rung")
+            })?);
+            RungLadder::new(vec![http, chromium])
+        };
+
+        Ok(BrowserPool::new(root.clone(), ladder).with_admission(admission))
     }
 }
 
@@ -388,11 +492,24 @@ impl Fetcher for BrowserFetcher {
 pub enum FetchMode {
     /// Plain HTTP only. Never launches a browser, no matter what a page needs.
     Http,
-    /// Plain HTTP first, escalating to a browser only for a page a plain fetch cannot read
-    /// (JS-rendered, or behind a bot wall). This is the mode the browser rung exists for.
+    /// Plain HTTP first, escalating to a browser when the cheap rung **refused** the page — a bot
+    /// wall, a challenge interstitial, a `403`/`429`/`503`.
+    ///
+    /// **A page that answers `200` ends the climb.** A JavaScript-rendered page is exactly that
+    /// shape: a `200` shell whose text only exists after its own script runs. So this mode does
+    /// *not* reach a browser for one, and the earlier version of this sentence — "escalating to a
+    /// browser only for a page a plain fetch cannot read (JS-rendered, or behind a bot wall)" —
+    /// claimed more than the ladder does; it is corrected here rather than quietly left standing.
+    /// The escalation rule is `hx-browser`'s `Ladder`, and it is deliberate: a page a plain `GET`
+    /// already answered must not spend a browser launch. [`FetchMode::Browser`] is how a caller asks
+    /// for a browser anyway.
     Auto,
     /// Drive a browser even for a page a plain fetch could read. Deliberate and costly; a caller
     /// that selects this is opting into a browser launch per fetched page.
+    ///
+    /// The fetcher this selects drives a real Chromium **for every page**: it has no plain rung in
+    /// front of it ([`BrowserFetcher::browser_first`]), which is the one property that separates it
+    /// from [`FetchMode::Auto`]'s escalating ladder.
     Browser,
 }
 
@@ -477,9 +594,9 @@ pub fn default_pool_root() -> std::path::PathBuf {
 /// | mode | browser installed? | result | why |
 /// |------|-------------------|--------|-----|
 /// | `Http` | (irrelevant) | plain `HttpFetcher` | plain fetch never launches a browser. |
-/// | `Auto` | yes | `BrowserFetcher` | escalation for pages a plain fetch cannot read. |
+/// | `Auto` | yes | escalating `BrowserFetcher` | escalation for pages a plain fetch was **refused** by (a wall, a challenge). |
 /// | `Auto` | no | plain `HttpFetcher` | no browser to escalate to; degrading to plain is the honest default — it never returns a page it did not fetch. |
-/// | `Browser` | yes | `BrowserFetcher` | explicit opt-in, as asked. |
+/// | `Browser` | yes | browser-first `BrowserFetcher` | explicit opt-in: a real browser for **every** page, including one a plain fetch could read. |
 /// | `Browser` | no | **error** | a caller that explicitly asked for a browser must not silently get a plain fetch; that would be lying about what it fetched. |
 ///
 /// The runtime honesty — a browser that runs but cannot fetch a page is a `Refused`, never an empty
@@ -522,13 +639,13 @@ pub(crate) fn select_fetcher_by(
             note: "auto: no browser on this host, degraded to plain fetch (honest default)",
         }),
         FetchMode::Browser if available() => {
-            let fetcher = BrowserFetcher::new(pool_root).map_err(|err| FetchRouteError {
+            let fetcher = BrowserFetcher::browser_first(pool_root).map_err(|err| FetchRouteError {
                 reason: format!("could not build the browser fetcher: {err}"),
             })?;
             Ok(FetchSelection {
                 fetcher: Arc::new(fetcher),
                 kind: SelectedFetcher::Browser,
-                note: "browser: explicit opt-in, driving a browser",
+                note: "browser: explicit opt-in, driving Chromium for every page",
             })
         }
         FetchMode::Browser => Err(FetchRouteError {
@@ -897,13 +1014,7 @@ mod browser_fetcher_tests {
         timeout: Duration,
     ) -> BrowserFetcher {
         let pool_root = PoolRoot::new(root).expect("pool root");
-        let ladder = RungLadder::new(vec![rung]);
-        let pool = BrowserPool::new(pool_root, ladder).with_admission(admission);
-        BrowserFetcher {
-            pool,
-            timeout,
-            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
-        }
+        BrowserFetcher::over_scripted_rung(pool_root, rung, admission).with_timeout(timeout)
     }
 
     /// A rung whose behaviour is dictated per call, panicking when called with no script left so an
@@ -1098,6 +1209,7 @@ mod browser_fetcher_tests {
 #[cfg(test)]
 mod fetch_router_tests {
     use super::*;
+    use hx_browser::{Admission, RungKind};
 
     fn client() -> reqwest::Client {
         reqwest::Client::new()
@@ -1171,6 +1283,70 @@ mod fetch_router_tests {
         let selection = select_fetcher_by(&client(), FetchMode::Browser, pool_root(), || true)
             .expect("explicit browser with a browser succeeds");
         assert_eq!(selection.kind, SelectedFetcher::Browser);
+        assert!(
+            selection.note.contains("every page"),
+            "the note must say this mode drives a browser for every page, not only for a refusal: {}",
+            selection.note
+        );
+    }
+
+    /// The two browser shapes differ in exactly one thing, and it is the plain rung.
+    ///
+    /// `FetchMode::Browser`'s promise is "drive a browser **even for a page a plain fetch could
+    /// read**", so the fetcher it selects must not consult a plain rung first — a `200` would end
+    /// the climb there and no browser would ever launch, which is precisely the JavaScript-rendered
+    /// page this is about. `Auto`'s shape keeps the cheap rung first, which is its own documented
+    /// cost rule. Asserted on the ladders rather than on a fetch, so it holds on a host with no
+    /// Chromium — the live behavioural half is `tests/browser_rung_canary.rs`.
+    #[test]
+    fn the_two_browser_shapes_differ_in_exactly_the_plain_rung() {
+        let root = pool_root();
+        let escalating = BrowserFetcher::new(root.clone()).expect("the auto shape");
+        let browser_first = BrowserFetcher::browser_first(root).expect("the browser shape");
+
+        assert_eq!(
+            escalating.pool().ladder().rungs(),
+            vec![RungKind::Http, RungKind::Interactive],
+            "Auto escalates: the cheap rung first, Chromium on a refusal"
+        );
+        assert_eq!(
+            browser_first.pool().ladder().rungs(),
+            vec![RungKind::Interactive],
+            "Browser must not have a plain rung in front of the browser"
+        );
+    }
+
+    /// `with_admission` rebuilds the pool's ladder rather than only relabelling the pool, so a
+    /// fetcher widened for a loopback stub cannot leave a **strict** rung behind it to refuse the
+    /// page's own subresources.
+    #[test]
+    fn widening_admission_rebuilds_the_rungs_on_the_same_policy() {
+        let fetcher = BrowserFetcher::browser_first(pool_root())
+            .expect("the browser shape")
+            .with_admission(Admission::AllowLocal)
+            .expect("the widened shape");
+
+        assert_eq!(fetcher.admission, Admission::AllowLocal);
+        assert_eq!(
+            fetcher.pool().admission(),
+            Admission::AllowLocal,
+            "the pool held the new policy"
+        );
+        assert_eq!(
+            fetcher.pool().ladder().rungs(),
+            vec![RungKind::Interactive],
+            "rebuilding must keep the shape it was built with"
+        );
+
+        let escalating = BrowserFetcher::new(pool_root())
+            .expect("the auto shape")
+            .with_admission(Admission::AllowLocal)
+            .expect("the widened shape");
+        assert_eq!(
+            escalating.pool().ladder().rungs(),
+            vec![RungKind::Http, RungKind::Interactive],
+            "and the other shape's plain rung must survive the rebuild"
+        );
     }
 
     /// The public, host-real selector agrees with the injected one on this host: if Chromium is present
