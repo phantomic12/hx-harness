@@ -178,6 +178,8 @@ impl Fetcher for HttpFetcher {
                         Ok(Some(FetchedPage::new(url, None, body)))
                     }
                 }
+                // The cache aborted an over-cap body mid-stream without assembling it: skip.
+                CacheOutcome::TooLarge => Ok(None),
                 CacheOutcome::Miss304 => Ok(None),
             }
         } else {
@@ -218,8 +220,18 @@ impl Fetcher for HttpFetcher {
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
 
-            let body = match tokio::time::timeout(self.timeout, response.text()).await {
-                Ok(Ok(body)) => body,
+            // The same bounded reader the cache uses: `Content-Length` above is only a fast
+            // path — a missing or dishonest header must not buy an unbounded allocation — so the
+            // body is still consumed chunk by chunk and aborted past the cap before any `String`
+            // is built.
+            let body = match tokio::time::timeout(
+                self.timeout,
+                crate::cache::read_bounded_text(response, self.max_body_bytes),
+            )
+            .await
+            {
+                Ok(Ok(Some(body))) => body,
+                Ok(Ok(None)) => return Ok(None),
                 // Same as above: the body-read error's `Display` echoes the request URL, which can carry a
                 // `?token=`/`key=` credential. Strip the URL so it cannot reach an error the model reads.
                 Ok(Err(err)) => return Err(transport_error(err)),
@@ -233,11 +245,7 @@ impl Fetcher for HttpFetcher {
                 }
             };
 
-            if body.len() > self.max_body_bytes {
-                Ok(None)
-            } else {
-                Ok(Some(FetchedPage::new(url, content_type.as_deref(), body)))
-            }
+            Ok(Some(FetchedPage::new(url, content_type.as_deref(), body)))
         }
     }
 }
@@ -2066,6 +2074,87 @@ mod tests {
             !small_citation.snippet.is_empty(),
             "small page within cap must be extracted normally"
         );
+    }
+
+    #[tokio::test]
+    async fn a_chunked_response_without_content_length_is_bounded_while_streaming() {
+        // No `Content-Length` anywhere: the cap can only hold if the body is measured while it
+        // streams. Over the cap the page is skipped without ever assembling the body; under the
+        // cap the chunks still assemble exactly.
+        let big = ChunkedServer::serve(vec![b'A'; 32 * 1024]).await;
+        let fetcher = HttpFetcher::new(reqwest::Client::new()).with_max_body_bytes(1024);
+
+        let skipped = fetcher.fetch(&big.url()).await.unwrap();
+        assert!(
+            skipped.is_none(),
+            "an over-cap chunked body must be skipped, not cited"
+        );
+
+        let small_body = vec![b'B'; 700];
+        let small = ChunkedServer::serve(small_body).await;
+        let page = fetcher
+            .fetch(&small.url())
+            .await
+            .unwrap()
+            .expect("a within-cap chunked body must be fetched");
+        assert_eq!(page.body.len(), 700);
+        assert!(
+            page.body.bytes().all(|b| b == b'B'),
+            "chunks must assemble exactly across boundaries"
+        );
+    }
+
+    /// A one-shot origin answering `Transfer-Encoding: chunked` with no `Content-Length` — the
+    /// shape whose missing length used to bypass the body cap's early check.
+    struct ChunkedServer {
+        addr: std::net::SocketAddr,
+        _handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl ChunkedServer {
+        async fn serve(body: Vec<u8>) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind free port");
+            let addr = listener.local_addr().expect("local addr");
+            let handle = tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                // Drain the request head so the client never blocks on a full socket buffer.
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while let Ok(n) = socket.read(&mut chunk).await {
+                    if n == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&chunk[..n]);
+                    if buffer.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let mut head =
+                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+                        .to_vec();
+                for piece in body.chunks(1024) {
+                    head.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+                    head.extend_from_slice(piece);
+                    head.extend_from_slice(b"\r\n");
+                }
+                head.extend_from_slice(b"0\r\n\r\n");
+                let _ = socket.write_all(&head).await;
+                let _ = socket.flush().await;
+            });
+            Self {
+                addr,
+                _handle: handle,
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}/stream", self.addr)
+        }
     }
 
     #[tokio::test]
