@@ -190,6 +190,11 @@ impl RemoteSandboxRuntime {
         self
     }
 
+    /// The configured egress-proxy binary path on the far host, if one was set.
+    pub fn proxy_bin(&self) -> Option<&str> {
+        self.proxy_bin.as_deref()
+    }
+
     /// Whether this sandbox needs an egress proxy on the far host: a networked spec with a non-empty,
     /// enforceable allowlist.
     fn egress_active(spec: &SandboxSpec) -> bool {
@@ -765,6 +770,7 @@ mod tests {
             workspace_path: DEFAULT_WORKSPACE_PATH.into(),
             user: None,
             env: vec![("RUST_LOG".into(), "info".into())],
+            runtime: None,
         }
     }
 

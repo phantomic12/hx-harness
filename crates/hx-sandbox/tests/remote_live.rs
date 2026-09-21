@@ -264,6 +264,7 @@ fn spec(workspace_host_path: &str, isolation: IsolationLevel) -> SandboxSpec {
         workspace_path: DEFAULT_WORKSPACE_PATH.to_string(),
         user: None,
         env: Vec::new(),
+        runtime: None,
     };
     spec.validate().expect("the spec must validate");
     spec
