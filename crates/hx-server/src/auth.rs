@@ -92,7 +92,6 @@ fn is_phone_respond_route(path: &str) -> bool {
     )
 }
 
-
 /// Routes that are WebSocket upgrades.
 ///
 /// A browser cannot set an `Authorization` header on a WebSocket handshake, so these routes accept

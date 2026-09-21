@@ -1328,7 +1328,11 @@ async fn post_sessions_opens_a_session_on_an_empty_store() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::CREATED, "a bare POST opens a session");
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "a bare POST opens a session"
+    );
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let created: serde_json::Value = serde_json::from_slice(&bytes).expect("create answers JSON");
     let id = created["id"]

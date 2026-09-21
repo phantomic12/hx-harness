@@ -12,12 +12,12 @@
 //! A valid request is `200` and the pushed message arrives through `WebhookConnector::receive`.
 
 use async_trait::async_trait;
+use hx_agent::{ApprovalQueue, ModelCall};
 use hx_core::error::{HxError, Result};
-use hx_core::ids::{CredentialId, ProviderId};
 use hx_core::ids::ConnectorId;
+use hx_core::ids::{CredentialId, ProviderId};
 use hx_gateway::webhook::WebhookConnector;
 use hx_gateway::Connector;
-use hx_agent::{ApprovalQueue, ModelCall};
 use hx_provider::{ChatRequest, ChatResponse, ModelRouter, ProviderRegistry};
 use hx_search::BackendRegistry;
 use hx_secrets::{EnvSecrets, Secret, SecretStores};
@@ -81,15 +81,20 @@ async fn harness() -> Harness {
     let now = chrono::Utc::now();
     let router = ModelRouter::from_config(&config, now).expect("router builds");
     let client = reqwest::Client::new();
-    let providers = ProviderRegistry::from_config(&config, client.clone()).expect("providers build");
+    let providers =
+        ProviderRegistry::from_config(&config, client.clone()).expect("providers build");
     let secrets = SecretStores::new().with(Arc::new(EnvSecrets));
-    let search = BackendRegistry::from_config(&config.search, client.clone(), &secrets).expect("search");
+    let search =
+        BackendRegistry::from_config(&config.search, client.clone(), &secrets).expect("search");
     let store = Store::from_config(&config).expect("store opens");
 
     // Register one webhook connector: the sender stays in the registry (what the route pushes into),
     // and the receiver becomes the hx-gateway connector we read from — exactly the runtime relationship.
     let mut webhooks = hx_server::webhook::WebhookRegistry::default();
-    let (_, rx) = webhooks.register(&ConnectorId::from("main-web"), hx_core::api_auth::ApiToken::new("supersecret"));
+    let (_, rx) = webhooks.register(
+        &ConnectorId::from("main-web"),
+        hx_core::api_auth::ApiToken::new("supersecret"),
+    );
 
     let state = AppState::from_parts(AppStateParts {
         config,
@@ -109,7 +114,9 @@ async fn harness() -> Harness {
         webhooks,
     });
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
     let app = hx_server::routes::app(Arc::clone(&state));
     tokio::spawn(async move {
@@ -123,7 +130,10 @@ async fn harness() -> Harness {
         rx,
     );
 
-    Harness { addr: addr.to_string(), webhook }
+    Harness {
+        addr: addr.to_string(),
+        webhook,
+    }
 }
 
 #[tokio::test]
@@ -139,7 +149,11 @@ async fn a_valid_post_pushes_an_inbound_message_into_receive() {
 
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 
-    let received = h.webhook.receive(&Secret::new("")).await.expect("a message");
+    let received = h
+        .webhook
+        .receive(&Secret::new(""))
+        .await
+        .expect("a message");
     match received {
         Some(hx_gateway::Inbound::Message { conversation, text }) => {
             assert_eq!(conversation.chat.as_str(), "777");

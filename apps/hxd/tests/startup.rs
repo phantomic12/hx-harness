@@ -343,7 +343,9 @@ async fn an_enabled_update_checker_reports_a_newer_release_from_a_loopback_feed(
             }))
         }),
     );
-    let listener = tokio::net::TcpListener::bind(mock_addr).await.expect("bind mock");
+    let listener = tokio::net::TcpListener::bind(mock_addr)
+        .await
+        .expect("bind mock");
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -351,7 +353,12 @@ async fn an_enabled_update_checker_reports_a_newer_release_from_a_loopback_feed(
     let config_path = write_update_config(temp.path(), &update_url, 1);
 
     let mut cmd = Command::new(HXD);
-    cmd.args(["--config", config_path.to_str().unwrap(), "--bind", "127.0.0.1:0"]);
+    cmd.args([
+        "--config",
+        config_path.to_str().unwrap(),
+        "--bind",
+        "127.0.0.1:0",
+    ]);
     cmd.env_remove("HX_API_TOKEN");
     cmd.env_remove("HX_BIND");
     cmd.env_remove("HX_CONFIG");

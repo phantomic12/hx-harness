@@ -119,17 +119,27 @@ impl WebhookConnector {
         // line, an error message, or — because a failed `ask` denies a run with its reason — a transcript.
         HxError::Connector {
             connector: self.id.to_string(),
-            reason: format!("could not reach the webhook outbound endpoint: {}", err.without_url()),
+            reason: format!(
+                "could not reach the webhook outbound endpoint: {}",
+                err.without_url()
+            ),
         }
     }
 
-    async fn post_outbound(&self, key: &Secret, conversation: &Conversation, text: &str) -> Result<()> {
+    async fn post_outbound(
+        &self,
+        key: &Secret,
+        conversation: &Conversation,
+        text: &str,
+    ) -> Result<()> {
         let Some(url) = self.outbound_url.as_deref() else {
             // Fail closed: a webhook-only channel with no outbound endpoint cannot reply, and dropping the
             // output would be a silent loss. An error is the honest report.
             return Err(HxError::Connector {
                 connector: self.id.to_string(),
-                reason: "no outbound_url is configured, so this webhook channel cannot deliver a reply".into(),
+                reason:
+                    "no outbound_url is configured, so this webhook channel cannot deliver a reply"
+                        .into(),
             });
         };
 
@@ -201,7 +211,8 @@ impl Connector for WebhookConnector {
                 })
             }
         };
-        self.post_outbound(key, conversation, &task.request.render()).await?;
+        self.post_outbound(key, conversation, &task.request.render())
+            .await?;
         // The prompt was posted; the answer arrives later through `receive` (pushed by the platform) and
         // is joined to the waiting run by `crate::bridge`. Returning `NoAnswer` here is the honest report of
         // what this call did — it asked, and nobody has answered yet.

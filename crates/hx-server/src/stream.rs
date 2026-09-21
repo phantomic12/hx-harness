@@ -101,7 +101,14 @@ pub async fn chat_stream(
     // Even if the run errors, the terminal event still arrives; the receiver closing (the run task
     // ended without a reply) is the only way the stream ends without one.
     let stream = stream::unfold(
-        (rx, reply_rx, session_rx, filter, Vec::new(), VecDeque::new()),
+        (
+            rx,
+            reply_rx,
+            session_rx,
+            filter,
+            Vec::new(),
+            VecDeque::new(),
+        ),
         move |(mut rx, mut reply_rx, mut session_rx, mut filter, mut buffered, mut ready)| async move {
             // A reply flush can queue several events at once (buffered own events plus the
             // terminal one); they leave in the order they happened in.
@@ -251,11 +258,7 @@ fn known_or_reply(
 /// Move the buffered events that belong to `id` onto the ready queue, in arrival order, and drop
 /// the rest. The rest are other sessions' events that arrived while the filter was `Pending` —
 /// dropping them is the filter, not data loss.
-fn flush_matching(
-    buffered: &mut Vec<LiveEvent>,
-    ready: &mut VecDeque<Event>,
-    id: &SessionId,
-) {
+fn flush_matching(buffered: &mut Vec<LiveEvent>, ready: &mut VecDeque<Event>, id: &SessionId) {
     for live in buffered.drain(..).filter(|live| live.session == *id) {
         ready.push_back(render_live(&live));
     }

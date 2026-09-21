@@ -98,7 +98,9 @@ impl std::error::Error for FanOutError {}
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum ChildOutcome {
     /// The child completed. `record` names the **member** it ran on and its recorded usage.
-    Ran(ChildRecord),
+    /// Boxed: the record is several strings and vecs wide while the error case is two
+    /// strings, so an inline record would bloat every outcome vector (clippy::large_enum_variant).
+    Ran(Box<ChildRecord>),
     /// The child failed. `member` is the member it was drawn to run on; `error` is the provider
     /// failure that marked it down.
     Errored { member: String, error: String },
@@ -187,7 +189,7 @@ pub async fn run_fan_out(
     let mut children = Vec::with_capacity(wanted);
     for spec in &specs {
         match spawner.run_child(spec, session, "fan-out child").await {
-            Ok(record) => children.push(ChildOutcome::Ran(record)),
+            Ok(record) => children.push(ChildOutcome::Ran(Box::new(record))),
             Err(err) => children.push(ChildOutcome::Errored {
                 member: spec.member_id.clone(),
                 error: spawner.redact_child_error(spec, &err),

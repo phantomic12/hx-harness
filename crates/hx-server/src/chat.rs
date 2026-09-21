@@ -350,11 +350,13 @@ pub async fn run_chat_with_session_notify(
         // GET /v1/approvals sees it and its answer route can reach it); only the wait-for-silence
         // changes to what the request asked for. A non-zero wait is honored per request rather than fixed to
         // the daemon default.
-        _ if request.approval_wait_secs.is_some_and(|w| w > 0) => SessionScopedQueue::new_with_wait(
-            Arc::clone(&state.approvals),
-            session_id.as_str().to_string(),
-            std::time::Duration::from_secs(request.approval_wait_secs.expect("checked > 0")),
-        ),
+        _ if request.approval_wait_secs.is_some_and(|w| w > 0) => {
+            SessionScopedQueue::new_with_wait(
+                Arc::clone(&state.approvals),
+                session_id.as_str().to_string(),
+                std::time::Duration::from_secs(request.approval_wait_secs.expect("checked > 0")),
+            )
+        }
         _ => SessionScopedQueue::new(
             Arc::clone(&state.approvals),
             session_id.as_str().to_string(),
@@ -362,14 +364,13 @@ pub async fn run_chat_with_session_notify(
     };
 
     let ttl = {
-        let mut limits = Limits::default();
         // Start from the configured agent maximum, not the hardcoded default, so changing
         // `agent.max_turns` in hx.yaml takes effect on daemon runs (GH #27). An explicit request
         // value still wins over config.
-        limits.max_turns = state.config.agent.max_turns;
-        if let Some(max_turns) = request.max_turns {
-            limits.max_turns = max_turns;
-        }
+        let mut limits = Limits {
+            max_turns: request.max_turns.unwrap_or(state.config.agent.max_turns),
+            ..Default::default()
+        };
         limits.deadline = Some(std::time::Duration::from_secs(
             request.deadline_secs.unwrap_or(DEFAULT_DEADLINE_SECS),
         ));

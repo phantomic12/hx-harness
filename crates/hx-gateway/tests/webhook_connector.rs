@@ -22,10 +22,7 @@ struct Stub {
     handle: tokio::task::JoinHandle<(String, String)>,
 }
 
-async fn stub(
-    status: u16,
-    body: &str,
-) -> Stub {
+async fn stub(status: u16, body: &str) -> Stub {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let body_owned = body.to_string();
@@ -34,7 +31,10 @@ async fn stub(
         let mut buffer = vec![0u8; 65536];
         let n = socket.read(&mut buffer).await.unwrap();
         let request = String::from_utf8_lossy(&buffer[..n]).to_string();
-        let head_end = request.find("\r\n\r\n").map(|i| i + 4).unwrap_or(request.len());
+        let head_end = request
+            .find("\r\n\r\n")
+            .map(|i| i + 4)
+            .unwrap_or(request.len());
         let body_start = head_end;
         socket
             .write_all(
@@ -50,7 +50,10 @@ async fn stub(
             .await
             .unwrap();
         socket.flush().await.ok();
-        (request[..head_end].to_string(), request[body_start..].to_string())
+        (
+            request[..head_end].to_string(),
+            request[body_start..].to_string(),
+        )
     });
     Stub { addr, handle }
 }
@@ -114,7 +117,15 @@ async fn receive_from_a_closed_channel_is_none_not_an_error() {
     // so `recv` would wait forever and the test would hang rather than fail. Dropping it is what makes
     // "nothing can ever be pushed" true, which is the case under test.
     drop(tx);
-    let received = con.receive(&Secret::new("")).await.unwrap();
+    // A timeout turns a regression (sender kept alive, `recv` pending forever) into a failure
+    // instead of wedging the whole suite behind this test.
+    let received = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        con.receive(&Secret::new("")),
+    )
+    .await
+    .expect("receive on a closed channel resolves instead of hanging")
+    .unwrap();
     assert!(received.is_none());
 }
 
@@ -128,9 +139,13 @@ async fn deliver_posts_to_the_outbound_url() {
     let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let con = webhook_connector(Some(format!("http://{}/reply", stub.addr)), rx);
 
-    con.deliver(&Secret::new("k"), &Target::Conversation(conversation()), "hi")
-        .await
-        .expect("deliver succeeds when outbound_url is set");
+    con.deliver(
+        &Secret::new("k"),
+        &Target::Conversation(conversation()),
+        "hi",
+    )
+    .await
+    .expect("deliver succeeds when outbound_url is set");
 
     let (head, body) = stub.handle.await.unwrap();
     assert!(head.starts_with("POST /reply"), "{head}");
@@ -148,7 +163,11 @@ async fn deliver_fails_closed_when_no_outbound_url_is_configured() {
     let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let con = webhook_connector(None, rx);
     let err = con
-        .deliver(&Secret::new("k"), &Target::Conversation(conversation()), "hi")
+        .deliver(
+            &Secret::new("k"),
+            &Target::Conversation(conversation()),
+            "hi",
+        )
         .await
         .expect_err("a webhook-only channel with no outbound URL must fail closed");
     assert!(err.to_string().contains("outbound_url"), "{err}");
@@ -193,10 +212,17 @@ async fn ask_posts_the_request_and_returns_no_answer() {
     };
 
     let verdict = con
-        .ask(&Secret::new("k"), &Target::Conversation(conversation()), &task)
+        .ask(
+            &Secret::new("k"),
+            &Target::Conversation(conversation()),
+            &task,
+        )
         .await
         .expect("ask succeeds when outbound_url is set");
-    assert!(matches!(verdict, hx_gateway::answer::AnswerVerdict::NoAnswer));
+    assert!(matches!(
+        verdict,
+        hx_gateway::answer::AnswerVerdict::NoAnswer
+    ));
 
     let (_, body) = stub.handle.await.unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();

@@ -20,7 +20,9 @@ use hx_core::ids::{AgentId, CredentialId, ProviderId, ToolCallId};
 use hx_core::message::{Message, Part};
 use hx_provider::{ChatRequest, ChatResponse, FinishReason, Usage};
 use hx_tools::testing::{BrokenHost, FakeHost, FakeSandbox};
-use hx_tools::{ReadFileTool, ShellTool, Tool, ToolContext, ToolError, ToolOutcome, ToolRegistry, WriteFileTool};
+use hx_tools::{
+    ReadFileTool, ShellTool, Tool, ToolContext, ToolError, ToolOutcome, ToolRegistry, WriteFileTool,
+};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -1648,15 +1650,13 @@ async fn an_oversized_write_is_refused_before_anything_lands() {
         agent(),
         model,
         Arc::new(registry),
-        token(vec![
-            Capability::new(
-                Resource::FsPath {
-                    path: "/ws".to_string(),
-                },
-                [Action::Write],
-            )
-            .with_max_bytes(2),
-        ]),
+        token(vec![Capability::new(
+            Resource::FsPath {
+                path: "/ws".to_string(),
+            },
+            [Action::Write],
+        )
+        .with_max_bytes(2)]),
         ApprovalSession::new(ApprovalPolicy::at(AutonomyLevel::Trusting)),
         Arc::new(AlwaysAllow),
     );
@@ -1672,7 +1672,11 @@ async fn an_oversized_write_is_refused_before_anything_lands() {
         "the over-bound write never landed"
     );
     let results = tool_results(&transcript);
-    assert!(results[0].2.contains("over the 2-byte grant bound"), "{}", results[0].2);
+    assert!(
+        results[0].2.contains("over the 2-byte grant bound"),
+        "{}",
+        results[0].2
+    );
 }
 
 #[tokio::test]
@@ -1684,15 +1688,13 @@ async fn a_spent_budget_stops_the_run_before_the_next_model_call() {
         agent(),
         model.clone(),
         Arc::new(tools()),
-        token(vec![
-            Capability::new(
-                Resource::Provider {
-                    id: ProviderId::from("test"),
-                },
-                [Action::Connect],
-            )
-            .with_budget(5.0),
-        ]),
+        token(vec![Capability::new(
+            Resource::Provider {
+                id: ProviderId::from("test"),
+            },
+            [Action::Connect],
+        )
+        .with_budget(5.0)]),
         ApprovalSession::new(ApprovalPolicy::paranoid()),
         Arc::new(AlwaysDeny),
     );
@@ -1717,15 +1719,13 @@ async fn an_unspent_budget_lets_the_run_proceed() {
         agent(),
         model.clone(),
         Arc::new(tools()),
-        token(vec![
-            Capability::new(
-                Resource::Provider {
-                    id: ProviderId::from("test"),
-                },
-                [Action::Connect],
-            )
-            .with_budget(5.0),
-        ]),
+        token(vec![Capability::new(
+            Resource::Provider {
+                id: ProviderId::from("test"),
+            },
+            [Action::Connect],
+        )
+        .with_budget(5.0)]),
         ApprovalSession::new(ApprovalPolicy::paranoid()),
         Arc::new(AlwaysDeny),
     );

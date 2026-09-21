@@ -37,7 +37,7 @@
 //! ([`post_payload`]) so the unit tests here can pin the wire shape without a socket.
 
 use async_trait::async_trait;
-use hx_agent::{Approver, ApprovalDecision};
+use hx_agent::{ApprovalDecision, Approver};
 use hx_core::approval::{ActionRequest, ApprovalOption, ApprovalRequest, RiskClass};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -108,10 +108,7 @@ impl std::fmt::Debug for PushPayload {
             .field("id", &self.id)
             .field("question", &self.question)
             .field("choices", &self.choices)
-            .field(
-                "respond_url",
-                &SanitizedUrl(self.respond_url.as_str()),
-            )
+            .field("respond_url", &SanitizedUrl(self.respond_url.as_str()))
             .finish()
     }
 }
@@ -192,10 +189,7 @@ impl std::fmt::Debug for PhoneApprover {
         f.debug_struct("PhoneApprover")
             .field("push_url", &SanitizedUrl(&self.push_url))
             .field("respond_base", &SanitizedUrl(&self.respond_base))
-            .field(
-                "waiting",
-                &self.waiting.lock().expect("phone").len(),
-            )
+            .field("waiting", &self.waiting.lock().expect("phone").len())
             .finish()
     }
 }
@@ -213,7 +207,10 @@ impl PhoneApprover {
     /// Test-only: seed a waiting approval and return its one-time token, so a route or module test can
     /// drive the respond path without going through a real push. The private fields stay private to the module;
     /// this is the seam tests use instead.
+    // Kept without current callers as the respond-path test seam; `dead_code` would otherwise fail
+    // the `-D warnings` gate on every build until the first caller lands.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn insert_for_test(
         &self,
         id: &str,
@@ -415,7 +412,11 @@ mod tests {
     #[test]
     fn the_token_never_appears_in_a_debug_rendering() {
         let token = RespondToken::new();
-        let payload = PushPayload::for_request("https://daemon", &request("push", RiskClass::External), &token);
+        let payload = PushPayload::for_request(
+            "https://daemon",
+            &request("push", RiskClass::External),
+            &token,
+        );
         let rendered = format!("{payload:?}");
         assert!(
             !rendered.contains(token.as_str()),
@@ -434,7 +435,10 @@ mod tests {
         let payload = PushPayload::for_request("https://daemon", &request, &RespondToken::new());
         assert_eq!(payload.id, "apr_phone_test");
         assert_eq!(payload.question, "git push origin main");
-        assert_eq!(payload.choices, vec!["allow".to_string(), "deny".to_string()]);
+        assert_eq!(
+            payload.choices,
+            vec!["allow".to_string(), "deny".to_string()]
+        );
         assert!(
             payload
                 .respond_url

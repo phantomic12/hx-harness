@@ -59,15 +59,14 @@ pub struct WebhookRegistry {
 impl WebhookRegistry {
     /// Register a connector's push endpoint, handing back the receiver the `hx-gateway` connector is
     /// built from.
-    pub fn register(&mut self, id: &ConnectorId, token: ApiToken) -> (UnboundedSender<Inbound>, UnboundedReceiver<Inbound>) {
+    pub fn register(
+        &mut self,
+        id: &ConnectorId,
+        token: ApiToken,
+    ) -> (UnboundedSender<Inbound>, UnboundedReceiver<Inbound>) {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        self.connectors.insert(
-            id.to_string(),
-            WebhookEntry {
-                sender,
-                token,
-            },
-        );
+        self.connectors
+            .insert(id.to_string(), WebhookEntry { sender, token });
         (self.connectors[&id.to_string()].sender.clone(), receiver)
     }
 
@@ -192,7 +191,9 @@ mod tests {
 
     #[test]
     fn webhook_route_predicate_matches_only_the_webhook_shape() {
-        assert!(crate::auth::is_webhook_route("/v1/connectors/main-web/webhook"));
+        assert!(crate::auth::is_webhook_route(
+            "/v1/connectors/main-web/webhook"
+        ));
         assert!(!crate::auth::is_webhook_route("/v1/connectors/main-web"));
         assert!(!crate::auth::is_webhook_route("/v1/status"));
         assert!(!crate::auth::is_webhook_route("/v1/connectors//webhook"));
