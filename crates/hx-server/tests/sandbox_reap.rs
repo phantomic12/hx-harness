@@ -81,10 +81,7 @@ impl SandboxRuntime for FakeEngine {
     }
 
     async fn remove(&self, runtime_id: &str) -> Result<()> {
-        self.removed
-            .lock()
-            .unwrap()
-            .push(runtime_id.to_string());
+        self.removed.lock().unwrap().push(runtime_id.to_string());
         Ok(())
     }
 
@@ -242,10 +239,8 @@ async fn reaping_with_no_managers_reaps_nothing() {
     // A daemon with no container engine at all (and no remote hosts yet) must not error:
     // remote managers appear lazily, so the reaper runs before any exist.
     let state = state_without_local_sandboxes().await;
-    assert!(
-        state
-            .reap_all_sandboxes(chrono::Utc::now())
-            .await
-            .is_empty()
-    );
+    assert!(state
+        .reap_all_sandboxes(chrono::Utc::now())
+        .await
+        .is_empty());
 }

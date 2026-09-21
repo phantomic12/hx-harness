@@ -158,10 +158,7 @@ fn js_rendered_page(token: &str) -> String {
     // itself rather than indexed by hand, so a token shape change cannot silently drop a piece (an
     // earlier version of this file split the token into four parts and spliced three of them in,
     // which left the page rendering a prefix of the token and the canary failing).
-    let pieces: Vec<String> = token
-        .split('_')
-        .map(|piece| format!("'{piece}'"))
-        .collect();
+    let pieces: Vec<String> = token.split('_').map(|piece| format!("'{piece}'")).collect();
     let array = pieces.join(", ");
 
     format!(
@@ -243,9 +240,8 @@ async fn the_browser_rung_reads_what_a_plain_fetch_cannot() {
 
     // The research task starts from a stub search backend that returns the local page, so both
     // paths below run the pipeline's real fan-out, dedup, extraction and citation steps.
-    let backends: Vec<Arc<dyn SearchBackend>> = vec![Arc::new(SearxngBackend::new(
-        server.base_url(),
-    ))];
+    let backends: Vec<Arc<dyn SearchBackend>> =
+        vec![Arc::new(SearxngBackend::new(server.base_url()))];
 
     // ---------------------------------------------------------------------------------------
     // The real selection path, on this host
@@ -286,7 +282,10 @@ async fn the_browser_rung_reads_what_a_plain_fetch_cannot() {
         "the selector's browser fetcher must refuse a loopback target (admission still runs), but \
          it produced: {refused_snippet}"
     );
-    eprintln!("selection: auto={:?}, browser={:?}", auto.kind, selected.kind);
+    eprintln!(
+        "selection: auto={:?}, browser={:?}",
+        auto.kind, selected.kind
+    );
     eprintln!("the selector's own browser fetcher on a loopback page: refused (admission runs)");
 
     // ---------------------------------------------------------------------------------------

@@ -406,7 +406,13 @@ fn publish_foreign_events(state: &Arc<AppState>, foreign: &SessionId, count: u64
 /// event sent before the subscription is missed by every implementation, fixed or not.
 async fn wait_for_first_session(state: &Arc<AppState>) -> String {
     for _ in 0..250 {
-        if let Some(summary) = state.store.list(10).expect("store lists").into_iter().next() {
+        if let Some(summary) = state
+            .store
+            .list(10)
+            .expect("store lists")
+            .into_iter()
+            .next()
+        {
             return summary.record.id.as_str().to_string();
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -417,7 +423,12 @@ async fn wait_for_first_session(state: &Arc<AppState>) -> String {
 /// Wait until a session's transcript holds a message, proving its run started past creation.
 async fn wait_for_transcript(state: &Arc<AppState>, session: &SessionId) {
     for _ in 0..250 {
-        if !state.store.messages(session).expect("store reads").is_empty() {
+        if !state
+            .store
+            .messages(session)
+            .expect("store reads")
+            .is_empty()
+        {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;

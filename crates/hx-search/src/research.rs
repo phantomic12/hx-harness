@@ -397,8 +397,8 @@ impl BrowserFetcher {
         rung: Arc<dyn hx_browser::rung::Fetcher>,
         admission: Admission,
     ) -> Self {
-        let pool = BrowserPool::new(root.clone(), RungLadder::new(vec![rung]))
-            .with_admission(admission);
+        let pool =
+            BrowserPool::new(root.clone(), RungLadder::new(vec![rung])).with_admission(admission);
         Self {
             root,
             admission,
@@ -414,8 +414,7 @@ impl BrowserFetcher {
         admission: Admission,
         browser_first: bool,
     ) -> Result<Self, std::io::Error> {
-        let root =
-            PoolRoot::new(root).map_err(|err| std::io::Error::other(err.to_string()))?;
+        let root = PoolRoot::new(root).map_err(|err| std::io::Error::other(err.to_string()))?;
         let pool = Self::build_pool(&root, admission, browser_first)?;
         Ok(Self {
             root,
@@ -437,16 +436,18 @@ impl BrowserFetcher {
         admission: Admission,
         browser_first: bool,
     ) -> Result<BrowserPool, std::io::Error> {
-        let chromium = Arc::new(hx_browser::ChromiumRung::with_admission(admission).map_err(|_| {
-            std::io::Error::other("could not build the Chromium rung")
-        })?);
+        let chromium = Arc::new(
+            hx_browser::ChromiumRung::with_admission(admission)
+                .map_err(|_| std::io::Error::other("could not build the Chromium rung"))?,
+        );
 
         let ladder = if browser_first {
             RungLadder::new(vec![chromium])
         } else {
-            let http = Arc::new(hx_browser::HttpRung::with_admission(admission).map_err(|_| {
-                std::io::Error::other("could not build the HTTP rung")
-            })?);
+            let http = Arc::new(
+                hx_browser::HttpRung::with_admission(admission)
+                    .map_err(|_| std::io::Error::other("could not build the HTTP rung"))?,
+            );
             RungLadder::new(vec![http, chromium])
         };
 
@@ -647,9 +648,10 @@ pub(crate) fn select_fetcher_by(
             note: "auto: no browser on this host, degraded to plain fetch (honest default)",
         }),
         FetchMode::Browser if available() => {
-            let fetcher = BrowserFetcher::browser_first(pool_root).map_err(|err| FetchRouteError {
-                reason: format!("could not build the browser fetcher: {err}"),
-            })?;
+            let fetcher =
+                BrowserFetcher::browser_first(pool_root).map_err(|err| FetchRouteError {
+                    reason: format!("could not build the browser fetcher: {err}"),
+                })?;
             Ok(FetchSelection {
                 fetcher: Arc::new(fetcher),
                 kind: SelectedFetcher::Browser,

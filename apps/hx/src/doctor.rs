@@ -323,7 +323,8 @@ const DATA_DIR: &str = "data dir";
 ///
 /// It points at the `config` line rather than repeating the parser's message ten times: the report
 /// is read top to bottom, and a reason duplicated is a reason nobody finishes reading.
-const NO_CONFIG: &str = "the config did not load, so this could not be checked — see the `config` line";
+const NO_CONFIG: &str =
+    "the config did not load, so this could not be checked — see the `config` line";
 
 /// Decide every check from the evidence.
 ///
@@ -332,7 +333,7 @@ const NO_CONFIG: &str = "the config did not load, so this could not be checked �
 /// branch a test can reach by constructing its input.
 pub fn diagnose(facts: &Facts, now: DateTime<Utc>) -> Report {
     let config = facts.config.as_ref().ok();
-    let report = Report {
+    Report {
         checks: vec![
             config_check(facts),
             providers_check(config, &facts.daemon),
@@ -345,8 +346,7 @@ pub fn diagnose(facts: &Facts, now: DateTime<Utc>) -> Report {
             token_check(&facts.bind, facts.bind_source, &facts.token),
             data_dir_check(config, &facts.data_dir),
         ],
-    };
-    report
+    }
 }
 
 /// Does the config file parse?
@@ -459,11 +459,7 @@ fn roles_check(config: Option<&Config>, now: DateTime<Utc>) -> Check {
         .collect();
     Check::pass(
         ROLES,
-        format!(
-            "{} role(s) resolve: {}",
-            bindings.len(),
-            names(&bindings)
-        ),
+        format!("{} role(s) resolve: {}", bindings.len(), names(&bindings)),
     )
 }
 
@@ -1011,7 +1007,11 @@ fn names(items: impl IntoIterator<Item = impl AsRef<str>>) -> String {
 ///
 /// The only part of this module that touches the world. Everything it finds out is turned into a
 /// [`Facts`] so that the decisions stay testable; nothing here interprets what it reads.
-pub async fn gather(config_path: &Path, daemon_override: Option<&str>, bind: Option<&str>) -> Facts {
+pub async fn gather(
+    config_path: &Path,
+    daemon_override: Option<&str>,
+    bind: Option<&str>,
+) -> Facts {
     let config = match std::fs::read_to_string(config_path) {
         Ok(raw) => Config::from_yaml(&raw).map_err(|err| err.to_string()),
         Err(err) => Err(format!("could not be read: {err}")),
@@ -1052,9 +1052,10 @@ pub async fn gather(config_path: &Path, daemon_override: Option<&str>, bind: Opt
 
     Facts {
         config_path: config_path.display().to_string(),
-        data_dir: config.as_ref().map(probe_data_dir).unwrap_or_else(|reason| {
-            Err(format!("{reason}, so the data directory is unknown"))
-        }),
+        data_dir: config
+            .as_ref()
+            .map(probe_data_dir)
+            .unwrap_or_else(|reason| Err(format!("{reason}, so the data directory is unknown"))),
         config,
         daemon: status,
         bind,
@@ -1415,11 +1416,11 @@ providers:
         };
         let (verdict, reason) = diagnose_ok(&facts, "providers");
         assert_eq!(verdict, Verdict::Warn);
-        assert!(reason.contains("this config names 1 provider(s)"), "{reason}");
         assert!(
-            reason.contains("the running daemon reports 4"),
+            reason.contains("this config names 1 provider(s)"),
             "{reason}"
         );
+        assert!(reason.contains("the running daemon reports 4"), "{reason}");
         assert!(
             reason.contains("started with a different config"),
             "the likely cause is named: {reason}"
@@ -1522,8 +1523,14 @@ roles:
         };
         let (verdict, reason) = diagnose_ok(&facts, "pools");
         assert_eq!(verdict, Verdict::Fail);
-        assert!(reason.contains("1 of 1 pool(s) have no live member"), "{reason}");
-        assert!(reason.contains("interactive (all 2 member(s) are out of rotation"), "{reason}");
+        assert!(
+            reason.contains("1 of 1 pool(s) have no live member"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("interactive (all 2 member(s) are out of rotation"),
+            "{reason}"
+        );
         assert!(
             reason.contains("anthropic-main/claude-opus-4-7, anthropic-main/claude-sonnet-4-7"),
             "the dead members are named, not counted: {reason}"
@@ -1554,7 +1561,10 @@ roles:
             reason.contains("no credential is configured for any of the 1 member(s)"),
             "{reason}"
         );
-        assert!(reason.contains("anthropic-main/claude-opus-4-7"), "{reason}");
+        assert!(
+            reason.contains("anthropic-main/claude-opus-4-7"),
+            "{reason}"
+        );
     }
 
     #[test]
@@ -1695,7 +1705,10 @@ roles:
         let facts = with_config(&format!("{HEALTHY}\n  broken: {{ image: \"\" }}\n"));
         let (verdict, reason) = diagnose_ok(&facts, "sandbox profiles");
         assert_eq!(verdict, Verdict::Fail);
-        assert!(reason.contains("1 of 2 profile(s) are unusable"), "{reason}");
+        assert!(
+            reason.contains("1 of 2 profile(s) are unusable"),
+            "{reason}"
+        );
         assert!(reason.contains("broken:"), "{reason}");
         assert!(
             reason.contains("image"),
@@ -1919,9 +1932,18 @@ search:
         };
         let (verdict, reason) = diagnose_ok(&facts, "search backends");
         assert_eq!(verdict, Verdict::Warn);
-        assert!(reason.contains("this config names 2 (duckduckgo, wikipedia)"), "{reason}");
-        assert!(reason.contains("the daemon reports 1 (duckduckgo)"), "{reason}");
-        assert!(reason.contains("started with a different config"), "{reason}");
+        assert!(
+            reason.contains("this config names 2 (duckduckgo, wikipedia)"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("the daemon reports 1 (duckduckgo)"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("started with a different config"),
+            "{reason}"
+        );
     }
 
     #[test]
@@ -2007,7 +2029,10 @@ roles:
         );
         let (verdict, reason) = diagnose_ok(&facts, "secrets");
         assert_eq!(verdict, Verdict::Fail);
-        assert!(reason.contains("2 of 2 reference(s) name a store the daemon does not have"), "{reason}");
+        assert!(
+            reason.contains("2 of 2 reference(s) name a store the daemon does not have"),
+            "{reason}"
+        );
         assert!(
             reason.contains("vault:anthropic/main") && reason.contains("vault:anthropic/backup"),
             "the references are named: {reason}"
@@ -2062,7 +2087,10 @@ roles:
         };
         let (verdict, reason) = diagnose_ok(&facts, "secrets");
         assert_eq!(verdict, Verdict::Warn);
-        assert!(reason.contains("every referenced store is configured (env, vault)"), "{reason}");
+        assert!(
+            reason.contains("every referenced store is configured (env, vault)"),
+            "{reason}"
+        );
         assert!(
             reason.contains("the vault is locked"),
             "a reference that cannot be used yet is not a reference that is wrong: {reason}"
@@ -2191,9 +2219,14 @@ hosts:
         };
         let (verdict, reason) = diagnose_ok(&facts, "api token");
         assert_eq!(verdict, Verdict::Fail);
-        assert!(reason.contains("`api.token` names something this deployment cannot resolve"), "{reason}");
         assert!(
-            reason.contains("refuses to start on this rather than serving an API whose token it cannot check"),
+            reason.contains("`api.token` names something this deployment cannot resolve"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains(
+                "refuses to start on this rather than serving an API whose token it cannot check"
+            ),
             "{reason}"
         );
     }
@@ -2218,7 +2251,10 @@ hosts:
         };
         let (verdict, reason) = diagnose_ok(&facts, "data dir");
         assert_eq!(verdict, Verdict::Fail);
-        assert!(reason.contains("~/.hx is not writable: Permission denied (os error 13)"), "{reason}");
+        assert!(
+            reason.contains("~/.hx is not writable: Permission denied (os error 13)"),
+            "{reason}"
+        );
         assert!(reason.contains("`hx.db` lives there"), "{reason}");
     }
 
@@ -2263,7 +2299,11 @@ search:
 "#,
         );
         let report = diagnose(&facts, Utc::now());
-        assert!(report.warned() > 0, "the fixture warns: {}", report.render(false));
+        assert!(
+            report.warned() > 0,
+            "the fixture warns: {}",
+            report.render(false)
+        );
         assert_eq!(report.failed(), 0);
         assert_eq!(report.exit_code(), 0);
         assert!(
@@ -2298,7 +2338,9 @@ search:
             config: Err("providers: invalid type\n  at line 3 column 5".to_string()),
             ..facts()
         };
-        let audit = check(&diagnose(&facts, Utc::now()), "config").reason.clone();
+        let audit = check(&diagnose(&facts, Utc::now()), "config")
+            .reason
+            .clone();
         assert!(!audit.contains('\n'), "{audit:?}");
         assert!(
             audit.contains("at line 3 column 5"),
@@ -2364,11 +2406,8 @@ search:
     fn the_data_directory_probe_writes_and_removes_its_file() {
         let dir = std::env::temp_dir().join(format!("hx-doctor-probe-ok-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let config = Config::from_yaml(&format!(
-            "daemon:\n  data_dir: \"{}\"\n",
-            dir.display()
-        ))
-        .expect("config parses");
+        let config = Config::from_yaml(&format!("daemon:\n  data_dir: \"{}\"\n", dir.display()))
+            .expect("config parses");
 
         let found = probe_data_dir(&config).expect("a fresh directory is writable");
         assert!(
@@ -2412,10 +2451,8 @@ search:
     fn the_doctor_command_takes_json_and_a_bind_address() {
         use clap::Parser;
 
-        let cli = crate::Cli::try_parse_from([
-            "hx", "doctor", "--json", "--bind", "0.0.0.0:8787",
-        ])
-        .expect("doctor takes --json and --bind");
+        let cli = crate::Cli::try_parse_from(["hx", "doctor", "--json", "--bind", "0.0.0.0:8787"])
+            .expect("doctor takes --json and --bind");
 
         match cli.command {
             crate::Command::Doctor { json, bind } => {

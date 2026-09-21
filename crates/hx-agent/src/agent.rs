@@ -35,8 +35,8 @@ use hx_core::ids::{AgentId, ToolCallId};
 use hx_core::message::{Message, Part};
 use hx_provider::{ToolSpec, Usage};
 use hx_tools::{Requirement, ToolContext, ToolError, ToolRegistry};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -486,8 +486,7 @@ impl AgentLoop {
                 usage,
             );
             if let Decision::Allow = decision {
-                enforced_resource =
-                    Some((requirement.resource.clone(), requirement.action));
+                enforced_resource = Some((requirement.resource.clone(), requirement.action));
 
                 // Phase 2b: the symlink re-check. The lexical check above compares strings; the
                 // host resolves what it would actually open, and the token is asked again about
@@ -513,8 +512,7 @@ impl AgentLoop {
                         if let Decision::Allow = recheck {
                             if canonical != *path {
                                 prepared.set_path(&canonical);
-                                enforced_resource =
-                                    Some((canonical_resource, requirement.action));
+                                enforced_resource = Some((canonical_resource, requirement.action));
                             }
                         } else {
                             return CallOutcome::refused(format!(
@@ -634,9 +632,7 @@ impl AgentLoop {
                         (&byte_gate, outcome.bytes_moved)
                     {
                         let now = chrono::Utc::now();
-                        if let Some(cap) =
-                            self.capability.max_bytes_for(resource, *action, now)
-                        {
+                        if let Some(cap) = self.capability.max_bytes_for(resource, *action, now) {
                             if moved > cap {
                                 let landed = if action.is_mutating() {
                                     " The write already landed; nothing about it is shown."

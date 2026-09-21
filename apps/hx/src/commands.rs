@@ -4,11 +4,10 @@
 //! is to report a security-relevant setting — which is exactly what `hx sandbox spec` does — the
 //! output is part of the interface and belongs under test.
 
-use chrono::Utc;
 use hx_core::approval::RiskClass;
 use hx_core::config::{Config, SandboxProfile};
 use hx_provider::ModelRouter;
-use hx_sandbox::{SandboxRuntime, SandboxSpec};
+use hx_sandbox::SandboxSpec;
 use std::fmt::Write;
 
 /// Render the routing table: pools, their routes, credential health, and role bindings.
@@ -482,6 +481,7 @@ pub fn render_search(report: &hx_search::SearchReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use hx_core::config::Config;
 
     const CONFIG: &str = r#"
