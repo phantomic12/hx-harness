@@ -793,21 +793,17 @@ mod tests {
         child: Option<Box<dyn ChildHandle>>,
         dir: PathBuf,
     ) {
-        rt.state
-            .lock()
-            .expect("firecracker state lock")
-            .vms
-            .insert(
-                runtime_id.to_string(),
-                VmInfo {
-                    child,
-                    cid: CID_FIRST,
-                    dir,
-                    image: PathBuf::from("/tmp/test-workspace.ext4"),
-                    host_workspace: "/tmp/host-work".to_string(),
-                    guest_workspace: "/workspace".to_string(),
-                },
-            );
+        rt.state.lock().expect("firecracker state lock").vms.insert(
+            runtime_id.to_string(),
+            VmInfo {
+                child,
+                cid: CID_FIRST,
+                dir,
+                image: PathBuf::from("/tmp/test-workspace.ext4"),
+                host_workspace: "/tmp/host-work".to_string(),
+                guest_workspace: "/workspace".to_string(),
+            },
+        );
     }
 
     /// A fake owned process with scripted kill/wait outcomes, standing in for the
@@ -852,10 +848,8 @@ mod tests {
     }
 
     fn test_scratch_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "hx-firecracker-r76-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("hx-firecracker-r76-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir
@@ -992,9 +986,7 @@ mod tests {
         // Already stopped (child taken by a previous stop): still tracked, still Ok.
         let dir = test_scratch_dir("stop-idempotent");
         track_test_vm(&rt, "stopped-vm", None, dir.clone());
-        rt.stop("stopped-vm", 10)
-            .await
-            .expect("stopped stop is Ok");
+        rt.stop("stopped-vm", 10).await.expect("stopped stop is Ok");
         assert_eq!(
             rt.vm_cid("stopped-vm"),
             Some(CID_FIRST),

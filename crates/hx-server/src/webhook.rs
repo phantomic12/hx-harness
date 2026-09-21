@@ -540,9 +540,7 @@ connectors:
                     .store
                     .messages(&summary.record.id)
                     .ok()
-                    .filter(|messages| {
-                        messages.iter().any(|m| m.text().contains("list the repo"))
-                    })
+                    .filter(|messages| messages.iter().any(|m| m.text().contains("list the repo")))
                     .map(|_| summary.record.id.clone())
             });
             if drained && found.is_some() {
@@ -577,7 +575,11 @@ connectors:
         // And the bridge left an event trail, not just transcript rows: a late reader sees the
         // message as events too.
         assert!(
-            !state.store.events(&session).expect("bridged events").is_empty(),
+            !state
+                .store
+                .events(&session)
+                .expect("bridged events")
+                .is_empty(),
             "the bridged session recorded events"
         );
     }
@@ -590,17 +592,11 @@ connectors:
         use http_body_util::BodyExt as _;
         for (err, status) in [
             (
-                TrySendError::Full(test_push(
-                    &ConnectorId::from("main-web"),
-                    "dropped",
-                )),
+                TrySendError::Full(test_push(&ConnectorId::from("main-web"), "dropped")),
                 StatusCode::TOO_MANY_REQUESTS,
             ),
             (
-                TrySendError::Closed(test_push(
-                    &ConnectorId::from("main-web"),
-                    "dropped",
-                )),
+                TrySendError::Closed(test_push(&ConnectorId::from("main-web"), "dropped")),
                 StatusCode::CONFLICT,
             ),
         ] {
@@ -618,7 +614,10 @@ connectors:
                 // WHY the three assertions together: `429` (not `200`, not `409`) tells the
                 // platform the event was refused but not dead, `Retry-After`/`retryable` tells it
                 // *when and how* to retry.
-                assert_eq!(retry_after.map(|v| v.to_str().unwrap().to_string()), Some("1".into()));
+                assert_eq!(
+                    retry_after.map(|v| v.to_str().unwrap().to_string()),
+                    Some("1".into())
+                );
                 assert_eq!(json["retryable"], true);
             } else {
                 assert!(retry_after.is_none());

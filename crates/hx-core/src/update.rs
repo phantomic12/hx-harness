@@ -252,7 +252,9 @@ mod tests {
             url: DEFAULT_UPDATE_URL.to_string(),
             interval_secs: 0,
         };
-        let err = cfg.validate().expect_err("enabled + interval 0 must fail validation");
+        let err = cfg
+            .validate()
+            .expect_err("enabled + interval 0 must fail validation");
         assert!(err.contains("interval_secs"), "{err}");
     }
 
@@ -263,7 +265,10 @@ mod tests {
             url: DEFAULT_UPDATE_URL.to_string(),
             interval_secs: 0,
         };
-        assert!(off.validate().is_ok(), "disabled spawns no task, so zero is harmless");
+        assert!(
+            off.validate().is_ok(),
+            "disabled spawns no task, so zero is harmless"
+        );
         let on = UpdateConfig {
             enabled: true,
             url: DEFAULT_UPDATE_URL.to_string(),

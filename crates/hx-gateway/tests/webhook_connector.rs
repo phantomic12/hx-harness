@@ -96,7 +96,8 @@ fn inbound_text() -> Inbound {
 #[tokio::test]
 async fn receive_yields_what_the_route_pushed() {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
-    tx.try_send(inbound_text()).expect("an empty bounded queue takes the push");
+    tx.try_send(inbound_text())
+        .expect("an empty bounded queue takes the push");
     let con = webhook_connector(None, rx);
     let received = con.receive(&Secret::new("")).await.expect("a message");
     match received {

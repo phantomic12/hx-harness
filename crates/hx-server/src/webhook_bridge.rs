@@ -38,8 +38,8 @@ use crate::state::AppState;
 use hx_core::approval::RiskClass;
 use hx_core::event::AgentEvent;
 use hx_core::ids::{AgentId, ConnectorId};
-use hx_gateway::{ApprovalBridge, AnswerOutcome, AnsweringChannel, Inbound};
 use hx_gateway::Connector as _;
+use hx_gateway::{AnswerOutcome, AnsweringChannel, ApprovalBridge, Inbound};
 use std::sync::{Arc, Weak};
 
 /// The strongest risk a webhook channel may authorise. A phone tap is a weaker signal than a
@@ -144,9 +144,7 @@ async fn route_inbound(
             let outcome = bridge.route(connector_id, inbound);
             match outcome {
                 AnswerOutcome::Answered {
-                    approval_id,
-                    by,
-                    ..
+                    approval_id, by, ..
                 } => {
                     tracing::info!(
                         connector = %connector_id,
@@ -174,10 +172,7 @@ async fn route_inbound(
                 }
             }
         }
-        Inbound::Message {
-            conversation,
-            text,
-        } => {
+        Inbound::Message { conversation, text } => {
             route_message(state, store, event_bus, connector_id, &conversation, &text).await;
         }
     }
@@ -197,7 +192,10 @@ async fn route_message(
 ) {
     let scope = conversation.canonical();
     let session = {
-        let mut sessions = state.webhook_sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sessions = state
+            .webhook_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(session) = sessions.get(&scope) {
             session.clone()
         } else {

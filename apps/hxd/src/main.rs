@@ -167,7 +167,9 @@ fn spawn_update_checker(cfg: UpdateConfig, current_version: &str) {
     // is also constructed programmatically, and a zero period would panic the ticker. Never
     // arm a zero-period interval; refuse loudly instead of clamping silently.
     if cfg.interval_secs == 0 {
-        tracing::error!("update checking is enabled with interval_secs: 0; refusing to start the checker");
+        tracing::error!(
+            "update checking is enabled with interval_secs: 0; refusing to start the checker"
+        );
         return;
     }
 

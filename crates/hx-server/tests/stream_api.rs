@@ -609,7 +609,10 @@ async fn a_delayed_new_session_stream_survives_a_flood_of_foreign_events() {
         .as_str()
         .expect("the reply names its session")
         .to_string();
-    assert!(body.contains(&own), "the stream lost its own session: {body:?}");
+    assert!(
+        body.contains(&own),
+        "the stream lost its own session: {body:?}"
+    );
 
     let live_sessions: Vec<String> = events
         .iter()
