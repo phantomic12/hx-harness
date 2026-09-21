@@ -775,6 +775,26 @@ the pool's `AllDown`, with both the dying and the finishing member recorded, no 
 lane whose model rejects a configured parameter is clamped and runs instead of failing at spawn — **met**
 (`build_spec` clamps at spawn).
 
+**Security audit (this milestone).** The spawn/fan-out/re-route path was audited against credential
+leakage and re-route semantics, and three concrete issues were fixed, each with a test that fails before
+and passes after (see `TESTING.md`):
+
+- **A dying provider can echo the very key it was given back in its error body.** `run_child`'s
+  failure reason is written to pool health (`mark_down`) and returned on `ChildRecord::dead_members` — both
+  read by a caller (eventually an HTTP client). The reason now goes through
+  `Spawner::redact_death_reason`, which registers the resolved key as a literal **and** runs the shared
+  `hx_secrets::Redactor`'s pattern pass, so an opaque leaked value and a `?token=`/`sk-` shape are
+  both masked. The fan-out module applies the pattern pass at its own boundary to the `ChildOutcome::Errored`
+  string (it does not hold the resolved secret, only `Spawner` does — an honest boundary documented in the code).
+- **A `ChildRecord`'s `Debug` could print a live key if a field ever carried the resolved value.** It does
+  not: the record names the credential **reference** only. Pinned by a test that fails if the resolved value
+  ever appears in the record's `Debug`.
+- **Non-death failures must not re-route or bench.** `run_lane`'s `member_death` guard already kept
+  `ProviderRejected` and `NoRoute` from re-routing; this audit adds the two remaining deterministic
+  non-death variants (`HxError::Denied`, `HxError::Secret`) as explicitly tested rules, and pins
+  **credential isolation across a re-route**: the member a lane re-draws onto is paid with its own
+  secret, never the dead member's.
+
 ---
 
 ## Open security items
