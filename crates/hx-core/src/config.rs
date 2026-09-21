@@ -664,6 +664,15 @@ pub struct ConnectorConfig {
     /// Allowlist of platform user/chat ids. Empty means deny everyone (fail closed).
     #[serde(default)]
     pub allow_from: Vec<String>,
+    /// Bound on the webhook ingress queue for this connector: how many un-consumed inbound events
+    /// may wait before the route refuses with `429`.
+    ///
+    /// WHY per-connector and optional: a quiet human-feedback channel and a firehose platform do not
+    /// share a burst profile, and an operator who never thinks about queues gets the default rather
+    /// than a misconfigured one. `None` means the webhook default; a value below 1 clamps
+    /// to 1 rather than failing the whole daemon over a typo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_capacity: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

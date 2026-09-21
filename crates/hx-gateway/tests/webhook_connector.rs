@@ -60,7 +60,7 @@ async fn stub(status: u16, body: &str) -> Stub {
 
 fn webhook_connector(
     url: Option<String>,
-    rx: tokio::sync::mpsc::UnboundedReceiver<Inbound>,
+    rx: tokio::sync::mpsc::Receiver<Inbound>,
 ) -> WebhookConnector {
     WebhookConnector::new(
         ConnectorId::from("main-web"),
@@ -95,8 +95,8 @@ fn inbound_text() -> Inbound {
 
 #[tokio::test]
 async fn receive_yields_what_the_route_pushed() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    tx.send(inbound_text()).unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    tx.try_send(inbound_text()).expect("an empty bounded queue takes the push");
     let con = webhook_connector(None, rx);
     let received = con.receive(&Secret::new("")).await.expect("a message");
     match received {
@@ -111,7 +111,7 @@ async fn receive_yields_what_the_route_pushed() {
 
 #[tokio::test]
 async fn receive_from_a_closed_channel_is_none_not_an_error() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Inbound>();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Inbound>(8);
     let con = webhook_connector(None, rx);
     // The sender must be dropped *before* the receive: a live sender means "a push may still come",
     // so `recv` would wait forever and the test would hang rather than fail. Dropping it is what makes
@@ -136,7 +136,7 @@ async fn receive_from_a_closed_channel_is_none_not_an_error() {
 #[tokio::test]
 async fn deliver_posts_to_the_outbound_url() {
     let stub = stub(200, r#"{"ok":true}"#).await;
-    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_tx, rx) = tokio::sync::mpsc::channel(8);
     let con = webhook_connector(Some(format!("http://{}/reply", stub.addr)), rx);
 
     con.deliver(
@@ -160,7 +160,7 @@ async fn deliver_posts_to_the_outbound_url() {
 
 #[tokio::test]
 async fn deliver_fails_closed_when_no_outbound_url_is_configured() {
-    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_tx, rx) = tokio::sync::mpsc::channel(8);
     let con = webhook_connector(None, rx);
     let err = con
         .deliver(
@@ -175,7 +175,7 @@ async fn deliver_fails_closed_when_no_outbound_url_is_configured() {
 
 #[tokio::test]
 async fn deliver_rejects_a_home_target() {
-    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_tx, rx) = tokio::sync::mpsc::channel(8);
     let con = webhook_connector(None, rx);
     let err = con
         .deliver(&Secret::new("k"), &Target::Home, "hi")
@@ -187,7 +187,7 @@ async fn deliver_rejects_a_home_target() {
 #[tokio::test]
 async fn ask_posts_the_request_and_returns_no_answer() {
     let stub = stub(200, r#"{"ok":true}"#).await;
-    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_tx, rx) = tokio::sync::mpsc::channel(8);
     let con = webhook_connector(Some(format!("http://{}/reply", stub.addr)), rx);
 
     let request = hx_core::approval::ApprovalRequest {

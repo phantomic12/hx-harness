@@ -90,11 +90,15 @@ fn outbound_body(conversation: &Conversation, text: &str) -> serde_json::Value {
 /// The receiver is the *only* thing that feeds [`receive`]; the webhook route in `hx-server` holds
 /// the sender end. This connector never talks to the platform to gather input — it is driven entirely by the
 /// route pushing what it parsed.
+///
+/// WHY a bounded channel: the sender lives behind an HTTP route anyone with the token can hit, so an
+/// unbounded queue would let a burst of `POST`s allocate memory without limit. A bounded queue turns
+/// overload into a `429` the platform retries instead of an OOM the operator debugs.
 pub struct WebhookConnector {
     id: ConnectorId,
     outbound_url: Option<String>,
     client: reqwest::Client,
-    rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Inbound>>,
+    rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Inbound>>,
 }
 
 impl WebhookConnector {
@@ -103,7 +107,7 @@ impl WebhookConnector {
         id: ConnectorId,
         outbound_url: Option<String>,
         client: reqwest::Client,
-        rx: tokio::sync::mpsc::UnboundedReceiver<Inbound>,
+        rx: tokio::sync::mpsc::Receiver<Inbound>,
     ) -> Self {
         Self {
             id,
@@ -278,7 +282,7 @@ mod tests {
     fn a_receive_from_a_closed_channel_is_none_not_an_error() {
         // No route is holding the sender: the channel is closed, which means no more pushes can ever arrive.
         // The loop must stop, so that is `None`, not a failure.
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
         drop(tx);
         let con = WebhookConnector::new(
             ConnectorId::from("main-web"),
