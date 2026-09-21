@@ -438,7 +438,9 @@ command with a button, receive a cron digest in a separate pinned thread.
 **Adversarial verification:** `docs/verification-m6.md` attacked six security claims and returned findings
 F1–F8. All eight are now closed on main: F1/F2 (`779c042`), F3/F4 (`56498de`), F5 (`8a49ffc`),
 F6 (`f13b529`), F7 (`80222ac`) and F8 (`2db46ca`, documented, deliberately unchanged). See that
-report's addendum for the per-finding status and commits.
+report's addendum for the per-finding status and commits. The report's source branch `feat/verify-m6`
+carries nothing `main` lacks — its copy of the file is `main`'s minus the addendum — and its eight
+throwaway `tmp_*.rs` probes are gone; see *Worktree hygiene*.
 
 - ✅ `rmcp` host: consume stdio and streamable-HTTP MCP servers, per-server tool namespacing,
   health checks and restarts. Landed with a hand-rolled MCP server as the double — real
@@ -920,6 +922,26 @@ branches with `git branch -d` only — if git refuses, the branch is left alone 
 `--skip-recent HOURS` additionally skips worktrees modified within the window, so lanes with
 agents still working are not pulled out from under them. First real run (2026-09-21) removed
 34 merged worktrees/branches and freed ~96 GiB (366→270 GiB used on `/home`).
+
+**Stale-branch triage (2026-09-21).** `feat/verify-m6`, `phase/polish` and `phase/remote-egress` were
+judged by their merge base, not by `git diff main..branch`. All three are already on `main` in full, so
+nothing was landed and no gate was needed for them:
+
+- `feat/verify-m6` — its one commit (`f2f1ca5`) adds `docs/verification-m6.md`; `main` has that file
+  (blob `14c4fdd`) as a 26-line **superset** (the per-finding addendum), merged at `a812670`. The
+  branch's eight untracked `tmp_*.rs` probes were discarded by the lane that landed the report
+  (`a9ef1d7`, whose message says so) and are no longer on disk anywhere; its worktree is clean.
+- `phase/polish` — three commits, all landed as PR #23 (`7389560`, first parent of the squash):
+  `git diff d735c99..phase/polish` and `git diff 7389560^1..7389560` share patch-id `807fb2b6`.
+- `phase/remote-egress` — three commits, all landed as PR #21 (`1ae5d80`):
+  `git diff 7389560..phase/remote-egress` and `git diff 1ae5d80^1..1ae5d80` share patch-id `0ffda538`.
+
+Nothing from these branches is deliberately unmerged — they are dead duplicates, and their content is
+superseded where `main` moved on afterwards (e.g. `m4-egress-cidr` on top of PR #21). One trap: because
+all three were squash-merged, **none is an ancestor of `main`**, so `prune-merged-worktrees.sh`'s
+ancestry test classifies them as unmerged and will never reclaim them; and each branch is checked out in
+its own worktree, so `git branch -d` cannot remove it while that worktree exists. Removing the three
+worktrees is the prerequisite for deleting the branches.
 
 ## Deliberately deferred
 
