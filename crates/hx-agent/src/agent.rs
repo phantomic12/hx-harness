@@ -277,6 +277,7 @@ impl AgentLoop {
                         final_text: last_assistant_text(transcript),
                         tool_calls,
                         refusals,
+                        dropped_events: self.dropped.load(Ordering::SeqCst),
                     });
                 }
             }
