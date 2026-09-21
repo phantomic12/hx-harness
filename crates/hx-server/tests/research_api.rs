@@ -144,11 +144,7 @@ impl PageServer {
                         _ => return,
                     };
                     let request = String::from_utf8_lossy(&head[..n]).to_string();
-                    let path = request
-                        .split_whitespace()
-                        .nth(1)
-                        .unwrap_or("/")
-                        .to_string();
+                    let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
 
                     // An unknown path is a 404 with an empty body, so a test that mistyped a URL
                     // gets an empty citation and a red assertion rather than a silently served
@@ -248,7 +244,10 @@ async fn harness(search: Arc<BackendRegistry>) -> Arc<AppState> {
             Arc::new(hx_provider::ProviderRegistry::new()),
             Arc::new(hx_secrets::SecretStores::new()),
         )),
-        tools: Arc::new(hx_server::chat::default_tools(vec![], reqwest::Client::new())),
+        tools: Arc::new(hx_server::chat::default_tools(
+            vec![],
+            reqwest::Client::new(),
+        )),
         approvals: hx_agent::ApprovalQueue::new(std::time::Duration::from_secs(1)),
         search,
         config,
@@ -300,38 +299,46 @@ async fn post(state: Arc<AppState>, body: &str) -> (StatusCode, serde_json::Valu
 async fn a_research_request_over_http_returns_citations_and_names_the_fetcher() {
     let pages = PageServer::serve(vec![
         ("/alpha", article("Alpha Article", SENTINEL)),
-        (
-            "/beta",
-            article("Beta Article", "SENTINEL-BETA"),
-        ),
+        ("/beta", article("Beta Article", "SENTINEL-BETA")),
     ])
     .await;
 
     let answering = ScriptedBackend::answering(
         "answering",
         vec![
-            SearchResult::new("Alpha from the backend", pages.url("/alpha"), "backend snippet")
-                .with_rank(0),
-            SearchResult::new("Beta from the backend", pages.url("/beta"), "backend snippet")
-                .with_rank(1),
+            SearchResult::new(
+                "Alpha from the backend",
+                pages.url("/alpha"),
+                "backend snippet",
+            )
+            .with_rank(0),
+            SearchResult::new(
+                "Beta from the backend",
+                pages.url("/beta"),
+                "backend snippet",
+            )
+            .with_rank(1),
         ],
     );
     let failing = ScriptedBackend::failing("failing", SearchError::Http { status: 503 });
 
-    let state = harness(registry_of(vec![
-        answering.clone(),
-        failing.clone(),
-    ]))
-    .await;
+    let state = harness(registry_of(vec![answering.clone(), failing.clone()])).await;
 
     let (status, body) = post(
         state,
         r#"{"query": "rust ownership", "fetch_mode": "http"}"#,
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "a research request must succeed: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a research request must succeed: {body}"
+    );
 
-    assert_eq!(body["query"], "rust ownership", "the query is echoed: {body}");
+    assert_eq!(
+        body["query"], "rust ownership",
+        "the query is echoed: {body}"
+    );
     assert_eq!(
         body["fetcher"], "http",
         "an explicit http mode must be served by the plain fetcher: {body}"
@@ -342,11 +349,18 @@ async fn a_research_request_over_http_returns_citations_and_names_the_fetcher() 
             .is_some_and(|note| !note.contains("browser")),
         "the http path must not claim any browser involvement: {body}"
     );
-    assert_eq!(body["paid_calls"], 0, "keyless research makes no paid calls: {body}");
+    assert_eq!(
+        body["paid_calls"], 0,
+        "keyless research makes no paid calls: {body}"
+    );
 
     // Both backends were reached and both outcomes are reported — one failure does not sink the
     // report, and it is named rather than dropped.
-    assert_eq!(answering.calls(), 1, "the answering backend was queried once");
+    assert_eq!(
+        answering.calls(),
+        1,
+        "the answering backend was queried once"
+    );
     assert_eq!(failing.calls(), 1, "the failing backend was queried once");
     let backends = body["backends"].as_array().expect("backends is a list");
     assert_eq!(backends.len(), 2, "one outcome per backend: {body}");
@@ -370,19 +384,11 @@ async fn a_research_request_over_http_returns_citations_and_names_the_fetcher() 
     // The citations came from the real pages the loopback server sent, extracted by the ladder the
     // route's own fetch path runs.
     let sources = body["sources"].as_array().expect("sources is a list");
-    assert_eq!(
-        sources.len(),
-        2,
-        "both searched URLs must be cited: {body}"
-    );
+    assert_eq!(sources.len(), 2, "both searched URLs must be cited: {body}");
 
     let alpha = sources
         .iter()
-        .find(|s| {
-            s["url"]
-                .as_str()
-                .is_some_and(|url| url.ends_with("/alpha"))
-        })
+        .find(|s| s["url"].as_str().is_some_and(|url| url.ends_with("/alpha")))
         .expect("the alpha page is cited");
     assert_eq!(
         alpha["title"], "Alpha Article",
@@ -394,16 +400,17 @@ async fn a_research_request_over_http_returns_citations_and_names_the_fetcher() 
             .is_some_and(|snippet| snippet.contains(SENTINEL)),
         "the snippet must carry the bytes the page server sent: {alpha}"
     );
-    let snippet_len = alpha["snippet"].as_str().map(str::chars).map(Iterator::count).unwrap_or(0);
+    let snippet_len = alpha["snippet"]
+        .as_str()
+        .map(str::chars)
+        .map(Iterator::count)
+        .unwrap_or(0);
     assert!(
         snippet_len <= hx_search::DEFAULT_SNIPPET_MAX_CHARS + 1,
         "the snippet cap must bite over HTTP too ({snippet_len} chars): {alpha}"
     );
     assert!(
-        matches!(
-            alpha["rung"].as_str(),
-            Some("plain") | Some("readability")
-        ),
+        matches!(alpha["rung"].as_str(), Some("plain") | Some("readability")),
         "the citation names the rung that produced it: {alpha}"
     );
 
@@ -411,11 +418,7 @@ async fn a_research_request_over_http_returns_citations_and_names_the_fetcher() 
     // pipeline followed every URL it cited rather than only the first.
     let beta = sources
         .iter()
-        .find(|s| {
-            s["url"]
-                .as_str()
-                .is_some_and(|url| url.ends_with("/beta"))
-        })
+        .find(|s| s["url"].as_str().is_some_and(|url| url.ends_with("/beta")))
         .expect("the beta page is cited");
     assert_eq!(beta["title"], "Beta Article", "{beta}");
     assert!(

@@ -2356,8 +2356,9 @@ search:
         // be conflict (retrying is pointless, nothing is broken) and the message must name the
         // missing rung rather than say "error".
         let err = FetchRouteError {
-            reason: "browser mode requested but no Chromium is installed at /usr/lib/chromium/chromium"
-                .to_string(),
+            reason:
+                "browser mode requested but no Chromium is installed at /usr/lib/chromium/chromium"
+                    .to_string(),
         };
         let api = research_route_error(err);
         assert_eq!(api.status, StatusCode::CONFLICT);
@@ -2378,7 +2379,10 @@ search:
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(body["error"].as_str().unwrap_or("").contains("query"), "{body}");
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("query"),
+            "{body}"
+        );
     }
 
     #[tokio::test]
@@ -2406,7 +2410,9 @@ search:
                     .method("POST")
                     .uri("/v1/research")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"query": "rust", "fetch_mode": "telepathy"}"#))
+                    .body(Body::from(
+                        r#"{"query": "rust", "fetch_mode": "telepathy"}"#,
+                    ))
                     .unwrap(),
             )
             .await
