@@ -14,13 +14,17 @@
 //!
 //! ## The allowlist
 //!
-//! `HX_EGRESS_ALLOW` is a comma-separated list of `hostname` or `*.domain` entries,
-//! e.g. `crates.io,*.crates.io`. Matching is deliberately simple: an entry with a leading
-//! `*.` matches any host whose name ends with that domain; any other entry matches a host exactly.
-//! Nothing else is accepted, because nothing else can be enforced *here*. A CIDR cannot be matched
-//! against an unresolved CONNECT target, so an allowlist entry that is not a hostname or `*.domain`
-//! is refused by [`crate::spec::SandboxSpec::validate`] before a sandbox is ever created —
-//! this proxy never sees it.
+//! `HX_EGRESS_ALLOW` is a comma-separated list of entries, each one a **hostname** or
+//! `*.domain` globe (e.g. `crates.io,*.crates.io`), a **raw IP** (`1.2.3.4`), or a
+//! **CIDR** (`1.2.3.0/24`). A name is matched by name: an entry with a leading `*.` matches
+//! any host whose name ends with that domain; any other entry matches a host exactly. An IP or CIDR
+//! is matched by *address*: the `CONNECT` target is resolved to an `IpAddr` first, then
+//! tested against the entry. Only a target that matches a name entry *or* falls inside an IP/CIDR
+//! entry is dialed.
+//!
+//! The ambiguous `inet_aton` family (`0x01010101`, `127.1`, `2130706433`) is refused everywhere:
+//! it is neither a canonical IP nor a real name, and the resolver would dial it as an address the
+//! operator never named.
 //!
 //! Only the HTTP `CONNECT` method is meaningful for egress (HTTPS is how package registries,
 //! git hosts and APIs are reached). Plain HTTP proxy requests are refused: an allowlisted proxy that
@@ -49,7 +53,7 @@
 
 use std::env;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::thread;
 
 const LISTEN_ADDR: &str = "0.0.0.0:3128";
@@ -62,9 +66,9 @@ hand. It listens on the internal network and forwards only CONNECT requests to
 destinations named in its allowlist.
 
 Environment:
-  HX_EGRESS_ALLOW   comma-separated `host` or `*.domain` entries, e.g.
-                    `crates.io,*.crates.io`. Absent or empty means nothing is
-                    allowed, which is the fail-closed default.
+  HX_EGRESS_ALLOW   comma-separated entries, each a `host`, `*.domain`, a raw IP,
+                    or a CIDR (e.g. `crates.io,*.crates.io,10.0.0.0/8`).
+                    Absent or empty means nothing is allowed, which is the fail-closed default.
 
 Options:
   -h, --help        print this and exit
@@ -120,29 +124,130 @@ fn main() {
     }
 }
 
-/// Parse `host,*.domain` into a matcher. An unrecognised shape is dropped rather than trusted:
-/// if it cannot be enforced, pretending it can is how the allowlist becomes a fiction.
-fn parse_allowlist(raw: String) -> Vec<String> {
-    raw.split(',')
-        .map(|s| s.trim().trim_end_matches('.').to_ascii_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect()
+/// One allowlist entry the proxy can enforce: a name, a raw IP, or a CIDR.
+///
+/// **A deliberate copy of `hx_sandbox::egress::policy::EgressRule`.** This binary is compiled
+/// with `std` alone and must stay that way (see the module doc); the two are kept in step by
+/// carrying the *same test table* on both sides, which is the accepted answer here rather than
+/// linking the library in. A CIDR is stored as its network plus a prefix and matched by address; an IP
+/// is matched exactly; a name by hostname.
+#[derive(Clone, Debug)]
+enum ProxyRule {
+    /// A hostname, exact (`crates.io`) or `*.domain` globe (`*.crates.io`).
+    Name(String),
+    /// A single canonical address.
+    Ip(IpAddr),
+    /// An address plus a prefix length.
+    Cidr { network: IpAddr, prefix: u8 },
 }
 
-/// A host is allowed when it equals an entry, or when an entry `*.domain` matches its suffix.
-fn allowed(host: &str, allow: &[String]) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    allow.iter().any(|entry| {
-        if let Some(domain) = entry.strip_prefix("*.") {
-            // `*.example.com` matches `a.example.com` but not the bare apex `example.com` —
-            // an entry that name the apex explicitly is the honest way to allow it.
-            host != domain
-                && host.ends_with(domain)
-                && host.as_bytes()[host.len() - domain.len() - 1] == b'.'
-        } else {
-            host == *entry
+impl ProxyRule {
+    /// Parse one entry. `None` for a shape this proxy cannot enforce — the ambiguous `inet_aton`
+    /// family, a `host:port`, an empty string.
+    fn parse(entry: &str) -> Option<ProxyRule> {
+        let entry = entry.trim().trim_end_matches('.');
+        if entry.is_empty() {
+            return None;
         }
+        if let Some((net, prefix)) = entry.split_once('/') {
+            let (address, prefix) = (net.parse::<IpAddr>().ok()?, prefix.parse().ok()?);
+            let max = if matches!(address, IpAddr::V4(_)) {
+                32
+            } else {
+                128
+            };
+            if prefix > max {
+                return None;
+            }
+            return Some(ProxyRule::Cidr {
+                network: address,
+                prefix,
+            });
+        }
+        match entry.parse::<IpAddr>() {
+            Ok(ip) => Some(ProxyRule::Ip(ip)),
+            Err(_) => Some(ProxyRule::Name(
+                entry.trim_end_matches('.').to_ascii_lowercase(),
+            )),
+        }
+    }
+
+    /// Whether this rule admits `ip`. A `Name` rule never admits an address by IP.
+    fn allows(&self, ip: IpAddr) -> bool {
+        match self {
+            ProxyRule::Ip(allowed) => *allowed == ip,
+            ProxyRule::Cidr { network, prefix } => match (ip, *network) {
+                (IpAddr::V4(a), IpAddr::V4(n)) => {
+                    let mask = if *prefix == 0 {
+                        0
+                    } else {
+                        u32::MAX << (32 - prefix)
+                    };
+                    (u32::from(a) & mask) == (u32::from(n) & mask)
+                }
+                (IpAddr::V6(a), IpAddr::V6(n)) => {
+                    let (a, n) = (u128::from(a), u128::from(n));
+                    let mask = if *prefix == 0 {
+                        0
+                    } else {
+                        u128::MAX << (128 - prefix)
+                    };
+                    (a & mask) == (n & mask)
+                }
+                _ => false,
+            },
+            ProxyRule::Name(_) => false,
+        }
+    }
+}
+
+/// Parse `host,*.domain,1.2.3.4,1.2.3.0/24` into matchers. An unrecognised shape is
+/// dropped rather than trusted: if it cannot be enforced, pretending it can is how the allowlist
+/// becomes a fiction.
+fn parse_allowlist(raw: String) -> Vec<ProxyRule> {
+    raw.split(',').filter_map(ProxyRule::parse).collect()
+}
+
+/// A host name is allowed when it equals a `Name` entry, or when a `*.domain` entry matches its
+/// suffix. IP/CIDR rules are *not* consulted here — they are address rules and are checked against
+/// the resolved address instead ([`allowed_address`]).
+fn allowed_name(host: &str, allow: &[ProxyRule]) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    allow.iter().any(|rule| match rule {
+        ProxyRule::Name(entry) => {
+            if let Some(domain) = entry.strip_prefix("*.") {
+                // `*.example.com` matches `a.example.com` but not the bare apex `example.com` —
+                // an entry that names the apex explicitly is the honest way to allow it.
+                host != domain
+                    && host.ends_with(domain)
+                    && host.as_bytes()[host.len() - domain.len() - 1] == b'.'
+            } else {
+                host == *entry
+            }
+        }
+        _ => false,
     })
+}
+
+/// An address is allowed when it falls inside an `Ip` or `Cidr` rule. Name rules are *not*
+/// consulted here (they are matched by name, not by a resolved IP, which can change between the check
+/// and the dial).
+fn allowed_address(ip: IpAddr, allow: &[ProxyRule]) -> bool {
+    allow.iter().any(|rule| rule.allows(ip))
+}
+
+/// Resolve a hostname to all its addresses for allowlist matching.
+///
+/// `TcpStream::connect` will later pick among these same addresses (via `getaddrinfo`), so checking
+/// the resolved set against the address rules matches what the dial can actually reach. An empty set means
+/// the name does not resolve here; the dial below will fail with a `502`, so a name that cannot be
+/// resolved is never a *bypass* — it is just denied at dial time.
+fn resolve(host: &str) -> Vec<IpAddr> {
+    use std::net::ToSocketAddrs;
+    (host, 0)
+        .to_socket_addrs()
+        .map(|addrs| addrs.map(|a| a.ip()).collect())
+        .unwrap_or_default()
 }
 
 /// Whether a `CONNECT` target is address-shaped in the `inet_aton` grammar rather than a name.
@@ -176,7 +281,7 @@ fn is_inet_aton_number(part: &str) -> bool {
     }
 }
 
-fn handle(mut client: TcpStream, allow: &[String]) {
+fn handle(mut client: TcpStream, allow: &[ProxyRule]) {
     let mut buf = [0u8; 4096];
     let read = match client.read(&mut buf) {
         Ok(n) if n > 0 => n,
@@ -214,24 +319,40 @@ fn handle(mut client: TcpStream, allow: &[String]) {
         return;
     }
 
-    if !allowed(host, allow) {
-        eprintln!("egress DENIED {host}:{port}");
-        // A clear, immediate refusal: the sandbox must observe the failure as a *denial*, not a
-        // hang, or a tool will retry into a black hole and the operator will never see why.
-        let _ = write_status(&mut client, 403, "Forbidden");
-        return;
-    }
-
-    // Defence in depth, and it is the difference between a refusal and a live connection. The
-    // validator refuses an address-shaped allowlist entry, but this proxy does not trust that: an
-    // entry that matched here (`0x01010101` matched `0x01010101` exactly) must still not be *dialed*,
-    // because the resolver would read it as 1.1.1.1. Measured before this guard existed: the proxy
-    // answered `200 Connection established` and opened a real connection to 1.1.1.1. The refusal is
-    // the same 403 the allowlist itself produces — the sandbox sees a denial, never a tunnel.
-    if is_address_shaped(host) {
-        eprintln!("egress DENIED {host}:{port} (address-shaped destination; not a name to dial)");
-        let _ = write_status(&mut client, 403, "Forbidden");
-        return;
+    // Decide whether this host may be dialed, and how the allowlist is consulted. The two match
+    // dimensions correspond to the two rule kinds: a *canonical address* is tested against the `Ip`
+    // and `Cidr` rules; a *name* is tested against the `Name` rules by name and, if that fails,
+    // against the `Ip`/`Cidr` rules by its resolved addresses (an allowlist of `10.0.0.0/8`
+    // must admit a `CONNECT` to a name that resolves into that block).
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        // A canonical address (`1.2.3.4`, `::1`) — unambiguous, so safe to reason about by
+        // address alone. Name rules never apply to an address.
+        if !allowed_address(ip, allow) {
+            eprintln!("egress DENIED {host}:{port}");
+            let _ = write_status(&mut client, 403, "Forbidden");
+            return;
+        }
+    } else {
+        // A name — but only a *real* name. The `inet_aton` family (`0x01010101`, `127.1`,
+        // `2130706433`) is neither a canonical IP (so it falls through the parse above) nor a name,
+        // and the resolver would dial it as an address; refuse it. Measured before this guard existed:
+        // the proxy answered `200 Connection established` and opened a real connection to 1.1.1.1.
+        if is_address_shaped(host) {
+            eprintln!(
+                "egress DENIED {host}:{port} (address-shaped destination; not a name to dial)"
+            );
+            let _ = write_status(&mut client, 403, "Forbidden");
+            return;
+        }
+        let allowed =
+            allowed_name(host, allow) || resolve(host).iter().any(|&ip| allowed_address(ip, allow));
+        if !allowed {
+            eprintln!("egress DENIED {host}:{port}");
+            // A clear, immediate refusal: the sandbox must observe the failure as a *denial*, not a
+            // hang, or a tool will retry into a black hole and the operator will never see why.
+            let _ = write_status(&mut client, 403, "Forbidden");
+            return;
+        }
     }
 
     eprintln!("egress ALLOWED {host}:{port}");
@@ -300,50 +421,73 @@ mod tests {
     fn the_domain_globe_matches_subdomains_but_not_the_apex() {
         // `*.crates.io` must admit `static.crates.io` and refuse the bare `crates.io` itself —
         // that apex is a separate destination and needs its own entry to be allowed.
-        let allow = vec!["*.crates.io".to_string(), "github.com".to_string()];
-        assert!(allowed("static.crates.io", &allow));
-        assert!(allowed("index.crates.io", &allow));
+        let allow = parse_allowlist("*.crates.io,github.com".to_string());
+        assert!(allowed_name("static.crates.io", &allow));
+        assert!(allowed_name("index.crates.io", &allow));
         assert!(
-            !allowed("crates.io", &allow),
+            !allowed_name("crates.io", &allow),
             "apex must not be swept in by the globe"
         );
         assert!(
-            !allowed("evilcrates.io", &allow),
+            !allowed_name("evilcrates.io", &allow),
             "suffix must not match a lookalike"
         );
-        assert!(allowed("github.com", &allow));
-        assert!(!allowed("gitlab.com", &allow));
+        assert!(allowed_name("github.com", &allow));
+        assert!(!allowed_name("gitlab.com", &allow));
     }
 
     #[test]
     fn an_exact_entry_matches_only_itself_case_insensitively() {
-        let allow = vec!["github.com".to_string()];
-        assert!(allowed("github.com", &allow));
-        assert!(allowed("GITHUB.COM", &allow));
-        assert!(!allowed("api.github.com", &allow));
+        let allow = parse_allowlist("github.com".to_string());
+        assert!(allowed_name("github.com", &allow));
+        assert!(allowed_name("GITHUB.COM", &allow));
+        assert!(!allowed_name("api.github.com", &allow));
     }
 
     #[test]
     fn a_trailing_dot_is_ignored_when_matching() {
-        let allow = vec!["example.com".to_string()];
-        assert!(allowed("example.com.", &allow));
-        assert!(!allowed("other.com.", &allow));
+        let allow = parse_allowlist("example.com".to_string());
+        assert!(allowed_name("example.com.", &allow));
+        assert!(!allowed_name("other.com.", &allow));
     }
 
     #[test]
-    fn unsupported_entry_shapes_match_nothing_and_never_allow_a_bypass() {
-        // A CIDR like `10.0.0.0/8` cannot be matched against an unresolved CONNECT target,
-        // so if one slips through it must be *inert* — it can never admit a connection, only fail
-        // to admit one. The validator rejects such shapes earlier, but the proxy must not trust them
-        // even if it somehow sees one (paranoia is the default in this file).
-        let allow = parse_allowlist("crates.io,10.0.0.0/8,*.example.com".to_string());
-        assert!(allowed("crates.io", &allow));
-        assert!(allowed("api.example.com", &allow));
-        assert!(
-            !allowed("10.0.0.5", &allow),
-            "a CIDR entry must admit nothing"
-        );
-        assert!(!allowed("crates.io.evil.com", &allow));
+    fn a_cidr_entry_allows_by_address_inside_and_blocks_outside() {
+        // A CIDR entry is enforced by address, so the Ip/Cidr rules are consulted against the
+        // resolved address of the target. Here we pin the address-side matching directly.
+        let allow = parse_allowlist("127.0.0.0/8,10.0.0.0/8,*.example.com".to_string());
+        assert!(allowed_name("api.example.com", &allow)); // the name globe still works alongside CIDRs
+        assert!(allowed_address("127.0.0.1".parse().unwrap(), &allow));
+        assert!(allowed_address("10.1.2.3".parse().unwrap(), &allow));
+        assert!(!allowed_address("11.0.0.1".parse().unwrap(), &allow));
+    }
+
+    #[test]
+    fn a_raw_ip_entry_allows_exactly_that_address() {
+        let allow = parse_allowlist("127.0.0.1".to_string());
+        assert!(allowed_address("127.0.0.1".parse().unwrap(), &allow));
+        assert!(!allowed_address("127.0.0.2".parse().unwrap(), &allow));
+    }
+
+    #[test]
+    fn a_name_entry_is_not_an_address_rule() {
+        // A name rule is matched by name, never by its resolved IP (which can change between the
+        // check and the dial), so it must never admit an address directly.
+        let allow = parse_allowlist("example.com".to_string());
+        assert!(allowed_name("example.com", &allow));
+        assert!(!allowed_address("93.184.216.34".parse().unwrap(), &allow));
+    }
+
+    #[test]
+    fn the_inet_aton_family_parses_to_rules_that_admit_nothing_by_address() {
+        // These are neither canonical IPs nor names, so if a hand-written HX_EGRESS_ALLOW feeds
+        // them to this proxy they must never admit an address. They sit stored as `Name` rules that
+        // equal themselves, but the `handle` path refuses an address-shaped *destination* (is_address_shaped)
+        // before it is ever matched or dialed — the dial-guard test proves that end to end. Here we
+        // pin the address side: none of them may admit any real address.
+        let allow = parse_allowlist("0x01010101,127.1,2130706433,0177.0.0.1".to_string());
+        assert!(!allowed_address("1.1.1.1".parse().unwrap(), &allow));
+        assert!(!allowed_address("127.0.0.1".parse().unwrap(), &allow));
     }
 
     // ---- the dial guard: real loopback sockets, no copy of the predicate ----
@@ -361,6 +505,7 @@ mod tests {
             .expect("the test listener has an address")
             .port();
         thread::spawn(move || {
+            let allow = parse_allowlist(allow.join(","));
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
                 let allow = allow.clone();
@@ -419,12 +564,12 @@ mod tests {
             "2130706433",
             "0177.0.0.1",
         ] {
-            let allow = vec![smuggled.to_string()];
+            let allow = parse_allowlist(smuggled.to_string());
             assert!(
-                allowed(smuggled, &allow),
-                "{smuggled} must match its own allowlist entry, or this test proves nothing"
+                allowed_name(smuggled, &allow),
+                "{smuggled} must match its own (name) allowlist entry, or this test proves nothing"
             );
-            let proxy = proxy_on_a_loopback_port(allow);
+            let proxy = proxy_on_a_loopback_port(vec![smuggled.to_string()]);
             let status = connect_through(proxy, &format!("{smuggled}:443"));
             assert!(
                 status.contains("403"),
@@ -435,6 +580,42 @@ mod tests {
                 "{smuggled} must never be tunneled: {status:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_proxy_dials_a_cidr_entry_that_contains_the_resolved_address() {
+        // The end-to-end proof that a CIDR entry really tunnels: allow `127.0.0.0/8` and
+        // CONNECT to `localhost` (which resolves to 127.0.0.1, inside the block). The proxy
+        // must resolve the name, match it against the CIDR by address, and answer 200 — not refuse
+        // it because there is no matching hostname, and not claim a false denial.
+        let upstream = TcpListener::bind("127.0.0.1:0").expect("bind a loopback upstream");
+        let upstream_port = upstream.local_addr().unwrap().port();
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = upstream.accept() {
+                let _ = stream.write_all(b"UPSTREAM\n");
+            }
+        });
+
+        let proxy = proxy_on_a_loopback_port(vec!["127.0.0.0/8".to_string()]);
+        let status = connect_through(proxy, &format!("localhost:{upstream_port}"));
+        assert!(
+            status.contains("200 Connection established"),
+            "a CIDR containing the resolved address must be dialed: {status:?}"
+        );
+    }
+
+    #[test]
+    fn the_proxy_refuses_to_dial_a_cidr_entry_that_does_not_contain_the_resolved_address() {
+        // The negative half of the CIDR pair: allow a block that does *not* contain loopback, and
+        // CONNECT to `localhost`. The name resolves to 127.0.0.1, which is outside `192.168.0.0/16`,
+        // so the proxy must refuse — an address-side allowlist is meaningless if a name that resolves outside
+        // it still gets through.
+        let proxy = proxy_on_a_loopback_port(vec!["192.168.0.0/16".to_string()]);
+        let status = connect_through(proxy, "localhost:443");
+        assert!(
+            status.contains("403"),
+            "a CIDR that does not contain the resolved address must be refused: {status:?}"
+        );
     }
 
     #[test]
