@@ -1702,7 +1702,21 @@ roles:
 
     #[test]
     fn an_invalid_profile_fails_naming_the_profile_and_the_defect() {
-        let facts = with_config(&format!("{HEALTHY}\n  broken: {{ image: \"\" }}\n"));
+        // The broken profile is declared alongside the valid one: appending an indented key to
+        // HEALTHY would nest it under `search:` (the last mapping) and fail the config instead.
+        let facts = with_config(
+            r#"
+providers:
+  anthropic-main: { kind: anthropic, models: ["m"], credentials: [{ id: a1, secret: "env:A" }] }
+pools:
+  interactive: { members: ["anthropic-main/m"] }
+roles:
+  builder: interactive
+sandbox_profiles:
+  dev: { image: ubuntu:24.04 }
+  broken: { image: "" }
+"#,
+        );
         let (verdict, reason) = diagnose_ok(&facts, "sandbox profiles");
         assert_eq!(verdict, Verdict::Fail);
         assert!(
@@ -2141,7 +2155,7 @@ hosts:
             &facts,
             "secrets",
             Verdict::Fail,
-            "1 reference(s) resolve through env and the daemon could not be read",
+            "2 reference(s) resolve through env and the daemon could not be read",
         );
     }
 
@@ -2255,7 +2269,7 @@ hosts:
             reason.contains("~/.hx is not writable: Permission denied (os error 13)"),
             "{reason}"
         );
-        assert!(reason.contains("`hx.db` lives there"), "{reason}");
+        assert!(reason.contains("(`hx.db`) lives there"), "{reason}");
     }
 
     #[test]
