@@ -207,7 +207,7 @@ pub fn redact_diff(lines: &[DiffLine], redactor: &Redactor) -> Vec<DiffLine> {
 }
 
 fn flush_run(
-    run: &mut Vec<String>,
+    run: &mut [String],
     kind: Option<DiffLineKind>,
     redactor: &Redactor,
     out: &mut Vec<DiffLine>,
