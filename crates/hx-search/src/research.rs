@@ -184,7 +184,10 @@ impl Fetcher for HttpFetcher {
 
             let response = match tokio::time::timeout(self.timeout, request.send()).await {
                 Ok(Ok(res)) => res,
-                Ok(Err(err)) => return Err(SearchError::Transport(err)),
+                // `SearchError::Transport` would echo the request URL, and a URL can carry a token in its
+                // query string. `without_url` drops the URL so a `?token=`/`key=` credential cannot reach
+                // an error the research report (and so the model) reads.
+                Ok(Err(err)) => return Err(transport_error(err)),
                 Err(_) => {
                     return Err(SearchError::TransportRedacted {
                         reason: format!("fetch timed out after {:.1}s", self.timeout.as_secs_f64()),
@@ -213,7 +216,9 @@ impl Fetcher for HttpFetcher {
 
             let body = match tokio::time::timeout(self.timeout, response.text()).await {
                 Ok(Ok(body)) => body,
-                Ok(Err(err)) => return Err(SearchError::Transport(err)),
+                // Same as above: the body-read error's `Display` echoes the request URL, which can carry a
+                // `?token=`/`key=` credential. Strip the URL so it cannot reach an error the model reads.
+                Ok(Err(err)) => return Err(transport_error(err)),
                 Err(_) => {
                     return Err(SearchError::TransportRedacted {
                         reason: format!(
@@ -230,6 +235,18 @@ impl Fetcher for HttpFetcher {
                 Ok(Some(FetchedPage::new(url, content_type.as_deref(), body)))
             }
         }
+    }
+}
+
+/// Convert a `reqwest::Error` to a credential-free transport error.
+///
+/// `reqwest::Error`'s `Display` (and `Debug`) append the request URL, and a URL can carry a token in
+/// its query string (`?token=`, `?key=`, `?apikey=`). `without_url` drops the URL, so such a
+/// credential cannot reach an error the research report — and so the model — reads. This is the plain
+/// [`HttpFetcher`]'s answer to the same problem the browser rungs solve with `transport_reason`.
+fn transport_error(err: reqwest::Error) -> SearchError {
+    SearchError::TransportRedacted {
+        reason: err.without_url().to_string(),
     }
 }
 
@@ -1932,5 +1949,33 @@ mod tests {
         }
 
         assert_eq!(report.paid_calls, 0);
+    }
+
+    /// The plain fetcher's transport errors must not carry a `?token=`/`key=` credential: `reqwest`'s
+    /// error `Display` appends the request URL, so a token-bearing URL would otherwise reach the report (and
+    /// so the model). `transport_error` strips the URL.
+    #[tokio::test]
+    async fn a_transport_error_does_not_carry_a_query_token() {
+        let token = "signed-token-9f3a2b7c";
+        // A dead port on loopback forces a connect (transport) error carrying the request URL.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind free port");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener); // now nothing listens; connecting fails with a transport error
+        let url = format!("http://{addr}/page?token={token}");
+
+        let fetcher = HttpFetcher::new(reqwest::Client::new());
+        let err = fetcher
+            .fetch(&url)
+            .await
+            .expect_err("a dead port must be a transport error");
+
+        let display = err.to_string();
+        assert!(
+            !display.contains(token),
+            "the query token must not reach the error: {display}"
+        );
+        assert!(display.contains("transport error"), "{display}");
     }
 }
