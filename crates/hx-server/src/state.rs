@@ -114,6 +114,14 @@ pub struct AppState {
     /// sender end of the channel the matching `hx-gateway::WebhookConnector` reads from, so
     /// `POST /v1/connectors/{id}/webhook` can be authenticated and pushed in one place.
     pub webhooks: crate::webhook::WebhookRegistry,
+    /// The harness session each webhook conversation bridges into, by
+    /// [`Conversation::canonical`](hx_gateway::Conversation::canonical).
+    ///
+    /// The [`crate::webhook_bridge`] loop finds or creates one session per conversation here, so
+    /// every message from one chat lands in one transcript instead of opening a session per push.
+    /// In-memory on purpose: it is routing, not history — the transcript itself is durable in the
+    /// store, and a restarted daemon re-creates sessions rather than resurrecting stale ids.
+    pub webhook_sessions: Mutex<HashMap<String, SessionId>>,
 }
 
 /// Everything [`AppState::build`] assembles, so a test can assemble it differently.
@@ -313,8 +321,12 @@ impl AppState {
 
     /// Assemble from parts. The seam a test uses to run the whole HTTP surface without a provider,
     /// a vault or a container engine.
+    ///
+    /// Starting the [`crate::webhook_bridge`] loops is part of assembly, not of `build` alone: a
+    /// retained webhook driver nobody reads is a queue that fills and then `429`s forever (#73),
+    /// and that is true no matter which constructor retained it.
     pub fn from_parts(parts: AppStateParts) -> Arc<Self> {
-        Arc::new(Self {
+        let state = Arc::new(Self {
             config: parts.config,
             router: parts.router,
             providers: parts.providers,
@@ -339,7 +351,10 @@ impl AppState {
             vault_unlocked: false,
             api_token: parts.api_token,
             webhooks: parts.webhooks,
-        })
+            webhook_sessions: Mutex::new(HashMap::new()),
+        });
+        crate::webhook_bridge::spawn_webhook_bridges(&state);
+        state
     }
 
     /// The routing table, recovering from a poisoned lock.

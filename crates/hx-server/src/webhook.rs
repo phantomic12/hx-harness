@@ -145,6 +145,19 @@ impl WebhookRegistry {
         self.drivers.lock().ok()?.get(id).cloned()
     }
 
+    /// Every retained driver id, sorted so bridge startup is deterministic.
+    ///
+    /// The seam [`crate::webhook_bridge::spawn_webhook_bridges`] starts one consumption loop from:
+    /// one task per id here, each reading through its driver.
+    pub fn driver_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = match self.drivers.lock() {
+            Ok(drivers) => drivers.keys().cloned().collect(),
+            Err(poisoned) => poisoned.into_inner().keys().cloned().collect(),
+        };
+        ids.sort();
+        ids
+    }
+
     fn lookup(&self, id: &str) -> Option<&WebhookEntry> {
         self.connectors.get(id)
     }
@@ -242,33 +255,8 @@ pub async fn webhook_handler(
     // The push never waits: `send().await` on a bounded channel would park an HTTP worker behind a
     // harness that reads slowly, and one slow connector would then stall the whole route. `try_send`
     // turns each outcome into the status the platform should act on instead.
-    match token.sender.try_send(inbound) {
-        Ok(()) => {}
-        // The sender was cloned on registration and a retained driver holds the receiver, so a
-        // closed channel means the connector was dropped — which is not a condition a caller can
-        // fix by retrying, so it is reported as a conflict rather than a success.
-        Err(TrySendError::Closed(_)) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({ "error": "the webhook connector is not listening" })),
-            )
-                .into_response();
-        }
-        // The queue is bounded, so a burst the harness has not consumed yet is backpressure, not
-        // loss: `429` with `Retry-After` tells the platform to retry, and `retryable: true` tells a
-        // client that treats every non-`200` as a dead letter to hold the event instead. The event
-        // itself was parsed and then refused — nothing was buffered, so a full queue cannot grow
-        // memory no matter how often the platform retries into it.
-        Err(TrySendError::Full(_)) => {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [(header::RETRY_AFTER, "1")],
-                Json(
-                    serde_json::json!({ "error": "the webhook queue is full; retry this event", "retryable": true }),
-                ),
-            )
-                .into_response();
-        }
+    if let Err(refused) = token.sender.try_send(inbound) {
+        return ingress_refusal(refused);
     }
 
     (
@@ -276,6 +264,38 @@ pub async fn webhook_handler(
         Json(serde_json::json!({ "accepted": true })),
     )
         .into_response()
+}
+
+/// The refusal a failed ingress push becomes.
+///
+/// A pure function of the push outcome (rather than an inline match) so the backpressure contract
+/// stays pinned by unit tests that do not depend on bridge timing: with the [`crate::webhook_bridge`]
+/// loop draining the queue, a full queue at HTTP level is a race, but `Full → 429` must hold
+/// whenever it happens.
+fn ingress_refusal(err: TrySendError<Inbound>) -> Response {
+    match err {
+        // The sender was cloned on registration and a retained driver holds the receiver, so a
+        // closed channel means the connector was dropped — which is not a condition a caller can
+        // fix by retrying, so it is reported as a conflict rather than a success.
+        TrySendError::Closed(_) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "the webhook connector is not listening" })),
+        )
+            .into_response(),
+        // The queue is bounded, so a burst the harness has not consumed yet is backpressure, not
+        // loss: `429` with `Retry-After` tells the platform to retry, and `retryable: true` tells a
+        // client that treats every non-`200` as a dead letter to hold the event instead. The event
+        // itself was parsed and then refused — nothing was buffered, so a full queue cannot grow
+        // memory no matter how often the platform retries into it.
+        TrySendError::Full(_) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, "1")],
+            Json(
+                serde_json::json!({ "error": "the webhook queue is full; retry this event", "retryable": true }),
+            ),
+        )
+            .into_response(),
+    }
 }
 
 /// Build the webhook route onto a router.
@@ -490,12 +510,13 @@ connectors:
     }
 
     #[tokio::test]
-    async fn a_state_built_from_config_consumes_a_configured_webhook_post() {
-        // WHY `build` and not a hand-assembled registry: #66 was `build` registering the sender
-        // and dropping the receiver, so only `build` can prove the channel stays open — a `200`
-        // here means the receiver survived startup, and the `receive` below means a driver reads it.
-        use hx_gateway::Connector as _;
-        let state = built_state("HX_WEBHOOK_TEST_TOKEN_CONSUMED", 16).await;
+    async fn a_post_reaches_the_bridge_without_a_manual_receive() {
+        // WHY `build` and no `driver.receive()`: #66 was `build` registering the sender and
+        // dropping the receiver, and #73 is `build` retaining the driver but never reading it —
+        // so only `build` can prove the loop is running. A `200` means the push landed; the queue
+        // draining to zero and the message appearing in a harness session means the *bridge*
+        // consumed it, with nobody calling `receive` in this test.
+        let state = built_state("HX_WEBHOOK_TEST_TOKEN_BRIDGE", 16).await;
         let (status, _, body) = post(
             &state,
             "main-web",
@@ -508,55 +529,100 @@ connectors:
             (StatusCode::OK, serde_json::json!({ "accepted": true }))
         );
 
-        let driver = state
-            .webhooks
-            .driver("main-web")
-            .expect("build retains the driver");
-        let received = driver
-            .receive(&hx_secrets::Secret::new(""))
-            .await
-            .expect("a message");
-        match received {
-            Some(hx_gateway::Inbound::Message { conversation, text }) => {
-                assert_eq!(conversation.chat.as_str(), "777");
-                assert_eq!(text, "list the repo");
+        // The bridge consumes asynchronously, so poll: the queue must drain and the session the
+        // bridge opened for this conversation must hold the posted text.
+        let mut bridged = None;
+        for _ in 0..200 {
+            let drained = state.webhooks.queue_depth("main-web") == Some(0);
+            let sessions = state.store.list(100).expect("sessions list");
+            let found = sessions.iter().find_map(|summary| {
+                state
+                    .store
+                    .messages(&summary.record.id)
+                    .ok()
+                    .filter(|messages| {
+                        messages.iter().any(|m| m.text().contains("list the repo"))
+                    })
+                    .map(|_| summary.record.id.clone())
+            });
+            if drained && found.is_some() {
+                bridged = found;
+                break;
             }
-            other => panic!("expected the posted message, got {other:?}"),
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+        let session = bridged.expect("the bridge consumed the post into a harness session");
+
+        // The same conversation routes to the same session: a second post lands in the same
+        // transcript rather than opening a session per push.
+        let (status, _, _) = post(
+            &state,
+            "main-web",
+            Some("test-supersecret"),
+            serde_json::json!({ "chat": "777", "text": "and the tests" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let mut same = false;
+        for _ in 0..200 {
+            let messages = state.store.messages(&session).expect("bridged transcript");
+            if messages.iter().any(|m| m.text().contains("and the tests")) {
+                same = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(same, "the second post joined the same harness session");
+
+        // And the bridge left an event trail, not just transcript rows: a late reader sees the
+        // message as events too.
+        assert!(
+            !state.store.events(&session).expect("bridged events").is_empty(),
+            "the bridged session recorded events"
+        );
     }
 
     #[tokio::test]
-    async fn a_post_past_a_full_queue_is_429_with_a_retry_hint_and_no_buffering() {
-        // WHY the three assertions together: `429` (not `200`, not `409`) tells the platform the
-        // event was refused but not dead, `Retry-After`/`retryable` tells it *when and how* to
-        // retry, and the unchanged depth proves the refused event was not buffered — a full queue
-        // that grows on refusal is unbounded with extra steps.
-        let state = built_state("HX_WEBHOOK_TEST_TOKEN_FULL", 1).await;
-        let body = serde_json::json!({ "chat": "777", "text": "hi" });
-        let (first, _, _) = post(&state, "main-web", Some("test-supersecret"), body.clone()).await;
-        assert_eq!(first, StatusCode::OK);
-        assert_eq!(state.webhooks.queue_depth("main-web"), Some(1));
-
-        let (status, headers, refused) =
-            post(&state, "main-web", Some("test-supersecret"), body).await;
-        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            headers
-                .get(header::RETRY_AFTER)
-                .map(|v| v.to_str().unwrap()),
-            Some("1")
-        );
-        assert_eq!(refused["retryable"], true);
-        assert_eq!(state.webhooks.queue_depth("main-web"), Some(1));
-
-        let report = state.status(chrono::Utc::now()).await;
-        assert_eq!(
-            report.webhook_queues,
-            vec![WebhookQueueDepth {
-                id: "main-web".into(),
-                depth: 1,
-                capacity: 1,
-            }]
-        );
+    async fn a_full_ingress_queue_refuses_with_a_retry_hint_and_no_buffering() {
+        // WHY through `ingress_refusal` and not HTTP: with the bridge loop draining the queue, a
+        // full queue at the route is a race — but `Full → 429` must hold whenever it happens, so
+        // the mapping is pinned here, deterministically, for both refusal shapes.
+        use http_body_util::BodyExt as _;
+        for (err, status) in [
+            (
+                TrySendError::Full(test_push(
+                    &ConnectorId::from("main-web"),
+                    "dropped",
+                )),
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                TrySendError::Closed(test_push(
+                    &ConnectorId::from("main-web"),
+                    "dropped",
+                )),
+                StatusCode::CONFLICT,
+            ),
+        ] {
+            let response = ingress_refusal(err);
+            assert_eq!(response.status(), status);
+            let retry_after = response.headers().get(header::RETRY_AFTER).cloned();
+            let bytes = response
+                .into_body()
+                .collect()
+                .await
+                .expect("a body")
+                .to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                // WHY the three assertions together: `429` (not `200`, not `409`) tells the
+                // platform the event was refused but not dead, `Retry-After`/`retryable` tells it
+                // *when and how* to retry.
+                assert_eq!(retry_after.map(|v| v.to_str().unwrap().to_string()), Some("1".into()));
+                assert_eq!(json["retryable"], true);
+            } else {
+                assert!(retry_after.is_none());
+            }
+        }
     }
 }
