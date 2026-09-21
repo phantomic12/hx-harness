@@ -715,8 +715,10 @@ promise about how it is used.
     Each degrades to a working window with a warning rather than failing to start. The tray icon, a live
     hotkey binding, a raised notification and the live OS dialog are not exercised headlessly — each module's
     doc says so.
-  - ⬜ **The phone-approval exit criterion is still unmet**: approving from a phone lock screen needs
-    Mobile (iOS/Android push), which is not reachable from this environment.
+  - ✅ **The phone-approval mechanism has landed** (`m7-phone-approval`): `crate::phone` pushes a
+    prompt to a generic webhook (a push relay, a `notify` endpoint, a script) and the tap comes back to
+    `POST /v1/phone/respond`. The risk ceiling is `Mutate` — a phone tap cannot authorise `Destructive`.
+    The remaining half is the *mobile push transport* (iOS/Android), deferred below.
   - ⬜ **Mobile (iOS + Android)** — explicitly deferred (needs the Android NDK/SDK and a macOS host for
     iOS signing; neither is available).
   - ✅ **CI matrix for all five release targets** — landed (`m9-ci-matrix`): `cargo check
