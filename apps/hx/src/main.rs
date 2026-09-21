@@ -140,6 +140,23 @@ enum Command {
         by: String,
     },
 
+    /// Run a fan-out: N children across N distinct members of one pool.
+    ///
+    /// Each child is a `session` id (which must exist on the daemon) and a prompt; the pool is
+    /// the daemon's configured `agent.default_pool`. One outcome comes back with a result per child,
+    /// in request order. Exits non-zero if any child errored, so a script can gate on it.
+    Fan {
+        /// A child call, as `session:prompt`, repeated. The session id must already exist on the
+        /// daemon (the fan-out records each child's usage under it); the prompt is what that child
+        /// asks. At least one is required.
+        #[arg(required = true, value_name = "SESSION:PROMPT")]
+        children: Vec<String>,
+
+        /// Print the daemon's outcome as JSON instead of a rendering.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Show the model pools, their routes, and the role bindings.
     Pools,
 
@@ -312,6 +329,36 @@ async fn main() -> Result<()> {
                     print!("{}", daemon::export(&client, &base, &id, format).await?);
                 }
                 other => anyhow::bail!("unknown export format '{other}'; known: json, md, none"),
+            }
+        }
+
+        Command::Fan { children, json } => {
+            let (client, base) = daemon::connect(&config, cli.daemon.as_deref())?;
+            // The route's `FanOutChild` takes `session` and `prompt`; the pool is whatever the
+            // daemon draws from (`agent.default_pool`), not a per-request value a client could send.
+            let children: Vec<serde_json::Value> = children
+                .iter()
+                .map(|child| {
+                    let (session, prompt) = match child.split_once(':') {
+                        Some((session, prompt)) => (session, prompt),
+                        None => {
+                            anyhow::bail!("a fan child must be `SESSION:PROMPT`, got '{child}'")
+                        }
+                    };
+                    Ok(serde_json::json!({ "session": session, "prompt": prompt }))
+                })
+                .collect::<anyhow::Result<_>>()?;
+
+            let outcome = daemon::fanout(&client, &base, &children).await?;
+            print!("{}", commands::render_fanout(&outcome, json));
+
+            // A fan-out where a child errored is not a success. Exit 1 so a script can gate on
+            // it without parsing the prose.
+            if outcome["children"]
+                .as_array()
+                .is_some_and(|children| children.iter().any(|c| c["Errored"].is_object()))
+            {
+                std::process::exit(1);
             }
         }
 

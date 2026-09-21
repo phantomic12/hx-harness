@@ -815,6 +815,14 @@ the pool's `AllDown`, with both the dying and the finishing member recorded, no 
 lane whose model rejects a configured parameter is clamped and runs instead of failing at spawn — **met**
 (`build_spec` clamps at spawn).
 
+A **CLI surface** for the fan-out has now landed: `hx fan SESSION:PROMPT SESSION:PROMPT …` POSTs the
+`children` to `/v1/fanout` with the daemon's bearer token and prints one line per child naming the member it ran on,
+exiting `1` if any child errored (so a script can gate on it); `--json` prints the daemon's outcome as JSON.
+It draws from the daemon's configured `agent.default_pool` — the route's `FanOutBody` is `{children:
+[{session, prompt}]}`, with the pool decided server-side, which is why the CLI takes a `session` per child and no
+pool/model/parameter flags. A `FanOutChild`'s usage is recorded under its `session`, so the session must already
+exist on the daemon.
+
 **Security audit (this milestone).** The spawn/fan-out/re-route path was audited against credential
 leakage and re-route semantics, and three concrete issues were fixed, each with a test that fails before
 and passes after (see `TESTING.md`):

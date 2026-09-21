@@ -1395,6 +1395,70 @@ pub fn render_session(value: &serde_json::Value) -> String {
     out
 }
 
+/// The fan-out outcome, written for a person unless `--json` was asked for.
+///
+/// The route's [`FanOutOutcome`](hx_server::fanout::FanOutOutcome) returns, per child in
+/// request order, either `Ran` (with the member it ran on) or `Errored` (with the member
+/// and a redacted reason). The outcome carries no answer text — the fan-out is a spawn/cost
+/// path, not a chat — so the honest render is one line per child naming its member, and the whole
+/// block is bracketed so a reader can see at a glance whether every child ran.
+pub fn render_fanout(outcome: &serde_json::Value, json: bool) -> String {
+    if json {
+        return match serde_json::to_string_pretty(outcome) {
+            Ok(pretty) => format!("{pretty}\n"),
+            Err(err) => format!("{{\"error\":\"could not serialise the fan-out: {err}\"}}\n"),
+        };
+    }
+
+    let members = outcome["members"].as_array().cloned().unwrap_or_default();
+    let children = outcome["children"].as_array().cloned().unwrap_or_default();
+    // "child" is irregular, so the plural is decided by count rather than a bare "s".
+    let plural = if members.len() == 1 {
+        "child"
+    } else {
+        "children"
+    };
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{} {}: {}",
+        members.len(),
+        plural,
+        members
+            .iter()
+            .map(|m| m.as_str().unwrap_or("?").to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let mut errored = 0usize;
+    for (index, child) in children.iter().enumerate() {
+        let label = if let Some(rec) = child["Ran"].as_object() {
+            format!("member {}", rec["model"].as_str().unwrap_or("?"))
+        } else if let Some(e) = child["Errored"].as_object() {
+            errored += 1;
+            format!(
+                "member {} — errored: {}",
+                e["member"].as_str().unwrap_or("?"),
+                e["error"].as_str().unwrap_or("?")
+            )
+        } else {
+            format!("unrecognised outcome {child}")
+        };
+        let _ = writeln!(out, "  {}: {label}", index + 1);
+    }
+
+    let verdict = if errored == 0 {
+        "all children ran".to_string()
+    } else if errored == 1 {
+        "1 child errored".to_string()
+    } else {
+        format!("{errored} children errored")
+    };
+    let _ = writeln!(out, "{verdict}");
+    out
+}
+
 #[cfg(test)]
 mod run_tests {
     use super::*;
@@ -1557,6 +1621,67 @@ mod run_tests {
         });
         let rendered = render_session(&value);
         assert!(!rendered.contains("no result"), "{rendered}");
+    }
+
+    #[test]
+    fn a_fanout_for_a_person_lists_members_and_the_verdict() {
+        let outcome = json!({
+            "members": ["cheap", "strong"],
+            "children": [
+                { "Ran": { "model": "cheap" } },
+                { "Ran": { "model": "strong" } },
+            ],
+        });
+        let rendered = render_fanout(&outcome, false);
+        assert!(rendered.contains("2 children: cheap, strong"), "{rendered}");
+        assert!(rendered.contains("member cheap"), "{rendered}");
+        assert!(rendered.contains("member strong"), "{rendered}");
+        assert!(rendered.contains("all children ran"), "{rendered}");
+        assert!(!rendered.contains("errored"), "{rendered}");
+    }
+
+    #[test]
+    fn a_fanout_with_an_errored_child_names_it_and_says_so() {
+        // The exit code 1 for an errored child is decided by the caller, but the *prose* must
+        // make it impossible to read a partial fan-out as a success.
+        let outcome = json!({
+            "members": ["a", "b"],
+            "children": [
+                { "Ran": { "model": "b" } },
+                { "Errored": { "member": "a", "error": "upstream 500" } },
+            ],
+        });
+        let rendered = render_fanout(&outcome, false);
+        assert!(rendered.contains("member b"), "{rendered}");
+        assert!(
+            rendered.contains("member a — errored: upstream 500"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("1 child errored"), "{rendered}");
+    }
+
+    #[test]
+    fn a_fanout_as_json_is_still_the_daemons_outcome() {
+        let outcome = json!({
+            "members": ["cheap"],
+            "children": [{ "Ran": { "model": "cheap" } }],
+        });
+        let rendered = render_fanout(&outcome, true);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&rendered).expect("the JSON mode emits JSON");
+        assert_eq!(parsed["members"][0], "cheap");
+    }
+
+    #[test]
+    fn an_unrecognized_child_outcome_is_shown_rather_than_dropped() {
+        // A shape this build cannot read must not vanish: a re-route or a new outcome variant
+        // that reaches the older CLI would otherwise read as "that child did nothing".
+        let outcome = json!({
+            "members": ["a"],
+            "children": [{ "Pending": { "member": "a" } }],
+        });
+        let rendered = render_fanout(&outcome, false);
+        assert!(rendered.contains("unrecognised outcome"), "{rendered}");
     }
 
     #[test]

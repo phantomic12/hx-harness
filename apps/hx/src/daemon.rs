@@ -298,6 +298,28 @@ pub async fn approve(
     Ok(reply)
 }
 
+/// Run a fan-out: N child calls across N **distinct** members of one pool.
+///
+/// `children` is the list of child calls, each an object with `session` (a session id that
+/// exists on the daemon, under which the child's usage is recorded) and `prompt`. One reply
+/// object comes back with one result per child, in request order; see the route's
+/// [`FanOutOutcome`](hx_server::fanout::FanOutOutcome) for the shape.
+pub async fn fanout(
+    client: &reqwest::Client,
+    base: &str,
+    children: &[serde_json::Value],
+) -> anyhow::Result<Value> {
+    let (_, reply) = send(
+        client
+            .post(format!("{base}/v1/fanout"))
+            .json(&serde_json::json!({ "children": children })),
+        base,
+        "the fan-out",
+    )
+    .await?;
+    Ok(reply)
+}
+
 /// A session's transcript as a document.
 pub async fn export(
     client: &reqwest::Client,
@@ -448,6 +470,47 @@ mod tests {
             "an unconfigured client sent a credential:\n{}",
             heads[0]
         );
+    }
+
+    #[tokio::test]
+    async fn fanout_posts_the_children_and_returns_the_outcome() {
+        // A real loopback listener records the request body so the client cannot agree with itself
+        // about what it sent: the wire is the truth.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let recorded: Arc<std::sync::Mutex<String>> = Arc::default();
+        let sink = Arc::clone(&recorded);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 8192];
+            let read = stream.read(&mut buf).await.unwrap_or(0);
+            *sink.lock().unwrap() = String::from_utf8_lossy(&buf[..read]).to_string();
+            let body = r#"{"members":["cheap"],"children":[{"Ran":{"model":"cheap"}}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+
+        let config = hx_core::config::Config::from_yaml("roles: {}\n").expect("config parses");
+        let (client, base) = connect(&config, Some(&addr.to_string())).expect("client builds");
+        let children = vec![
+            serde_json::json!({ "session": "ses_1", "prompt": "do a" }),
+            serde_json::json!({ "session": "ses_1", "prompt": "do b" }),
+        ];
+        let outcome = fanout(&client, &base, &children).await.expect("a reply");
+
+        let sent = recorded.lock().unwrap().clone();
+        let (_, body) = sent.split_once("\r\n\r\n").expect("a body");
+        let parsed: serde_json::Value = serde_json::from_str(body).expect("the body is JSON");
+        assert_eq!(parsed["children"][0]["session"], "ses_1");
+        assert_eq!(parsed["children"][1]["prompt"], "do b");
+        // And the outcome comes back whole, in request order.
+        assert_eq!(outcome["members"][0], "cheap");
     }
 
     #[tokio::test]
