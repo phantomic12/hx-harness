@@ -11,24 +11,24 @@
 //! needs a real shared or browser-grade cache should use one; a second fetch of a result page is
 //! both slow and rude to the origin, and that is the whole problem this solves.
 //!
-//! ## Why the key drops the query, and what that costs
+//! ## Why the key digests the query instead of dropping it
 //!
-//! [`cache_key`] is what a repeat fetch looks up, and it is the URL with its query and fragment
-//! removed. The reason is a security property, not tidiness: a query string can carry a
-//! **credential**. A signed URL (`…?X-Amz-Signature=…`, `…?token=…`), a Google PSE call
-//! (`…?key=…`) — the credential is in the query, and the key is what becomes a filename, a `Debug`
-//! line and a log field. Keeping the query in the key would write a live credential into the cache
-//! directory and into every diagnostic that prints an entry. So the query never reaches a filename,
-//! never reaches a log, and never reaches the serialized entry on disk, and
-//! `a_token_in_the_query_never_reaches_a_key_or_a_filename` asserts it against a real fetch.
+//! [`cache_key`] is what a repeat fetch looks up: the URL with its fragment removed and, when a
+//! query is present, a hexadecimal digest of the complete query-carrying URL appended. The shape
+//! answers two requirements that pull in opposite directions:
 //!
-//! **The cost, named honestly:** two URLs that differ only in their query collapse to one entry.
-//! `…/search?page=1` and `…/search?page=2` share a slot, and the second fetch revalidates against
-//! the first one's validators. That is accepted deliberately, because for the caller this exists
-//! for — re-fetching result URLs the agent has already chosen — the query is a tracking or
-//! authentication tail rather than the identity of the document, and because the alternative
-//! (keying on the whole URL) puts credentials on disk as filenames. The trade is a rare extra
-//! network round trip against a credential in a directory listing.
+//! - A query string can carry a **credential** (`…?X-Amz-Signature=…`, `…?token=…`, `…?key=…`),
+//!   and the key is what becomes a filename, a `Debug` line and a log field. The query's
+//!   plaintext never reaches a filename, a log, or the serialized entry on disk — only the
+//!   digest does — and `a_token_in_the_query_never_reaches_a_key_or_a_filename` asserts it
+//!   against a real fetch.
+//! - Two URLs that differ only in their query are **different entries**. Collapsing them meant a
+//!   fresh first response (`Cache-Control: max-age`) was served for a URL the origin was never
+//!   asked for: content fetched under one credential cited as another request's answer.
+//!   `two_query_variants_of_one_path_hold_distinct_bodies_while_fresh` pins the fix.
+//!
+//! The fragment is still dropped without a trace: it is never sent to the origin, so it is not
+//! part of the resource's identity and two URLs differing only in `#…` share one entry.
 //!
 //! The on-disk entry document deliberately does **not** store the full URL or its query string.
 //! An earlier design stored the full URL so the document would "name its own resource", but that
@@ -52,9 +52,11 @@
 //!   injected clock recorded it, not the file's mtime.** mtime is set by whatever last wrote or
 //!   copied the directory, so a restore, an `rsync` or a checkout would reorder eviction by an
 //!   accident of the filesystem rather than by age.
-//! - Over the body cap, the body is **not stored at all** — and the fetched body is still returned
-//!   to the caller. A truncated entry would be a lie about what the origin said, and the caller
-//!   would never be told the difference.
+//! - Over the body cap, the body is **aborted mid-stream, never stored, and never returned** —
+//!   and whatever was filed for the key is dropped. A truncated entry would be a lie about what
+//!   the origin said, and returning the full body would need the unbounded allocation the cap
+//!   exists to prevent. The caller learns the page was too large ([`CacheOutcome::TooLarge`])
+//!   and skips it rather than citing a fragment.
 //!
 //! ## On disk
 //!
@@ -78,12 +80,15 @@
 //! instead of sleeping. Nothing here reads the wall clock except [`SystemClock`].
 
 use crate::backend::SearchError;
+use futures::StreamExt as _;
 use reqwest::header::{
     CACHE_CONTROL, DATE, ETAG, EXPIRES, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED,
 };
 use serde::{Deserialize, Serialize};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
@@ -117,30 +122,44 @@ impl Clock for SystemClock {
     }
 }
 
-/// The key an entry is filed under: `url` with its query and fragment removed.
+/// The key an entry is filed under: the URL with its fragment removed, plus — when a query is
+/// present — a hexadecimal digest of the complete query-carrying URL.
 ///
-/// This is the function that keeps a signed URL's token out of a filename and out of a log line,
-/// and it is also the function that makes two URLs differing only in their query collide. Both
-/// halves of that are the design, and the module doc argues them; the test
-/// `two_urls_that_differ_only_in_their_query_share_one_entry` pins the cost so it stays a decision
-/// rather than becoming a surprise.
+/// WHY a digest rather than the query: the key is what becomes a filename, a log field and the
+/// `key` field of the entry on disk, and a query can carry a live credential (`?token=…`). The
+/// digest lets the query influence *identity* — `…?token=A` and `…?token=B` are different
+/// entries, so a fresh first response can never be served for a URL the origin was never asked
+/// for — without the credential's plaintext ever reaching a filename, a log or the serialized
+/// entry.
 ///
-/// A string that is not an absolute URL is stripped by hand rather than rejected, so a relative
-/// path still keys consistently instead of collapsing every such input onto one entry.
+/// WHY the digest covers the complete canonical URL rather than just the query string: path and
+/// query together name the resource, and one rule ("same canonical URL, same key") cannot drift
+/// the way two half-rules can.
+///
+/// The fragment is dropped before digesting: it is never sent to the origin, so two URLs that
+/// differ only in `#…` are the same entry. A string that is not an absolute URL is split by hand
+/// on the same rule, so a relative path still keys consistently instead of collapsing every such
+/// input onto one entry.
 pub fn cache_key(url: &str) -> String {
     match Url::parse(url) {
         Ok(mut parsed) => {
-            parsed.set_query(None);
             parsed.set_fragment(None);
-            parsed.to_string()
+            let canonical = parsed.to_string();
+            let has_query = parsed.query().is_some();
+            parsed.set_query(None);
+            let base = parsed.to_string();
+            if has_query {
+                format!("{base}#{:016x}", fnv1a(&canonical))
+            } else {
+                base
+            }
         }
         Err(_) => {
             let without_fragment = url.split('#').next().unwrap_or(url);
-            without_fragment
-                .split('?')
-                .next()
-                .unwrap_or(without_fragment)
-                .to_string()
+            match without_fragment.split_once('?') {
+                Some((base, _)) => format!("{base}#{:016x}", fnv1a(without_fragment)),
+                None => without_fragment.to_string(),
+            }
         }
     }
 }
@@ -160,6 +179,12 @@ pub enum CacheOutcome {
     Revalidated(String),
     /// The origin answered with a body (a `200`), stored if it fit the caps.
     Fetched(String),
+    /// The origin answered with a body over the cache's `max_body_bytes`. The body was aborted
+    /// mid-stream and never assembled: returning it would need the unbounded allocation the cap
+    /// exists to prevent, and storing a truncation would lie about what the origin said. Nothing
+    /// is stored — and whatever was previously filed for the key is dropped, because it is now
+    /// known to be superseded by a response the cache refused to keep.
+    TooLarge,
     /// The origin answered `304` and nothing was stored to reuse. A miss, reported as one.
     Miss304,
 }
@@ -167,14 +192,15 @@ pub enum CacheOutcome {
 impl CacheOutcome {
     /// The body, when there is one.
     ///
-    /// `None` for [`CacheOutcome::Miss304`], deliberately: a caller that unwraps the body of a miss
-    /// gets a compile error rather than an empty string that renders as an empty page.
+    /// `None` for [`CacheOutcome::TooLarge`] and [`CacheOutcome::Miss304`], deliberately: a
+    /// caller that unwraps the body of a miss gets a compile error rather than an empty string
+    /// that renders as an empty page.
     pub fn body(&self) -> Option<&str> {
         match self {
             CacheOutcome::Fresh(body)
             | CacheOutcome::Revalidated(body)
             | CacheOutcome::Fetched(body) => Some(body),
-            CacheOutcome::Miss304 => None,
+            CacheOutcome::TooLarge | CacheOutcome::Miss304 => None,
         }
     }
 
@@ -187,9 +213,9 @@ impl CacheOutcome {
 
 /// One cache entry, as it is stored on disk.
 ///
-/// Deliberately does not store the full URL: `key` already names the resource query-free and
-/// matches the filename. The earlier justification — *"Stored so the entry names its own
-/// resource"* — was not load-bearing because no read path ever inspected `Entry::url`, and
+/// Deliberately does not store the full URL: `key` already names the resource — the query folded
+/// into a digest rather than stored in plaintext — and matches the filename. The earlier
+/// justification — *"Stored so the entry names its own resource"* — was not load-bearing because no read path ever inspected `Entry::url`, and
 /// storing it wrote live query credentials (`?token=...`) to disk in plaintext. Dropping the
 /// field keeps credentials off disk entirely.
 ///
@@ -343,7 +369,7 @@ impl UrlCache {
             });
         }
 
-        // Read the headers into owned values before `text()` consumes the response.
+        // Read the headers into owned values before the body consumes the response.
         let etag = header_string(response.headers(), ETAG);
         let last_modified = header_string(response.headers(), LAST_MODIFIED);
         let cache_control = header_string(response.headers(), CACHE_CONTROL);
@@ -351,7 +377,20 @@ impl UrlCache {
         let expires = header_string(response.headers(), EXPIRES);
         let now = self.clock.now_secs();
 
-        let body = response.text().await.map_err(transport_error)?;
+        // Bounded read: an over-cap body aborts mid-stream and is never assembled, so a hostile
+        // page cannot force an arbitrarily large allocation behind a missing or dishonest
+        // `Content-Length`.
+        let Some(body) = read_bounded_text(response, self.max_body_bytes)
+            .await
+            .map_err(transport_error)?
+        else {
+            // Over the cap: store nothing, and drop whatever was filed for the key — the copy
+            // that was there is now known to be superseded by a response the cache refused to
+            // keep. No body is returned: there is no bounded value to hand over that would still
+            // be what the origin said.
+            self.remove(&key);
+            return Ok(CacheOutcome::TooLarge);
+        };
 
         self.store(&Entry {
             key,
@@ -412,22 +451,50 @@ impl UrlCache {
         };
 
         // Write-then-rename, so a process that dies mid-write leaves no half-parsed entry for the
-        // next run to trip over. The temporary name keeps the `.json` extension off itself so the
-        // eviction scan below cannot mistake it for an entry.
-        let temporary = self.root.join(format!(
-            "{}.{}.tmp",
-            entry_file_name(&entry.key),
-            std::process::id()
-        ));
-        if std::fs::write(&temporary, json).is_err() {
-            return;
-        }
-        if std::fs::rename(&temporary, self.entry_path(&entry.key)).is_err() {
-            let _ = std::fs::remove_file(&temporary);
-            return;
+        // next run to trip over. The temporary name is unique per write — process id plus a
+        // process-wide atomic counter — because concurrent fetches for the same key in one daemon
+        // would otherwise truncate and rename the *same* path under each other, interleaving JSON
+        // or filing another writer's body under this key. Created exclusively (`create_new`, with
+        // a fresh suffix on the residual collision), fsynced before the rename, and atomically
+        // renamed over the entry, so a reader only ever sees a complete document or nothing. The
+        // name keeps the `.json` extension off itself so the eviction scan cannot mistake it for
+        // an entry.
+        for _ in 0..8 {
+            let temporary = self.unique_tmp_path(&entry.key);
+            let written = (|| -> std::io::Result<()> {
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temporary)?;
+                file.write_all(json.as_bytes())?;
+                file.sync_all()?;
+                drop(file);
+                std::fs::rename(&temporary, self.entry_path(&entry.key))
+            })();
+            match written {
+                Ok(()) => break,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => {
+                    let _ = std::fs::remove_file(&temporary);
+                    return;
+                }
+            }
         }
 
         self.evict_to_cap();
+    }
+
+    /// A temporary path for one [`Self::store`] call: the entry filename plus the process id and
+    /// a per-write atomic suffix, so no two concurrent writers in this daemon share a path.
+    fn unique_tmp_path(&self, key: &str) -> PathBuf {
+        static TMP_SUFFIX: AtomicU64 = AtomicU64::new(0);
+        let n = TMP_SUFFIX.fetch_add(1, Ordering::Relaxed);
+        self.root.join(format!(
+            "{}.{}.{}.tmp",
+            entry_file_name(key),
+            std::process::id(),
+            n
+        ))
     }
 
     /// Drop the oldest entries until the cap holds.
@@ -631,6 +698,39 @@ fn days_from_civil(year: u64, month: u64, day: u64) -> u64 {
     (era * 146_097 + day_of_era - 719_468) as u64
 }
 
+/// Read a response body bounded by `limit` bytes — the one reader both the cached and the
+/// uncached research paths use.
+///
+/// WHY one reader: the limit has to hold wherever a body is read, and two copies of "read then
+/// check the length" already drifted once. The uncached path checked `Content-Length` up front,
+/// which a missing or dishonest header bypasses, and both paths buffered the full body with
+/// `text()` before comparing. This consumes `bytes_stream()` chunk by chunk and aborts past the
+/// limit, so an oversized body is never assembled into a `String`.
+///
+/// Returns `Ok(Some(body))` when the whole body fit in `limit` bytes, `Ok(None)` when it did
+/// not — the caller skips rather than truncates, because a truncated page would cite a document
+/// the origin never published — and `Err` on a transport failure, with the request URL still
+/// attached for the caller to strip (each path has its own credential rule).
+///
+/// The bytes are decoded as UTF-8 lossily, matching what `text()` produced for the ASCII and
+/// UTF-8 pages this cache serves. The accumulator never holds more than `limit` bytes: the check
+/// runs before each chunk is appended, so even one hostile chunk cannot push it over.
+pub(crate) async fn read_bounded_text(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<Option<String>, reqwest::Error> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk?;
+        if buf.len().saturating_add(bytes.len()) > limit {
+            return Ok(None);
+        }
+        buf.extend_from_slice(&bytes);
+    }
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+}
+
 /// A transport error with the request URL removed via [`reqwest::Error::without_url`].
 ///
 /// `reqwest::Error`'s `Display` and `Debug` implementations append the request URL, so an error
@@ -689,6 +789,9 @@ mod tests {
         status: u16,
         headers: Vec<(String, String)>,
         body: String,
+        /// When true, the body goes out as `Transfer-Encoding: chunked` with no `Content-Length`
+        /// at all — the shape a missing-length hostile page takes.
+        chunked: bool,
     }
 
     impl Reply {
@@ -699,6 +802,7 @@ mod tests {
                 status: 200,
                 headers: vec![("etag".to_string(), etag.to_string())],
                 body: body.to_string(),
+                chunked: false,
             }
         }
 
@@ -708,6 +812,18 @@ mod tests {
                 status: 200,
                 headers: Vec::new(),
                 body: body.to_string(),
+                chunked: false,
+            }
+        }
+
+        /// A `200` with no `Content-Length`, framed as `Transfer-Encoding: chunked` — the shape
+        /// whose missing length used to bypass the body cap's early check.
+        fn chunked_ok(body: &str) -> Self {
+            Self {
+                status: 200,
+                headers: Vec::new(),
+                body: body.to_string(),
+                chunked: true,
             }
         }
 
@@ -723,6 +839,7 @@ mod tests {
                     ),
                 ],
                 body: body.to_string(),
+                chunked: false,
             }
         }
 
@@ -732,6 +849,7 @@ mod tests {
                 status: 200,
                 headers: vec![("last-modified".to_string(), last_modified.to_string())],
                 body: body.to_string(),
+                chunked: false,
             }
         }
 
@@ -740,6 +858,7 @@ mod tests {
                 status: 304,
                 headers: Vec::new(),
                 body: String::new(),
+                chunked: false,
             }
         }
 
@@ -748,11 +867,26 @@ mod tests {
             for (name, value) in &self.headers {
                 head.push_str(&format!("{name}: {value}\r\n"));
             }
-            head.push_str(&format!("content-length: {}\r\n", self.body.len()));
-            head.push_str("connection: close\r\n\r\n");
-
-            let mut bytes = head.into_bytes();
-            bytes.extend_from_slice(self.body.as_bytes());
+            let mut bytes = if self.chunked {
+                // No `Content-Length`: chunked framing only, in small pieces so the body arrives
+                // as several stream chunks rather than one.
+                head.push_str("transfer-encoding: chunked\r\n");
+                head.push_str("connection: close\r\n\r\n");
+                let mut bytes = head.into_bytes();
+                for piece in self.body.as_bytes().chunks(512) {
+                    bytes.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+                    bytes.extend_from_slice(piece);
+                    bytes.extend_from_slice(b"\r\n");
+                }
+                bytes.extend_from_slice(b"0\r\n\r\n");
+                bytes
+            } else {
+                head.push_str(&format!("content-length: {}\r\n", self.body.len()));
+                head.push_str("connection: close\r\n\r\n");
+                let mut bytes = head.into_bytes();
+                bytes.extend_from_slice(self.body.as_bytes());
+                bytes
+            };
             bytes
         }
     }
@@ -812,6 +946,7 @@ mod tests {
                                 body:
                                     "the origin was asked for a reply it was not scripted to give"
                                         .to_string(),
+                                chunked: false,
                             },
                             false,
                         ),
@@ -919,12 +1054,18 @@ mod tests {
     // -----------------------------------------------------------------------------------------
 
     #[test]
-    fn a_key_strips_the_query_and_the_fragment_and_keeps_the_path() {
+    fn a_key_digests_the_query_and_drops_the_fragment_but_keeps_the_path() {
         // The key is what a repeat fetch looks up *and* what becomes a filename, so both halves
-        // matter: the path has to survive, and everything after it must not.
-        assert_eq!(
-            cache_key("https://example.com/a/b?token=xyz#section"),
-            "https://example.com/a/b"
+        // matter: the path has to survive, the fragment has to go, and the query must influence
+        // identity without appearing in plaintext.
+        let key = cache_key("https://example.com/a/b?token=xyz#section");
+        assert!(
+            key.starts_with("https://example.com/a/b#"),
+            "the path stays and the query becomes a digest suffix: {key}"
+        );
+        assert!(
+            !key.contains("xyz") && !key.contains("token"),
+            "a credential must not reach the key: {key}"
         );
         assert_eq!(
             cache_key("https://example.com/a/b"),
@@ -937,21 +1078,37 @@ mod tests {
     }
 
     #[test]
-    fn two_urls_that_differ_only_in_their_query_share_one_entry() {
-        // The cost of query-stripping, pinned as a decision rather than left to be discovered: the
-        // second fetch of a paged URL revalidates against the first page's validators. Accepted
-        // deliberately, because the alternative writes a signed URL's token onto the disk.
-        assert_eq!(
-            cache_key("https://example.com/search?page=1&q=x"),
-            cache_key("https://example.com/search?page=2&q=x")
-        );
+    fn two_urls_that_differ_only_in_their_query_get_distinct_entries() {
+        // The collision this replaces: a fresh first response used to be served for a URL the
+        // origin was never asked for. The digest keeps query values out of the key while keeping
+        // the entries apart.
+        let first = cache_key("https://example.com/search?page=1&q=x");
+        let second = cache_key("https://example.com/search?page=2&q=x");
+        assert_ne!(first, second, "different queries are different entries");
+        for key in [&first, &second] {
+            assert!(
+                key.starts_with("https://example.com/search#"),
+                "the path stays readable: {key}"
+            );
+            assert!(
+                !key.contains("page=1") && !key.contains("page=2"),
+                "query plaintext must not reach the key: {key}"
+            );
+        }
+        // Determinism: the same URL always keys the same way.
+        assert_eq!(first, cache_key("https://example.com/search?page=1&q=x"));
     }
 
     #[test]
-    fn a_relative_input_is_stripped_by_hand_rather_than_collapsing_to_nothing() {
+    fn a_relative_input_is_keyed_by_hand_rather_than_collapsing_to_nothing() {
         // `Url::parse` refuses a relative path, and a fallback that returned an empty key would put
         // every such input in one entry.
-        assert_eq!(cache_key("/a/b?token=xyz"), "/a/b");
+        let key = cache_key("/a/b?token=xyz");
+        assert!(
+            key.starts_with("/a/b#"),
+            "the path stays and the query becomes a digest suffix: {key}"
+        );
+        assert!(!key.contains("xyz"), "{key}");
         assert_eq!(cache_key("/a/b"), "/a/b");
     }
 
@@ -1174,6 +1331,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn two_query_variants_of_one_path_hold_distinct_bodies_while_fresh() {
+        // The regression entries collapsing by query caused: with `max-age` the first response is
+        // fresh, and the second query variant must still go to the origin for its own body —
+        // never be served the first variant's. Afterwards the first variant must still be fresh.
+        let origin = Origin::serve(vec![
+            Reply::ok_with_max_age("\"a\"", "body-for-A", 60),
+            Reply::ok_with_max_age("\"b\"", "body-for-B", 60),
+        ])
+        .await;
+        let dir = temp_dir("query-distinct");
+        let clock = TestClock::starting_at(1_000_000);
+        let cache = UrlCache::with_clock(&dir, 8, 4096, Arc::new(clock));
+        let url_a = origin.url("/page?token=A");
+        let url_b = origin.url("/page?token=B");
+
+        let first = cache.fetch(&client(), &url_a).await.unwrap();
+        assert_eq!(first, CacheOutcome::Fetched("body-for-A".to_string()));
+
+        let second = cache.fetch(&client(), &url_b).await.unwrap();
+        assert_eq!(
+            second,
+            CacheOutcome::Fetched("body-for-B".to_string()),
+            "a fresh entry for ?token=A must never answer ?token=B"
+        );
+        assert_eq!(origin.connection_count(), 2);
+
+        let again = cache.fetch(&client(), &url_a).await.unwrap();
+        assert_eq!(again, CacheOutcome::Fresh("body-for-A".to_string()));
+        assert_eq!(origin.connection_count(), 2);
+
+        assert!(cache.contains(&url_a));
+        assert!(cache.contains(&url_b));
+        assert_eq!(entry_file_names(&dir).len(), 2);
+
+        origin.assert_fully_scripted();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // -----------------------------------------------------------------------------------------
     // Bounds
     // -----------------------------------------------------------------------------------------
@@ -1215,9 +1411,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_oversized_body_is_not_stored_but_is_still_returned() {
-        // Truncating the entry would be a lie about what the origin said, and the caller would
-        // never be told. The full body goes back, and nothing is filed.
+    async fn an_oversized_body_is_aborted_mid_stream_never_stored_and_never_built() {
+        // The cap bounds allocation, not just the directory: the body is aborted once the limit
+        // is passed, so no oversized `String` is ever assembled — and therefore none is stored
+        // and none is returned. The caller learns `TooLarge` and skips the page.
         let body = "x".repeat(200);
         let origin = Origin::serve(vec![
             Reply::ok("\"big\"", &body),
@@ -1230,8 +1427,9 @@ mod tests {
 
         let outcome = cache.fetch(&client(), &url).await.unwrap();
 
-        assert_eq!(outcome, CacheOutcome::Fetched(body.clone()));
-        assert_eq!(outcome.body().map(str::len), Some(200));
+        assert_eq!(outcome, CacheOutcome::TooLarge);
+        assert_eq!(outcome.body(), None, "there is no bounded body to hand over");
+        assert!(outcome.made_a_request());
         assert!(
             !cache.contains(&url),
             "a body over the cap must not be stored at all"
@@ -1244,8 +1442,56 @@ mod tests {
 
         // And a second fetch proves it: with nothing filed, the origin is asked again.
         let again = cache.fetch(&client(), &url).await.unwrap();
-        assert_eq!(again, CacheOutcome::Fetched(body));
+        assert_eq!(again, CacheOutcome::TooLarge);
         assert_eq!(origin.connection_count(), 2);
+
+        origin.assert_fully_scripted();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_chunked_body_without_content_length_over_the_cap_is_aborted_not_buffered() {
+        // No `Content-Length` anywhere on the wire: the cap can only hold if the body is measured
+        // while it streams. The 4 KiB body arrives as eight 512-byte chunks against a 1 KiB cap.
+        let body = "y".repeat(4096);
+        let origin = Origin::serve(vec![Reply::chunked_ok(&body)]).await;
+        let dir = temp_dir("chunked-too-large");
+        let cache = UrlCache::new(&dir, 8, 1024);
+        let url = origin.url("/stream");
+
+        let outcome = cache.fetch(&client(), &url).await.unwrap();
+
+        assert_eq!(outcome, CacheOutcome::TooLarge);
+        assert_eq!(outcome.body(), None);
+        assert!(
+            !cache.contains(&url),
+            "an aborted body must not be stored at all"
+        );
+        assert!(
+            entry_file_names(&dir).is_empty(),
+            "{:?}",
+            entry_file_names(&dir)
+        );
+
+        origin.assert_fully_scripted();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_chunked_body_without_content_length_within_the_cap_is_assembled_exactly() {
+        // The other half: chunked framing must still assemble a small body byte-for-byte, across
+        // chunk boundaries, and file it like any other response.
+        let body = "z".repeat(700);
+        let origin = Origin::serve(vec![Reply::chunked_ok(&body)]).await;
+        let dir = temp_dir("chunked-small");
+        let cache = UrlCache::new(&dir, 8, 1024);
+        let url = origin.url("/stream");
+
+        let outcome = cache.fetch(&client(), &url).await.unwrap();
+
+        assert_eq!(outcome, CacheOutcome::Fetched(body.clone()));
+        assert!(cache.contains(&url));
+        assert_eq!(entry_file_names(&dir).len(), 1);
 
         origin.assert_fully_scripted();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1268,7 +1514,10 @@ mod tests {
         let url = format!("{plain}?token={token}&page=2");
 
         let key = cache_key(&url);
-        assert_eq!(key, plain);
+        assert!(
+            key.starts_with(&plain),
+            "the key still names the path: {key}"
+        );
         assert!(
             !key.contains(token),
             "the key is what becomes a filename and a log field: {key}"
@@ -1459,6 +1708,66 @@ mod tests {
         assert_eq!(outcome, CacheOutcome::Fetched("fetched anyway".to_string()));
 
         origin.assert_fully_scripted();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_writes_for_one_key_leave_a_single_complete_entry() {
+        // The race `store` used to have: every writer for one key truncated and renamed the same
+        // `<name>.<pid>.tmp` path, so writers released at once could interleave JSON or file one
+        // writer's body under another's rename. Sixteen threads store distinct bodies behind a
+        // barrier; afterwards the directory must hold exactly the entry file — no orphan temps —
+        // parsing cleanly with the right key and one writer's complete body, never a splice.
+        use std::sync::Barrier;
+
+        const WRITERS: usize = 16;
+        let dir = temp_dir("concurrent-writers");
+        let cache = Arc::new(UrlCache::new(&dir, 64, 4096));
+        let url = "http://example.com/shared?round=1";
+        let key = cache_key(url);
+        let barrier = Arc::new(Barrier::new(WRITERS));
+
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|i| {
+                let (cache, barrier) = (Arc::clone(&cache), Arc::clone(&barrier));
+                let key = key.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    cache.store(&Entry {
+                        key,
+                        etag: None,
+                        last_modified: None,
+                        stored_at: 1_000 + i as u64,
+                        max_age: None,
+                        body: format!("complete-body-from-writer-{i:02}"),
+                    })
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("a writer thread must not panic");
+        }
+
+        let names = entry_file_names(&dir);
+        assert_eq!(
+            names.len(),
+            1,
+            "one entry file and no orphan temp files: {names:?}"
+        );
+        let text = std::fs::read_to_string(dir.join(&names[0])).unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_str(&text).expect("concurrent writes must leave a parseable document");
+        assert_eq!(stored["key"], key);
+        let body = stored["body"].as_str().expect("a body field");
+        assert!(
+            (0..WRITERS).any(|i| body == format!("complete-body-from-writer-{i:02}")),
+            "the stored body is one writer's complete body, not a splice: {body}"
+        );
+        assert!(
+            cache.contains(url),
+            "the entry reads back through the cache's own read path"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
