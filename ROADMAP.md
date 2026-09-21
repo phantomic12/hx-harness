@@ -812,10 +812,17 @@ pure, self-contained module a future spawner will draw from. That is what has la
   clamps are recorded on the spec and the record but **do not yet reach the provider call** —
   `hx-provider`'s `ChatRequest` has no field for a pool `Param`, so `run_child` sends none; the gap
   is pinned by `the_clamped_parameter_reaches_the_provider_call`, left `#[ignore]`d until `ChatRequest`
-  grows the field. **[`Spawner::run_child`] does not run an
-  agent loop or dispatch tools**, and does exactly what it claims: one provider call per child, recorded.
-  Tested over a scripted pool and a scripted provider with each assertion proven to fail by a mutation
-  (see `TESTING.md`).
+  grows the field. **[`Spawner::run_child`] runs one provider call per child by default, and an
+  opt-in bounded tool loop when the spec names tools**: `ChildSpec::tools` (default empty) with
+  `max_tool_iters` (default 8) runs provider call → tool calls → tool results until the model
+  answers without a tool call or the cap is hit. Only `read_file` and `write_file` may run — a call
+  for any other name is refused, not executed — each call is gated by the child's capability token
+  (`prepare`, then the token check, the same two phases a normal run applies before approval; a
+  child has no approver to ask), a denial fails the child as a recorded error, never a bypass, and
+  `ChildRecord::tools_used` names what ran. The loop is deliberately *not* `hx-agent`'s (coupled to
+  sessions/store/approvals), and usage is summed across iterations and recorded once on the final
+  answer. Tested over a scripted pool and a scripted provider with each assertion proven to fail by
+  a mutation (see `TESTING.md`).
 
 The routing reasoning this milestone is about, restated for what remains: lanes could not differ because a fan-out
 has no per-child model to differ; one model's parameter set is not another's because a 400 for `reasoning_effort`
@@ -826,6 +833,9 @@ of N children across N distinct members, and the re-route of a running child ont
 dies. What still is **not** built is a full subagent runtime: nothing in this repository yet spawns **N concurrent
 lanes** as a fan-out and drives them to a result — `run_lane` is a single prompt run that re-draws on death, and
 the fan-out runs the children it allocates sequentially (a dead child stops its own lane and the rest continue).
+Nor does the child tool loop reach everything: it runs `read_file`/`write_file` only (shell execution in a child
+is a separate review), `run_lane` never runs it, and neither the `/v1/fanout` route nor the `hx fan` CLI exposes
+it — over HTTP every child is still exactly one provider call with an empty `tools_used`.
 
 **Exit criteria**: ✅ **a fan-out of N lanes runs across N members of a pool, each lane's model recorded in the
 audit chain** — met by the fan-out module (`crates/hx-server/src/fanout.rs`), tested over a scripted pool and a
