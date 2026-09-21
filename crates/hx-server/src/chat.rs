@@ -183,6 +183,25 @@ pub async fn run_chat(
     request: ChatRequest,
     now: DateTime<Utc>,
 ) -> Result<ChatReply> {
+    run_chat_with_session_notify(state, request, now, None).await
+}
+
+/// Run one request against one session, reporting the session id as soon as it exists.
+///
+/// WHY the extra channel exists: the SSE route (`POST /v1/chat/stream`) subscribes to the
+/// process-wide broadcast bus *before* the run starts, and for a request that starts a new
+/// session the id does not exist until this function creates it. Without an early report the
+/// stream cannot tell its own run's events from another session's, and concurrent clients would
+/// receive each other's prompts, tool args and output. The id is sent immediately after the
+/// session is created-or-resumed — before the prompt is appended and long before the first
+/// event is published — so a subscriber that buffers until it learns the id only ever buffers
+/// other sessions' events, never its own. `None` keeps the plain call free of the mechanism.
+pub async fn run_chat_with_session_notify(
+    state: &Arc<AppState>,
+    request: ChatRequest,
+    now: DateTime<Utc>,
+    session_tx: Option<tokio::sync::oneshot::Sender<SessionId>>,
+) -> Result<ChatReply> {
     if request.prompt.trim().is_empty() {
         return Err(HxError::Config("prompt is empty".to_string()));
     }
@@ -263,6 +282,16 @@ pub async fn run_chat(
             (record.id, true, 0)
         }
     };
+
+    // Report the session before anything is published on the bus: the SSE route filters by this
+    // id, and every event this run emits (starting with the loop's, via `write_events`) is sent
+    // after this point. A subscriber therefore never has to classify one of this run's own
+    // events while still ignorant of the id — anything buffered before this send is provably
+    // another session's. A validation failure above returns before creating a session, in which
+    // case the sender is dropped and the subscriber learns there will never be an id.
+    if let Some(notify) = session_tx {
+        notify.send(session_id.clone()).ok();
+    }
 
     // Stored first: a run that dies has still been asked.
     let prompt = Message::user(request.prompt.clone());
@@ -550,7 +579,10 @@ pub fn default_tools(
 }
 
 /// A stable agent id for a workspace, so the same checkout keeps the same identity across runs.
-fn agent_id(workspace: &str) -> AgentId {
+///
+/// `pub(crate)` because `POST /v1/sessions` opens a session the same way a chat run would, and
+/// two spellings of the identity would split one checkout's sessions across two agents.
+pub(crate) fn agent_id(workspace: &str) -> AgentId {
     AgentId::from_raw(format!("hxd:{}", workspace.trim_end_matches('/')))
 }
 

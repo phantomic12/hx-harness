@@ -16,12 +16,13 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use hx_agent::{ApprovalQueue, ModelCall};
 use hx_core::error::{HxError, Result};
-use hx_core::ids::{CredentialId, ProviderId};
+use hx_core::event::AgentEvent;
+use hx_core::ids::{AgentId, CredentialId, ProviderId, SessionId};
 use hx_core::message::{Message, Part, Role};
 use hx_provider::{ChatRequest, ChatResponse, FinishReason, ModelRouter, ProviderRegistry, Usage};
 use hx_search::BackendRegistry;
 use hx_secrets::{EnvSecrets, SecretStores};
-use hx_server::{app, AppState, AppStateParts, ModelFactory};
+use hx_server::{app, AppState, AppStateParts, LiveEvent, ModelFactory};
 use hx_store::Store;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -84,6 +85,67 @@ search:
 "#;
 
 async fn harness(replies: Vec<Result<ChatResponse>>) -> Arc<AppState> {
+    let model = Arc::new(ScriptedModel {
+        replies: Mutex::new(VecDeque::from(replies)),
+    });
+    build_state(Arc::new(Scripted(Arc::clone(&model))) as Arc<dyn ModelFactory>).await
+}
+
+/// A model that holds the run open until the test releases it.
+///
+/// WHY a gate instead of two racing streams: the leak needs another session's bus events to land
+/// *mid-run*, and two runs interleave only by luck. The gate freezes the run after it has
+/// subscribed and created its session, so the test can publish foreign events by hand —
+/// deterministically the overlap the bug needs, with no sleeps praying for a race.
+struct GatedModel {
+    replies: Mutex<VecDeque<Result<ChatResponse>>>,
+    gate: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl ModelCall for GatedModel {
+    async fn complete(&self, _req: ChatRequest) -> Result<ChatResponse> {
+        self.gate.notified().await;
+        self.replies.lock().unwrap().pop_front().unwrap_or_else(|| {
+            Err(HxError::Provider(
+                "the scripted model was asked for more turns than it has answers".to_string(),
+            ))
+        })
+    }
+
+    fn model(&self) -> String {
+        "scripted-model".to_string()
+    }
+
+    fn provider_id(&self) -> ProviderId {
+        ProviderId::from_raw("local")
+    }
+
+    fn credential_id(&self) -> CredentialId {
+        CredentialId::from_raw("local-1")
+    }
+}
+
+struct Gated(Arc<GatedModel>);
+
+impl ModelFactory for Gated {
+    fn for_role(&self, _role: &str) -> Result<Arc<dyn ModelCall>> {
+        Ok(Arc::clone(&self.0) as Arc<dyn ModelCall>)
+    }
+}
+
+async fn gated_harness(
+    replies: Vec<Result<ChatResponse>>,
+    gate: Arc<tokio::sync::Notify>,
+) -> Arc<AppState> {
+    let model = Arc::new(GatedModel {
+        replies: Mutex::new(VecDeque::from(replies)),
+        gate,
+    });
+    build_state(Arc::new(Gated(Arc::clone(&model))) as Arc<dyn ModelFactory>).await
+}
+
+async fn build_state(models: Arc<dyn ModelFactory>) -> Arc<AppState> {
     let mut config = hx_core::config::Config::from_yaml(CONFIG).expect("config parses");
     let dir = tempfile::tempdir().expect("temp dir");
     config.daemon.data_dir = dir.keep().join("data").display().to_string();
@@ -108,9 +170,7 @@ async fn harness(replies: Vec<Result<ChatResponse>>) -> Arc<AppState> {
         providers: Arc::new(providers),
         secrets: Arc::new(SecretStores::new().with(Arc::new(EnvSecrets))),
         store: Arc::new(store),
-        models: Arc::new(Scripted(Arc::new(ScriptedModel {
-            replies: Mutex::new(VecDeque::from(replies)),
-        }))),
+        models,
         tools: Arc::new(hx_server::chat::default_tools(vec![], client)),
         approvals: ApprovalQueue::new(std::time::Duration::from_secs(1)),
         phone: None,
@@ -315,5 +375,140 @@ async fn the_stream_does_not_leak_another_runs_events() {
     assert!(
         !second.contains(&first_sessions[0]),
         "the second run's stream carries the first session's id"
+    );
+}
+
+/// Publish another session's live events the way a concurrent chat would.
+///
+/// A raw bus send, not a second run: a second run interleaves only by luck, while a direct send
+/// is the exact bytes a concurrent run puts on the bus, under the test's control.
+fn publish_foreign_events(state: &Arc<AppState>, foreign: &SessionId, count: u64) {
+    for seq in 1..=count {
+        state
+            .event_bus
+            .send(LiveEvent {
+                session: foreign.clone(),
+                seq,
+                event: AgentEvent::TurnStarted {
+                    agent: AgentId::from_raw("hxd:foreign"),
+                    turn: 1,
+                },
+            })
+            .ok();
+    }
+}
+
+/// Wait until the store holds a session, and return its id.
+///
+/// WHY poll the store and not sleep: the stream subscribes before the run creates its session,
+/// so a session row proves the subscription predates every foreign event the test publishes next.
+/// A fixed sleep proves nothing — on a loaded machine the run may not have started yet, and an
+/// event sent before the subscription is missed by every implementation, fixed or not.
+async fn wait_for_first_session(state: &Arc<AppState>) -> String {
+    for _ in 0..250 {
+        if let Some(summary) = state.store.list(10).expect("store lists").into_iter().next() {
+            return summary.record.id.as_str().to_string();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the run never created a session");
+}
+
+/// Wait until a session's transcript holds a message, proving its run started past creation.
+async fn wait_for_transcript(state: &Arc<AppState>, session: &SessionId) {
+    for _ in 0..250 {
+        if !state.store.messages(session).expect("store reads").is_empty() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the run never started on session {}", session.as_str());
+}
+
+#[tokio::test]
+async fn a_new_session_stream_drops_other_sessions_events_published_mid_run() {
+    // A request that starts a session cannot name it, so the filter learns the id from the run
+    // while foreign events are already arriving. This is the exact window the old code leaked:
+    // every bus event forwarded, whatever its session.
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let state = gated_harness(vec![Ok(answer("hello"))], Arc::clone(&gate)).await;
+
+    let streaming = tokio::spawn({
+        let state = Arc::clone(&state);
+        async move {
+            stream(
+                &state,
+                serde_json::json!({ "prompt": "hi", "autonomy": "yolo" }),
+            )
+            .await
+        }
+    });
+
+    let own = wait_for_first_session(&state).await;
+
+    let foreign = SessionId::from_raw("ses_foreigneventsthatmustnotleak");
+    publish_foreign_events(&state, &foreign, 3);
+
+    gate.notify_one();
+    let (status, body) = streaming.await.expect("the stream task runs");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !body.contains(foreign.as_str()),
+        "another session's events leaked into the stream: {body:?}"
+    );
+    assert!(
+        body.contains(own.as_str()),
+        "the stream lost its own session's events: {body:?}"
+    );
+    let events = parse_sse(&body);
+    assert_eq!(
+        events.last().map(|(name, _)| name.as_deref()),
+        Some(Some("done")),
+        "the stream still ends with the reply: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_session_stream_forwards_only_its_own_mid_run_events() {
+    // A request that resumes a session filters by the named id from the first byte. A foreign
+    // event published mid-run must not appear even though the run is live and the bus is shared.
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let state = gated_harness(vec![Ok(answer("welcome back"))], Arc::clone(&gate)).await;
+
+    let target = state
+        .store
+        .create(hx_store::NewSession::new(), chrono::Utc::now())
+        .expect("session creates")
+        .id;
+
+    let streaming = tokio::spawn({
+        let state = Arc::clone(&state);
+        let session = target.as_str().to_string();
+        async move {
+            stream(
+                &state,
+                serde_json::json!({ "prompt": "again", "session": session, "autonomy": "yolo" }),
+            )
+            .await
+        }
+    });
+
+    // The prompt append proves the resumed run is past creation and the stream is subscribed;
+    // foreign events from here on are seen by the stream's receiver for certain.
+    wait_for_transcript(&state, &target).await;
+
+    let foreign = SessionId::from_raw("ses_resumefiltermustdropthis");
+    publish_foreign_events(&state, &foreign, 3);
+
+    gate.notify_one();
+    let (status, body) = streaming.await.expect("the stream task runs");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !body.contains(foreign.as_str()),
+        "another session's events leaked into the resumed stream: {body:?}"
+    );
+    assert!(
+        body.contains(target.as_str()),
+        "the resumed stream lost its own session's events: {body:?}"
     );
 }
