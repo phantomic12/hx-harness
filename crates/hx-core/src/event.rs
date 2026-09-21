@@ -25,6 +25,15 @@ pub enum AgentEvent {
         agent: AgentId,
         text: String,
     },
+    /// Inbound platform input (a webhook chat message, a bridged user line). Kept separate
+    /// from `TextDelta` so no consumer can render a remote user's words as model output:
+    /// `TextDelta` is agent output, this is what the agent has not seen yet.
+    MessageReceived {
+        /// The conversation's canonical scope (`platform/chat/thread`), when the producer
+        /// knows it — the audit trail's way of telling which remote chat spoke.
+        conversation: Option<String>,
+        text: String,
+    },
     /// Extended-thinking output, kept separate so clients can hide it independently.
     ReasoningDelta {
         agent: AgentId,
@@ -89,7 +98,7 @@ impl AgentEvent {
     pub fn agent(&self) -> Option<&AgentId> {
         use AgentEvent::*;
         match self {
-            SessionStarted { .. } => None,
+            SessionStarted { .. } | MessageReceived { .. } => None,
             TurnStarted { agent, .. }
             | TextDelta { agent, .. }
             | ReasoningDelta { agent, .. }
@@ -173,5 +182,22 @@ mod tests {
         };
         let v: serde_json::Value = serde_json::to_value(&e).unwrap();
         assert_eq!(v["event"], "text_delta");
+    }
+
+    #[test]
+    fn inbound_input_is_not_agent_output_on_the_wire() {
+        // The #77 regression shape: inbound platform text must serialise as its own
+        // variant, never as a `text_delta`, and it belongs to no agent.
+        let e = AgentEvent::MessageReceived {
+            conversation: Some("webhook:main-web/777/".into()),
+            text: "hi".into(),
+        };
+        assert!(e.agent().is_none());
+        assert!(!e.needs_attention());
+        let v: serde_json::Value = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["event"], "message_received");
+        assert_eq!(v["text"], "hi");
+        let back: AgentEvent = serde_json::from_value(v).unwrap();
+        assert_eq!(back, e);
     }
 }

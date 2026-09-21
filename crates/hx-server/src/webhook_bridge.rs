@@ -37,7 +37,7 @@
 use crate::state::AppState;
 use hx_core::approval::RiskClass;
 use hx_core::event::AgentEvent;
-use hx_core::ids::{AgentId, ConnectorId};
+use hx_core::ids::ConnectorId;
 use hx_gateway::Connector as _;
 use hx_gateway::{AnswerOutcome, AnsweringChannel, ApprovalBridge, Inbound};
 use std::sync::{Arc, Weak};
@@ -47,13 +47,6 @@ use std::sync::{Arc, Weak};
 /// [`hx_gateway::answer::AnswerAuthority`] documents for a chat bridge, enforced again by the
 /// queue at the moment the answer arrives.
 pub const WEBHOOK_CHANNEL_CEILING: RiskClass = RiskClass::Mutate;
-
-/// The agent id inbound webhook traffic is attributed to in the event trail. Webhook text arrives
-/// from a remote platform, not from a model turn, so it must not borrow a real agent's id — a
-/// reader of the trail can then tell platform input from generated output.
-fn webhook_agent() -> AgentId {
-    AgentId::from_raw("webhook")
-}
 
 /// Start one driver loop per retained webhook connector. Called once from
 /// [`AppState::from_parts`](crate::state::AppState::from_parts), so both the daemon (`build`)
@@ -247,8 +240,10 @@ async fn route_message(
         );
         return;
     }
-    let event = AgentEvent::TextDelta {
-        agent: webhook_agent(),
+    // The transcript row and the trail agree: this is inbound platform input, not model
+    // output, so it is recorded as `MessageReceived` — never as `TextDelta` (#77).
+    let event = AgentEvent::MessageReceived {
+        conversation: Some(scope.clone()),
         text: text.to_string(),
     };
     match store.append_event(&session, &event, now) {
@@ -275,4 +270,163 @@ async fn route_message(
         session = %session.as_str(),
         "a webhook message reached its harness session"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use hx_core::error::{HxError, Result};
+    use hx_core::ids::{CredentialId, ProviderId};
+    use hx_gateway::{ChatId, Platform, ThreadId};
+    use hx_provider::{ChatRequest, ChatResponse, ModelRouter, ProviderRegistry};
+    use hx_search::BackendRegistry;
+    use hx_secrets::{EnvSecrets, SecretStores};
+    use hx_store::Store;
+    use std::sync::Arc;
+
+    struct DeadModel;
+    #[async_trait]
+    impl hx_agent::ModelCall for DeadModel {
+        async fn complete(&self, _req: ChatRequest) -> Result<ChatResponse> {
+            Err(HxError::Provider("not used in this test".to_string()))
+        }
+        fn model(&self) -> String {
+            "dead".to_string()
+        }
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::from_raw("local")
+        }
+        fn credential_id(&self) -> CredentialId {
+            CredentialId::from_raw("local-1")
+        }
+    }
+
+    struct Dead(Arc<DeadModel>);
+    impl crate::chat::ModelFactory for Dead {
+        fn for_role(&self, _role: &str) -> Result<Arc<dyn hx_agent::ModelCall>> {
+            Ok(Arc::clone(&self.0) as Arc<dyn hx_agent::ModelCall>)
+        }
+    }
+
+    const CONFIG: &str = r#"
+providers:
+  local:
+    kind: ollama
+    base_url: http://127.0.0.1:9
+    models: ["dead-model"]
+    credentials:
+      - { id: local-1, secret: "env:HX_TEST_KEY_NOT_SET" }
+
+pools:
+  interactive: { members: ["local/dead-model"] }
+
+roles:
+  builder: interactive
+
+search:
+  backends: []
+"#;
+
+    async fn test_state() -> (Arc<AppState>, Arc<Store>) {
+        let mut config = hx_core::config::Config::from_yaml(CONFIG).expect("config parses");
+        let dir = tempfile::tempdir().expect("temp dir");
+        config.daemon.data_dir = dir.keep().display().to_string();
+        let now = chrono::Utc::now();
+        let router = ModelRouter::from_config(&config, now).expect("router builds");
+        let client = reqwest::Client::new();
+        let providers =
+            ProviderRegistry::from_config(&config, client.clone()).expect("providers build");
+        let secrets = SecretStores::new().with(Arc::new(EnvSecrets));
+        let search =
+            BackendRegistry::from_config(&config.search, client.clone(), &secrets).expect("search");
+        let store = Arc::new(Store::from_config(&config).expect("store opens"));
+        let state = AppState::from_parts(crate::state::AppStateParts {
+            config,
+            router: Arc::new(std::sync::Mutex::new(router)),
+            providers: Arc::new(providers),
+            secrets: Arc::new(secrets),
+            store: Arc::clone(&store),
+            models: Arc::new(Dead(Arc::new(DeadModel))),
+            tools: Arc::new(crate::chat::default_tools(vec![], client)),
+            approvals: hx_agent::ApprovalQueue::new(std::time::Duration::from_secs(1)),
+            phone: None,
+            search: Arc::new(search),
+            sandboxes: None,
+            sandbox_unavailable_reason: Some("no container engine in a test".to_string()),
+            started_at: now,
+            api_token: None,
+            webhooks: Default::default(),
+        });
+        (state, store)
+    }
+
+    #[tokio::test]
+    async fn an_inbound_webhook_message_is_recorded_as_input_not_model_output() {
+        // The #77 regression shape: the transcript row is `Message::user`, so the event
+        // trail must say inbound input too — never a `TextDelta` attributed to "webhook".
+        let (state, store) = test_state().await;
+        let mut live = state.event_bus.subscribe();
+        let conversation = hx_gateway::Conversation {
+            platform: Platform::from("webhook:main-web"),
+            chat: ChatId::from("777"),
+            thread: ThreadId::from(""),
+        };
+        let scope = conversation.canonical();
+        let connector = ConnectorId::from("main-web");
+
+        route_message(
+            &state,
+            &store,
+            &state.event_bus,
+            &connector,
+            &conversation,
+            "list the repo",
+        )
+        .await;
+
+        let session = state
+            .webhook_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&scope)
+            .cloned()
+            .expect("the conversation owns a session");
+        let events = store.events(&session).expect("events read back");
+        let inbound = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::MessageReceived { conversation, text } => {
+                    Some((conversation.clone(), text.clone()))
+                }
+                _ => None,
+            })
+            .expect("an inbound event, not a text delta");
+        assert_eq!(inbound.0.as_deref(), Some(scope.as_str()));
+        assert_eq!(inbound.1, "list the repo");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::TextDelta { .. })),
+            "no model-output event for platform input: {events:?}"
+        );
+
+        let messages = store.messages(&session).expect("transcript reads back");
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m.role, hx_core::message::Role::User)),
+            "the transcript row stays a user message: {messages:?}"
+        );
+
+        let live = live
+            .try_recv()
+            .expect("the live bus carries the inbound event");
+        assert_eq!(live.session, session);
+        assert!(
+            matches!(live.event, AgentEvent::MessageReceived { .. }),
+            "live subscribers see input, not output: {:?}",
+            live.event
+        );
+    }
 }

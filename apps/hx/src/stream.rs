@@ -136,7 +136,12 @@ pub fn progress_line(event: &Value) -> Option<String> {
             let ok = event["result"]["is_error"] != Value::Bool(true);
             Some(format!("  {} {name}", if ok { "ok" } else { "failed" }))
         }
-        "text_delta" => None,    // already printed live, as it arrived
+        "text_delta" => None, // already printed live, as it arrived
+        // Inbound platform input: shown as input, never as model output (#77).
+        "message_received" => {
+            let text = event["text"].as_str().unwrap_or("?");
+            Some(format!("< {text}"))
+        }
         "turn_finished" => None, // the reply itself carries the outcome
         _ => None,
     }
@@ -316,6 +321,24 @@ mod tests {
         // Text deltas and turn boundaries are rendered elsewhere, so they are not duplicated here.
         assert!(progress_line(&serde_json::json!({"event": "text_delta", "text": "hi"})).is_none());
         assert!(progress_line(&serde_json::json!({"event": "turn_finished"})).is_none());
+    }
+
+    #[test]
+    fn inbound_input_is_shown_as_input_not_model_output() {
+        // #77: a bridged platform message renders as inbound text, visibly distinct from the
+        // model's own deltas (which `progress_line` stays silent on).
+        let line = progress_line(&serde_json::json!({
+            "event": "message_received",
+            "conversation": "webhook:main-web/777/",
+            "text": "list the repo",
+        }))
+        .expect("inbound input gets a line");
+        assert!(line.contains("list the repo"), "{line}");
+        assert_ne!(
+            progress_line(&serde_json::json!({"event": "text_delta", "text": "list the repo"})),
+            Some(line.clone()),
+            "input and output never render the same way"
+        );
     }
 
     #[test]
