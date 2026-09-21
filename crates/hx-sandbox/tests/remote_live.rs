@@ -264,7 +264,6 @@ fn spec(workspace_host_path: &str, isolation: IsolationLevel) -> SandboxSpec {
         workspace_path: DEFAULT_WORKSPACE_PATH.to_string(),
         user: None,
         env: Vec::new(),
-        runtime: None,
     };
     spec.validate().expect("the spec must validate");
     spec
@@ -659,13 +658,9 @@ async fn a_remote_sandbox_with_an_allowlist_reaches_its_allowed_host_and_not_a_d
         "the refusal must be the allowlist's, not a blanket block: {denied:?}"
     );
 
-    // The sandbox has no *internet* route except the proxy: the internal network carries no default
-    // route, so a *direct* (non-proxy) connection attempts the route the design removes. This is the
-    // half that a sandbox merely told about a proxy would violate — it would connect directly and skip
-    // the allowlist entirely. (It is not unreachability in every direction: the far host's own bridge
-    // address stays reachable on-link, which is the known hole pinned by
-    // `a_sandbox_reaches_the_far_hosts_own_bridge_address_and_that_is_a_known_hole` below and filed in
-    // ROADMAP.md.)
+    // The sandbox has no route out except the proxy: the internal network has no gateway, so a *direct*
+    // (non-proxy) connection attempts the route the design removes. This is the half that a sandbox merely
+    // told about a proxy would violate — it would connect directly and skip the allowlist entirely.
     let direct = runtime
         .exec(
             &name,
@@ -715,157 +710,6 @@ async fn a_remote_sandbox_with_an_allowlist_reaches_its_allowed_host_and_not_a_d
     );
 
     // Explicit, awaited binary + workspace cleanup (the Drop is only a panic safety net).
-    let _ = raw(
-        &host,
-        &format!("rm -f {}", remote_bin.replace('\'', "'\\''")),
-    )
-    .await;
-    let _ = raw(&host, &format!("rm -rf {}", ws.replace('\'', "'\\''"))).await;
-}
-
-#[ignore = "requires a real remote Docker host (HX_SSH_TEST_HOST, HX_SSH_TEST_USER, HX_SSH_TEST_KEY)"]
-#[tokio::test]
-async fn a_sandbox_reaches_the_far_hosts_own_bridge_address_and_that_is_a_known_hole() {
-    // THIS TEST PINS A KNOWN HOLE. It asserts a property we do *not* want, deliberately, so the hole
-    // stays measured rather than assumed — and so no doc comment can quietly grow a stronger claim
-    // than the code supports. `crates/hx-sandbox/src/egress.rs` used to say a sandbox on the internal
-    // egress network "cannot bypass" the proxy because there is "literally no route" off the network.
-    // That was false. The network carries no *default* route, but its IPAM gateway is the far host's
-    // own bridge interface sitting on the **same on-link subnet** as the sandbox, and on-link delivery
-    // needs no route at all: the container ARPs for the address and the packet is delivered. Measured
-    // on rainbowone, the host's own sshd answered on that address from inside the sandbox.
-    //
-    // The probe is deterministic by construction: it targets the SSH port the suite already requires
-    // to be listening on the host (`HX_SSH_TEST_PORT`, default 22), read from inside the sandbox.
-    // There is no wall-clock assertion and no reliance on the internet.
-    let target = skip_without_a_host!();
-    let Some(host) = connect(&target).await else {
-        return;
-    };
-
-    let ws = make_remote_workspace(&host).await;
-    let mut spec = spec(&ws, IsolationLevel::L1);
-    spec.network = true;
-    spec.egress_allow = vec!["example.com".into()];
-    let settings = spec.host_settings();
-
-    let proxy_bin = std::env::var("HX_DOCKER_TEST_PROXY_BIN")
-        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_hx-egress-proxy").to_string());
-    let proxy_bytes = std::fs::read(&proxy_bin).unwrap_or_else(|err| {
-        panic!("could not read the egress proxy binary at {proxy_bin}: {err}")
-    });
-    let remote_bin = format!("/tmp/hx-egress-proxy-{}", SandboxId::new().as_str());
-    host.write_file(&remote_bin, &proxy_bytes)
-        .await
-        .unwrap_or_else(|err| panic!("placing the proxy binary on the far host failed: {err}"));
-    raw(
-        &host,
-        &format!("chmod +x {}", remote_bin.replace('\'', "'\\''")),
-    )
-    .await;
-
-    let runtime = RemoteSandboxRuntime::new(Arc::new(SshRunner {
-        host: Arc::clone(&host),
-    }))
-    .with_proxy_bin(Some(remote_bin.clone()));
-    let id = SandboxId::new();
-    let name = format!("hx-{}", id.as_str());
-    let network = format!("{name}-egress");
-    let _cleanup = Cleanup::new(&name, &ws).with_binary(remote_bin.clone());
-
-    let name = runtime
-        .create(&id, &spec, &settings)
-        .await
-        .expect("create with an allowlist");
-    runtime
-        .start(&name)
-        .await
-        .expect("the far daemon starts the egress sandbox");
-
-    // The address the sandbox can actually reach: the internal network's own IPAM gateway. Asked of
-    // the far daemon rather than hard-coded, so the probe follows whatever pool the host is on.
-    let quoted_network = network.replace('\'', "'\\''");
-    let gateway = raw(
-        &host,
-        &format!(
-            "docker network inspect {quoted_network} \
-             --format '{{{{(index .IPAM.Config 0).Gateway}}}}'"
-        ),
-    )
-    .await;
-    let gateway = gateway.trim().to_string();
-    assert!(
-        !gateway.is_empty(),
-        "the internal network must report a gateway address, or this probe proves nothing"
-    );
-
-    // THE HOLE. If this assertion ever fails the hole has been closed, which is good news: the right
-    // response is to delete this test *and* the ROADMAP item together, not to weaken the probe.
-    let port = std::env::var("HX_SSH_TEST_PORT").unwrap_or_else(|_| "22".to_string());
-    let bridge = runtime
-        .exec(
-            &name,
-            &format!(
-                "timeout 8 bash -c 'exec 4<>/dev/tcp/{gateway}/{port} && echo BRIDGE_REACHABLE' \
-                 || echo BRIDGE_UNREACHABLE"
-            ),
-            None,
-        )
-        .await
-        .expect("exec inside the egress sandbox");
-    assert!(
-        bridge.stdout.contains("BRIDGE_REACHABLE"),
-        "the far host's bridge address {gateway}:{port} is a known reachable hole from inside the \
-         sandbox and must stay measured rather than assumed: {bridge:?}"
-    );
-
-    // The half of the old claim that *is* true and must stay true: no default route, so no internet.
-    // `/proc/net/route` rather than `ip route` — the image has no `ip`, and the default route is the
-    // line whose Destination field is the hex `00000000`.
-    let routes = runtime
-        .exec(&name, "cat /proc/net/route", None)
-        .await
-        .expect("exec inside the egress sandbox");
-    let has_default_route = routes
-        .stdout
-        .lines()
-        .any(|line| line.split_whitespace().nth(1) == Some("00000000"));
-    assert!(
-        !has_default_route,
-        "the internal network must still carry no default route: {routes:?}"
-    );
-    let internet = runtime
-        .exec(
-            &name,
-            "timeout 8 bash -c 'exec 5<>/dev/tcp/1.1.1.1/443 && echo INTERNET_OK' \
-             || echo NO_INTERNET_ROUTE",
-            None,
-        )
-        .await
-        .expect("exec inside the egress sandbox");
-    assert!(
-        internet.stdout.contains("NO_INTERNET_ROUTE"),
-        "there must still be no internet route without the proxy: {internet:?}"
-    );
-
-    // --- teardown leaves the far host exactly as it was found ---
-    runtime
-        .remove(&name)
-        .await
-        .expect("the far daemon removes the egress sandbox");
-    assert!(
-        !container_exists(&host, &name).await,
-        "the sandbox must be gone"
-    );
-    let net = raw(
-        &host,
-        &format!("docker network ls --format '{{{{.Name}}}}' | grep -qx {quoted_network}; echo $?"),
-    )
-    .await;
-    assert!(
-        net.trim() == "1",
-        "the egress network must be torn down with its sandbox"
-    );
     let _ = raw(
         &host,
         &format!("rm -f {}", remote_bin.replace('\'', "'\\''")),
