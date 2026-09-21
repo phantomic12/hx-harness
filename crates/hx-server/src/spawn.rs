@@ -47,7 +47,7 @@ use hx_core::error::{HxError, Result};
 use hx_core::ids::{ProviderId, SessionId};
 use hx_core::message::Message;
 use hx_core::pool::{member_death, DrawError, ModelPool, Param, ParamClamp};
-use hx_provider::{ChatRequest, ProviderRegistry};
+use hx_provider::{ChatRequest, Provider, ProviderRegistry};
 use hx_secrets::{Redactor, Secret, SecretStores};
 use hx_store::UsageRecord;
 use serde::Serialize;
@@ -97,6 +97,76 @@ fn redact_death_reason(key: &Secret, err: &HxError) -> String {
     let mut redactor = Redactor::new();
     redactor.register(key.expose());
     redactor.redact(&err.to_string()).text
+}
+
+/// What one prepared child's run produced: either its record, or its member's death.
+///
+/// `Failed` carries **both** redactions' inputs: `reason` is the death reason already redacted
+/// with the resolved key as a registered literal (what `mark_down` stores), and `error` is the
+/// raw provider error for the caller to redact at its own boundary (what the fan-out reports).
+/// A store-write failure is not a member death, so it is a `Result::Err` instead — no member is
+/// benched for it, exactly as `run_child`'s `?` behaved.
+pub enum PreparedOutcome {
+    /// The child completed. Carries the same [`ChildRecord`] `run_child` would have returned.
+    Ran(ChildRecord),
+    /// The provider call failed. `member` is the member the child was drawn to run on.
+    Failed {
+        member: String,
+        reason: String,
+        error: HxError,
+    },
+}
+
+/// One allocated child with everything its run needs, owned rather than borrowed.
+///
+/// Built by [`Spawner::prepare_child`]; run with [`PreparedChild::run`].
+pub struct PreparedChild {
+    provider: Arc<dyn Provider>,
+    key: Secret,
+    spec: ChildSpec,
+    store: Arc<hx_store::Store>,
+}
+
+impl PreparedChild {
+    /// Make the child's one provider call and record its usage — shareably.
+    ///
+    /// This is the `&mut`-free middle of `run_child`: the same request, the same record, the
+    /// same redacted death reason. The pool-health write is the caller's job
+    /// ([`Spawner::mark_down`]), applied after the concurrent join.
+    pub async fn run(self, session: &SessionId, prompt: &str) -> Result<PreparedOutcome> {
+        let request = ChatRequest::new(self.spec.model(), vec![Message::user(prompt)]);
+        let response = match self.provider.complete(request, &self.key).await {
+            Ok(response) => response,
+            Err(err) => {
+                return Ok(PreparedOutcome::Failed {
+                    member: self.spec.member_id.clone(),
+                    reason: redact_death_reason(&self.key, &err),
+                    error: err,
+                });
+            }
+        };
+
+        let usage = response.usage;
+        let record = UsageRecord::new(
+            self.spec.member_id.clone(),
+            self.spec.credential.clone(),
+            self.spec.model(),
+            usage.input_tokens,
+            usage.output_tokens,
+        )
+        .cached(usage.cached_input_tokens)
+        .reasoning(usage.reasoning_tokens);
+        self.store.record_usage(session, &record, Utc::now())?;
+
+        Ok(PreparedOutcome::Ran(ChildRecord {
+            model: self.spec.model().to_string(),
+            credential: self.spec.credential.clone(),
+            clamps: self.spec.clamps.clone(),
+            usage: record,
+            base_url: self.spec.base_url.clone(),
+            dead_members: Vec::new(),
+        }))
+    }
 }
 
 /// The spawner that draws children from a model pool.
@@ -156,6 +226,33 @@ impl Spawner {
         session: &SessionId,
         prompt: &str,
     ) -> Result<ChildRecord> {
+        // One implementation of "one provider call, recorded": prepare the shareable work, run
+        // it, then apply the pool-health write. The fan-out (`crate::fanout`) runs the middle
+        // step concurrently across children and applies the write serially after the join; doing
+        // it here keeps the two paths from drifting apart.
+        let prepared = self.prepare_child(spec)?;
+        match prepared.run(session, prompt).await? {
+            PreparedOutcome::Ran(record) => Ok(record),
+            PreparedOutcome::Failed {
+                member,
+                reason,
+                error,
+            } => {
+                self.mark_down(&member, reason);
+                Err(error)
+            }
+        }
+    }
+
+    /// Split one allocated child into an owned unit of work that can run without `&mut self`.
+    ///
+    /// Resolving the provider and the credential is read-only (both registries sit behind `Arc`),
+    /// so this takes `&self`. The returned [`PreparedChild::run`] does the provider call and the
+    /// usage record — both shareable — but deliberately **not** the pool-health write: `mark_down`
+    /// needs `&mut`, so the caller applies [`Spawner::mark_down`] with the [`PreparedOutcome`]'s
+    /// reason afterwards. A resolve failure is returned as-is (that child's own error, exactly as
+    /// `run_child`'s pre-call `?` did — no member is benched for a request that never ran).
+    pub fn prepare_child(&self, spec: &ChildSpec) -> Result<PreparedChild> {
         let provider = self
             .providers
             .resolve(&ProviderId::from(spec.member_id.clone()), spec.model())
@@ -164,37 +261,21 @@ impl Spawner {
             .secrets
             .resolve_str(&spec.credential)
             .map_err(|err| hx_core::error::HxError::Secret(err.to_string()))?;
-
-        let request = ChatRequest::new(spec.model(), vec![Message::user(prompt)]);
-        let response = match provider.complete(request, &key).await {
-            Ok(response) => response,
-            Err(err) => {
-                self.pool
-                    .mark_down(&spec.member_id, redact_death_reason(&key, &err), Utc::now());
-                return Err(err);
-            }
-        };
-
-        let usage = response.usage;
-        let record = UsageRecord::new(
-            spec.member_id.clone(),
-            spec.credential.clone(),
-            spec.model(),
-            usage.input_tokens,
-            usage.output_tokens,
-        )
-        .cached(usage.cached_input_tokens)
-        .reasoning(usage.reasoning_tokens);
-        self.store.record_usage(session, &record, Utc::now())?;
-
-        Ok(ChildRecord {
-            model: spec.model().to_string(),
-            credential: spec.credential.clone(),
-            clamps: spec.clamps.clone(),
-            usage: record,
-            base_url: spec.base_url.clone(),
-            dead_members: Vec::new(),
+        Ok(PreparedChild {
+            provider,
+            key,
+            spec: spec.clone(),
+            store: Arc::clone(&self.store),
         })
+    }
+
+    /// Bench a member with a reason, timestamped now.
+    ///
+    /// This is the pool-health half of a failed child run, exposed so the fan-out can apply it
+    /// serially after its concurrent join. Same write `run_child` always did, same clock.
+    pub fn mark_down(&mut self, member: &str, reason: String) {
+        self.pool
+            .mark_down(member, reason, Utc::now());
     }
 
     /// Run a child that **re-routes on member death** and continues, rather than failing the lane.
