@@ -170,7 +170,31 @@ impl SandboxManager {
 
         if let Err(err) = self.runtime.start(&runtime_id).await {
             // Roll back rather than leaving an untracked container behind.
-            let _ = self.runtime.remove(&runtime_id).await;
+            if let Err(remove_err) = self.runtime.remove(&runtime_id).await {
+                // WHY the half-created sandbox is *tracked* here instead of just reported:
+                // the container exists on the engine but nothing points at it, which is
+                // exactly the invisible leak the reaper exists to prevent. Marking it
+                // `Failed` makes the next reap retry the removal (reap sweeps `Failed`
+                // handles regardless of TTL), so a transient engine failure cleans up on
+                // its own instead of holding disk until someone notices.
+                let handle = SandboxHandle {
+                    id: id.clone(),
+                    profile: spec.profile.clone(),
+                    runtime_id,
+                    state: SandboxState::Failed,
+                    created_at: now,
+                    expires_at: now + Duration::seconds(spec.ttl_secs as i64),
+                    workspace_host_path: spec.workspace_host_path.clone(),
+                    workspace_path: spec.workspace_path.clone(),
+                    isolation: spec.isolation,
+                };
+                live.insert(id.to_string(), handle);
+                return Err(HxError::Sandbox(format!(
+                    "sandbox failed to launch ({err}), and removing the half-created container \
+                     failed as well ({remove_err}); it is still tracked and the reaper will retry \
+                     the removal"
+                )));
+            }
             return Err(HxError::Sandbox(format!(
                 "sandbox started but failed to launch ({err}); it has been removed"
             )));
@@ -234,6 +258,13 @@ impl SandboxManager {
 
     /// Stop and remove a sandbox. Idempotent: destroying something already gone is not an error,
     /// because the caller almost always means "make sure this is not running".
+    ///
+    /// A sandbox whose engine removal fails stays tracked (marked `Failed`) instead of being
+    /// deregistered: once deregistered, nothing points at the container and the reaper can never
+    /// retry, so the old "deregister and report" behaviour was a slow leak dressed as cleanup.
+    /// Only a successful `remove` deregisters; a `stop` failure with a successful `remove` still
+    /// deregisters, because the container is gone and holding its slot would be the leak in the
+    /// other direction.
     pub async fn destroy(&self, id: &str) -> Result<()> {
         let handle = self.live.lock().await.remove(id);
 
@@ -247,6 +278,20 @@ impl SandboxManager {
         }
         if let Err(err) = self.runtime.remove(&handle.runtime_id).await {
             errors.push(format!("remove: {err}"));
+            // WHY reinsert rather than return the error: the container still exists on the
+            // engine, and this map is the only thing that can find it again. Marking it
+            // `Failed` keeps `exec` away (it only runs `Running` sandboxes) while making
+            // the next reap retry the removal — reap sweeps `Failed` handles regardless
+            // of TTL, so a transient engine failure resolves itself within one interval
+            // instead of holding a slot and disk until the TTL happens to expire.
+            let mut handle = handle;
+            handle.state = SandboxState::Failed;
+            self.live.lock().await.insert(id.to_string(), handle);
+            return Err(HxError::Sandbox(format!(
+                "sandbox {id} could not be removed from the engine ({}); it is still tracked \
+                 and the reaper will retry the removal",
+                errors.join("; ")
+            )));
         }
 
         if errors.is_empty() {
@@ -261,11 +306,16 @@ impl SandboxManager {
     }
 
     /// Reap sandboxes past their TTL, returning the ids that were removed.
+    ///
+    /// `Failed` handles are swept regardless of TTL: they are sandboxes a previous
+    /// `destroy` (or a failed `spawn` rollback) could not remove from the engine, and
+    /// waiting for a TTL that may be hours away before retrying would leave the
+    /// container — and its slot — held for no reason.
     pub async fn reap(&self, now: DateTime<Utc>) -> Result<Vec<SandboxId>> {
         let expired: Vec<(String, SandboxId)> = {
             let live = self.live.lock().await;
             live.values()
-                .filter(|h| h.is_expired(now))
+                .filter(|h| h.is_expired(now) || h.state == SandboxState::Failed)
                 .map(|h| (h.id.to_string(), h.id.clone()))
                 .collect()
         };
@@ -298,7 +348,7 @@ mod tests {
     use super::*;
     use crate::spec::{HostSettings, SandboxSpec};
     use hx_core::config::IsolationLevel;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// Records everything it was asked to do, and can be told to fail at a chosen step.
     #[derive(Default)]
@@ -310,7 +360,10 @@ mod tests {
         fail_start: bool,
         fail_create: bool,
         fail_stop: bool,
-        fail_remove: bool,
+        // WHY atomic rather than a plain bool: a retry test flips the engine from failing to
+        // healthy *between* a failed destroy and the reaping retry, while the manager holds
+        // only a shared reference. A `Mutex<bool>` would do, but the atomic never blocks.
+        fail_remove: AtomicBool,
         counter: AtomicUsize,
     }
 
@@ -376,7 +429,7 @@ mod tests {
         }
 
         async fn remove(&self, runtime_id: &str) -> Result<()> {
-            if self.fail_remove {
+            if self.fail_remove.load(Ordering::SeqCst) {
                 return Err(HxError::Sandbox("remove failed".into()));
             }
             self.removed.lock().await.push(runtime_id.to_string());
@@ -586,6 +639,67 @@ mod tests {
         let err = manager.destroy(handle.id.as_str()).await.unwrap_err();
         assert!(err.to_string().contains("deregistered"), "{err}");
         assert_eq!(manager.free_slots().await, 1, "the slot must be released");
+    }
+
+    #[tokio::test]
+    async fn a_destroy_whose_removal_fails_stays_tracked_until_removal_succeeds() {
+        // The leak-prevention invariant for teardown: a container the engine would not
+        // remove still exists, so deregistering it would make it invisible to the reaper
+        // forever. It must stay tracked (and hold its slot, which is honest — the
+        // container is still there) until a retry removes it.
+        let runtime = Arc::new(FakeRuntime::default());
+        runtime.fail_remove.store(true, Ordering::SeqCst);
+        let manager = manager_with(runtime.clone(), 1);
+        let handle = manager.spawn(&spec(3600), t0()).await.unwrap();
+
+        let err = manager.destroy(handle.id.as_str()).await.unwrap_err();
+        assert!(err.to_string().contains("still tracked"), "{err}");
+        assert!(
+            manager.get(handle.id.as_str()).await.is_some(),
+            "the sandbox must still be tracked so the reaper can retry"
+        );
+        assert_eq!(
+            manager.free_slots().await,
+            0,
+            "the slot is still occupied by a container that still exists"
+        );
+
+        // The engine recovers; the next reap retries the removal and frees the slot,
+        // without waiting for the TTL.
+        runtime.fail_remove.store(false, Ordering::SeqCst);
+        let reaped = manager.reap(t0()).await.unwrap();
+        assert_eq!(reaped, vec![handle.id.clone()]);
+        assert_eq!(manager.free_slots().await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_whose_rollback_fails_stays_tracked_for_the_reaper() {
+        // Same invariant on the creation path: `start` failed, and the rollback `remove`
+        // failed too, so the container exists but was never tracked. Reporting "has been
+        // removed" would be a lie; track it as `Failed` so the reaper retries.
+        let runtime = Arc::new(FakeRuntime {
+            fail_start: true,
+            ..Default::default()
+        });
+        runtime.fail_remove.store(true, Ordering::SeqCst);
+        let manager = manager_with(runtime.clone(), 4);
+
+        let err = manager.spawn(&spec(3600), t0()).await.unwrap_err();
+        assert!(err.to_string().contains("still tracked"), "{err}");
+        assert_eq!(
+            manager.list().await.len(),
+            1,
+            "the half-created sandbox must be tracked"
+        );
+        assert_eq!(
+            manager.list().await[0].state,
+            SandboxState::Failed,
+            "marked Failed so exec refuses it while the reaper retries it"
+        );
+
+        runtime.fail_remove.store(false, Ordering::SeqCst);
+        assert_eq!(manager.reap(t0()).await.unwrap().len(), 1);
+        assert!(manager.list().await.is_empty());
     }
 
     #[tokio::test]

@@ -27,6 +27,10 @@ md5.workspace = true
 getrandom.workspace = true
 # WinRM is SOAP over HTTP, so its transport is an HTTP client rather than a socket.
 reqwest.workspace = true
+# Unix-only: process-group kill on command timeouts. `target`-gated so non-Unix builds
+# (Windows uses `taskkill /T`) do not link it.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
