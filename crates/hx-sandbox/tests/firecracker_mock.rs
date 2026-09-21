@@ -196,11 +196,17 @@ async fn the_root_drive_is_read_only_and_the_workspace_is_writable() {
     );
     assert_eq!(root.2["path_on_host"], "/images/rootfs.ext4");
 
+    // #58: the workspace is now a provisioned block image in the sandbox drive dir,
+    // not the bare host directory.
     assert_eq!(
         ws.2["is_read_only"], false,
         "the workspace drive must be writable"
     );
-    assert_eq!(ws.2["path_on_host"], "/mnt/ws");
+    let ws_path = ws.2["path_on_host"].as_str().unwrap_or_default();
+    assert!(
+        ws_path.ends_with(".ext4") && ws_path.contains("sbx_drives"),
+        "workspace drive must be a provisioned block image, got {ws_path}"
+    );
 }
 
 #[tokio::test]

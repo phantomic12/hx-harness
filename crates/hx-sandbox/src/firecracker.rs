@@ -12,21 +12,28 @@
 //!
 //! ## Lifecycle
 //!
-//! - `create` spawns `firecracker --api-sock <path>`, waits for the socket, then PUTs the
-//!   boot source (kernel + rootfs), the drives (root plus the workspace, which is what makes the
-//!   sandbox's work survive it), a vsock device (the only side channel out of a network-off
+//! - `create` resolves the binary through `PATH` (a bare `firecracker` name is looked up like a
+//!   shell would, not `stat`ed against the current directory), provisions a bounded workspace
+//!   block image, spawns `firecracker --api-sock <path>`, waits for the socket, then PUTs the
+//!   boot source (kernel + rootfs, plus which guest path the workspace mounts at), the drives
+//!   (root plus the provisioned workspace image, which is what makes the sandbox's work survive
+//!   it), a vsock device with a per-microVM CID (the only side channel out of a network-off
 //!   microVM), and the machine config (vCPU count, memory) from the spec. The runtime id a
 //! - `start` PUTs `InstanceStart`.
-//! - `stop` / `remove` kill the owned `firecracker` process and remove the temp directory the
-//!   microVM was built in. Firecracker has no graceful-stop API; killing the process is how a
-//!   microVM is stopped.
-//! - `exec` runs in the guest over the vsock device through an [`ExecChannel`] (see below).
+//! - `stop` kills the owned `firecracker` process but retains the microVM's identity (CID,
+//!   workspace mapping) until `remove`; Firecracker has no graceful-stop API, so killing the
+//!   process is how a microVM is stopped.
+//! - `remove` drops that identity — the CID returns to the pool — and removes the temp directory
+//!   the microVM was built in.
+//! - `exec` runs in the guest over that microVM's vsock device through an [`ExecChannel`] that is
+//!   told *which* microVM the command is for (see below).
 //!
 //! ## `exec`: the chosen path
 //!
 //! Firecracker has no `docker exec`-equivalent. The chosen path is a guest-side SSH daemon reached
 //! over the microVM's vsock device: the runtime sets up the vsock, and an [`ExecChannel`]
-//! implementation performs the command on the far side of it. The seam exists because the guest must be
+//! implementation performs the command on the far side of it, addressed by the per-microVM CID
+//! the runtime hands it in [`VmExecTarget`]. The seam exists because the guest must be
 //! provisioned with `sshd` and a key for this to work — a real transport is deployment work, not
 //! library work — and because the hermetic suite needs a transport it can observe without a KVM host.
 //! The vsock device is created during `create` (an observable API call), so a profile that asks for
@@ -35,6 +42,16 @@
 //! A sandbox whose L3 asks for exec must be configured with an [`ExecChannel`] (a real SSH-over-vsock
 //! adapter where one is available); the default returns a clear error rather than pretending to run a command
 //! that did not actually run in the guest.
+//!
+//! ## Workspace: a block image, not the host directory
+//!
+//! Firecracker's block API attaches host *files* as guest drives; handing it the spec's workspace
+//! directory would fail (a directory is not a block image) and would conflate the host working
+//! tree with guest block storage. So `create` provisions `<vm-dir>/workspace.ext4` — a sparse,
+//! bounded regular file sized from `spec.workspace_mb` — and attaches *that* as the writable
+//! drive. The guest mounts `/dev/vdb` where the boot args say (`hx_workspace=<path>`); the
+//! runtime remembers which host directory the sandbox's work lives in and exposes it via
+//! [`FirecrackerRuntime::host_workspace`], so an operator can map a guest write back to the host.
 //!
 //! ## Security posture
 //!
@@ -68,19 +85,56 @@ const SOCKET_WAIT: Duration = Duration::from_secs(5);
 const ROOT_DRIVE: &str = "rootfs";
 /// The `drive_id` for the workspace volume.
 const WORKSPACE_DRIVE: &str = "workspace";
+/// The file name of the provisioned workspace block image inside the microVM's dir.
+const WORKSPACE_IMAGE_NAME: &str = "workspace.ext4";
 /// The guest's network-free side channel.
 const VSOCK_ID: &str = "vsock";
 
-/// Runs a command *inside* the guest of a Firecracker microVM.
+/// First guest CID handed out. CIDs 0–2 are reserved (hypervisor, host, and the well-known
+/// addresses); guest microVMs start at 3 by vsock convention.
+const CID_FIRST: u32 = 3;
+
+/// Bounds for the provisioned workspace image. The spec's `workspace_mb` sizes the sandbox, but
+/// the image must stay bounded: a profile asking for terabytes must not materialise terabytes.
+const MIN_WORKSPACE_IMAGE_BYTES: u64 = 64 << 20;
+const MAX_WORKSPACE_IMAGE_BYTES: u64 = 8 << 30;
+
+/// Where an [`ExecChannel`] must deliver a command: the identity of one live microVM.
+///
+/// A single channel implementation serves every microVM this runtime owns (one SSH-over-vsock
+/// client, not one per guest), so the runtime tells it *which* guest each call is for. Without
+/// this, `exec` on two live microVMs would be indistinguishable at the transport and a command
+/// meant for one guest could run in the other.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VmExecTarget {
+    /// The runtime id `create` returned (the microVM's API socket path).
+    pub runtime_id: String,
+    /// The guest CID of the vsock device this microVM was configured with.
+    pub cid: u32,
+    /// Host path of that vsock device's Unix socket.
+    pub uds_path: PathBuf,
+    /// Where the workspace is mounted inside the guest; the default working directory.
+    pub guest_workspace: String,
+}
+
+/// Runs a command *inside* the guest of one Firecracker microVM.
 ///
 /// Firecracker's API has no `exec`. The chosen path is a guest `sshd` reached over the vsock
 /// device; this trait is that transport. A real implementation is deployment work (the guest must run
 /// `sshd` with a key the host trusts) and deliberately lives behind a seam so the hermetic suite can
 /// observe it and so a crate caller can supply a real one without the library depending on an SSH stack.
+///
+/// The `vm` argument is which microVM the command is for — the transport dials `vm.cid`, not a
+/// shared endpoint, so concurrent guests cannot receive each other's commands.
 #[async_trait]
 pub trait ExecChannel: Send + Sync {
-    /// Run `command` in the guest and return its combined output.
-    async fn exec(&self, command: &str, workdir: Option<&str>) -> Result<SandboxExecOutput>;
+    /// Run `command` in the guest of `vm` and return its combined output.
+    async fn exec(
+        &self,
+        vm: &VmExecTarget,
+        command: &str,
+        workdir: Option<&str>,
+    ) -> Result<SandboxExecOutput>;
 }
 
 /// The default [`ExecChannel`]: refuse loudly rather than claim a command ran.
@@ -91,7 +145,12 @@ struct NoExecChannel;
 
 #[async_trait]
 impl ExecChannel for NoExecChannel {
-    async fn exec(&self, _command: &str, _workdir: Option<&str>) -> Result<SandboxExecOutput> {
+    async fn exec(
+        &self,
+        _vm: &VmExecTarget,
+        _command: &str,
+        _workdir: Option<&str>,
+    ) -> Result<SandboxExecOutput> {
         Err(HxError::Sandbox(
             "this Firecracker sandbox has no ExecChannel configured; exec needs a guest sshd \
              reached over vsock (set one via with_exec_channel)"
@@ -110,6 +169,58 @@ fn default_kvm() -> PathBuf {
     PathBuf::from("/dev/kvm")
 }
 
+/// Clamp the spec's workspace ceiling to a bounded image size.
+///
+/// WHY the clamp: `workspace_mb` is an accounting ceiling, not a disk allocation — a profile
+/// asking for 16 TiB must not produce a 16 TiB image. The floor keeps tiny workspaces usable;
+/// the ceiling keeps a fat profile from exhausting the host.
+fn workspace_image_bytes(workspace_mb: u64) -> u64 {
+    workspace_mb
+        .saturating_mul(1024 * 1024)
+        .clamp(MIN_WORKSPACE_IMAGE_BYTES, MAX_WORKSPACE_IMAGE_BYTES)
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+}
+
+/// One live (or stopped-but-not-removed) microVM: everything `exec` and `remove` need to find it.
+struct VmInfo {
+    /// The owned process; `None` after `stop` (killing it is how the microVM stops).
+    child: Option<Child>,
+    /// The unique guest CID this microVM's vsock was configured with.
+    cid: u32,
+    /// The staging dir: socket, workspace image, vsock socket.
+    dir: PathBuf,
+    /// The provisioned workspace block image attached as the writable drive.
+    image: PathBuf,
+    /// The host working tree the sandbox's work lives in (from the spec).
+    host_workspace: String,
+    /// Where that workspace mounts inside the guest (from the spec).
+    guest_workspace: String,
+}
+
+/// Owned microVMs plus the CID pool. One lock: create/stop/remove/exec are infrequent, and a
+/// single lock keeps the CID pool and the VM map from disagreeing.
+struct State {
+    vms: HashMap<String, VmInfo>,
+    /// Next never-used CID. Freed CIDs in `free_cids` are preferred over minting new ones.
+    next_cid: u32,
+    /// CIDs released by `remove`, ready for reuse.
+    free_cids: Vec<u32>,
+}
+
 /// A Firecracker microVM sandbox runtime.
 pub struct FirecrackerRuntime {
     /// Path to the `firecracker` binary (or just `firecracker`, found on `PATH`).
@@ -122,9 +233,9 @@ pub struct FirecrackerRuntime {
     kernel: PathBuf,
     /// Host path of the guest root filesystem image.
     rootfs: PathBuf,
-    /// runtime_id -> the owned process for that microVM. Killing it is how the microVM stops.
-    vms: Mutex<HashMap<String, Child>>,
-    /// The transport used by `exec`.
+    /// runtime_id -> the microVM's owned process, CID, and workspace mapping.
+    state: Mutex<State>,
+    /// The transport used by `exec`, routed per microVM via [`VmExecTarget`].
     exec: Box<dyn ExecChannel>,
 }
 
@@ -137,12 +248,18 @@ impl FirecrackerRuntime {
             work_dir,
             kernel,
             rootfs,
-            vms: Mutex::new(HashMap::new()),
+            state: Mutex::new(State {
+                vms: HashMap::new(),
+                next_cid: CID_FIRST,
+                free_cids: Vec::new(),
+            }),
             exec: Box::new(NoExecChannel),
         }
     }
 
     /// Point at a specific `firecracker` binary and KVM device, for tests and non-standard hosts.
+    ///
+    /// A bare binary name (no path separator) is resolved through `PATH`, like a shell would.
     pub fn with_paths(mut self, bin: PathBuf, kvm: PathBuf) -> Self {
         self.bin = bin;
         self.kvm = kvm;
@@ -150,19 +267,114 @@ impl FirecrackerRuntime {
     }
 
     /// Set the [`ExecChannel`] used by `exec` (the default refuses).
+    ///
+    /// One channel serves all microVMs; each call carries which guest it is for in
+    /// [`VmExecTarget`], so a shared transport still routes to the requested microVM.
     pub fn with_exec_channel(mut self, exec: Box<dyn ExecChannel>) -> Self {
         self.exec = exec;
         self
     }
 
+    /// Resolve the configured binary the way a shell would: an explicit path (absolute or
+    /// containing a separator) is used as-is; a bare name is looked up on `PATH`.
+    ///
+    /// WHY: the default is `PathBuf::from("firecracker")`, and checking that with `fs::metadata`
+    /// stats the *current directory* — a `PATH`-installed binary reported unavailable, and worse,
+    /// a `./firecracker` lookalike in whatever directory the process happened to run from would
+    /// count as usable.
+    fn resolve_bin(&self) -> PathBuf {
+        if self.bin.components().count() > 1 {
+            return self.bin.clone();
+        }
+        let name = self.bin.as_os_str();
+        std::env::var_os("PATH")
+            .iter()
+            .flat_map(std::env::split_paths)
+            .map(|dir| dir.join(name))
+            .find(|candidate| is_executable(candidate))
+            .unwrap_or_else(|| self.bin.clone())
+    }
+
     /// Whether the binary is present and the KVM device is usable. Both must hold for a microVM.
     fn binary_usable(&self) -> bool {
-        let bin = &self.bin;
-        std::fs::metadata(bin).map(|m| m.is_file()).unwrap_or(false)
+        let bin = self.bin.clone();
+        if bin.components().count() > 1 {
+            return is_executable(&bin);
+        }
+        // A bare name counts when `PATH` resolves it to an executable.
+        std::env::var_os("PATH")
+            .iter()
+            .flat_map(std::env::split_paths)
+            .map(|dir| dir.join(&bin))
+            .any(|candidate| is_executable(&candidate))
     }
 
     fn kvm_usable(&self) -> bool {
         std::fs::metadata(&self.kvm).is_ok()
+    }
+
+    /// Hand out a guest CID no live microVM holds. Freed CIDs are reused first so the pool stays
+    /// dense; otherwise the counter advances.
+    fn alloc_cid(&self) -> u32 {
+        let mut state = self.state.lock().expect("firecracker state lock");
+        if let Some(cid) = state.free_cids.pop() {
+            return cid;
+        }
+        let cid = state.next_cid;
+        state.next_cid = state.next_cid.saturating_add(1).max(CID_FIRST);
+        if state.next_cid < CID_FIRST {
+            state.next_cid = CID_FIRST;
+        }
+        cid
+    }
+
+    /// Return a microVM's CID to the pool. Called when its identity is dropped (`remove`, or a
+    /// failed `create` rolling back).
+    fn release_cid(&self, runtime_id: &str) {
+        let mut state = self.state.lock().expect("firecracker state lock");
+        if let Some(info) = state.vms.remove(runtime_id) {
+            state.free_cids.push(info.cid);
+        }
+    }
+
+    /// The guest CID of a tracked microVM, if it is still owned by this runtime.
+    pub fn vm_cid(&self, runtime_id: &str) -> Option<u32> {
+        self.state
+            .lock()
+            .expect("firecracker state lock")
+            .vms
+            .get(runtime_id)
+            .map(|info| info.cid)
+    }
+
+    /// The provisioned workspace block image attached to a microVM, if tracked.
+    pub fn workspace_image(&self, runtime_id: &str) -> Option<PathBuf> {
+        self.state
+            .lock()
+            .expect("firecracker state lock")
+            .vms
+            .get(runtime_id)
+            .map(|info| info.image.clone())
+    }
+
+    /// The host working tree a microVM's guest workspace maps back to, if tracked.
+    pub fn host_workspace(&self, runtime_id: &str) -> Option<String> {
+        self.state
+            .lock()
+            .expect("firecracker state lock")
+            .vms
+            .get(runtime_id)
+            .map(|info| info.host_workspace.clone())
+    }
+
+    /// Where a microVM's workspace mounts inside its guest, if tracked.
+    pub fn guest_workspace(&self, runtime_id: &str) -> Option<String> {
+        self.state
+            .lock()
+            .expect("firecracker state lock")
+            .vms
+            .get(runtime_id)
+            .map(|info| info.guest_workspace.clone())
     }
 
     /// The per-microVM socket path for `runtime_id` (which is the socket path itself).
@@ -252,18 +464,54 @@ impl SandboxRuntime for FirecrackerRuntime {
         let sock = dir.join("api.sock");
         let runtime_id = sock.to_string_lossy().to_string();
 
-        let child = Command::new(&self.bin)
+        // The workspace block image: a bounded sparse file the block API can attach. The spec's
+        // host path is a directory and can never be a `path_on_host` — Firecracker would reject
+        // it, and even if it did not, guest block writes would land directly in the host tree.
+        let image_path = dir.join(WORKSPACE_IMAGE_NAME);
+        let image_file = std::fs::File::create(&image_path).map_err(|e| {
+            HxError::Sandbox(format!(
+                "could not create workspace image {}: {e}",
+                image_path.display()
+            ))
+        })?;
+        image_file
+            .set_len(workspace_image_bytes(spec.workspace_mb))
+            .map_err(|e| {
+                HxError::Sandbox(format!(
+                    "could not size workspace image {}: {e}",
+                    image_path.display()
+                ))
+            })?;
+        drop(image_file);
+
+        // A CID no live microVM holds; two guests never share the vsock identity `exec` dials.
+        let cid = self.alloc_cid();
+        let vsock_sock = dir.join("vsock.sock");
+
+        let bin = self.resolve_bin();
+        let child = Command::new(&bin)
             .arg("--api-sock")
             .arg(&sock)
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| {
-                HxError::Sandbox(format!("could not spawn firecracker ({:?}): {e}", self.bin))
+                HxError::Sandbox(format!("could not spawn firecracker ({bin:?}): {e}"))
             })?;
-        self.vms
+        self.state
             .lock()
-            .expect("firecracker vms lock")
-            .insert(runtime_id.clone(), child);
+            .expect("firecracker state lock")
+            .vms
+            .insert(
+                runtime_id.clone(),
+                VmInfo {
+                    child: Some(child),
+                    cid,
+                    dir: dir.clone(),
+                    image: image_path.clone(),
+                    host_workspace: spec.workspace_host_path.clone(),
+                    guest_workspace: spec.workspace_path.clone(),
+                },
+            );
 
         // Any failure from here on leaves a spawned process behind; clean it up so `create` does
         // not leak a microVM (the manager also rolls back via `remove`, but a process that never got a
@@ -271,13 +519,18 @@ impl SandboxRuntime for FirecrackerRuntime {
         let result = async {
             self.wait_for_socket(&runtime_id).await?;
 
-            // Boot source: guest kernel and its arguments. No `initrd`.
+            // Boot source: guest kernel and its arguments. The guest's init reads `hx_workspace`
+            // from the cmdline and mounts the workspace drive (`/dev/vdb`) there — that is the
+            // mount step, declared where the mock can see it. No `initrd`.
             self.put_json(
                 &runtime_id,
                 "/boot-source",
                 &json!({
                     "kernel_image_path": self.kernel.to_string_lossy(),
-                    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off",
+                    "boot_args": format!(
+                        "console=ttyS0 reboot=k panic=1 pci=off hx_workspace={}",
+                        spec.workspace_path,
+                    ),
                 }),
             )
             .await?;
@@ -295,14 +548,14 @@ impl SandboxRuntime for FirecrackerRuntime {
             )
             .await?;
 
-            // Workspace drive from the spec, writable — the sandbox's work must survive it.
+            // Workspace drive: the provisioned image, writable — the sandbox's work must survive it.
             // No workspace means nothing is mounted, which is refused earlier by `spec.validate`.
             self.put_json(
                 &runtime_id,
                 &format!("/drives/{WORKSPACE_DRIVE}"),
                 &json!({
                     "drive_id": WORKSPACE_DRIVE,
-                    "path_on_host": spec.workspace_host_path,
+                    "path_on_host": image_path.to_string_lossy(),
                     "is_root_device": false,
                     "is_read_only": false,
                 }),
@@ -310,13 +563,14 @@ impl SandboxRuntime for FirecrackerRuntime {
             .await?;
 
             // The vsock device: the only side channel out of a network-off microVM, used by `exec`.
+            // Each microVM gets its own guest CID — the identity the exec transport dials.
             self.put_json(
                 &runtime_id,
                 "/vsock",
                 &json!({
                     "vsock_id": VSOCK_ID,
-                    "guest_cid": 3,
-                    "uds_path": format!("{}/vsock.sock", dir.to_string_lossy()),
+                    "guest_cid": cid,
+                    "uds_path": vsock_sock.to_string_lossy(),
                 }),
             )
             .await?;
@@ -338,11 +592,9 @@ impl SandboxRuntime for FirecrackerRuntime {
         .await;
 
         if let Err(e) = result {
-            // Tear down the process we spawned so a failed create does not leak a microVM.
-            self.vms
-                .lock()
-                .expect("firecracker vms lock")
-                .remove(&runtime_id);
+            // Tear down the process we spawned so a failed create does not leak a microVM, and
+            // hand the CID back so a retry does not drain the pool.
+            self.release_cid(&runtime_id);
             let _ = std::fs::remove_dir_all(&dir);
             return Err(e);
         }
@@ -360,10 +612,15 @@ impl SandboxRuntime for FirecrackerRuntime {
     }
 
     async fn stop(&self, runtime_id: &str, _grace_secs: i64) -> Result<()> {
-        // Firecracker has no graceful-stop API; killing the process is how a microVM stops.
+        // Firecracker has no graceful-stop API; killing the process is how a microVM stops. The
+        // microVM's identity (CID, workspace mapping) is retained until `remove` — a stopped VM
+        // still owns its CID, so nothing else can take it while the VM exists.
         let child = {
-            let mut vms = self.vms.lock().expect("firecracker vms lock");
-            vms.remove(runtime_id)
+            let mut state = self.state.lock().expect("firecracker state lock");
+            state
+                .vms
+                .get_mut(runtime_id)
+                .and_then(|info| info.child.take())
         };
         if let Some(mut child) = child {
             let _ = child.kill().await;
@@ -373,18 +630,45 @@ impl SandboxRuntime for FirecrackerRuntime {
     }
 
     async fn remove(&self, runtime_id: &str) -> Result<()> {
-        // Remove the microVM's staging directory (idempotent).
+        // Dropping the identity releases the CID back to the pool; then remove the staging
+        // directory (idempotent — removing an unknown or already-removed VM is fine).
+        self.release_cid(runtime_id);
         let _ = std::fs::remove_dir_all(self.dir_for(runtime_id));
         Ok(())
     }
 
     async fn exec(
         &self,
-        _runtime_id: &str,
+        runtime_id: &str,
         command: &str,
         workdir: Option<&str>,
     ) -> Result<SandboxExecOutput> {
-        self.exec.exec(command, workdir).await
+        // Route to the requested microVM: look up its live identity and hand it to the transport,
+        // so the command reaches that guest's vsock CID and no other's. An untracked id is
+        // refused — running it against a default endpoint would execute somewhere the caller did
+        // not name. No caller-supplied workdir means the guest workspace, where the work is.
+        let (target, guest_workspace) = {
+            let state = self.state.lock().expect("firecracker state lock");
+            match state.vms.get(runtime_id) {
+                Some(info) => (
+                    VmExecTarget {
+                        runtime_id: runtime_id.to_string(),
+                        cid: info.cid,
+                        uds_path: info.dir.join("vsock.sock"),
+                        guest_workspace: info.guest_workspace.clone(),
+                    },
+                    info.guest_workspace.clone(),
+                ),
+                None => {
+                    return Err(HxError::Sandbox(format!(
+                        "no such firecracker microVM: {runtime_id}"
+                    )));
+                }
+            }
+        };
+        self.exec
+            .exec(&target, command, workdir.or(Some(&guest_workspace)))
+            .await
     }
 }
 
@@ -409,5 +693,25 @@ mod tests {
         let rt =
             FirecrackerRuntime::new("/tmp/fc".into(), "/tmp/kernel".into(), "/tmp/rootfs".into());
         assert_eq!(rt.name(), "firecracker");
+    }
+
+    #[test]
+    fn workspace_image_size_is_bounded() {
+        // A zero or missing ceiling still yields a usable image; a huge one is clamped.
+        assert_eq!(
+            workspace_image_bytes(0),
+            MIN_WORKSPACE_IMAGE_BYTES,
+            "no ceiling still provisions a minimal image"
+        );
+        assert_eq!(
+            workspace_image_bytes(16_384),
+            MAX_WORKSPACE_IMAGE_BYTES,
+            "the default 16 GiB ceiling must not materialise 16 GiB"
+        );
+        assert_eq!(
+            workspace_image_bytes(u64::MAX),
+            MAX_WORKSPACE_IMAGE_BYTES,
+            "an absurd ceiling saturates instead of overflowing"
+        );
     }
 }
