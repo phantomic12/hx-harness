@@ -889,6 +889,28 @@ The two ways to close it, and why neither is taken now:
 
 Closing it is a deliberate, reviewable change with its own test — not a doc edit.
 
+## Worktree hygiene
+
+Each fix lane lives in its own worktree under `/home/yoav/projects/hx-wt/`. Once a lane's
+branch is merged into `main`, its worktree is just disk — `scripts/prune-merged-worktrees.sh`
+reclaims it. Run it after a batch of lanes lands:
+
+```bash
+# Dry-run first (the default): prints what would be removed.
+scripts/prune-merged-worktrees.sh --skip-recent 2 \
+  --keep feat/<each-still-active-lane>...
+# Then for real:
+scripts/prune-merged-worktrees.sh --apply --skip-recent 2 \
+  --keep feat/<each-still-active-lane>...
+```
+
+The script never touches the main worktree or detached-HEAD worktrees, skips dirty worktrees
+(uncommitted changes are never discarded), skips branches not merged into `main`, and deletes
+branches with `git branch -d` only — if git refuses, the branch is left alone and reported.
+`--skip-recent HOURS` additionally skips worktrees modified within the window, so lanes with
+agents still working are not pulled out from under them. First real run (2026-09-21) removed
+34 merged worktrees/branches and freed ~96 GiB (366→270 GiB used on `/home`).
+
 ## Deliberately deferred
 
 Full-text search across session history (FTS5 is fine until it isn't) · skill marketplace
