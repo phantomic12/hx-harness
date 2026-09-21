@@ -26,7 +26,7 @@ pub mod spec;
 
 pub use docker::{logs, to_container_config, to_host_config, wait_for_engine, DockerRuntime};
 pub use egress::EgressProxy;
-pub use firecracker::{ExecChannel, FirecrackerRuntime};
+pub use firecracker::{ExecChannel, FirecrackerRuntime, VmExecTarget};
 pub use remote::{
     create_command, egress_network_name, egress_setup_commands, egress_sidecar_name,
     egress_teardown_commands, exec_command, remove_command, start_command, stop_command,
