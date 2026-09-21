@@ -1420,6 +1420,144 @@ was widened to match `token` alone). Treating a cancelled dialog as an error, ac
 just a valid directory), swallowing an unavailable dialog, and dropping the `is_dir` workspace-root check each
 turned its specific test red.
 
+## Release installer verification (M9)
+
+`release.yml`'s `verify-install` job proves the release actually installs: it runs
+`scripts/verify-release.sh dist <version>` on the real `dist/` artifact (ubuntu-latest),
+on tag pushes *and* on `workflow_dispatch` dry runs (`publish=false`), and `publish`
+now **needs** that job — a run whose installer verification fails cannot publish a
+release. The job installs cosign first, so with `SHA256SUMS.sig` present the script
+requires the install log to show the signature verification running — the signature path
+is exercised, not skipped. When the `.sig` (or cosign) is missing the script says so
+explicitly (`NOTE: ... NOT exercised`) and verifies the checksum path with
+`COSIGN_SKIP=1`, rather than passing silently.
+
+What the script asserts, with no network beyond the runner itself (the local `dist/` is
+served to `install.sh` as a `file://` `HX_RELEASE_BASE_URL`, into a throwaway
+`--prefix`):
+
+- the good `dist/` installs: both binaries land and `hx --version` prints the expected
+  version;
+- an archive with one changed byte (one byte appended to a copy, `SHA256SUMS` untouched)
+  is REJECTED — `install.sh` exits non-zero with `checksum mismatch`;
+- with `COSIGN_SKIP=1` the checksum path alone still rejects it, and the plain-directory
+  `HX_RELEASE_BASE_URL` spelling is exercised on this leg, so both fetch branches are
+  covered.
+
+The tamper appends a byte rather than overwriting one at a fixed offset: `dd
+if=/dev/zero ... seek=N` is a no-op whenever the byte at N is already zero (about 1 in
+256 for a gzip stream), which would leave an intact archive in the "tampered" directory
+and turn the assertion into one that cannot fail. The file size is compared before and
+after, so a tamper that did not take is a hard failure, not a silent pass.
+
+`install.sh` support for this: `HX_RELEASE_BASE_URL` overrides the GitHub release page
+(http(s) downloads via curl/wget, `file://` URLs and plain local paths are copied), and
+`--prefix DIR` overrides `HX_INSTALL_DIR`. Neither weakens verification — the checksum
+always runs.
+
+### What was run, and what it printed
+
+There are **no new Rust tests** — this is a workflow and a shell installer, not a crate.
+Measured on the `feat/m9-release-verify` tree (x86_64 Linux):
+
+```console
+$ sh -n install.sh && sh -n scripts/verify-release.sh && echo "POSIX syntax ok"
+POSIX syntax ok
+$ shellcheck -s sh install.sh scripts/verify-release.sh && echo "shellcheck clean"
+shellcheck clean                                   # ShellCheck 0.11.0
+$ python3 -c 'import yaml; yaml.safe_load(open(".github/workflows/release.yml")); print("ok")'
+ok
+$ sh scripts/verify-release.sh /home/yoav/projects/hx-dist-test 0.0.1
+verify-release: NOTE: no SHA256SUMS.sig in /home/yoav/projects/hx-dist-test — the signature path is NOT exercised by this run (checksum path only, COSIGN_SKIP=1)
+verify-release: NOTE: cosign is NOT installed — the signature path is NOT exercised by this run (checksum path only)
+verify-release: ok: both binaries landed in the prefix
+verify-release: ok: hx --version prints the expected version (hx 0.0.1)
+verify-release: ok: good install says explicitly it ran checksum-only (COSIGN_SKIP=1)
+verify-release: ok: tampered archive rejected (install.sh exited non-zero on checksum/signature)
+verify-release: ok: COSIGN_SKIP=1 still rejects the tampered archive on the checksum alone
+verify-release: ALL CHECKS PASSED (version 0.0.1, target x86_64-unknown-linux-musl)
+```
+
+`dist/` there was built from this tree's `target/release/hx` and `hxd`, packaged the way
+the `package` job does (`tar -czf ... --owner=0 --group=0 --numeric-owner`, then
+`sha256sum ./* > SHA256SUMS`). The same script was also run under **busybox ash with a
+busybox-only `PATH`** (BusyBox v1.35.0) against the **published `v0.0.1`
+`x86_64-unknown-linux-musl` asset**, whose checksum matches the release's own
+`SHA256SUMS` — `ALL CHECKS PASSED` again, so the "deliberately POSIX sh" claim is
+measured under ash and not only under bash-as-`sh`.
+
+### The assertions are proven able to fail
+
+Three mutations, each reverted afterwards:
+
+| mutation | result |
+|---|---|
+| the tamper's append disabled, its size check left in place | red — `the tamper did not change the archive copy (11212312 -> 11212312 bytes)` |
+| the tamper's append **and** its size check disabled | red — `tampered archive was ACCEPTED (COSIGN_SKIP=1)` |
+| `install.sh`'s checksum comparison forced false | red — `COSIGN_SKIP=1 run failed but not on the checksum` |
+
+The third is why the plain "exits non-zero" leg is not the whole proof: with the checksum
+comparison gone, the corrupted stream still fails, inside `tar` (`invalid compressed
+data--format violated`) — a rejection that has nothing to do with verification. The
+`checksum mismatch` assertion is what pins the verification itself. Ten bytes were also
+checked by hand: appending one byte to the archive makes `install.sh` print
+
+```console
+error: checksum mismatch for hx-0.0.1-x86_64-unknown-linux-musl.tar.gz
+  expected: efdc502f0b07fa065a0e2be806a53e85e6efbf90e7e17d522f3ca7024b92b32c
+  actual:   f946be8e6f10ea377f85fc3a3513af1fbeb585b964ae727293cc21d097764d4e
+Nothing was installed. Do not run this download.
+```
+
+### The signature path, stated honestly
+
+The `.sig` path has never run in CI (no release has been cut since signing landed), and
+it cannot be exercised on a workstation:
+
+- The published `v0.0.1` release has **no `.sig` assets** — it predates the signing step
+  (`ci(release): sign release artifacts with Sigstore keyless cosign`, 2026-09-20). `gh
+  release view v0.0.1` lists five archives plus `SHA256SUMS`, and `SHA256SUMS.sig` is a
+  404 on the release page.
+- A keyless signature carries the OIDC identity of the run that produced it, ref
+  included. Decoded from the signing certificates of the real runs: tag push 34929789922
+  → `.../release.yml@refs/tags/v0.0.1`; `workflow_dispatch` run 34928276981 (on `main`)
+  → `.../release.yml@refs/heads/main`. `install.sh`'s default
+  `--cert-identity-regexp` is the `v*`-tag form, which is what a user installing a
+  published release must require — and it correctly rejects a dry run's own signature.
+  So the `verify-install` step sets `COSIGN_CERT_IDENTITY_REGEXP` to
+  `...@refs/(tags/v.*|heads/.+)` **on dispatch runs only**; a tag push still exercises
+  the exact default users get, and an override is printed when it is in force rather
+  than applied silently.
+- Locally that plumbing was exercised with a **scripted double for `cosign
+  verify-blob`** (cosign 3.1.3 itself was present, but keyless signing needs a GitHub
+  OIDC token that a workstation does not have; the double reproduces only the
+  identity-regexp match against the decoded `refs/heads/main` certificate): default
+  identity + that certificate → install fails, exactly as a dry run would have before
+  this change; the dispatch override → `ALL CHECKS PASSED`, including the assertion that
+  signature verification ran; an override matching nothing → still fails closed. **No
+  cryptographic verification ran on this host**, so the `--cert-oidc-issuer` and identity
+  flags themselves remain verified by reading plus the first real `v*` tag push.
+
+**What this does not claim.** Only the runner's own target is installed — a macOS or
+Windows packaging mistake is not caught here. Per the tiers below this is tier B for the
+checksum path (run for real, locally and in CI) and tier C for the live signature until
+a tag push signs one for real.
+
+### The `install.sh` defect this lane found on the way
+
+`shellcheck` on `install.sh` flagged the "not on your PATH" block: the `zsh)` and
+`bash)` arms had mis-quoted format strings (SC1012, SC2016, SC2086). Measured before the
+fix, running `install.sh` with `SHELL=/bin/zsh` printed an empty line — no advice at all
+— and `SHELL=/bin/bash` printed only the generic form; worse, the misparse turned the
+trailing `>> ~/.zshrc` into a redirection into a **stray file in `$HOME`** named
+`.zshrcn "$install_dir" ;;
+            bash) printf ` (1072 bytes; observed and
+removed). It is pre-existing — the same five findings are present at `HEAD`, in lines
+this milestone does not otherwise touch — but it is in the file this lane edits and
+`shellcheck` named it, so it is fixed here: the standard `'\''` idiom, with the three
+arms now printing `echo 'export PATH="<dir>:$PATH"' >> ~/.zshrc`, the same for
+`~/.bashrc`, and the bare `export` for other shells, and nothing written to `$HOME`.
+
 ## Release workflow code signing (M9)
 
 `release.yml`'s `package` job signs every `dist/` artifact — the five archives plus

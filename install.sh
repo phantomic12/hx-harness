@@ -5,8 +5,26 @@
 #   curl -fsSL https://raw.githubusercontent.com/phantomic12/hx-harness/main/install.sh | sh
 #
 # Environment:
-#   HX_VERSION      version to install, without the leading v (default: latest release)
-#   HX_INSTALL_DIR  where to put the binaries (default: ~/.local/bin)
+#   HX_VERSION          version to install, without the leading v (default: latest release)
+#   HX_INSTALL_DIR      where to put the binaries (default: ~/.local/bin)
+#   HX_RELEASE_BASE_URL override the release download location (default: the GitHub
+#                       release page for the version). A local directory also works —
+#                       a plain path (/tmp/dist, ./dist) or a file:// URL — in which
+#                       case the archives are copied, not downloaded. Used by
+#                       scripts/verify-release.sh to install from a local dist/.
+#   COSIGN_SKIP=1       skip Sigstore signature verification (checksum still verified)
+#   COSIGN_CERT_IDENTITY_REGEXP
+#                       expected Sigstore certificate identity, as a regex (default:
+#                       this repo's release workflow running on a v* tag — what a
+#                       user installing a published release must require). Set it
+#                       only to exercise the installer's signature path from a
+#                       workflow run whose OIDC identity is not a v* tag: a
+#                       release.yml workflow_dispatch dry run signs as
+#                       .../release.yml@refs/heads/main, which the default
+#                       deliberately rejects. See .github/workflows/release.yml.
+#
+# Flags:
+#   --prefix DIR        same as HX_INSTALL_DIR=DIR (the flag wins when both are given)
 #
 # Deliberately POSIX sh, not bash: this runs via `sh`, and on Debian and Alpine that is
 # dash and busybox ash respectively. Bash-only syntax would break on exactly the systems
@@ -42,26 +60,46 @@ usage() {
     cat <<EOF
 hx installer
 
-Usage: install.sh [--help]
+Usage: install.sh [--prefix DIR] [--help]
 
 Environment:
-  HX_VERSION      version to install, without the leading v (default: latest)
-  HX_INSTALL_DIR  install destination (default: ~/.local/bin)
+  HX_VERSION          version to install, without the leading v (default: latest)
+  HX_INSTALL_DIR      install destination (default: ~/.local/bin)
+  HX_RELEASE_BASE_URL release download location (default: the GitHub release page;
+                      a local directory path or file:// URL also works)
+  COSIGN_SKIP=1       skip Sigstore signature verification (checksum still verified)
+  COSIGN_CERT_IDENTITY_REGEXP
+                      expected Sigstore certificate identity as a regex (default:
+                      this repo's release.yml running on a v* tag; set only to
+                      exercise the pipeline from a non-tag workflow run)
 
 Examples:
   sh install.sh                        # latest release, into ~/.local/bin
   HX_VERSION=0.0.1 sh install.sh       # a specific version
   HX_INSTALL_DIR=/usr/local/bin sh install.sh   # system-wide (needs write access)
+  sh install.sh --prefix /tmp/hx-test  # explicit destination (wins over HX_INSTALL_DIR)
+  HX_RELEASE_BASE_URL=file:///tmp/dist HX_VERSION=0.0.1 sh install.sh  # local dist/
 EOF
 }
 
-for arg in "$@"; do
-    case "$arg" in
+prefix_arg=""
+while [ $# -gt 0 ]; do
+    case "$1" in
         -h | --help)
             usage
             exit 0
             ;;
-        *) fail "unrecognised argument: $arg (try --help)" ;;
+        --prefix)
+            [ $# -ge 2 ] || fail "--prefix needs a directory argument (try --help)"
+            prefix_arg="$2"
+            shift 2
+            ;;
+        --prefix=*)
+            prefix_arg="${1#--prefix=}"
+            [ -n "$prefix_arg" ] || fail "--prefix needs a non-empty directory (try --help)"
+            shift
+            ;;
+        *) fail "unrecognised argument: $1 (try --help)" ;;
     esac
 done
 
@@ -141,7 +179,12 @@ fi
 
 # ---------------------------------------------------------------- destination
 
-install_dir="${HX_INSTALL_DIR:-$HOME/.local/bin}"
+# A --prefix flag wins over the environment; the environment wins over the default.
+if [ -n "$prefix_arg" ]; then
+    install_dir="$prefix_arg"
+else
+    install_dir="${HX_INSTALL_DIR:-$HOME/.local/bin}"
+fi
 mkdir -p "$install_dir" || fail "could not create $install_dir"
 [ -w "$install_dir" ] || fail "$install_dir is not writable
 Re-run with a writable directory:
@@ -150,19 +193,39 @@ Re-run with a writable directory:
 # ---------------------------------------------------------------- download
 
 archive="hx-${version}-${target}.tar.gz"
-base_url="https://github.com/$REPO/releases/download/v${version}"
+base_url="${HX_RELEASE_BASE_URL:-https://github.com/$REPO/releases/download/v${version}}"
+
+# Fetch one release file into $2. http(s) goes over the network via curl/wget;
+# a file:// URL or a plain local directory is copied instead, so a local dist/
+# directory can stand in for a published release with no network involved.
+fetch() {
+    src="$1"
+    dest="$2"
+    case "$src" in
+        file://*)
+            cp "${src#file://}" "$dest" || return 1
+            ;;
+        http://* | https://*)
+            download "$src" "$dest" || return 1
+            ;;
+        *)
+            # A plain local path (HX_RELEASE_BASE_URL given as a directory).
+            cp "$src" "$dest" || return 1
+            ;;
+    esac
+}
 
 tmp=$(mktemp -d 2>/dev/null || mktemp -d -t hx)
 # shellcheck disable=SC2064
 trap "rm -rf '$tmp'" EXIT INT TERM
 
 step "Downloading $archive"
-download "$base_url/$archive" "$tmp/$archive" ||
+fetch "$base_url/$archive" "$tmp/$archive" ||
     fail "download failed: $base_url/$archive
 Check that release v$version has an asset for $target:
   https://github.com/$REPO/releases/tag/v$version"
 
-download "$base_url/SHA256SUMS" "$tmp/SHA256SUMS" ||
+fetch "$base_url/SHA256SUMS" "$tmp/SHA256SUMS" ||
     fail "download failed: $base_url/SHA256SUMS"
 
 # ---------------------------------------------------------------- verify
@@ -198,12 +261,22 @@ info "    ${GREEN}ok${RESET} ${DIM}${actual}${RESET}"
 if [ "${COSIGN_SKIP:-0}" = "1" ]; then
     info "    ${DIM}signature verification skipped (COSIGN_SKIP=1)${RESET}"
 elif command -v cosign >/dev/null 2>&1; then
+    # The default identity is the release workflow on a v* tag: that is what a
+    # signature has to carry to be trusted for a published release, and it is
+    # what every user who does not set the override below gets. The override
+    # exists so CI can exercise this branch from a run whose OIDC identity is
+    # not a v* tag (a workflow_dispatch dry run signs as @refs/heads/<branch>);
+    # it is printed when set, so an override is never silent.
+    identity_regexp="${COSIGN_CERT_IDENTITY_REGEXP:-https://github.com/$REPO/.github/workflows/release.yml@refs/tags/v.*}"
     step "Verifying Sigstore signature (keyless)"
-    download "$base_url/SHA256SUMS.sig" "$tmp/SHA256SUMS.sig" ||
+    if [ -n "${COSIGN_CERT_IDENTITY_REGEXP:-}" ]; then
+        info "    ${DIM}accepting certificate identity $identity_regexp (COSIGN_CERT_IDENTITY_REGEXP, not the v*-tag default)${RESET}"
+    fi
+    fetch "$base_url/SHA256SUMS.sig" "$tmp/SHA256SUMS.sig" ||
         fail "download failed: $base_url/SHA256SUMS.sig"
     cosign verify-blob \
         --signature "$tmp/SHA256SUMS.sig" \
-        --cert-identity-regexp 'https://github.com/'"$REPO"'/.github/workflows/release.yml@refs/tags/v.*' \
+        --cert-identity-regexp "$identity_regexp" \
         --cert-oidc-issuer https://token.actions.githubusercontent.com \
         "$tmp/SHA256SUMS" ||
         fail "Sigstore signature verification failed for SHA256SUMS
@@ -255,9 +328,12 @@ case ":${PATH}:" in
     *)
         printf '\n%s%s is not on your PATH.%s Add it:\n\n' "$YELLOW" "$install_dir" "$RESET"
         shell_name=$(basename "${SHELL:-sh}")
+        # The snippets below print $PATH unexpanded on purpose: they are advice for
+        # the user's own shell profile, not something this script expands.
+        # shellcheck disable=SC2016
         case "$shell_name" in
-            zsh) printf '  echo '"'"'export PATH="%s:$PATH"'"'" >> ~/.zshrc\n' "$install_dir" ;;
-            bash) printf '  echo '"'"'export PATH="%s:$PATH"'"'" >> ~/.bashrc\n' "$install_dir" ;;
+            zsh) printf '  echo '\''export PATH="%s:$PATH"'\'' >> ~/.zshrc\n' "$install_dir" ;;
+            bash) printf '  echo '\''export PATH="%s:$PATH"'\'' >> ~/.bashrc\n' "$install_dir" ;;
             *) printf '  export PATH="%s:$PATH"\n' "$install_dir" ;;
         esac
         printf '\nThen start a new shell, or run the binaries by absolute path:\n'

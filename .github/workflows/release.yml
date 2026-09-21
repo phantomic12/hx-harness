@@ -232,9 +232,51 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # End-to-end proof that the release actually installs: runs install.sh against
+  # the real dist/ artifact from a local file:// URL into a throwaway --prefix,
+  # and checks that one changed byte in a copy of the archive is rejected (with
+  # and without cosign). Deliberately NOT gated on `publish`: it runs on tag
+  # pushes AND on workflow_dispatch dry runs (publish=false), so a broken
+  # installer fails the run before a release is published. `release` needs this
+  # job, so a failed verification blocks publication instead of racing it.
+  verify-install:
+    name: verify-install
+    needs: [plan, package]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Installed so the signature path is exercised, not skipped: with cosign
+      # present and SHA256SUMS.sig in dist/, verify-release.sh requires the
+      # install log to show the signature verification running.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.8.2
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+
+      - name: Verify the release installs
+        shell: bash
+        env:
+          # A keyless signature carries the OIDC identity of the run that produced
+          # it: a tag push signs as .../release.yml@refs/tags/v0.0.1, a
+          # workflow_dispatch dry run as .../release.yml@refs/heads/main (decoded
+          # from the signing certificate of dry run 34928276981). install.sh
+          # requires the v*-tag identity by default — that is the policy users
+          # get, and a tag push here still exercises it exactly. A dry run would
+          # otherwise fail on the identity rather than on the installer, so widen
+          # the expectation to this run's own ref for this step only.
+          # Empty means "unset", so install.sh uses its v*-tag default.
+          COSIGN_CERT_IDENTITY_REGEXP: "${{ github.event_name == 'workflow_dispatch' && format('https://github.com/{0}/.github/workflows/release.yml@refs/(tags/v.*|heads/.+)', github.repository) || '' }}"
+        run: |
+          set -euo pipefail
+          bash scripts/verify-release.sh dist "${{ needs.plan.outputs.version }}"
+
   release:
     name: publish
-    needs: [plan, package]
+    needs: [plan, package, verify-install]
     if: needs.plan.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
