@@ -24,6 +24,10 @@
 //!
 //! The bulk of extraction still happens through the in-crate [`Fetcher`] abstraction; [`HttpFetcher`]
 //! is the plain path, and [`BrowserFetcher`] is a [`Fetcher`] the same research loop can be handed.
+//! The research path's **fetch step** — [`select_fetcher`] and [`research_with_fetch_mode`] — is what
+//! makes that a running decision rather than a manual construction: it chooses `BrowserFetcher` for the
+//! `Auto` or `Browser` modes and `HttpFetcher` otherwise, honours browser availability with a fallback that
+//! cannot lie (see [`select_fetcher`]), and records the choice for tests and honest reporting.
 //! The chromium tests that drive real Chromium run **locally** — the browser is installed on the developer
 //! host (`/usr/lib/chromium/chromium`) and not on the remote build host — and are `#[ignore]`d so
 //! they never run in the offload gate.
@@ -355,6 +359,187 @@ impl Fetcher for BrowserFetcher {
             page.into_body_untrusted(),
         )))
     }
+}
+
+/// Which fetcher the research path runs for a target.
+///
+/// This is the **selection** a running research task makes, and it is the documented cost rule:
+/// launching a browser is expensive and observable, so it is never something an ordinary plain fetch
+/// quietly becomes. A caller picks one of these modes; the choice is deliberate and recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FetchMode {
+    /// Plain HTTP only. Never launches a browser, no matter what a page needs.
+    Http,
+    /// Plain HTTP first, escalating to a browser only for a page a plain fetch cannot read
+    /// (JS-rendered, or behind a bot wall). This is the mode the browser rung exists for.
+    Auto,
+    /// Drive a browser even for a page a plain fetch could read. Deliberate and costly; a caller
+    /// that selects this is opting into a browser launch per fetched page.
+    Browser,
+}
+
+impl FetchMode {
+    /// True when this mode may launch a browser at all.
+    pub fn may_launch_browser(&self) -> bool {
+        !matches!(self, FetchMode::Http)
+    }
+}
+
+/// Which fetcher a [`FetchSelection`] landed on, so the choice is observable (and testable) rather
+/// than merely present.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectedFetcher {
+    /// The plain HTTP path.
+    Http,
+    /// The browser-backed path (its ladder tries plain HTTP first, then real Chromium).
+    Browser,
+}
+
+/// The outcome of the research path's fetch step: a ready [`Fetcher`] plus an honest record of
+/// which one was chosen and why.
+pub struct FetchSelection {
+    fetcher: Arc<dyn Fetcher>,
+    pub kind: SelectedFetcher,
+    pub note: &'static str,
+}
+
+impl std::fmt::Debug for FetchSelection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FetchSelection")
+            .field("kind", &self.kind)
+            .field("note", &self.note)
+            .finish()
+    }
+}
+
+impl FetchSelection {
+    /// The chosen fetcher, ready to hand to a [`ResearchTask`].
+    pub fn fetcher(&self) -> Arc<dyn Fetcher> {
+        Arc::clone(&self.fetcher)
+    }
+}
+
+/// A selection that could not be made — used only when a caller explicitly asked for a browser and
+/// none is available, which must fail rather than silently degrade to a fetch it did not intend.
+#[derive(Debug)]
+pub struct FetchRouteError {
+    pub reason: String,
+}
+
+impl std::fmt::Display for FetchRouteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for FetchRouteError {}
+
+/// True when a runnable Chromium binary is installed on **this** host.
+///
+/// Chromium is at `/usr/lib/chromium/chromium` on the developer host and **not** on the remote
+/// build host nor necessarily in a deployment, so the routing below must not assume it exists. This
+/// check is the honest gate the fallback rules key off: a browser that is not installed can neither
+/// be selected for `Auto` nor fulfil an explicit `Browser` request.
+pub fn browser_available() -> bool {
+    std::path::Path::new(hx_browser::rungs::chromium::DEFAULT_CHROMIUM_PATH).is_file()
+}
+
+/// Where the browser pool keeps its per-session profiles, for [`select_fetcher`]'s `BrowserFetcher`.
+///
+/// A real research run backs this with a real directory under the daemon's data root; a test supplies
+/// a scratch directory (and serves all pages from a local stub, never a third-party site).
+pub fn default_pool_root() -> std::path::PathBuf {
+    std::env::temp_dir().join("hx-search-browser-pool")
+}
+
+/// The research path's **fetch step**: choose the fetcher to run for `mode`.
+///
+/// ## The rule (and the cost/consent it documents)
+///
+/// | mode | browser installed? | result | why |
+/// |------|-------------------|--------|-----|
+/// | `Http` | (irrelevant) | plain `HttpFetcher` | plain fetch never launches a browser. |
+/// | `Auto` | yes | `BrowserFetcher` | escalation for pages a plain fetch cannot read. |
+/// | `Auto` | no | plain `HttpFetcher` | no browser to escalate to; degrading to plain is the honest default — it never returns a page it did not fetch. |
+/// | `Browser` | yes | `BrowserFetcher` | explicit opt-in, as asked. |
+/// | `Browser` | no | **error** | a caller that explicitly asked for a browser must not silently get a plain fetch; that would be lying about what it fetched. |
+///
+/// The runtime honesty — a browser that runs but cannot fetch a page is a `Refused`, never an empty
+/// body — is enforced by [`BrowserFetcher`] itself (and its rungs), not by this selector.
+pub fn select_fetcher(
+    client: &reqwest::Client,
+    mode: FetchMode,
+    pool_root: impl Into<std::path::PathBuf>,
+) -> Result<FetchSelection, FetchRouteError> {
+    select_fetcher_by(client, mode, pool_root, browser_available)
+}
+
+/// The [`select_fetcher`] decision under an injected browser-availability check, so the choice is
+/// brittleness-proof in tests rather than depending on which host the test happens to run on.
+pub(crate) fn select_fetcher_by(
+    client: &reqwest::Client,
+    mode: FetchMode,
+    pool_root: impl Into<std::path::PathBuf>,
+    available: impl Fn() -> bool,
+) -> Result<FetchSelection, FetchRouteError> {
+    match mode {
+        FetchMode::Http => Ok(FetchSelection {
+            fetcher: Arc::new(HttpFetcher::new(client.clone())),
+            kind: SelectedFetcher::Http,
+            note: "http: plain fetch policy, no escalation",
+        }),
+        FetchMode::Auto if available() => {
+            let fetcher = BrowserFetcher::new(pool_root).map_err(|err| FetchRouteError {
+                reason: format!("could not build the browser fetcher: {err}"),
+            })?;
+            Ok(FetchSelection {
+                fetcher: Arc::new(fetcher),
+                kind: SelectedFetcher::Browser,
+                note: "auto: browser available, escalating plain-HTTP-then-Chromium",
+            })
+        }
+        FetchMode::Auto => Ok(FetchSelection {
+            fetcher: Arc::new(HttpFetcher::new(client.clone())),
+            kind: SelectedFetcher::Http,
+            note: "auto: no browser on this host, degraded to plain fetch (honest default)",
+        }),
+        FetchMode::Browser if available() => {
+            let fetcher = BrowserFetcher::new(pool_root).map_err(|err| FetchRouteError {
+                reason: format!("could not build the browser fetcher: {err}"),
+            })?;
+            Ok(FetchSelection {
+                fetcher: Arc::new(fetcher),
+                kind: SelectedFetcher::Browser,
+                note: "browser: explicit opt-in, driving a browser",
+            })
+        }
+        FetchMode::Browser => Err(FetchRouteError {
+            reason: format!(
+                "browser mode requested but no Chromium is installed at {}",
+                hx_browser::rungs::chromium::DEFAULT_CHROMIUM_PATH
+            ),
+        }),
+    }
+}
+
+/// Run a research task through the fetch-selection **running path**: choose the fetcher for `mode`,
+/// then execute the normal research pipeline over it.
+///
+/// This is the entry a production caller uses when it wants the research extraction step to select a
+/// fetcher — plain HTTP, or browser escalation — rather than construct one by hand. It is deliberately
+/// fallible only in the one case that must not be papered over (an explicit `Browser` request with no
+/// browser); every other mode returns a report exactly as [`research`] does.
+pub async fn research_with_fetch_mode(
+    backends: &[Arc<dyn SearchBackend>],
+    client: &reqwest::Client,
+    mode: FetchMode,
+    pool_root: impl Into<std::path::PathBuf>,
+    request: &ResearchRequest,
+) -> Result<ResearchReport, FetchRouteError> {
+    let selection = select_fetcher(client, mode, pool_root)?;
+    let task = ResearchTask::new(backends.to_vec(), client.clone(), selection.fetcher);
+    Ok(task.run(request).await)
 }
 
 /// A request for a multi-source research report.
@@ -890,6 +1075,114 @@ mod browser_fetcher_tests {
             .await
             .expect_err("refused");
         assert!(matches!(err, SearchError::Refused { .. }), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod fetch_router_tests {
+    use super::*;
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::new()
+    }
+
+    fn pool_root() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("hx-fetch-router-test-{}", std::process::id()))
+    }
+
+    /// Http mode must always select the plain fetcher and never a browser, even on a host that has one.
+    #[test]
+    fn http_mode_selects_the_plain_fetcher_even_when_a_browser_is_installed() {
+        let selection = select_fetcher_by(&client(), FetchMode::Http, pool_root(), || true)
+            .expect("http mode never fails");
+        assert_eq!(selection.kind, SelectedFetcher::Http);
+        assert!(
+            !selection.note.contains("browser"),
+            "the http note must not claim any browser involvement: {}",
+            selection.note
+        );
+        assert!(!FetchMode::Http.may_launch_browser());
+    }
+
+    /// Auto mode escalates to the browser exactly when one is available — the case the rung exists for.
+    #[test]
+    fn auto_mode_selects_the_browser_fetcher_when_a_browser_is_available() {
+        let selection = select_fetcher_by(&client(), FetchMode::Auto, pool_root(), || true)
+            .expect("auto mode with a browser succeeds");
+        assert_eq!(selection.kind, SelectedFetcher::Browser);
+        assert!(
+            selection.note.contains("escalat"),
+            "the auto note must describe escalation: {}",
+            selection.note
+        );
+        assert!(FetchMode::Auto.may_launch_browser());
+    }
+
+    /// Auto mode degrades to plain HTTP when no browser is installed — an honest default, never a lie.
+    #[test]
+    fn auto_mode_without_a_browser_degrades_to_plain_http() {
+        let selection = select_fetcher_by(&client(), FetchMode::Auto, pool_root(), || false)
+            .expect("auto mode without a browser degrades, it does not fail");
+        assert_eq!(
+            selection.kind,
+            SelectedFetcher::Http,
+            "no browser means plain fetch, never a pretend browser"
+        );
+        assert!(
+            selection.note.contains("degraded"),
+            "the note must record the degradation honestly: {}",
+            selection.note
+        );
+    }
+
+    /// Explicit Browser with no browser must FAIL, never silently degrade to a fetch the caller did not
+    /// ask for — that would be returning a page it did not fetch the way the caller intended.
+    #[test]
+    fn explicit_browser_mode_without_a_browser_fails_honestly() {
+        let err = select_fetcher_by(&client(), FetchMode::Browser, pool_root(), || false)
+            .expect_err("explicit browser with no browser must not silently degrade");
+        assert!(
+            err.reason.contains("no Chromium"),
+            "the error must name the missing browser: {}",
+            err.reason
+        );
+    }
+
+    /// Explicit Browser with a browser honours the request.
+    #[test]
+    fn explicit_browser_mode_with_a_browser_selects_the_browser_fetcher() {
+        let selection = select_fetcher_by(&client(), FetchMode::Browser, pool_root(), || true)
+            .expect("explicit browser with a browser succeeds");
+        assert_eq!(selection.kind, SelectedFetcher::Browser);
+    }
+
+    /// The public, host-real selector agrees with the injected one on this host: if Chromium is present
+    /// here, Auto escalates and Browser succeeds; if it is not, Auto degrades to plain and Browser fails.
+    /// This is gated on the real host's browser so it never fails on a host without Chromium.
+    #[test]
+    fn the_public_selector_tracks_the_real_host_browser() {
+        let real_available = browser_available();
+        let sel =
+            select_fetcher(&client(), FetchMode::Auto, pool_root()).expect("auto is infallible");
+        if real_available {
+            assert_eq!(
+                sel.kind,
+                SelectedFetcher::Browser,
+                "on a host with Chromium, auto must escalate"
+            );
+        } else {
+            assert_eq!(
+                sel.kind,
+                SelectedFetcher::Http,
+                "on a host without Chromium, auto must degrade to plain"
+            );
+        }
+        let browser_mode = select_fetcher(&client(), FetchMode::Browser, pool_root());
+        if real_available {
+            assert!(browser_mode.is_ok());
+        } else {
+            assert!(browser_mode.is_err());
+        }
     }
 }
 
