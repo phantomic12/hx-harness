@@ -27,10 +27,7 @@ use hx_core::config::SandboxProfile;
 use hx_core::error::HxError;
 use hx_core::ids::SessionId;
 use hx_sandbox::SandboxSpec;
-use hx_search::{
-    default_pool_root, select_fetcher, FetchMode, FetchRouteError, Recency, ResearchRequest,
-    ResearchTask, SearchQuery,
-};
+use hx_search::{Recency, SearchQuery};
 use hx_secrets::Redactor;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -100,23 +97,14 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/terminals/{id}", delete(kill_terminal))
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{id}", post(answer_approval))
-        // The phone's tap comes back here — see `crate::phone`. Exempt from the bearer token (the
-        // route authenticates with the one-time token inside `respond_url`).
-        .route("/v1/approvals/{id}/respond", post(respond_approval))
         // The diff/review pane's data source. A diff of file changes is owned by the daemon (it is
         // the only thing that can read the file), so the pane asks for it here rather than inventing it.
         .route("/v1/diff", post(diff_file))
-        // The M8 fan-out surface: N concurrent child model calls across N distinct pool members,
-        // answered per child. This is the first production caller of the spawner that draws from the
-        // model pool (see `crate::fanout`). It is gated by the same bearer token as everything
+        // The M8 fan-out surface: N child model calls across N distinct pool members, run one at a
+        // time, answered per child. This is the first production caller of the spawner that draws from
+        // the model pool (see `crate::fanout`). It is gated by the same bearer token as everything
         // else on this router.
         .route("/v1/fanout", post(fanout))
-        // M5's webhook half: external platforms `POST` inbound events here, authenticated by their
-        // own per-connector bearer token rather than the daemon's (see `crate::auth::is_webhook_route`).
-        .merge(crate::webhook::routes())
-        // The M6 research pipeline's production caller: runs the keyless fan-out, extraction and
-        // citation through the fetch selector, behind the same bearer-token gate.
-        .route("/v1/research", post(research))
         .with_state(state)
         // Applied last, so it wraps every route including the WebSocket upgrades. `from_fn_with_state`
         // rather than `from_fn`: the token lives on `AppState`, and reading it from a request
@@ -754,66 +742,6 @@ async fn answer_approval(
     }
 }
 
-/// The body of a phone/lock-screen tap.
-///
-/// The phone taps `POST /v1/approvals/{id}/respond` with a bare `verdict` of `allow` or `deny`.
-/// Compare this with [`ApprovalAnswer`]: the phone is a thin approval surface, not a full client, so the
-/// choice it sends is a single yes/no and `respond_with` picks the ceiling — `allow` maps to
-/// [`ApprovalOption::AllowOnce`] (a one-shot grant, the least the phone can mean by "let it run").
-#[derive(Debug, Deserialize)]
-pub struct RespondApprovalBody {
-    /// The one-time token from the pushed `respond_url`. See [`crate::phone::PhoneApprover`].
-    token: String,
-    /// `allow` or `deny`.
-    verdict: String,
-}
-
-/// The phone's tap comes back here, through the `respond_url` the push carried.
-///
-/// **Why this has no bearer check**: the phone never holds the daemon's long-lived secret. The push put a
-/// **one-time** [`crate::phone::PhoneApprover`] token into the `respond_url` it sent, and `approve_phone`
-/// verifies that token here against its own per-approval record before acting. A caller who does not know the
-/// token is refused, whether or not they hold a bearer token; a caller who does know it holds the proof the
-/// push itself issued, which is the phone's grant. The one-time nature means replaying the `respond_url` cannot
-/// approve twice.
-async fn respond_approval(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(body): Json<RespondApprovalBody>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let Some(phone) = &state.phone else {
-        // No webhook is configured and no push exists under this id: the route is a 404, not a 400,
-        // because there is no approval this url could answer.
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            "no phone approval push is configured on this daemon",
-        ));
-    };
-
-    match phone.respond(&id, &body.token, &body.verdict) {
-        Ok(()) => {}
-        Err(phone_err) => {
-            use crate::phone::PhoneRespondError::*;
-            return Err(match phone_err {
-                Idle => ApiError::new(
-                    StatusCode::NOT_FOUND,
-                    format!("no approval is waiting under '{id}' — it was answered already, or it expired"),
-                ),
-                Token => ApiError::new(
-                    StatusCode::FORBIDDEN,
-                    "the one-time token in this respond_url does not match the approval — refused",
-                ),
-                Verdict => ApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    "verdict must be 'allow' or 'deny'",
-                ),
-            });
-        }
-    }
-
-    Ok(Json(serde_json::json!({ "responded": id })))
-}
-
 /// A diff of a proposed file change, computed from the real file on disk.
 ///
 /// Body `{ "path": "...", "proposed": "..." }`. The current content is read from the local host (via
@@ -905,7 +833,14 @@ pub struct FanOutChild {
 ///
 /// `children` is the list of child calls. The returned outcome has one result per child, in
 /// request order. Every child in a fan-out runs against **one** caller session (the first
-/// child's), which is the single-session contract of `crate::fanout::run_fan_out`.
+/// child's), which is the single-session contract of `crate::fanout::run_fan_out`; the other
+/// children's `session` fields are accepted for shape and ignored, which
+/// `tests/fanout_merged.rs` pins.
+///
+/// Refused before anything runs: an empty `children` array (400), a child whose prompt is blank
+/// (400 — the built-in web client refuses the same row, and a blank prompt is a model call that
+/// buys nothing), and the session the children will be recorded under when it does not exist (404).
+/// A refusal spends no provider call and writes nothing.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct FanOutBody {
     pub children: Vec<FanOutChild>,
@@ -919,14 +854,20 @@ fn default_fanout_pool() -> String {
     "interactive".to_string()
 }
 
-/// `POST /v1/fanout` — run N child model calls across N distinct pool members.
+/// `POST /v1/fanout` — run N child model calls, one per distinct pool member, one at a time.
 ///
 /// The M8 exit criterion as an HTTP surface: every child is allocated a spec on a *distinct*
-/// healthy member before any runs, the children then run **concurrently** (bounded by the
-/// configured `agent.fanout_max_parallel`), a short pool fails loudly (no child runs), and a
-/// member that dies mid-fan-out fails only its own child while the others complete. Each completed child's
-/// response names the member it ran on and its recorded usage; a dying member's error is already
-/// redacted at the fanout boundary (see `crate::fanout`).
+/// healthy member before any runs, a short pool fails loudly (no child runs), and a member that
+/// dies mid-fan-out fails only its own child while the others complete. Each completed child's
+/// response names the member it ran on and its recorded usage; a dying member's error is redacted
+/// at the fanout boundary with the member's own credential registered as a literal (see
+/// `crate::spawn::Spawner::redact_child_error`).
+///
+/// The children run **one at a time**: `run_fan_out` awaits each `run_child` in a loop. This
+/// comment used to call them "N concurrent child model calls", which was never true of the code —
+/// `ROADMAP.md`'s M8 section says sequential, and `a_fan_out_runs_its_children_one_at_a_time`
+/// in `tests/fanout_merged.rs` pins it. Do not re-word this back without also making the loop
+/// concurrent.
 ///
 /// The `Spawner` is built per request from `Config` plus the state's providers, secret stores
 /// and store. This is the same wiring `AppState::build` uses for the model path, and no new
@@ -944,9 +885,38 @@ async fn fanout(
         ));
     }
 
+    // A child with nothing to ask is a provider call that buys nothing, and the built-in web client
+    // refuses exactly that row before sending it (`each row needs both a session and a prompt`). The
+    // route used to accept it and spend the call, so the two surfaces disagreed; it now names the
+    // child and refuses. Whitespace counts as blank for the same reason.
+    for (index, child) in body.children.iter().enumerate() {
+        if child.prompt.trim().is_empty() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "child {} has an empty prompt: a fan-out child needs something to ask",
+                    index + 1
+                ),
+            ));
+        }
+    }
+
     // `run_fan_out` runs every child against a single caller session; the first child's is
     // that session. This is the primitive's documented contract, not a guess.
     let session = hx_core::ids::SessionId::from_raw(body.children[0].session.clone());
+
+    // The session must already exist — every child's usage is recorded under it, and `hx fan`'s help
+    // says so. Without this check the fan-out made the provider call first and failed afterwards
+    // inside `Store::record_usage` (`touch` refuses a session that is not there), reporting that as
+    // an *errored child* in a 200: a model call paid for, nothing in the audit chain, and an
+    // internal store message rendered as the child's failure.
+    state.store.record(&session).map_err(|err| match err {
+        hx_core::error::HxError::NotFound(_) => ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("no such session: {}", session.as_str()),
+        ),
+        other => ApiError::from(other),
+    })?;
 
     // `default_pool` carries the configured default, which may be empty/absent; fall back to a
     // sensible name when it is. The pool the fan-out draws from is built per request from
@@ -974,147 +944,21 @@ async fn fanout(
 
     let prompts: Vec<&str> = body.children.iter().map(|c| c.prompt.as_str()).collect();
 
-    let outcome = crate::fanout::run_fan_out(
-        &mut spawner,
-        &session,
-        &prompts,
-        state.config.agent.fanout_max_parallel,
-    )
-    .await
-    .map_err(|e| {
-        let status = match &e {
-            // A shortage is the client's to fix (run fewer, retry later) — client error.
-            crate::fanout::FanOutError::NotEnoughMembers { .. } => StatusCode::UNPROCESSABLE_ENTITY,
-            // An all-down/empty pool is a server-side capability problem.
-            crate::fanout::FanOutError::Draw(_) => StatusCode::SERVICE_UNAVAILABLE,
-        };
-        ApiError::new(status, e.to_string())
-    })?;
+    let outcome = crate::fanout::run_fan_out(&mut spawner, &session, &prompts)
+        .await
+        .map_err(|e| {
+            let status = match &e {
+                // A shortage is the client's to fix (run fewer, retry later) — client error.
+                crate::fanout::FanOutError::NotEnoughMembers { .. } => {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                }
+                // An all-down/empty pool is a server-side capability problem.
+                crate::fanout::FanOutError::Draw(_) => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            ApiError::new(status, e.to_string())
+        })?;
 
     Ok(Json(outcome))
-}
-
-// ---------------------------------------------------------------------------
-// Research: the M6 pipeline's production caller
-// ---------------------------------------------------------------------------
-//
-// `hx-search` owns the pipeline (`ResearchTask`) and the fetch decision (`select_fetcher`);
-// this route is the caller that runs one through the other. It never reaches the network
-// itself: every page fetch goes through the selected `Fetcher`, plain or browser-backed.
-
-/// `POST /v1/research` — the research request.
-///
-/// `fetch_mode` is the `hx_search::FetchMode` vocabulary (`http`, `auto`, `browser`); omitted
-/// means `auto`, the mode the browser rung exists for. `max_sources` caps the cited sources;
-/// omitted means the pipeline default.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ResearchBody {
-    pub query: String,
-    #[serde(default)]
-    pub max_sources: Option<usize>,
-    #[serde(default)]
-    pub fetch_mode: Option<FetchMode>,
-}
-
-impl ResearchBody {
-    /// Split the wire body into the pipeline request and the fetch decision it runs under.
-    ///
-    /// Pure, so the CLI mapping test and the route share one meaning of the fields rather than
-    /// two parsers that can drift.
-    pub fn into_request_and_mode(self) -> (ResearchRequest, FetchMode) {
-        let mode = self.fetch_mode.unwrap_or(FetchMode::Auto);
-        let request = match self.max_sources {
-            Some(max) => ResearchRequest::new(self.query).with_max_sources(max),
-            None => ResearchRequest::new(self.query),
-        };
-        (request, mode)
-    }
-}
-
-/// `POST /v1/research` — the research report, plus which fetcher ran it.
-///
-/// `fetcher` is `http` or `browser` — the `SelectedFetcher` the selector landed on — and
-/// `fetch_note` is its honest record of why (including the `auto` degradation when no browser
-/// is installed). The rest is the pipeline's own report.
-#[derive(Debug, Serialize)]
-pub struct ResearchResponse {
-    pub query: String,
-    pub fetcher: &'static str,
-    pub fetch_note: String,
-    pub backends: Vec<hx_search::BackendOutcome>,
-    pub sources: Vec<hx_search::Citation>,
-    pub paid_calls: usize,
-}
-
-/// Turn a refused fetch selection into the status a caller should react to.
-///
-/// An explicit browser request with no browser installed is `409 Conflict`, not a 500: the
-/// daemon is fine, the request asked for a rung this host cannot run. `auto` never reaches
-/// here — it degrades inside `select_fetcher` — so this fires only for an explicit mode.
-pub fn research_route_error(err: FetchRouteError) -> ApiError {
-    ApiError::new(StatusCode::CONFLICT, err.to_string())
-}
-
-/// `POST /v1/research` — fan out over the configured backends, extract, and cite.
-///
-/// The fetcher is chosen by the existing `select_fetcher` — the selection logic lives in
-/// `hx-search` and is called here, never duplicated. A blank query is a 400; a daemon with no
-/// backends configured is a 503, the same answer `/v1/search` gives.
-async fn research(
-    State(state): State<Arc<AppState>>,
-    body: Result<Json<ResearchBody>, axum::extract::rejection::JsonRejection>,
-) -> Response {
-    // A thin shell over `research_inner`: the extractor plumbing stays trivial and the route's
-    // real work is testable as a plain async fn taking the state by value.
-    let body = match body {
-        Ok(Json(body)) => body,
-        Err(rejection) => {
-            return ApiError::new(StatusCode::BAD_REQUEST, rejection.body_text()).into_response()
-        }
-    };
-    match research_inner(state, body).await {
-        Ok(json) => json.into_response(),
-        Err(err) => err.into_response(),
-    }
-}
-
-/// The route's real work.
-async fn research_inner(
-    state: Arc<AppState>,
-    body: ResearchBody,
-) -> Result<Json<ResearchResponse>, ApiError> {
-    if body.query.trim().is_empty() {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "a research request needs a non-empty `query`",
-        ));
-    }
-    if state.search.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no search backends are configured; set `search.backends` in the config",
-        ));
-    }
-
-    let (request, mode) = body.into_request_and_mode();
-    let client = state.search.client().clone();
-    let selection =
-        select_fetcher(&client, mode, default_pool_root()).map_err(research_route_error)?;
-    let task = ResearchTask::new(state.search.all(), client, selection.fetcher());
-    let report = task.run(&request).await;
-
-    let fetcher = match selection.kind {
-        hx_search::SelectedFetcher::Http => "http",
-        hx_search::SelectedFetcher::Browser => "browser",
-    };
-    Ok(Json(ResearchResponse {
-        query: report.query,
-        fetcher,
-        fetch_note: selection.note.to_string(),
-        backends: report.backends,
-        sources: report.sources,
-        paid_calls: report.paid_calls,
-    }))
 }
 
 /// Every event of a session, in order: what a client that just attached renders.
@@ -2385,181 +2229,5 @@ search:
             body["denied"].is_string(),
             "the reason must be reported: {body}"
         );
-    }
-
-    async fn phone_state() -> (Arc<AppState>, Arc<crate::phone::PhoneApprover>) {
-        let mut config = hx_core::config::Config::from_yaml(CONFIG).expect("config parses");
-        let dir = tempfile::tempdir().expect("temp dir");
-        config.daemon.data_dir = dir.keep().display().to_string();
-        config.approval.push_url = Some("http://mock-push.local/hook".to_string());
-        let state = build_state(config).await;
-        let phone = state.phone.clone().expect("push_url configured builds a phone approver");
-        (state, phone)
-    }
-
-    /// A running approval must be resolvable by its one-time token with **no bearer header** — that is
-    /// the whole point of the phone path, and the reason this route is exempt from `require_bearer` (it
-    /// authenticates with the token instead).
-    #[tokio::test]
-    async fn phone_approval_can_be_answered_from_the_lock_screen() {
-        let (state, phone) = phone_state().await;
-        let id = "apr_phone_route";
-        let (reply, answer) = tokio::sync::oneshot::channel();
-        let token = phone.insert_for_test(
-            id,
-            hx_core::approval::RiskClass::External,
-            reply,
-        );
-
-        // The tap carries only the one-time token — no bearer header.
-        let response = app(state)
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/v1/approvals/{id}/respond"))
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({ "token": token.as_str(), "verdict": "allow" }).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let (option, by) = answer.await.expect("the waiting run receives the answer");
-        assert_eq!(option, hx_core::approval::ApprovalOption::AllowOnce);
-        assert_eq!(by, "phone");
-    }
-
-    /// A wrong one-time token is refused even though the route needs no bearer header: the exemption is
-    /// not an open door.
-    #[tokio::test]
-    async fn a_wrong_phone_token_is_refused() {
-        let (state, phone) = phone_state().await;
-        let (reply, _answer) = tokio::sync::oneshot::channel();
-        phone.insert_for_test(
-            "apr_wrong",
-            hx_core::approval::RiskClass::External,
-            reply,
-        );
-        let response = app(state)
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/approvals/apr_wrong/respond")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({ "token": "wrong-token", "verdict": "allow" }).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        // The id is real and waiting, but the one-time token does not match: that is a 403 — the route
-        // is exempt from the bearer header, so the token check is the only door, and it must refuse.
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    }
-
-    // ---- research -----------------------------------------------------------
-
-    #[test]
-    fn a_research_body_without_options_means_auto_and_the_pipeline_default() {
-        // The default is `Auto` — the mode the browser rung exists for — and not `Http`: a
-        // caller that says nothing gets escalation where possible, not a silent downgrade.
-        let body = ResearchBody {
-            query: "rust".to_string(),
-            max_sources: None,
-            fetch_mode: None,
-        };
-        let (request, mode) = body.into_request_and_mode();
-        assert_eq!(mode, FetchMode::Auto, "an omitted mode must mean auto");
-        assert_eq!(request.query, "rust");
-        assert_eq!(
-            request.max_sources,
-            hx_search::DEFAULT_MAX_SOURCES,
-            "an omitted cap must mean the pipeline default"
-        );
-    }
-
-    #[test]
-    fn a_research_body_honours_an_explicit_mode_and_cap() {
-        let body = ResearchBody {
-            query: "rust".to_string(),
-            max_sources: Some(3),
-            fetch_mode: Some(FetchMode::Http),
-        };
-        let (request, mode) = body.into_request_and_mode();
-        assert_eq!(mode, FetchMode::Http);
-        assert_eq!(request.max_sources, 3);
-    }
-
-    #[test]
-    fn a_refused_fetch_selection_is_a_409_carrying_the_reason() {
-        // The 409 is the route's whole answer to "explicit browser, no browser": the status must
-        // be conflict (retrying is pointless, nothing is broken) and the message must name the
-        // missing rung rather than say "error".
-        let err = FetchRouteError {
-            reason:
-                "browser mode requested but no Chromium is installed at /usr/lib/chromium/chromium"
-                    .to_string(),
-        };
-        let api = research_route_error(err);
-        assert_eq!(api.status, StatusCode::CONFLICT);
-        assert!(
-            api.message.contains("Chromium"),
-            "the 409 must name the unavailable rung: {}",
-            api.message
-        );
-    }
-
-    #[tokio::test]
-    async fn a_blank_research_query_is_a_400_not_an_empty_report() {
-        let state = test_state().await;
-        let (status, body) = post(
-            state,
-            "/v1/research",
-            serde_json::json!({ "query": "   ", "fetch_mode": "http" }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(
-            body["error"].as_str().unwrap_or("").contains("query"),
-            "{body}"
-        );
-    }
-
-    #[tokio::test]
-    async fn research_without_backends_says_so_instead_of_returning_nothing() {
-        // The same answer `/v1/search` gives: an empty registry is a configuration problem, not
-        // an empty report.
-        let state = test_state().await;
-        let (status, body) = post(
-            state,
-            "/v1/research",
-            serde_json::json!({ "query": "rust", "fetch_mode": "http" }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    }
-
-    #[tokio::test]
-    async fn a_research_body_that_does_not_parse_is_a_400() {
-        // `fetch_mode: "telepathy"` parses as JSON but not as a `ResearchBody`; the route maps
-        // every such rejection to 400 rather than axum's default 422.
-        let state = test_state().await;
-        let response = app(state)
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/research")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"query": "rust", "fetch_mode": "telepathy"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
