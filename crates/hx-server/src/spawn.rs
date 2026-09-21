@@ -79,9 +79,15 @@ pub const MAX_ANSWER_CHARS: usize = 4_000;
 /// and after.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChildSpec {
-    /// The pool member this child was drawn from. It is the model (its `id`), the endpoint and the
-    /// credential — all in one, because a pool member *is* a drawable model.
+    /// The pool member this child was drawn from: its pool id (draw order, health, audit), its
+    /// declared provider and model (the route), its endpoint and its credential reference.
+    /// The id is never the route — resolving the provider or naming the model from it would send
+    /// the child to an endpoint that was never declared.
     pub member_id: String,
+    /// The registry id of the provider that serves this child, from the drawn member.
+    pub provider: String,
+    /// The model name the request carries, from the drawn member.
+    pub model: String,
     pub base_url: String,
     /// A credential **reference** (`vault:…` / `env:…`), never a value — same discipline as the
     /// pool and `hx-secrets`.
@@ -95,9 +101,9 @@ pub struct ChildSpec {
 }
 
 impl ChildSpec {
-    /// The model id this child runs on — the **drawn member**, not a global.
+    /// The model name the request carries — the **drawn member's declared model**, not its pool id.
     pub fn model(&self) -> &str {
-        &self.member_id
+        &self.model
     }
 }
 
@@ -197,6 +203,8 @@ impl Spawner {
         let effective = member.clamp(requested);
         Ok(ChildSpec {
             member_id: member.id.clone(),
+            provider: member.provider.clone(),
+            model: member.model.clone(),
             base_url: member.base_url.clone(),
             credential: member.credential.clone(),
             params: effective.params,
@@ -206,9 +214,9 @@ impl Spawner {
 
     /// Run one child: one provider call against the spec's (drawn) member, then record its usage.
     ///
-    /// The provider is resolved by the **drawn member's id** and the request is built with the
-    /// **drawn member's** model, so the recorded [`UsageRecord`]'s `model` is the member this spec
-    /// drew — not the first member, not a global. The request also carries the spec's effective
+    /// The provider is resolved by the **drawn member's declared provider** and the request is built
+    /// with the **drawn member's declared model**, so the recorded [`UsageRecord`] names the route
+    /// the member declared — not the member's pool id. The request also carries the spec's effective
     /// (clamped) parameters, so a member that accepts a kind receives it. The call runs under the
     /// spawner's child deadline: a member that never answers is a dead member, marked down like
     /// any other 5xx/timeout, and the returned [`ChildRecord`] carries the child's final answer
@@ -223,7 +231,7 @@ impl Spawner {
     ) -> Result<ChildRecord> {
         let provider = self
             .providers
-            .resolve(&ProviderId::from(spec.member_id.clone()), spec.model())
+            .resolve(&ProviderId::from(spec.provider.clone()), spec.model())
             .map_err(|err| hx_core::error::HxError::NoRoute(err.to_string()))?;
         let key = self
             .secrets
@@ -245,7 +253,7 @@ impl Spawner {
 
         let usage = response.usage;
         let record = UsageRecord::new(
-            spec.member_id.clone(),
+            spec.provider.clone(),
             spec.credential.clone(),
             spec.model(),
             usage.input_tokens,
@@ -371,7 +379,7 @@ impl Spawner {
         loop {
             let provider = self
                 .providers
-                .resolve(&ProviderId::from(spec.member_id.clone()), spec.model())
+                .resolve(&ProviderId::from(spec.provider.clone()), spec.model())
                 .map_err(|err| hx_core::error::HxError::NoRoute(err.to_string()))?;
             let key = self
                 .secrets
@@ -386,7 +394,7 @@ impl Spawner {
                 Ok(response) => {
                     let usage = response.usage;
                     let record = UsageRecord::new(
-                        spec.member_id.clone(),
+                        spec.provider.clone(),
                         spec.credential.clone(),
                         spec.model(),
                         usage.input_tokens,
@@ -448,7 +456,7 @@ impl Spawner {
 /// What a run produced and recorded for a child.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ChildRecord {
-    /// The model (drawn member) this child **finished** on.
+    /// The declared model this child **finished** on.
     pub model: String,
     /// The credential **reference** that paid for it.
     pub credential: String,
@@ -494,6 +502,13 @@ mod tests {
     fn member(id: &str, accepts: &[Param]) -> PoolMember {
         PoolMember {
             id: id.to_string(),
+            // WHY the provider is the id here: these fixtures share one registry helper keyed by
+            // id, and they pin draw/health/audit behaviour, not routing. The model is still
+            // distinct from the id, so every model assertion below pins the declared model — and
+            // `a_child_runs_against_its_members_declared_provider_and_model` pins the provider
+            // with all three names different.
+            provider: id.to_string(),
+            model: format!("{id}-model"),
             base_url: format!("{id}.example.test"),
             credential: format!("vault:pool/{id}"),
             accepts: accepts.to_vec(),
@@ -532,14 +547,15 @@ mod tests {
         Hang,
     }
 
-    /// A provider that answers without a network. The id is the member it stands in for.
+    /// A provider that answers without a network. The id is the provider it stands in for — the
+    /// pool member that routes to it names this id in its `provider` field.
     ///
     /// `err` scripts *how* the member answers when it does not succeed, so tests can distinguish a
     /// member death (a 5xx — worth re-routing) from a request the member refused (a 400 — not).
     struct ScriptedProvider {
         id: ProviderId,
         err: ScriptedErr,
-        /// The model the upstream *echoes back*. `None` means the member's own id, which is the
+        /// The model the upstream *echoes back*. `None` means the provider's own id, which is the
         /// trap: a fixture whose echo is the id cannot tell a record that took its model from the
         /// drawn member from one that took it from the response.
         echoes: Option<String>,
@@ -754,7 +770,19 @@ mod tests {
             store(),
         );
         let spec = pen.build_spec(&[]).expect("both healthy");
-        assert_eq!(spec.model(), "cheap", "the first draw is the first member");
+        assert_eq!(
+            spec.member_id, "cheap",
+            "the first draw is the first member"
+        );
+        assert_eq!(
+            spec.provider, "cheap",
+            "the spec carries the drawn member's declared provider"
+        );
+        assert_eq!(
+            spec.model(),
+            "cheap-model",
+            "the spec carries the drawn member's declared model, not its pool id"
+        );
         assert!(spec.clamps.is_empty());
         assert_eq!(spec.base_url, "cheap.example.test");
         assert_eq!(spec.credential, "vault:pool/cheap");
@@ -794,13 +822,14 @@ mod tests {
             .run_child(&spec, s.id(), "hi")
             .await
             .expect("a clamped child runs");
-        assert_eq!(rec.usage.model, "strong");
+        assert_eq!(rec.usage.model, "strong-model");
         assert_eq!(rec.usage.input_tokens, 10);
     }
 
     #[tokio::test]
     async fn a_failed_member_marks_down_and_the_next_spec_draws_a_healthy_one() {
-        // The registry resolves a member's id to its own provider; a is scripted to fail.
+        // Each member routes to its declared provider — kept equal to the id in this fixture,
+        // so the registry is keyed by id — and a is scripted to fail.
         let mut reg = ProviderRegistry::new();
         reg.insert(ScriptedProvider::new("a").failing());
         reg.insert(ScriptedProvider::new("b"));
@@ -815,7 +844,7 @@ mod tests {
             st.clone(),
         );
         let spec_a = pen.build_spec(&[]).expect("draws");
-        assert_eq!(spec_a.model(), "a");
+        assert_eq!(spec_a.model(), "a-model");
         let s = session(&st);
         let err = pen
             .run_child(&spec_a, s.id(), "hi")
@@ -828,7 +857,7 @@ mod tests {
             let spec = pen.build_spec(&[]).expect("b is healthy");
             assert_eq!(
                 spec.model(),
-                "b",
+                "b-model",
                 "a down member is not drawn while a healthy one remains"
             );
         }
@@ -847,19 +876,23 @@ mod tests {
             st.clone(),
         );
         let spec = pen.build_spec(&[]).expect("b is healthy");
-        assert_eq!(spec.model(), "b");
+        assert_eq!(spec.model(), "b-model");
 
         let s = session(&st);
         let rec = pen.run_child(&spec, s.id(), "hi").await.expect("runs");
-        assert_eq!(rec.usage.model, "b");
-        assert_eq!(rec.model, "b");
+        assert_eq!(rec.usage.model, "b-model");
+        assert_eq!(rec.model, "b-model");
         // Read back out of the database, not out of the record this module just handed us: the claim
         // is about what was *recorded*, and a returned record agreeing with itself proves nothing.
         // (This assertion replaced `assert_eq!(s.record.id.as_str(), s.id().as_str())`, which
         // compared a value to the value it was built from and therefore could not fail.)
         assert_eq!(
             durable_usage_rows(&st, s.id()),
-            vec![("b".to_string(), "vault:pool/b".to_string(), "b".to_string())],
+            vec![(
+                "b".to_string(),
+                "vault:pool/b".to_string(),
+                "b-model".to_string()
+            )],
             "the durable row names the drawn member and the reference that paid"
         );
     }
@@ -883,13 +916,71 @@ mod tests {
         assert_eq!(provider.calls(), 1, "one child is one provider call");
         assert_eq!(
             provider.seen()[0].model,
-            "b",
+            "b-model",
             "and the request asked the drawn member's provider for the drawn member's model"
         );
         assert_eq!(
             st.totals(s.id()).expect("totals read").provider_calls,
             1,
             "and exactly one row for it"
+        );
+    }
+
+    /// A child runs against its member's declared provider and model, never its pool id.
+    ///
+    /// The defect this pins: the spawner resolved the member id as the provider id and sent it as
+    /// the model name, ignoring both declared fields. The registry here holds only the declared
+    /// provider — no entry for the pool id — so the old code fails at resolve time, and even past
+    /// that it would send the wrong model and record the wrong route.
+    #[tokio::test]
+    async fn a_child_runs_against_its_members_declared_provider_and_model() {
+        let member = PoolMember {
+            id: "cheap".to_string(),
+            provider: "upstream-a".to_string(),
+            model: "atlas-large".to_string(),
+            base_url: "https://upstream-a.example.test".to_string(),
+            credential: "vault:pool/cheap".to_string(),
+            accepts: Vec::new(),
+            health: MemberHealth::Healthy,
+        };
+        let (reg, provider) = registry_and_provider("upstream-a");
+        let st = store();
+        let mut pen = Spawner::new(
+            ModelPool::new(vec![member]),
+            reg,
+            secrets_for("cheap"),
+            st.clone(),
+        );
+        let spec = pen.build_spec(&[]).expect("draws");
+        assert_eq!(spec.member_id, "cheap");
+        assert_eq!(spec.provider, "upstream-a");
+        assert_eq!(spec.model(), "atlas-large");
+        assert_eq!(spec.base_url, "https://upstream-a.example.test");
+
+        let s = session(&st);
+        let rec = pen.run_child(&spec, s.id(), "hi").await.expect("runs");
+
+        let seen = provider.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].model, "atlas-large",
+            "the request carries the declared model, not the pool id"
+        );
+        assert_eq!(rec.model, "atlas-large");
+        assert_eq!(rec.usage.provider, "upstream-a");
+        assert_eq!(rec.usage.model, "atlas-large");
+        assert_eq!(
+            rec.base_url, "https://upstream-a.example.test",
+            "the record carries the declared endpoint"
+        );
+        assert_eq!(
+            durable_usage_rows(&st, s.id()),
+            vec![(
+                "upstream-a".to_string(),
+                "vault:pool/cheap".to_string(),
+                "atlas-large".to_string()
+            )],
+            "the durable row names the declared route and the reference that paid"
         );
     }
 
@@ -913,7 +1004,7 @@ mod tests {
         let next = pen
             .build_spec(&[])
             .expect("a member that answered must still be drawable");
-        assert_eq!(next.model(), "only");
+        assert_eq!(next.model(), "only-model");
     }
 
     #[tokio::test]
@@ -927,15 +1018,15 @@ mod tests {
             secrets_for("a"),
             store(),
         );
-        assert_eq!(pen.build_spec(&[]).expect("draws").model(), "a");
+        assert_eq!(pen.build_spec(&[]).expect("draws").model(), "a-model");
         assert_eq!(
             pen.build_spec(&[]).expect("draws").model(),
-            "b",
+            "b-model",
             "the second draw is the next healthy member, not the first one again"
         );
         assert_eq!(
             pen.build_spec(&[]).expect("draws").model(),
-            "a",
+            "a-model",
             "and it cycles"
         );
     }
@@ -960,13 +1051,13 @@ mod tests {
         let rec = pen.run_child(&spec, s.id(), "hi").await.expect("runs");
 
         assert_eq!(
-            rec.usage.model, "b",
+            rec.usage.model, "b-model",
             "the drawn member is the model of record, not the upstream's name for it"
         );
-        assert_eq!(rec.model, "b");
+        assert_eq!(rec.model, "b-model");
         assert_eq!(
             durable_usage_rows(&st, s.id())[0].2,
-            "b",
+            "b-model",
             "and the durable row says the same"
         );
     }
@@ -1183,7 +1274,7 @@ mod tests {
         let spec = pen.build_spec(&[]).expect("draws");
         let s = session(&st);
         let rec = pen.run_child(&spec, s.id(), "hi").await.expect("runs");
-        assert_eq!(rec.usage.model, "b");
+        assert_eq!(rec.usage.model, "b-model");
         let totals = st.totals(s.id()).expect("totals read");
         assert_eq!(totals.provider_calls, 1);
         assert_eq!(totals.input_tokens, 10);
@@ -1257,8 +1348,8 @@ mod tests {
             .expect("the child re-routes and continues");
 
         // The child finished on the healthy member…
-        assert_eq!(rec.model, "b", "the finish is on the healthy member");
-        assert_eq!(rec.usage.model, "b");
+        assert_eq!(rec.model, "b-model", "the finish is on the healthy member");
+        assert_eq!(rec.usage.model, "b-model");
         // …and the audit names the one that died and why — a model switch is never silent.
         assert_eq!(rec.dead_members.len(), 1, "{:?}", rec.dead_members);
         assert_eq!(rec.dead_members[0].0, "a");
@@ -1269,7 +1360,7 @@ mod tests {
         );
         // Health is shared: a dead member stays down for a subsequent draw.
         let spec = pen.build_spec(&[]).expect("b remains healthy");
-        assert_eq!(spec.model(), "b");
+        assert_eq!(spec.model(), "b-model");
     }
 
     /// When every member dies, the run fails bounded with the pool's own AllDown error — it never retries
@@ -1330,7 +1421,7 @@ mod tests {
         );
         // A subsequent draw reaches the healthy set (b, by the round-robin cursor) and can still run.
         let spec = pen.build_spec(&[]).expect("a healthy member remains");
-        assert_eq!(spec.model(), "b");
+        assert_eq!(spec.model(), "b-model");
     }
 
     /// A missing provider route is a configuration fact (NoRoute), not a member death:

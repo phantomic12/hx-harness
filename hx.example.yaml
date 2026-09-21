@@ -42,6 +42,15 @@ providers:
       # the limiter has something to attach limits to.
       - { id: local, secret: "vault:local/none", limits: { concurrent: 2 } }
 
+  # A cheap OpenAI-compatible upstream for background-grade children.
+  openai-cheap:
+    kind: openai
+    base_url: https://api.openai.com
+    models: [gpt-4o-mini]
+    routing: priority
+    credentials:
+      - { id: cheap, secret: "env:OPENAI_API_KEY", limits: { rpm: 60, tpm: 60000 } }
+
 # ---------------------------------------------------------------------------
 # Pools: named lists of provider/model routes, with an optional ceiling that
 # spans all of them.
@@ -67,19 +76,25 @@ pools:
     inherits: background
     limits: { concurrent: 2, daily_usd: 5.0 }
 
-# M8 model pools: per-child model members a future subagent spawner draws from.
-# The routing rules (health-aware draw, capability clamping) are built and tested in
-# hx-core; nothing draws from these yet. The credential is a *reference* — never a value.
+# M8 model pools: per-child model members the subagent spawner draws from.
+# Each member routes by its declared `provider` (a registry id from above) and `model` (the model
+# name the request carries) — the `id` names the member inside the pool only, never the route.
+# `base_url` must agree with the provider's configured URL (a mismatch fails when the pool is
+# built), so the recorded URL is the contacted one. The credential is a *reference* — never a value.
 # `accepts` is the set of parameters this member accepts; anything else requested is clamped
 # to the nearest accepted value (or dropped) and the clamp is recorded, never sent raw.
 model_pools:
   builder:
     - id: builder-strong
+      provider: anthropic-main
+      model: claude-opus-4-7
       base_url: https://api.anthropic.com
       credential: "vault:anthropic/main"
       accepts:
         - { kind: reasoning_effort, value: high }
     - id: builder-cheap
+      provider: openai-cheap
+      model: gpt-4o-mini
       base_url: https://api.openai.com
       credential: "env:OPENAI_API_KEY"
       accepts:

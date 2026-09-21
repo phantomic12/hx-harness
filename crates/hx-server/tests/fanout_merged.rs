@@ -45,6 +45,13 @@ fn now() -> chrono::DateTime<chrono::Utc> {
 fn member(id: &str) -> PoolMember {
     PoolMember {
         id: id.to_string(),
+        // These tests pin fan-out shape, not member routing: the provider is the id so the
+        // scripted registries (keyed by id) resolve unchanged, and the model is the id so the
+        // route responses keep their names. Routing with distinct names is pinned in
+        // `spawn.rs` (`a_child_runs_against_its_members_declared_provider_and_model`) and
+        // `hx-core`'s pool/config tests.
+        provider: id.to_string(),
+        model: id.to_string(),
         base_url: format!("https://{id}.example.test"),
         credential: format!("vault:pool/{id}"),
         accepts: Vec::new(),
@@ -256,6 +263,8 @@ async fn harness(
         .into_iter()
         .map(|id| hx_core::pool::ModelPoolMemberConfig {
             id: id.clone(),
+            provider: id.clone(),
+            model: id.clone(),
             base_url: format!("https://{id}.example.test"),
             credential: format!("vault:pool/{id}"),
             accepts: Vec::new(),

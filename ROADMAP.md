@@ -784,7 +784,7 @@ What that means is that the hard part — the **routing rules** — can and shou
 pure, self-contained module a future spawner will draw from. That is what has landed here:
 
 - ✅ **A model pool the harness draws children from** (`crates/hx-core/src/pool.rs`) — `PoolMember` (id,
-  base URL, a credential **reference**, the parameters it accepts, a health state) and `ModelPool` (ordered
+  declared provider and model, base URL, a credential **reference**, the parameters it accepts, a health state) and `ModelPool` (ordered
   members + the draw policy). Members are configuration: deserializable from the `hx-core` config under
   `model_pools:` via `Config::model_pool`, additive and `Default`, so existing config files keep parsing.
   **Nothing draws from this pool yet** — the module doc says so plainly, because that gap is the honest shape
