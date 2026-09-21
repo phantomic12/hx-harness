@@ -213,6 +213,34 @@ against Telegram itself), no daemon-side receive loop (nothing in `hxd` drives `
 and no `approval.ask_via` config key — a channel's ceiling and conversation are constructed in code
 today. None of those is a property of the loop-back; they are the plumbing that will call it.
 
+## The generic webhook connector (M5)
+
+The **push** half of M5, complementing Telegram's long-poll. `crates/hx-gateway/src/webhook.rs` is the
+connector: it holds a `tokio::sync::mpsc` receiver and implements `Connector` by yielding what the route
+pushed (`receive`), and by `POST`ing outbound replies to an optional `outbound_url` (`deliver`/`ask`),
+**failing closed** when none is set. `crates/hx-server/src/webhook.rs` is the HTTP surface:
+`POST /v1/connectors/{id}/webhook` authenticates against the **connector's own** bearer token and pushes the
+parsed envelope into that channel.
+
+Evidence is in two files, both hermetic:
+
+- `crates/hx-gateway/tests/webhook_connector.rs` — the connector over the `Connector` trait against a
+  local one-shot HTTP stub: `receive` yields exactly what was pushed (including a closed channel as `None`, not
+  an error), `deliver` `POST`s chat/thread/text to `outbound_url` with a bearer header, `deliver` to a
+  `Home` target is refused, `deliver` with no `outbound_url` **fails closed**, and `ask` posts the
+  rendered question and returns `NoAnswer` (the human's answer arrives later through `receive`).
+- `crates/hx-server/tests/webhook_api.rs` — the route through the real server: a valid token + body is `200`
+  and the message lands in `WebhookConnector::receive`; a wrong token, a missing token, and an unknown
+  connector id are refusals (`401`/`404`), and a malformed body is `400`. The route is exempt from the
+  daemon's global bearer middleware because it is its own auth boundary, per connector.
+
+The config surface is covered in `hx-core`: `kind: webhook` parses with an optional `outbound_url`, and a
+webhook connector whose `token` cannot be resolved is a **startup failure** (`AppState::build`), not a route
+left open.
+
+**What this does not cover:** the daemon-side receive loop that drives `Connector::receive` per channel — the
+same umbrella "not here" as Telegram, listed below.
+
 ## The ceiling, on the path an answer is actually applied through
 
 The loop-back above shipped with a ceiling that a reviewer could read as satisfied and that was not.

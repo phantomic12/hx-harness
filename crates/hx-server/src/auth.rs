@@ -134,7 +134,7 @@ pub async fn require_bearer(
         return next.run(request).await;
     };
 
-    if is_exempt(request.uri().path()) {
+    if is_exempt(request.uri().path()) || is_webhook_route(request.uri().path()) {
         return next.run(request).await;
     }
 
@@ -144,6 +144,29 @@ pub async fn require_bearer(
         // way to learn whether a guess was close, or whether a token is configured at all.
         _ => unauthorized(),
     }
+}
+
+/// Routes that are answered without the *daemon's* token because they carry their own.
+///
+/// A webhook `POST` authenticates against the **connector's** configured token, not the daemon's
+/// `api_token`: a remote platform holds only its own key, and sharing the daemon's master token with every
+/// platform would defeat having per-connector tokens at all. So these routes are exempt from the global
+/// middleware and do their own verification in the handler ([`crate::webhook`]) — which fails closed.
+pub fn is_webhook_route(path: &str) -> bool {
+    // Path shape: /v1/connectors/{id}/webhook
+    let mut segments = path.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (Some(""), Some("v1"), Some("connectors"), Some(id), Some("webhook"), None)
+            if !id.is_empty()
+    )
 }
 
 /// The token a request presents, if any.
