@@ -67,6 +67,13 @@
 //! match (a CIDR, a raw IP, or anything address-shaped in the `inet_aton` grammar) is refused up
 //! front, the same shape [`SpecError::EgressNotEnforced`](crate::spec::SpecError) refuses locally.
 //!
+//! The far-host bridge hole [`crate::egress`] records applies here unchanged: no *internet*
+//! route except the sidecar, but the far host's own bridge address stays reachable from inside
+//! the sandbox until the host is provisioned otherwise. The supported closure is
+//! `scripts/harden-sandbox-egress.sh`, run as root **on the far host** for the egress subnet
+//! (`--apply SUBNET PROXY_PORT`, `--check` to re-verify); the runtime alone does NOT close it,
+//! on either the near or the far host.
+//!
 //! ## Refusals come before resources, on every path
 //!
 //! [`RemoteSandboxRuntime::create`] runs `spec.validate()`, then the proxy-binary check, then

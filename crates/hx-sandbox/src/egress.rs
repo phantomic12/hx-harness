@@ -53,11 +53,17 @@
 //! filed as an open security item in `ROADMAP.md`. **Do not "fix" this text back to the stronger
 //! claim** — the stronger claim was the defect.
 //!
-//! The two ways to close it, and why neither is taken here: a `DOCKER-USER` rule on the far host
-//! needs far-host root and has to be installed per host (so the module would depend on a
-//! configuration it cannot verify); running the sandbox with a network namespace it controls itself
-//! is the privileged route, and it would weaken the isolation this module exists to provide. Both are
-//! recorded in `ROADMAP.md` rather than half-done here.
+//! The two ways to close it: running the sandbox with a network namespace the runtime
+//! controls itself is the privileged route, and it would weaken the isolation this module
+//! exists to provide, so it is recorded in `ROADMAP.md` rather than half-done here. The other
+//! way — a packet-filter rule on the far host — now exists as host provisioning, not runtime:
+//! `scripts/harden-sandbox-egress.sh` (`--apply SUBNET PROXY_PORT` as root on each sandbox
+//! host, `--check` to re-verify after any firewall reset). It carries the same policy in both
+//! the `DOCKER-USER` chain (the forwarded path) and the `INPUT` chain (traffic to addresses
+//! the host itself owns, like the bridge address, is delivered locally and never traverses
+//! `DOCKER-USER`). Until that script has been run and verified on a host, the honest statement
+//! above stands: **the runtime alone does NOT close this hole.** Do not "fix" this text back
+//! to the stronger claim — the stronger claim was the defect.
 //!
 //! ## What is deliberately NOT enforced here
 //!

@@ -872,8 +872,9 @@ and passes after (see `TESTING.md`):
 
 ## Open security items
 
-**A remote sandbox can reach the far host's own bridge address.** *(Open. Measured, pinned, not
-closed.)* The internal `-egress` network a remote sandbox rides carries no **default** route, which is
+**A remote sandbox can reach the far host's own bridge address.** *(Measured, pinned, with a
+provisioning step that closes it — but enforcement is host-side and must be verified per
+host.)* The internal `-egress` network a remote sandbox rides carries no **default** route, which is
 what makes the proxy sidecar the only way *to the internet* — but "no default route" is not "no
 reachable address". The network's IPAM config still assigns a gateway, and that gateway **is the far
 host's own bridge interface on the same on-link subnet as the sandbox**. On-link delivery needs no
@@ -883,21 +884,39 @@ host's own sshd banner, along with `4330`, `9191`, `20140` and `44321-44323`. Co
 ports are dropped by Docker's network isolation; **host-native services are not.**
 
 So the honest statement of what egress enforcement buys is: *no internet route except the sidecar; the
-far host's own services remain reachable from inside the sandbox.* `crates/hx-sandbox/src/egress.rs`
+far host's own services remain reachable from inside the sandbox — until the host is provisioned
+otherwise.* `crates/hx-sandbox/src/egress.rs`
 and `src/remote.rs` claimed more than that ("literally no route" off the network; the sidecar the only
 way out) and both are corrected, with the correction saying the old claim was wrong so it is not
 "fixed" back. The behaviour is pinned by
 `a_sandbox_reaches_the_far_hosts_own_bridge_address_and_that_is_a_known_hole` in
 `crates/hx-sandbox/tests/remote_live.rs`, which asserts the hole **is still there** *and* that the
-no-default-route half still holds — a test that fails when the hole closes is the point.
+no-default-route half still holds — a test that fails when the hole closes is the point. That test
+is deliberately untouched by the change below: run it per host, and when the hole closes there it
+fails there, which is the good-news signal (do not weaken the probe to make it pass).
 
-The two ways to close it, and why neither is taken now:
+The provisioning step now exists: `scripts/harden-sandbox-egress.sh`. Run as root on each sandbox
+host, once per egress subnet (`--apply SUBNET PROXY_PORT`, e.g. `--apply 10.200.7.0/24 3128`),
+then verify from inside a sandbox (`nc -vz <bridge-ip> 22` must time out while the proxy port
+still answers). It installs the same policy in two chains, because the two destinations take
+different netfilter paths: `DOCKER-USER` for the forwarded path, and `INPUT` for traffic to
+addresses the host itself owns — the bridge address is delivered locally and never traverses
+`DOCKER-USER`, so forward-path rules alone would leave the measured sshd hole open. `--check`
+re-verifies (exit 0 only when every rule is present), `--revert` removes exactly what `--apply`
+added, and `--print-rules` prints the lines without touching anything. Pinned by the tripwire
+`crates/hx-sandbox/tests/egress_hardening_rules.rs`, which asserts the exact rule fragments for
+the sample subnet (gateway DROP, proxy-port ACCEPT, both chain anchors) and fails if the script
+is edited without updating it. Enforcement still lives outside the runtime and lapses silently if
+the rules are flushed, so re-run `--check` after any firewall reset — the runtime alone still
+does NOT close this hole.
 
-- **A `DOCKER-USER` chain rule on the far host** dropping sandbox→bridge traffic. It works and it is
-  the standard answer, but it needs far-host root, it has to be installed and *verified* per host, and
-  the module would then depend on a configuration outside its control — enforcement that silently
-  lapses when the rule is missing is worse than a documented hole, because the docs would still claim
-  it. A version of this belongs in a host-provisioning step, not in the sandbox runtime.
+The two ways to close it, and where each stands now:
+
+- **A packet-filter rule on the far host** dropping sandbox→bridge traffic. ✅ This is the
+  standard answer and it now exists: `scripts/harden-sandbox-egress.sh` (see above). It still
+  needs far-host root and has to be installed and *verified* per host, which is why it lives in
+  host provisioning and not in the sandbox runtime — the module would otherwise depend on a
+  configuration it cannot verify.
 - **Running the sandbox in a network namespace the runtime controls itself** (rather than letting
   Docker place it on a bridge). This is the privileged route and it weakens the isolation this module
   exists to provide.
