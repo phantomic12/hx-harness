@@ -60,6 +60,14 @@ enum SessionFilter {
     Absent,
 }
 
+/// How many bus events may wait for a new session's id before the oldest is shed.
+///
+/// A new-session request subscribes before its id exists, so every bus event until the run
+/// reports it lands in the pending buffer — and a run stuck behind the `<new>` session lock
+/// can wait arbitrarily long while other sessions' bursts pour in. The report precedes this
+/// run's first event, so anything shed here is another session's and is dropped, not lost.
+const MAX_PENDING_BUFFERED: usize = 256;
+
 /// Run a chat and stream its events, ending with the run's reply.
 ///
 /// The subscription happens *before* the run is spawned, so no event the run emits is missed: the
@@ -142,8 +150,9 @@ pub async fn chat_stream(
                                 // filter doing its job — the bus is shared, the stream is not.
                                 SessionFilter::Known(_) => {}
                                 // The run has not reported its session yet; hold the event until
-                                // the id is known, then keep it only if it is ours.
-                                SessionFilter::Pending => buffered.push(live),
+                                // the id is known, then keep it only if it is ours. Bounded:
+                                // a delayed run must not pile foreign bursts without limit.
+                                SessionFilter::Pending => push_pending(&mut buffered, live),
                                 // The run failed before owning a session, so no bus event can be
                                 // ours; the `error` terminal event below is the whole answer.
                                 SessionFilter::Absent => {}
@@ -188,6 +197,34 @@ pub async fn chat_stream(
                                 return Some((Ok(event), (rx, reply_rx, session_rx, filter, buffered, ready)));
                             }
                             None => break,
+                        }
+                    }
+                    // The run's session report, awaited on its own: without this the id is
+                    // learned only when a bus event or the reply arrives to trigger a poll,
+                    // so a quiet bus leaves the filter `Pending` — and the buffer growing —
+                    // for no reason. Learning it eagerly shrinks the pending window to the
+                    // run's creation latency, after which foreign events are dropped by the
+                    // `Known` arm without ever touching the buffer.
+                    notified = async {
+                        match session_rx.as_mut() {
+                            Some(rx) => rx.await.ok(),
+                            None => std::future::pending().await,
+                        }
+                    }, if matches!(filter, SessionFilter::Pending) => {
+                        match notified {
+                            Some(id) => {
+                                flush_matching(&mut buffered, &mut ready, &id);
+                                filter = SessionFilter::Known(id);
+                            }
+                            // The sender is gone and no id ever came: the run failed before
+                            // owning a session, so nothing buffered can be ours.
+                            None => {
+                                filter = SessionFilter::Absent;
+                                buffered.clear();
+                            }
+                        }
+                        if let Some(event) = ready.pop_front() {
+                            return Some((Ok(event), (rx, reply_rx, session_rx, filter, buffered, ready)));
                         }
                     }
                 }
@@ -264,6 +301,20 @@ fn flush_matching(buffered: &mut Vec<LiveEvent>, ready: &mut VecDeque<Event>, id
     }
 }
 
+/// Hold one bus event while the filter is `Pending`, keeping the buffer bounded.
+///
+/// A run delayed before it owns a session (behind the `<new>` session lock, on a slow
+/// store) can watch an unbounded number of other sessions' events go by; without the cap
+/// each one is retained until the id arrives only to be dropped by [`flush_matching`].
+/// Shedding the oldest is safe for the same reason the flush is: the run's report precedes
+/// its first event, so nothing shed here is ever this run's own.
+fn push_pending(buffered: &mut Vec<LiveEvent>, live: LiveEvent) {
+    if buffered.len() >= MAX_PENDING_BUFFERED {
+        buffered.remove(0);
+    }
+    buffered.push(live);
+}
+
 /// One bus event as an SSE `data:` event, tagged with its session — the same [`LiveEvent`] the
 /// bus carries — so a client following more than one run can tell them apart.
 fn render_live(live: &LiveEvent) -> Event {
@@ -274,4 +325,36 @@ fn render_live(live: &LiveEvent) -> Event {
         })
         .to_string(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hx_core::event::AgentEvent;
+    use hx_core::ids::AgentId;
+
+    fn foreign(seq: u64) -> LiveEvent {
+        LiveEvent {
+            session: SessionId::from_raw("ses_pendingflood"),
+            seq,
+            event: AgentEvent::TurnStarted {
+                agent: AgentId::from_raw("hxd:foreign"),
+                turn: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn the_pending_buffer_sheds_the_oldest_first() {
+        let mut buffered = Vec::new();
+        for seq in 0..(MAX_PENDING_BUFFERED as u64 * 2) {
+            push_pending(&mut buffered, foreign(seq));
+        }
+        assert_eq!(buffered.len(), MAX_PENDING_BUFFERED);
+        assert_eq!(buffered.first().unwrap().seq, MAX_PENDING_BUFFERED as u64);
+        assert_eq!(
+            buffered.last().unwrap().seq,
+            MAX_PENDING_BUFFERED as u64 * 2 - 1
+        );
+    }
 }

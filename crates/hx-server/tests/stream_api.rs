@@ -523,3 +523,107 @@ async fn a_resumed_session_stream_forwards_only_its_own_mid_run_events() {
         "the resumed stream lost its own session's events: {body:?}"
     );
 }
+
+#[tokio::test]
+async fn a_delayed_new_session_stream_survives_a_flood_of_foreign_events() {
+    // Two new-session runs serialize on the `<new>` session lock, so the second run's
+    // stream waits with no id while the first run sits gated at the model. Thousands of
+    // foreign events in that window used to pile into an unbounded pending buffer — one
+    // retained `LiveEvent` per stranger, all dropped only when the id finally arrived.
+    // They must be shed as they come, and the delayed stream must still carry its own
+    // run to `done`.
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let state = gated_harness(
+        vec![Ok(answer("first")), Ok(answer("second"))],
+        Arc::clone(&gate),
+    )
+    .await;
+
+    let first = tokio::spawn({
+        let state = Arc::clone(&state);
+        async move {
+            stream(
+                &state,
+                serde_json::json!({ "prompt": "one", "autonomy": "yolo" }),
+            )
+            .await
+        }
+    });
+    // The first run created its session and is now parked at the model's gate, holding
+    // the `<new>` lock every later new-session run queues behind.
+    wait_for_first_session(&state).await;
+
+    let second = tokio::spawn({
+        let state = Arc::clone(&state);
+        async move {
+            stream(
+                &state,
+                serde_json::json!({ "prompt": "two", "autonomy": "yolo" }),
+            )
+            .await
+        }
+    });
+
+    // The second run blocks behind the first without owning a session yet. A pause lets
+    // its stream subscribe so the flood below lands inside its pending window rather
+    // than before it; events missed that way would only make the leak assertion easier,
+    // never flaky.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let foreign = SessionId::from_raw("ses_pendingfloodmustbedropped");
+    publish_foreign_events(&state, &foreign, 5_000);
+
+    // Release the first run; the second then reaches its own gated model call, which is
+    // woken by re-notifying until its stream finishes.
+    gate.notify_one();
+    let (first_status, first_body) = first.await.expect("the first stream runs");
+    assert_eq!(first_status, StatusCode::OK, "{first_body}");
+
+    let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            gate.notify_waiters();
+            if second.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        second.await.expect("the stream task runs")
+    })
+    .await
+    .expect("the delayed stream still finishes under flood");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !body.contains(foreign.as_str()),
+        "another session's flood leaked into the delayed stream: {body:?}"
+    );
+
+    let events = parse_sse(&body);
+    let (name, data) = events.last().expect("the stream says something: {body:?}");
+    assert_eq!(
+        name.as_deref(),
+        Some("done"),
+        "the delayed stream still ends with the reply: {body:?}"
+    );
+    let own = serde_json::from_str::<serde_json::Value>(data).expect("the done event is JSON")
+        ["reply"]["session_id"]
+        .as_str()
+        .expect("the reply names its session")
+        .to_string();
+    assert!(body.contains(&own), "the stream lost its own session: {body:?}");
+
+    let live_sessions: Vec<String> = events
+        .iter()
+        .filter(|(name, _)| name.is_none())
+        .map(|(_, data)| {
+            serde_json::from_str::<serde_json::Value>(data).expect("each event is JSON")["session"]
+                .as_str()
+                .expect("tagged with a session")
+                .to_string()
+        })
+        .collect();
+    assert!(!live_sessions.is_empty(), "{body:?}");
+    assert!(
+        live_sessions.iter().all(|session| *session == own),
+        "only the delayed run's own events are forwarded: {live_sessions:?}"
+    );
+}
