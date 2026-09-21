@@ -4,7 +4,7 @@ Status: 2026-09-20. Companion to `ROADMAP.md` (which tracks features); this file
 
 ```console
 $ cargo test --workspace
-1545 tests, 0 failed                     # includes 25 chat API tests and 4 database reopen tests
+1550 tests, 0 failed                     # includes 25 chat API tests and 4 database reopen tests
 60 ignored                               # live: Docker, SSH, pty, WinRM, search, a real model, a real bot
 
 # The five live suites below — 29 tests — are `#[ignore]`d by default.
@@ -1376,7 +1376,7 @@ turned its specific test red.
 ## Running the suite
 
 ```bash
-cargo test --workspace --locked   # 1545 tests, 0 failed, 60 ignored live tests
+cargo test --workspace --locked   # 1550 tests, 0 failed, 60 ignored live tests
 cargo test -p hx-store          # 58 — migrations, the transcript, and 4 that reopen the file
 cargo test -p hx-agent          # 63 — the loop's gate, the routed model call, the transcript sink
 cargo test -p hx-tools          # 102 — requirements, bounded output, the two-phase registry, workspace resolution, the trash
