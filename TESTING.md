@@ -451,6 +451,12 @@ The test proves it can fail: removing the admission check lets a real `GET /stol
 the listener, and disabling the reaper lets the browser pid survive — both flip the test red. The browser
 child is reaped on every exit path (success, transport failure, a genuine timeout via a stub that holds
 the connection with `std::future::pending`, and future drop), each asserted against a real `/proc/{pid}`.
+**One stability note (verify-spawner):** the timeout-reaping test used to assert `err.contains("did not answer")`
+with an 800ms request timeout, and flaked under load because `fetch` budgets startup with
+`min(request.timeout, 5s)` — at 800ms a slow-starting Chromium returned the startup-timeout message
+(`"did not write DevToolsActivePort within startup budget")` instead, which does not contain that phrase. Reaping
+still happened; the phrase was incidental. The test now uses a 5s request timeout (so the hanging target, not
+startup, is what times out) and asserts the error is a timeout-family transport message rather than one specific phrase.
 ## The M8 model pool (B — unit-tested)
 
 `crates/hx-core/src/pool.rs` is the routing half of M8, built **before** the spawner that would draw
@@ -498,10 +504,15 @@ be able to fail at all.
 made real): `Spawner::build_spec` draws a **healthy** member and clamps the requested parameters to it
 (reusing the pool's `clamp` and `DrawError`, not a second error type), producing a `ChildSpec` that carries
 **the drawn member as its model**, its endpoint, its credential reference and the clamps applied; `run_child`
-makes **one provider call** through `hx-provider` against the drawn member with the clamped parameters, marks the
+makes **one provider call** through `hx-provider` against the drawn member, marks the
 member down on failure, and records a `UsageRecord` whose `model` is the **drawn member** (and whose cost
 lands in the store's totals) — so "which model did this child work" and "did this lane spend money" are
-answerable after the fact. It is **not** a fan-out: it does not run an agent loop, dispatch tools, or
+answerable after the fact. **One honesty note (verify-spawner):** the doc and an earlier draft of this section
+said the call is made "with the clamped parameters"; it is not — `hx-provider`'s `ChatRequest` has no
+field for a pool `Param`, so `run_child` sends none. The clamps are computed and recorded on the spec and the
+record and **stop there**; the gap is pinned by `the_clamped_parameter_reaches_the_provider_call`, left
+`#[ignore]`d so it turns green when `ChatRequest` grows the field. It is **not** a fan-out: it does not
+run an agent loop, dispatch tools, or
 re-route a *running* lane when a member dies — that last one needs running children, needs this spawner to exist
 first, and is explicitly out of scope. Tested over a **scripted pool and a scripted provider, no network**.
 
@@ -513,6 +524,12 @@ first, and is explicitly out of scope. Tested over a **scripted pool and a scrip
 | `a_failed_member_marks_down_and_the_next_spec_draws_a_healthy_one` | A failed call marks the member down; the next spec is drawn from a healthy member |
 | `a_spec_cannot_be_built_from_an_empty_pool` / `a_spec_cannot_be_built_when_every_member_is_down` | A spec on an empty pool or an all-down pool fails loudly with the pool's own `DrawError` |
 | `build_spec_carries_the_drawn_member_and_its_identity` | The spec carries the drawn member's model, endpoint and credential reference |
+| `the_drawn_members_credential_pays_and_only_its_reference_is_recorded` | The drawn member's secret actually pays for the call, and the record and durable row carry the **reference**, never the value |
+| `run_child_makes_exactly_one_provider_call` | One child is one provider call (a hidden retry would spend a second call's money while recording one row), and the request asks the drawn member's provider for the drawn member's model |
+| `a_successful_call_leaves_the_member_healthy` | A single-member pool (so round-robin cannot hide a success that wrongly marks its member down) |
+| `two_spawns_in_a_row_draw_two_different_healthy_members` | `build_spec` goes through the pool's own cursor draw, not a first-healthy pick |
+| `the_recorded_model_is_the_drawn_member_even_when_the_upstream_names_another_model` | The record's model is the drawn member, not the model the upstream *echoes back* |
+| `the_clamped_parameter_reaches_the_provider_call` (**`#[ignore]`d — defect pinned**) | Fails on the current code: the clamped parameter never reaches the `ChatRequest`. Un-ignore when `hx-provider`'s `ChatRequest` grows a pool-`Param` field |
 
 **Every assertion was proven to fail by a mutation, then reverted** (each reddening ran against the specific
 test):

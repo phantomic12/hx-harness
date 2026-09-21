@@ -721,12 +721,16 @@ pure, self-contained module a future spawner will draw from. That is what has la
   member and clamps the requested parameters to it (reusing the pool's `clamp` and [`DrawError`],
   not a second error type), producing a [`ChildSpec`] that carries **the drawn member as its model**,
   its endpoint, its credential **reference**, and the clamps applied. [`Spawner::run_child`] makes
-  **one provider call** against the drawn member's endpoint and credential with the clamped parameters
-  (through `hx-provider`, no network in tests), marks the member down on failure, and on success
+  **one provider call** against the drawn member's endpoint and credential (through `hx-provider`, no
+  network in tests), marks the member down on failure, and on success
   records a `UsageRecord` whose `model` is the **drawn member** — so "which model did this child
   work" and "did this lane spend money" are answerable after the fact. A member that rejects a
   requested kind is **clamped and run rather than failing at spawn** — the exit criterion, and the
-  `HTTP 400` it prevents is a real observed failure mode. **[`Spawner::run_child`] does not run an
+  `HTTP 400` it prevents is a real observed failure mode. **Honesty note (verify-spawner):** the
+  clamps are recorded on the spec and the record but **do not yet reach the provider call** —
+  `hx-provider`'s `ChatRequest` has no field for a pool `Param`, so `run_child` sends none; the gap
+  is pinned by `the_clamped_parameter_reaches_the_provider_call`, left `#[ignore]`d until `ChatRequest`
+  grows the field. **[`Spawner::run_child`] does not run an
   agent loop or dispatch tools**, and does exactly what it claims: one provider call per child, recorded.
   Tested over a scripted pool and a scripted provider with each assertion proven to fail by a mutation
   (see `TESTING.md`).
