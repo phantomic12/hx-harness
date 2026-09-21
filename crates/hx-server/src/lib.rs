@@ -32,6 +32,7 @@ pub mod terminal;
 #[cfg(unix)]
 pub mod terminal_ws;
 pub mod webhook;
+pub mod webhook_bridge;
 
 pub use chat::{ChatReply, ChatRequest, ModelFactory, RouterModels};
 pub use routes::{app, status_for, ApiError};
