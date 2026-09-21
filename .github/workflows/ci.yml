@@ -90,6 +90,12 @@ jobs:
             libgtk-3-dev libglib2.0-dev \
             libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev \
             libxdo-dev libayatana-appindicator3-dev librsvg2-dev
+      # chromium_rung integration tests drive a real Chromium over CDP; the rung
+      # hardcodes /usr/lib/chromium/chromium, and the tests self-skip if it's absent.
+      - name: Install Chromium (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get install -y chromium
       # --locked fails if Cargo.lock is out of date with the manifests. That is deliberate:
       # an un-updated lockfile is a real bug, and better caught here than by a user.
       - run: cargo test --workspace --locked

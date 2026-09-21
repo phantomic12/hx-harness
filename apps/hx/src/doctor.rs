@@ -2279,11 +2279,11 @@ hosts:
         let dir = std::env::temp_dir().join(format!("hx-doctor-home-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::write(&dir, b"a file, not a directory").expect("the fixture is writable");
-        let config = Config::from_yaml(&format!(
-            "daemon:\n  data_dir: \"{}/data\"\n",
-            dir.display()
-        ))
-        .expect("config parses");
+        // Normalize separators so the embedded path is valid YAML on Windows too (backslashes are
+        // escape characters in a double-quoted YAML scalar).
+        let dir_str = dir.display().to_string().replace('\\', "/");
+        let config = Config::from_yaml(&format!("daemon:\n  data_dir: \"{dir_str}/data\"\n",))
+            .expect("config parses");
 
         let verdict = probe_data_dir(&config).expect_err("a directory below a file cannot be made");
         assert!(
@@ -2420,7 +2420,10 @@ search:
     fn the_data_directory_probe_writes_and_removes_its_file() {
         let dir = std::env::temp_dir().join(format!("hx-doctor-probe-ok-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let config = Config::from_yaml(&format!("daemon:\n  data_dir: \"{}\"\n", dir.display()))
+        // Normalize separators so the embedded path is valid YAML on Windows too (backslashes are
+        // escape characters in a double-quoted YAML scalar).
+        let dir_str = dir.display().to_string().replace('\\', "/");
+        let config = Config::from_yaml(&format!("daemon:\n  data_dir: \"{dir_str}\"\n"))
             .expect("config parses");
 
         let found = probe_data_dir(&config).expect("a fresh directory is writable");
@@ -2447,7 +2450,17 @@ search:
         // `expand_home` is a copy of `hx-store`'s private rule (the CLI does not link SQLite for
         // one path). A difference between the two would make this check about a directory the
         // daemon never uses, so the expansion itself is pinned.
-        let home = std::env::var_os("HOME").expect("these tests run with HOME set");
+        let home_var = {
+            #[cfg(windows)]
+            {
+                "USERPROFILE"
+            }
+            #[cfg(not(windows))]
+            {
+                "HOME"
+            }
+        };
+        let home = std::env::var_os(home_var).expect("these tests run with the home var set");
         assert_eq!(
             expand_home("~/.hx"),
             PathBuf::from(home).join(".hx"),

@@ -3,6 +3,12 @@
 //! Drives headless Chromium over CDP, enforcing target admission on every request via CDP
 //! `Fetch.enable` request interception before bytes reach the wire, and reaping the browser child
 //! process on every exit path.
+//!
+//! Linux-only: it launches a local Chromium binary and inspects `/proc/<pid>` for reaping
+//! assertions, so it cannot run on macOS/Windows CI runners. When the Chromium binary is not
+//! installed (e.g. a minimal CI image) each test self-skips instead of failing.
+
+#![cfg(target_os = "linux")]
 
 use hx_browser::error::FetchError;
 use hx_browser::profile::{PoolRoot, SessionProfile};
@@ -135,9 +141,27 @@ fn request_for(url: &str, admission: Admission, profile: Arc<SessionProfile>) ->
     }
 }
 
+/// Skip the test if the Chromium binary the rung drives is not installed.
+///
+/// These are true integration tests that launch a local Chromium over CDP and inspect
+/// `/proc/<pid>`. On CI images that don't carry Chromium (and on any host where it is not
+/// installed) they cannot run, so self-skip rather than fail.
+macro_rules! require_chromium {
+    () => {
+        if !std::path::Path::new(hx_browser::rungs::chromium::DEFAULT_CHROMIUM_PATH).exists() {
+            eprintln!(
+                "SKIP: no Chromium at {}",
+                hx_browser::rungs::chromium::DEFAULT_CHROMIUM_PATH
+            );
+            return;
+        }
+    };
+}
+
 #[tokio::test]
 async fn a_page_whose_script_fetches_a_private_address_is_blocked_and_the_listener_accepts_zero_connections(
 ) {
+    require_chromium!();
     // The target of the page's JS fetch is a REAL listener.
     // If the admission guard ran after connecting or failed to intercept the request,
     // this counter would move. Zero connections proves admission before the wire.
@@ -201,6 +225,7 @@ fetch('http://{target_addr}/stolen')
 #[tokio::test]
 async fn a_page_whose_script_navigates_to_a_private_address_is_blocked_and_the_listener_receives_zero_requests(
 ) {
+    require_chromium!();
     let target = Stub::silent().await;
     let target_addr = target.addr;
 
@@ -253,6 +278,7 @@ window.location.href = 'http://{target_addr}/stolen';
 
 #[tokio::test]
 async fn the_browser_child_process_is_reaped_after_a_successful_fetch() {
+    require_chromium!();
     let stub = Stub::new(|mut socket| async move {
         let mut buf = [0u8; 1024];
         let _ = socket.read(&mut buf).await;
@@ -277,6 +303,7 @@ async fn the_browser_child_process_is_reaped_after_a_successful_fetch() {
 
 #[tokio::test]
 async fn the_browser_child_process_is_reaped_after_a_transport_failure() {
+    require_chromium!();
     let rung = ChromiumRung::with_admission(Admission::AllowLocal).expect("rung");
     let (_temp, session_profile) = profile("reap-fail");
     // Port 1 is closed, so navigation fails immediately
@@ -298,6 +325,7 @@ async fn the_browser_child_process_is_reaped_after_a_transport_failure() {
 
 #[tokio::test]
 async fn the_browser_child_process_is_reaped_when_the_fetch_times_out() {
+    require_chromium!();
     // Stub accepts connection and hangs forever.
     let stub = Stub::hanging().await;
 
@@ -333,6 +361,7 @@ async fn the_browser_child_process_is_reaped_when_the_fetch_times_out() {
 
 #[tokio::test]
 async fn the_browser_child_process_is_reaped_when_the_fetch_future_is_dropped() {
+    require_chromium!();
     let stub = Stub::silent().await;
 
     let rung = ChromiumRung::with_admission(Admission::AllowLocal).expect("rung");
@@ -381,6 +410,7 @@ async fn the_browser_child_process_is_reaped_when_the_fetch_future_is_dropped() 
 
 #[tokio::test]
 async fn a_wall_status_escalates_and_a_challenge_marker_escalates_too() {
+    require_chromium!();
     let forbidden = Stub::new(|mut socket| async move {
         let mut buf = [0u8; 1024];
         let _ = socket.read(&mut buf).await;
@@ -417,6 +447,7 @@ async fn a_wall_status_escalates_and_a_challenge_marker_escalates_too() {
 
 #[tokio::test]
 async fn a_body_over_the_cap_is_refused_rather_than_buffered() {
+    require_chromium!();
     let oversize = "x".repeat(MAX_BODY_BYTES + 1024);
     let stub = Stub::new(move |mut socket| {
         let body = oversize.clone();
@@ -450,6 +481,7 @@ async fn a_body_over_the_cap_is_refused_rather_than_buffered() {
 
 #[tokio::test]
 async fn the_rung_names_itself_without_a_url_or_a_credential() {
+    require_chromium!();
     let rung = ChromiumRung::new().expect("rung");
     assert_eq!(rung.name(), "chromium");
     assert_eq!(rung.kind(), RungKind::Interactive);
