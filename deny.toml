@@ -30,6 +30,23 @@ ignore = [
     #
     # Revisit when RustCrypto/RSA#626 lands constant-time padding.
     "RUSTSEC-2023-0071",
+    # proc-macro-error 1.0.4 is unmaintained (maintainer unreachable; RUSTSEC notes it
+    # also pins syn 1.x). It reaches us via glib-macros/gtk3-macros, i.e. the gtk stack,
+    # so it is load-bearing rather than incidental. Alternatives (manyhow,
+    # proc-macro2-diagnostics) would require upstream gtk-rs to migrate first.
+    # Revisit if gtk-rs moves off proc-macro-error.
+    "RUSTSEC-2024-0370",
+    # The rust-unic family (unic-*) is unmaintained as a whole (rustsec/advisory-db#2414).
+    # It reaches us as a chain — urlpattern -> unic-ucd-ident -> unic-ucd-version /
+    # unic-char-property -> unic-char-range -> unic-common — via tauri-utils (tauri).
+    # Unicode identifier tables are static data; unmaintained here means no new Unicode
+    # versions, not a live defect. Revisit if urlpattern/tauri migrate to icu_properties
+    # or unicode-ident.
+    "RUSTSEC-2025-0075", # unic-char-range
+    "RUSTSEC-2025-0080", # unic-common
+    "RUSTSEC-2025-0081", # unic-char-property
+    "RUSTSEC-2025-0098", # unic-ucd-version
+    "RUSTSEC-2025-0100", # unic-ucd-ident
 ]
 
 [licenses]
@@ -51,6 +68,11 @@ allow = [
     "ISC",
     "MIT",
     "MIT-0",
+    # MPL-2.0 is weak (file-level) copyleft, not viral like GPL/AGPL: combining MPL-2.0
+    # files into a larger binary does not impose copyleft on our own code, so it is
+    # compatible with shipping hx as a binary. In the tree via the dom_query/css stack
+    # (cssparser, cssparser-macros, selectors, dtoa-short) and dirs-sys (option-ext).
+    "MPL-2.0",
     "Unicode-3.0",
     "Unlicense",
     "Zlib",
