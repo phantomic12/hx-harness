@@ -436,3 +436,49 @@ async fn the_diff_route_computes_the_change_against_the_real_file() {
         "the pane must read the diff from the daemon, not invent it"
     );
 }
+
+/// The fan-out pane's tripwire: the served page carries the rows, the buttons, the result host,
+/// and the exact `/v1/fanout` endpoint the pane POSTs its children to.
+///
+/// The tempting wrong test is driving a real fan-out, which needs a live pool and a model —
+/// a static page cannot supply either. What this pins is the half a static page *has*: that the
+/// pane exists, that its request names the route's `children` shape, and that its renderer reads
+/// the outcome's `Ran`/`Errored` halves rather than a field nobody sends. Rendering is the
+/// browser's, and this is the limit of what a test without one can claim.
+#[tokio::test]
+async fn the_fanout_pane_posts_children_to_the_fanout_route_and_reads_the_outcome() {
+    let server = harness().await;
+    let page = reqwest::Client::new()
+        .get(format!("http://{}/", server.addr))
+        .send()
+        .await
+        .expect("a response")
+        .text()
+        .await
+        .expect("a body");
+
+    for id in [
+        "fanout-rows",
+        "fanout-add",
+        "fanout-run",
+        "fanout-error",
+        "fanout-out",
+    ] {
+        assert!(
+            page.contains(&format!("id=\"{id}\"")),
+            "the fan-out pane's element {id} is missing from the served page"
+        );
+    }
+    assert!(
+        page.contains("/v1/fanout"),
+        "the pane must run its children through the daemon's fan-out route, not invent them"
+    );
+    assert!(
+        page.contains("children"),
+        "the pane's request must carry the route's `children` shape"
+    );
+    assert!(
+        page.contains("child.Ran") && page.contains("child.Errored"),
+        "the pane must read the outcome's Ran/Errored halves rather than a field nobody sends"
+    );
+}

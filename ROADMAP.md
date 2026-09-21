@@ -833,6 +833,13 @@ It draws from the daemon's configured `agent.default_pool` — the route's `FanO
 pool/model/parameter flags. A `FanOutChild`'s usage is recorded under its `session`, so the session must already
 exist on the daemon.
 
+The built-in web client has a matching **fan-out pane** (`crates/hx-server/static/index.html`): N rows of
+session + prompt, an add-row button and a run button, POSTing the same `{children: [{session, prompt}]}` shape to
+`/v1/fanout` through the page's bearer-token helper and rendering one card per child — member, model, ran/errored
+status, token usage, and the (already redacted) error for failed children — with the route's 400/422/503 refusals
+shown as sentences rather than raw JSON. Vanilla HTML/JS, no build step; the tripwire is a served-content assertion
+in `crates/hx-server/tests/web_client_api.rs`, same style as the diff pane's.
+
 **Security audit (this milestone).** The spawn/fan-out/re-route path was audited against credential
 leakage and re-route semantics, and three concrete issues were fixed, each with a test that fails before
 and passes after (see `TESTING.md`):
