@@ -1322,12 +1322,13 @@ That output is what makes the two defects in §7 of `docs/approvals.md` *visible
 single `*rm -rf /*` that also matched `/tmp`, and a config with no `agent:` section printed no rules at
 all until `AgentConfig::default()` was fixed.
 
-## The desktop shell's desktop three (M7)
+## The desktop shell's desktop four (M7)
 
-`apps/hx-desktop` — a Tauri 2 desktop shell — now carries the three desktop features that make it an
-*app* rather than a window: a **system tray**, a **global hotkey**, and **OS notifications** for approval
-requests. The real tray icon, a live hotkey binding, and a raised notification all need a desktop session
-and a display server, which CI does not have — so what is tested, headlessly, is each feature's pure core:
+`apps/hx-desktop` — a Tauri 2 desktop shell — now carries the four desktop features that make it an
+*app* rather than a window: a **system tray**, a **global hotkey**, **OS notifications** for approval
+requests, and a **native file picker**. The real tray icon, a live hotkey binding, a raised
+notification and the live OS dialog all need a desktop session and a display server, which CI does not have
+— so what is tested, headlessly, is each feature's pure core:
 
 - **Tray menu definition** (`src/tray.rs`): the exact item set (`toggle-window`, `open-approvals`,
   `quit`), that every id resolves to a real [`TrayAction`], and that a stray id is not ours. The real
@@ -1340,15 +1341,24 @@ and a display server, which CI does not have — so what is tested, headlessly, 
   binding as a warning and still lets the window start. A real compositor binding is not exercised.
 - **Approval notification body** (`src/notification.rs`): `build_approval_notification` names the tool and
   the session, and **never leaks a token or a path outside the workspace** — the summary is redacted
-  per-token by shape (a ≥16-alphanumeric token made only of alphanumerics plus `-`/`_`/`.`, or an
-  absolute path that is not under the workspace root), including a token hidden inside a URL's `?token=` or a
-  `key=value` pair, where the value is masked while the URL/key structure stays visible. An unknown session is
-  labeled, not omitted. Raising the actual notification (the plugin call) is not exercised.
+  per-token by shape (a ≥16-char all-alphanumeric token, or an absolute path that is not under the
+  workspace root), including a token hidden inside a URL's `?token=` or a `key=value` pair where the value is
+  masked while the URL/key structure stays visible. An unknown session is labeled, not omitted. Raising the actual notification (the plugin call) is not exercised.
+- **Native file picker decision** (`src/picker.rs`): `decide_picker` turns the dialog's answer into a
+  decision — a **cancelled** dialog is a silent keep (not an error, and never reported as one), a chosen
+  path is validated against the same rule the rest of the app uses for a workspace root (non-empty and a real
+  directory, per `crates/hx-sandbox`'s `workspace_host_path` rule) with a non-directory/blank choice
+  refused, and a valid choice is adopted. `run_picker` reports an **unavailable** dialog (headless / no
+  backend) as `Unavailable`, which the caller warns on and continues with a working window — the same
+  degrade contract as the tray, hotkey and notification. The dialog is behind a `PickerBackend` trait and the
+  validity check is injected, so the whole decision runs headlessly; the live OS dialog is not exercised.
 
 Each assertion was proven to fail by mutating the production code: removing the tray `toggle-window` mapping,
-swallowing a refused hotkey as `Registered`, dropping the token redaction, dropping the path-outside check, the
-URL-`?token=`/`key=value` embedded-token masking (reverting `mask_embedded` put the token back in the body),
-and omitting the unknown-session label each turned its specific test red.
+swallowing a refused hotkey as `Registered`, dropping the token redaction, dropping the path-outside check,
+the URL-`?token=`/`key=value` embedded-token masking (reverting `mask_embedded` put the token back in the body),
+omitting the unknown-session label, treating a cancelled dialog as an error, accepting any chosen path (not
+just a valid directory), swallowing an unavailable dialog, and dropping the `is_dir` workspace-root check each
+turned its specific test red.
 
 ## Running the suite
 
@@ -1362,7 +1372,7 @@ cargo test -p hx-sandbox        # 108 — includes the ladder and the rollback i
 cargo test -p hx-remote         # 132 — includes known_hosts parsing and the host key policy
 cargo test -p hx-gateway        # 72 — the connector trait, the Telegram wire, and the approval loop-back
 cargo test -p hx-core           # 168 — classification, the policy ladder, and the ceiling comparison
-cargo test -p hx-desktop       # 25 — the shell: endpoint resolution, bundle identity, and the desktop three's testable cores
+cargo test -p hx-desktop       # 33 — the shell: endpoint resolution, bundle identity, and the desktop four's testable cores
 cargo build --workspace         # clean: 0 warnings, 0 deprecations
 cargo clippy --workspace --all-targets --locked -- -D warnings   # clean (this is what CI runs)
 
@@ -1389,7 +1399,7 @@ HX_SSH_TEST_HOST=<host> HX_SSH_TEST_USER=<user> HX_SSH_TEST_KEY=~/.ssh/id_ed2551
   needs a token and a chat.
 - **13 crates with logic**: unit-tested at the level of pure functions and in-process lifecycles. There
   are no empty crates left — `hx-browser` and `hx-mcp` were the last two, and both now carry tests.
-  (A 14th, `hx-desktop`, carries 26 tests for its endpoint/token resolution, bundle reuse and the desktop three.)
+  (A 14th, `hx-desktop`, carries 33 tests for its endpoint/token resolution, bundle reuse and the desktop four.)
 - **The store's resume path is tested across a real process boundary, in the only way a test can**:
   four tests in `crates/hx-store/tests/resume.rs` drop the `Store` and open a *new connection* to
   the same file, then continue the conversation. One of them is the case M1's exit criterion turns

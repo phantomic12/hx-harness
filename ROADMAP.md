@@ -661,17 +661,18 @@ promise about how it is used.
   - ✅ **Tauri 2 desktop shell** reusing the exact web UI bundle (`apps/hx-desktop`): it references
     `crates/hx-server/static/index.html` directly via Tauri's `frontendDist` rather than forking it, and
     reuses `hx-secrets::resolve_api_token` so `api.token` literals, `store:name` references and
-    `HX_API_TOKEN` all work. Tested (25 tests) for the endpoint/token resolution pure function (local vs
+    `HX_API_TOKEN` all work. Tested (33 tests) for the endpoint/token resolution pure function (local vs
     remote, config-vs-env precedence, eager remote-missing-token failure), for bundle-path identity, and
-    for the desktop three's testable cores. It can target a local or remote `hxd`.
-  - ✅ **Desktop: system tray, global hotkey, OS notifications** — landed. The tray menu is a pure
+    for the desktop four's testable cores. It can target a local or remote `hxd`.
+  - ✅ **Desktop: system tray, global hotkey, OS notifications, native file picker** — landed. The tray menu is a pure
     `TRAY_MENU`/`action_for` pair so a renamed or dropped item fails a test; a refused hotkey binding
     surfaces as `Refused` rather than being swallowed; the approval notification names the tool and the
     session and redacts token-shaped values — including one hidden inside a URL's `?token=` or a `key=value`
-    pair — and paths outside the workspace. Each degrades to a working
-    window with a warning rather than failing to start. **Native file pickers are not landed**, and the
-    tray icon, a live hotkey binding and a raised notification are not exercised headlessly — each
-    module's doc says so.
+    pair — and paths outside the workspace; and the **native file picker** keeps its decision logic
+    (cancel vs not-a-directory vs accept, plus the unavailable-dialog degradation) in a pure,
+    headlessly-tested core with the OS dialog as a thin shell. Each degrades to a working window with a
+    warning rather than failing to start. The tray icon, a live hotkey binding, a raised notification and
+    the live OS dialog are not exercised headlessly — each module's doc says so.
   - ⬜ **The phone-approval exit criterion is still unmet**: approving from a phone lock screen needs
     Mobile (iOS/Android push), which is not reachable from this environment.
   - ⬜ **Mobile (iOS + Android)** — explicitly deferred (needs the Android NDK/SDK and a macOS host for
