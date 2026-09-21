@@ -199,10 +199,33 @@ jobs:
           echo "--- produced ---"
           ls -la
 
+      # Keyless Sigstore signatures over every artifact, including SHA256SUMS itself.
+      # These are detached `.sig` blobs a user can verify with their own cosign from
+      # the release page, independently of trusting GitHub's attestation store. The
+      # installer verifies `SHA256SUMS.sig` when cosign is present (see
+      # docs/code-signing.md). Keyless: the signature binds to the GitHub Actions OIDC
+      # identity of THIS workflow run (`id-token: write`), so no private key or secret
+      # is involved.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.8.2
+
+      - name: Sign artifacts (Sigstore keyless)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in dist/*; do
+            echo "==> signing $file"
+            cosign sign-blob --yes --output-signature "${file}.sig" "$file"
+          done
+          echo "--- signed ---"
+          ls -la dist
+
       - uses: actions/attest-build-provenance@v4
         with:
           subject-path: "dist/*"
 
+      # `dist/*` already globs the `.sig` blobs, so they ride along in both the
+      # artifact and the GitHub Release exactly like the archives and SHA256SUMS.
       - uses: actions/upload-artifact@v7
         with:
           name: dist

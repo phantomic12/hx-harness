@@ -188,6 +188,34 @@ Nothing was installed. Do not run this download."
 fi
 info "    ${GREEN}ok${RESET} ${DIM}${actual}${RESET}"
 
+# ---------------------------------------------------------------- signature
+#
+# Optional second layer: keyless Sigstore verification of SHA256SUMS itself via cosign.
+# This is intentionally not required — it is an *additional* check for users who have
+# cosign on their PATH (see docs/code-signing.md). The checksum above is the primary
+# verification and always runs.
+
+if [ "${COSIGN_SKIP:-0}" = "1" ]; then
+    info "    ${DIM}signature verification skipped (COSIGN_SKIP=1)${RESET}"
+elif command -v cosign >/dev/null 2>&1; then
+    step "Verifying Sigstore signature (keyless)"
+    download "$base_url/SHA256SUMS.sig" "$tmp/SHA256SUMS.sig" ||
+        fail "download failed: $base_url/SHA256SUMS.sig"
+    cosign verify-blob \
+        --signature "$tmp/SHA256SUMS.sig" \
+        --cert-identity-regexp 'https://github.com/'"$REPO"'/.github/workflows/release.yml@refs/tags/v.*' \
+        --cert-oidc-issuer https://token.actions.githubusercontent.com \
+        "$tmp/SHA256SUMS" ||
+        fail "Sigstore signature verification failed for SHA256SUMS
+The release is either not signed, or the signature does not match this workflow's
+identity. Nothing was installed. (cosign is present; override with COSIGN_SKIP=1.)"
+    info "    ${GREEN}ok${RESET} ${DIM}signature matches the release workflow${RESET}"
+else
+    warn "cosign is not installed; skipping signature verification.
+Install cosign (https://docs.sigstore.dev/cosign/installation) to verify the release
+signature. The checksum above is still verified. Set COSIGN_SKIP=1 to silence this."
+fi
+
 # ---------------------------------------------------------------- install
 
 step "Unpacking"

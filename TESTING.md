@@ -1420,6 +1420,41 @@ was widened to match `token` alone). Treating a cancelled dialog as an error, ac
 just a valid directory), swallowing an unavailable dialog, and dropping the `is_dir` workspace-root check each
 turned its specific test red.
 
+## Release workflow code signing (M9)
+
+`release.yml`'s `package` job signs every `dist/` artifact — the five archives plus
+`SHA256SUMS` and `SHA256SUMS.sig` — with **keyless Sigstore cosign**. `install.sh`
+verifies `SHA256SUMS.sig` when `cosign` is on `$PATH`, checksum-only with a warning
+otherwise, and `COSIGN_SKIP=1` skips it.
+
+There are **no new Rust tests** — this is a workflow and a shell installer, not a crate. The
+entire signing path is a GitHub Actions run that opens a real connection to Sigstore's Fulcio
+and Rekor, so it cannot be exercised locally or in CI without minting a real OIDC token;
+it is verified end to end only when a `v*` tag push runs `release.yml`. What *is* checked
+in this tree:
+
+- The `sigstore/cosign-installer@v3.8.2` action and the `sign-blob` loop are
+  installed as ordinary workflow steps in `package`, whose `permissions` already carry
+  `id-token: write` (no new secret or permission). The `dist/*` and `files: dist/*`
+  globs already include the `.sig` blobs, so they reach both the artifact and the GitHub
+  Release without a second list to drift.
+- `install.sh` passes `sh -n` (POSIX syntax) and its three-way branch (cosign
+  present / absent / `COSIGN_SKIP=1`) is deliberate and fail-safe: a missing cosign can
+  never make a checksum-correct install fail.
+- The workflow YAML is syntax-checked with `yq`/`python -c` when those tools are
+  present (see below) and reviewed by inspection otherwise.
+
+```console
+$ python3 -c 'import yaml,sys; yaml.safe_load(open(".github/workflows/release.yml")); print("ok")'
+ok
+```
+
+**What this does not claim.** No cosign binary is run in this tree and no artifact has been
+signed here, so the cert-identity regexp and OIDC-issuer flags are verified by reading
+Sigstore's documented semantics (see `docs/code-signing.md`) rather than by a live run. The
+first real `v*` tag push is the moment the signing path is actually exercised. Per the tiers
+below this is tier C until that run happens.
+
 ## The CI tiers
 
 Every branch that touches Rust or CI is gated on the same five tiers plus the cross-target

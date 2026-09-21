@@ -701,7 +701,12 @@ promise about how it is used.
     (`x86_64`/`aarch64` linux-musl via `cross`, `x86_64`/`aarch64` apple-darwin and
     `x86_64` windows-msvc on their own runners), so a lockfile or `#[cfg]` change that breaks a
     release target fails on the PR instead of at the next tagged release. All five compile.
-  - ⬜ **Auto-update, code signing** — not landed.
+  - ✅ **Auto-update, code signing** — the signing half landed (`m9-code-signing`): `release.yml` now
+    signs every `dist/` artifact (including `SHA256SUMS`) with **keyless Sigstore cosign**, so a user can
+    verify a release with their own cosign against the public transparency log, independent of GitHub's
+    attestation store. `install.sh` verifies `SHA256SUMS.sig` when cosign is present (checksum-only
+    with a warning otherwise, `COSIGN_SKIP=1` to skip), and `docs/code-signing.md` documents the
+    expected identity and issuer. Auto-update itself remains in the roadmap.
 
 **Exit criteria:** an approval requested by a running agent pings your phone; you approve it
 from the lock screen and the agent continues. **Unmet.** The desktop shell is a window that points at the
