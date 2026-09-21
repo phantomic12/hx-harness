@@ -627,7 +627,9 @@ impl TelegramConnector {
                 let text = response
                     .text()
                     .await
-                    .unwrap_or_else(|err| format!("<unreadable body: {err}>"));
+                    .unwrap_or_else(|err| format!("<unreadable body: {}>", err.without_url()));
+                // `without_url` for the same reason as the transport error above: the URL carries
+                // `/bot<token>/`, and this string is classified into verdicts surfaced to callers.
                 let verdict = classify(status, &text, retry_after.as_deref());
                 let parsed = serde_json::from_str::<Value>(&text).ok();
                 (verdict, parsed)
