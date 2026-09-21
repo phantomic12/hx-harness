@@ -684,7 +684,12 @@ promise about how it is used.
     Mobile (iOS/Android push), which is not reachable from this environment.
   - ⬜ **Mobile (iOS + Android)** — explicitly deferred (needs the Android NDK/SDK and a macOS host for
     iOS signing; neither is available).
-  - ⬜ **Auto-update, code signing, CI matrix for all five targets** — not landed.
+  - ✅ **CI matrix for all five release targets** — landed (`m9-ci-matrix`): `cargo check
+    --workspace --all-targets --locked` now runs on every PR for all five targets release.yml builds
+    (`x86_64`/`aarch64` linux-musl via `cross`, `x86_64`/`aarch64` apple-darwin and
+    `x86_64` windows-msvc on their own runners), so a lockfile or `#[cfg]` change that breaks a
+    release target fails on the PR instead of at the next tagged release. All five compile.
+  - ⬜ **Auto-update, code signing** — not landed.
 
 **Exit criteria:** an approval requested by a running agent pings your phone; you approve it
 from the lock screen and the agent continues. **Unmet.** The desktop shell is a window that points at the
