@@ -50,6 +50,7 @@ use hx_core::pool::{member_death, DrawError, ModelPool, Param, ParamClamp};
 use hx_provider::{ChatRequest, ProviderRegistry};
 use hx_secrets::{Redactor, Secret, SecretStores};
 use hx_store::UsageRecord;
+use serde::Serialize;
 use std::sync::Arc;
 
 /// A child, as chosen at spawn: the model it will run on, its endpoint, its credential
@@ -325,7 +326,7 @@ impl Spawner {
 }
 
 /// What a run produced and recorded for a child.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ChildRecord {
     /// The model (drawn member) this child **finished** on.
     pub model: String,

@@ -113,7 +113,7 @@ enum ParamKind {
 /// `requested` is what the caller asked for; `sent` is what the member will actually receive. `sent`
 /// is [`None`] when the parameter was **dropped** because the member supports none of that kind — the
 /// honest alternative to sending a value the model would `400` on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct ParamClamp {
     pub requested: Param,
     pub sent: Option<Param>,

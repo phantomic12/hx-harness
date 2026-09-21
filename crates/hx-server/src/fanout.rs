@@ -58,6 +58,7 @@
 use crate::spawn::{ChildRecord, Spawner};
 use hx_core::ids::SessionId;
 use hx_secrets::Redactor;
+use serde::Serialize;
 use std::collections::BTreeSet;
 
 /// A recognized way a fan-out can fail to meet its guarantee, before or during execution.
@@ -95,7 +96,7 @@ impl std::error::Error for FanOutError {}
 ///
 /// Every child is attempted even if another dies; a dead member surfaces as [`ChildOutcome::Errored`]
 /// for that child only, and the others are [`ChildOutcome::Ran`] with their own recorded record.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum ChildOutcome {
     /// The child completed. `record` names the **member** it ran on and its recorded usage.
     Ran(ChildRecord),
@@ -106,7 +107,7 @@ pub enum ChildOutcome {
 
 /// The whole fan-out: one outcome per input prompt, plus the answer to "did the N-distinct guarantee
 /// hold".
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct FanOutOutcome {
     /// The members the fan-out actually drew, one per child (N of them, by construction distinct
     /// unless the pool is short). The exit criterion's "N members, not N copies of one" is asserted
