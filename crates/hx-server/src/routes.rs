@@ -27,7 +27,10 @@ use hx_core::config::SandboxProfile;
 use hx_core::error::HxError;
 use hx_core::ids::SessionId;
 use hx_sandbox::SandboxSpec;
-use hx_search::{Recency, SearchQuery};
+use hx_search::{
+    default_pool_root, select_fetcher, FetchMode, FetchRouteError, Recency, ResearchRequest,
+    ResearchTask, SearchQuery,
+};
 use hx_secrets::Redactor;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -97,6 +100,9 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/terminals/{id}", delete(kill_terminal))
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{id}", post(answer_approval))
+        // The phone's tap comes back here — see `crate::phone`. Exempt from the bearer token (the
+        // route authenticates with the one-time token inside `respond_url`).
+        .route("/v1/approvals/{id}/respond", post(respond_approval))
         // The diff/review pane's data source. A diff of file changes is owned by the daemon (it is
         // the only thing that can read the file), so the pane asks for it here rather than inventing it.
         .route("/v1/diff", post(diff_file))
@@ -105,6 +111,12 @@ pub fn app(state: Arc<AppState>) -> Router {
         // the model pool (see `crate::fanout`). It is gated by the same bearer token as everything
         // else on this router.
         .route("/v1/fanout", post(fanout))
+        // The M6 research pipeline's production caller: runs the keyless fan-out, extraction and
+        // citation through the fetch selector, behind the same bearer-token gate.
+        .route("/v1/research", post(research))
+        // M5's webhook half: external platforms `POST` inbound events here, authenticated by their
+        // own per-connector bearer token rather than the daemon's (see `crate::auth::is_webhook_route`).
+        .merge(crate::webhook::routes())
         .with_state(state)
         // Applied last, so it wraps every route including the WebSocket upgrades. `from_fn_with_state`
         // rather than `from_fn`: the token lives on `AppState`, and reading it from a request
@@ -789,6 +801,66 @@ async fn answer_approval(
     }
 }
 
+/// The body of a phone/lock-screen tap.
+///
+/// The phone taps `POST /v1/approvals/{id}/respond` with a bare `verdict` of `allow` or `deny`.
+/// Compare this with [`ApprovalAnswer`]: the phone is a thin approval surface, not a full client, so the
+/// choice it sends is a single yes/no and `respond_with` picks the ceiling — `allow` maps to
+/// [`ApprovalOption::AllowOnce`] (a one-shot grant, the least the phone can mean by "let it run").
+#[derive(Debug, Deserialize)]
+pub struct RespondApprovalBody {
+    /// The one-time token from the pushed `respond_url`. See [`crate::phone::PhoneApprover`].
+    token: String,
+    /// `allow` or `deny`.
+    verdict: String,
+}
+
+/// The phone's tap comes back here, through the `respond_url` the push carried.
+///
+/// **Why this has no bearer check**: the phone never holds the daemon's long-lived secret. The push put a
+/// **one-time** [`crate::phone::PhoneApprover`] token into the `respond_url` it sent, and `approve_phone`
+/// verifies that token here against its own per-approval record before acting. A caller who does not know the
+/// token is refused, whether or not they hold a bearer token; a caller who does know it holds the proof the
+/// push itself issued, which is the phone's grant. The one-time nature means replaying the `respond_url` cannot
+/// approve twice.
+async fn respond_approval(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<RespondApprovalBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Some(phone) = &state.phone else {
+        // No webhook is configured and no push exists under this id: the route is a 404, not a 400,
+        // because there is no approval this url could answer.
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "no phone approval push is configured on this daemon",
+        ));
+    };
+
+    match phone.respond(&id, &body.token, &body.verdict) {
+        Ok(()) => {}
+        Err(phone_err) => {
+            use crate::phone::PhoneRespondError::*;
+            return Err(match phone_err {
+                Idle => ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    format!("no approval is waiting under '{id}' — it was answered already, or it expired"),
+                ),
+                Token => ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "the one-time token in this respond_url does not match the approval — refused",
+                ),
+                Verdict => ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "verdict must be 'allow' or 'deny'",
+                ),
+            });
+        }
+    }
+
+    Ok(Json(serde_json::json!({ "responded": id })))
+}
+
 /// A diff of a proposed file change, computed from the real file on disk.
 ///
 /// Body `{ "path": "...", "proposed": "..." }`. The current content is read from the local host (via
@@ -1020,6 +1092,129 @@ async fn fanout(
         })?;
 
     Ok(Json(outcome))
+}
+
+// ---------------------------------------------------------------------------
+// Research: the M6 pipeline's production caller
+// ---------------------------------------------------------------------------
+//
+// `hx-search` owns the pipeline (`ResearchTask`) and the fetch decision (`select_fetcher`);
+// this route is the caller that runs one through the other. It never reaches the network
+// itself: every page fetch goes through the selected `Fetcher`, plain or browser-backed.
+
+/// `POST /v1/research` — the research request.
+///
+/// `fetch_mode` is the `hx_search::FetchMode` vocabulary (`http`, `auto`, `browser`); omitted
+/// means `auto`, the mode the browser rung exists for. `max_sources` caps the cited sources;
+/// omitted means the pipeline default.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ResearchBody {
+    pub query: String,
+    #[serde(default)]
+    pub max_sources: Option<usize>,
+    #[serde(default)]
+    pub fetch_mode: Option<FetchMode>,
+}
+
+impl ResearchBody {
+    /// Split the wire body into the pipeline request and the fetch decision it runs under.
+    ///
+    /// Pure, so the CLI mapping test and the route share one meaning of the fields rather than
+    /// two parsers that can drift.
+    pub fn into_request_and_mode(self) -> (ResearchRequest, FetchMode) {
+        let mode = self.fetch_mode.unwrap_or(FetchMode::Auto);
+        let request = match self.max_sources {
+            Some(max) => ResearchRequest::new(self.query).with_max_sources(max),
+            None => ResearchRequest::new(self.query),
+        };
+        (request, mode)
+    }
+}
+
+/// `POST /v1/research` — the research report, plus which fetcher ran it.
+///
+/// `fetcher` is `http` or `browser` — the `SelectedFetcher` the selector landed on — and
+/// `fetch_note` is its honest record of why (including the `auto` degradation when no browser
+/// is installed). The rest is the pipeline's own report.
+#[derive(Debug, Serialize)]
+pub struct ResearchResponse {
+    pub query: String,
+    pub fetcher: &'static str,
+    pub fetch_note: String,
+    pub backends: Vec<hx_search::BackendOutcome>,
+    pub sources: Vec<hx_search::Citation>,
+    pub paid_calls: usize,
+}
+
+/// Turn a refused fetch selection into the status a caller should react to.
+///
+/// An explicit browser request with no browser installed is `409 Conflict`, not a 500: the
+/// daemon is fine, the request asked for a rung this host cannot run. `auto` never reaches
+/// here — it degrades inside `select_fetcher` — so this fires only for an explicit mode.
+pub fn research_route_error(err: FetchRouteError) -> ApiError {
+    ApiError::new(StatusCode::CONFLICT, err.to_string())
+}
+
+/// `POST /v1/research` — fan out over the configured backends, extract, and cite.
+///
+/// The fetcher is chosen by the existing `select_fetcher` — the selection logic lives in
+/// `hx-search` and is called here, never duplicated. A blank query is a 400; a daemon with no
+/// backends configured is a 503, the same answer `/v1/search` gives.
+async fn research(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<ResearchBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    // A thin shell over `research_inner`: the extractor plumbing stays trivial and the route's
+    // real work is testable as a plain async fn taking the state by value.
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return ApiError::new(StatusCode::BAD_REQUEST, rejection.body_text()).into_response()
+        }
+    };
+    match research_inner(state, body).await {
+        Ok(json) => json.into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+/// The route's real work.
+async fn research_inner(
+    state: Arc<AppState>,
+    body: ResearchBody,
+) -> Result<Json<ResearchResponse>, ApiError> {
+    if body.query.trim().is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "a research request needs a non-empty `query`",
+        ));
+    }
+    if state.search.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no search backends are configured; set `search.backends` in the config",
+        ));
+    }
+
+    let (request, mode) = body.into_request_and_mode();
+    let client = state.search.client().clone();
+    let selection =
+        select_fetcher(&client, mode, default_pool_root()).map_err(research_route_error)?;
+    let task = ResearchTask::new(state.search.all(), client, selection.fetcher());
+    let report = task.run(&request).await;
+
+    let fetcher = match selection.kind {
+        hx_search::SelectedFetcher::Http => "http",
+        hx_search::SelectedFetcher::Browser => "browser",
+    };
+    Ok(Json(ResearchResponse {
+        query: report.query,
+        fetcher,
+        fetch_note: selection.note.to_string(),
+        backends: report.backends,
+        sources: report.sources,
+        paid_calls: report.paid_calls,
+    }))
 }
 
 /// Every event of a session, in order: what a client that just attached renders.
