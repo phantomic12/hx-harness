@@ -183,6 +183,7 @@ async fn harness(
             reqwest::Client::new(),
         )),
         approvals: hx_agent::ApprovalQueue::new(std::time::Duration::from_secs(1)),
+        phone: None,
         search: Arc::new(
             hx_search::BackendRegistry::from_config(
                 &config.search,

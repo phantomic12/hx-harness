@@ -231,6 +231,7 @@ async fn harness() -> Option<(Arc<AppState>, std::path::PathBuf, tempfile::TempD
         models: Arc::new(Scripted(model)),
         tools: Arc::new(hx_server::chat::default_tools(vec![], client)),
         approvals: ApprovalQueue::new(std::time::Duration::from_secs(1)),
+        phone: None,
         search: Arc::new(search),
         sandboxes: Some(manager),
         sandbox_unavailable_reason: None,

@@ -312,6 +312,10 @@ pub async fn run_chat(
              `approval_wait_secs` and a client polling GET /v1/approvals, or run with \
              `autonomy: \"yolo\"` if the work is safe to do unattended.",
         )),
+        // A phone/lock-screen webhook is the answering surface when one is configured: the prompt is
+        // pushed to the phone (see `crate::phone`) and the tap comes back to `POST
+        // /v1/approvals/{id}/respond`. Otherwise the request lands in the queue a terminal/browser polls.
+        _ if state.phone.is_some() => Arc::clone(state.phone.as_ref().expect("checked")).clone(),
         _ => SessionScopedQueue::new(
             Arc::clone(&state.approvals),
             session_id.as_str().to_string(),

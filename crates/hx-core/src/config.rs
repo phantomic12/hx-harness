@@ -53,6 +53,34 @@ pub struct Config {
     pub terminal: TerminalConfig,
     #[serde(default)]
     pub api: ApiConfig,
+    /// The phone/lock-screen approval push. Off by default: a daemon that names no
+    /// `approval.push_url` posts nothing and the approval answer route never accepts a token.
+    #[serde(default)]
+    pub approval: ApprovalConfig,
+}
+
+/// Push-based, phone/lock-screen approvals over a generic webhook.
+///
+/// This is the M7 exit criterion's transport-agnostic half: when an approval is requested and
+/// `push_url` is set, the daemon posts a JSON payload to the webhook, which forwards it to the
+/// operator's phone as a notification; the operator taps allow/deny from the lock screen; the tap
+/// comes back to `POST /v1/approvals/{id}/respond` with the one-time token the notification
+/// carried.
+///
+/// No APNs/FCM provider is required (and none is bundled): a generic webhook — a push-relay you run,
+/// a `notify` endpoint, even a script that turns the JSON into a notification — is all this path
+/// needs. See `crates/hx-server/src/phone.rs` for the shape it POSTs and
+/// `docs/phone-approval.md` for the end-to-end flow.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalConfig {
+    /// The webhook URL the daemon POSTs to when an `` approval `` is requested. Default off.
+    ///
+    /// The token in the `respond_url` this payload carries is a one-time secret and **must not reach a
+    /// log line**: the module that mints it redacts it from every message it writes (see
+    /// `crates/hx-server/src/phone.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_url: Option<String>,
 }
 
 /// The daemon's HTTP API.

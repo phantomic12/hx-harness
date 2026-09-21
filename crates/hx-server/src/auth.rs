@@ -68,8 +68,30 @@ use std::sync::Arc;
 
 /// Routes answered without a token. See the module doc for the reasoning behind each.
 pub fn is_exempt(path: &str) -> bool {
-    path == "/healthz" || path == "/"
+    path == "/healthz" || path == "/" || is_phone_respond_route(path)
 }
+
+/// The phone/lock-screen respond route.
+///
+/// Exempt from the bearer token **on purpose**: the phone never holds the API's long-lived bearer
+/// secret, and this route authenticates with the **one-time** token that travelled inside the pushed
+/// `respond_url` instead ([`crate::phone::PhoneApprover`]). The route verifies that token against its own
+/// per-approval record and refuses anything else, so exemption here is not an open door — see the doc on
+/// that route.
+fn is_phone_respond_route(path: &str) -> bool {
+    let mut segments = path.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (Some(""), Some("v1"), Some("approvals"), Some(id), Some("respond")) if !id.is_empty()
+    )
+}
+
 
 /// Routes that are WebSocket upgrades.
 ///

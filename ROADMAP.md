@@ -702,10 +702,15 @@ promise about how it is used.
     Each degrades to a working window with a warning rather than failing to start. The tray icon, a live
     hotkey binding, a raised notification and the live OS dialog are not exercised headlessly — each module's
     doc says so.
-  - ⬜ **The phone-approval exit criterion is still unmet**: approving from a phone lock screen needs
-    Mobile (iOS/Android push), which is not reachable from this environment.
   - ⬜ **Mobile (iOS + Android)** — explicitly deferred (needs the Android NDK/SDK and a macOS host for
     iOS signing; neither is available).
+  - ✅ **Phone/lock-screen approval path via a push webhook** — the transport half landed: with
+    `approval.push_url` configured, a run's prompt is `POST`ed to a generic webhook whose `respond_url`
+    carries a **one-time** token, and the lock-screen tap comes back to `POST /v1/approvals/{id}/respond`
+    (the one bearer-exempt route, which authenticates with that token instead). `allow` maps to a one-shot
+    grant and can never authorise above the phone ceiling; a failed push expires to a denial (fail-closed). The
+    token is redacted from logs and a replay cannot answer twice. No real iOS/Android client — the webhook is
+    the transport an operator fills in with their own push relay — see `docs/phone-approval.md`.
   - ✅ **CI matrix for all five release targets** — landed (`m9-ci-matrix`): `cargo check
     --workspace --all-targets --locked` now runs on every PR for all five targets release.yml builds
     (`x86_64`/`aarch64` linux-musl via `cross`, `x86_64`/`aarch64` apple-darwin and

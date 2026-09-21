@@ -97,6 +97,9 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/terminals/{id}", delete(kill_terminal))
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{id}", post(answer_approval))
+        // The phone's tap comes back here — see `crate::phone`. Exempt from the bearer token (the
+        // route authenticates with the one-time token inside `respond_url`).
+        .route("/v1/approvals/{id}/respond", post(respond_approval))
         // The diff/review pane's data source. A diff of file changes is owned by the daemon (it is
         // the only thing that can read the file), so the pane asks for it here rather than inventing it.
         .route("/v1/diff", post(diff_file))
@@ -740,6 +743,66 @@ async fn answer_approval(
             ),
         )),
     }
+}
+
+/// The body of a phone/lock-screen tap.
+///
+/// The phone taps `POST /v1/approvals/{id}/respond` with a bare `verdict` of `allow` or `deny`.
+/// Compare this with [`ApprovalAnswer`]: the phone is a thin approval surface, not a full client, so the
+/// choice it sends is a single yes/no and `respond_with` picks the ceiling — `allow` maps to
+/// [`ApprovalOption::AllowOnce`] (a one-shot grant, the least the phone can mean by "let it run").
+#[derive(Debug, Deserialize)]
+pub struct RespondApprovalBody {
+    /// The one-time token from the pushed `respond_url`. See [`crate::phone::PhoneApprover`].
+    token: String,
+    /// `allow` or `deny`.
+    verdict: String,
+}
+
+/// The phone's tap comes back here, through the `respond_url` the push carried.
+///
+/// **Why this has no bearer check**: the phone never holds the daemon's long-lived secret. The push put a
+/// **one-time** [`crate::phone::PhoneApprover`] token into the `respond_url` it sent, and `approve_phone`
+/// verifies that token here against its own per-approval record before acting. A caller who does not know the
+/// token is refused, whether or not they hold a bearer token; a caller who does know it holds the proof the
+/// push itself issued, which is the phone's grant. The one-time nature means replaying the `respond_url` cannot
+/// approve twice.
+async fn respond_approval(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<RespondApprovalBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Some(phone) = &state.phone else {
+        // No webhook is configured and no push exists under this id: the route is a 404, not a 400,
+        // because there is no approval this url could answer.
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "no phone approval push is configured on this daemon",
+        ));
+    };
+
+    match phone.respond(&id, &body.token, &body.verdict) {
+        Ok(()) => {}
+        Err(phone_err) => {
+            use crate::phone::PhoneRespondError::*;
+            return Err(match phone_err {
+                Idle => ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    format!("no approval is waiting under '{id}' — it was answered already, or it expired"),
+                ),
+                Token => ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "the one-time token in this respond_url does not match the approval — refused",
+                ),
+                Verdict => ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "verdict must be 'allow' or 'deny'",
+                ),
+            });
+        }
+    }
+
+    Ok(Json(serde_json::json!({ "responded": id })))
 }
 
 /// A diff of a proposed file change, computed from the real file on disk.
@@ -2186,5 +2249,78 @@ search:
             body["denied"].is_string(),
             "the reason must be reported: {body}"
         );
+    }
+
+    async fn phone_state() -> (Arc<AppState>, Arc<crate::phone::PhoneApprover>) {
+        let mut config = hx_core::config::Config::from_yaml(CONFIG).expect("config parses");
+        let dir = tempfile::tempdir().expect("temp dir");
+        config.daemon.data_dir = dir.keep().display().to_string();
+        config.approval.push_url = Some("http://mock-push.local/hook".to_string());
+        let state = build_state(config).await;
+        let phone = state.phone.clone().expect("push_url configured builds a phone approver");
+        (state, phone)
+    }
+
+    /// A running approval must be resolvable by its one-time token with **no bearer header** — that is
+    /// the whole point of the phone path, and the reason this route is exempt from `require_bearer` (it
+    /// authenticates with the token instead).
+    #[tokio::test]
+    async fn phone_approval_can_be_answered_from_the_lock_screen() {
+        let (state, phone) = phone_state().await;
+        let id = "apr_phone_route";
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let token = phone.insert_for_test(
+            id,
+            hx_core::approval::RiskClass::External,
+            reply,
+        );
+
+        // The tap carries only the one-time token — no bearer header.
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/approvals/{id}/respond"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "token": token.as_str(), "verdict": "allow" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let (option, by) = answer.await.expect("the waiting run receives the answer");
+        assert_eq!(option, hx_core::approval::ApprovalOption::AllowOnce);
+        assert_eq!(by, "phone");
+    }
+
+    /// A wrong one-time token is refused even though the route needs no bearer header: the exemption is
+    /// not an open door.
+    #[tokio::test]
+    async fn a_wrong_phone_token_is_refused() {
+        let (state, phone) = phone_state().await;
+        let (reply, _answer) = tokio::sync::oneshot::channel();
+        phone.insert_for_test(
+            "apr_wrong",
+            hx_core::approval::RiskClass::External,
+            reply,
+        );
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/approvals/apr_wrong/respond")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "token": "wrong-token", "verdict": "allow" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The id is real and waiting, but the one-time token does not match: that is a 403 — the route
+        // is exempt from the bearer header, so the token check is the only door, and it must refuse.
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }
