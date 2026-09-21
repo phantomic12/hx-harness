@@ -100,6 +100,11 @@ pub fn app(state: Arc<AppState>) -> Router {
         // The diff/review pane's data source. A diff of file changes is owned by the daemon (it is
         // the only thing that can read the file), so the pane asks for it here rather than inventing it.
         .route("/v1/diff", post(diff_file))
+        // The M8 fan-out surface: N concurrent child model calls across N distinct pool members,
+        // answered per child. This is the first production caller of the spawner that draws from the
+        // model pool (see `crate::fanout`). It is gated by the same bearer token as everything
+        // else on this router.
+        .route("/v1/fanout", post(fanout))
         .with_state(state)
         // Applied last, so it wraps every route including the WebSocket upgrades. `from_fn_with_state`
         // rather than `from_fn`: the token lives on `AppState`, and reading it from a request
@@ -805,6 +810,112 @@ async fn diff_file(
         binary,
         diff: rendered,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Fan-out: N concurrent child model calls across N distinct pool members
+// ---------------------------------------------------------------------------
+//
+// This is the first *production* surface for the M8 spawner (see `crate::spawn`
+// and `crate::fanout`). The spawner owns the pool's per-request health state, so a
+// Spawner is built from `Config` + the state's providers/secrets/store for the duration
+// of the request — it is not a field on `AppState` (which has no model pool to point at
+// until a caller names one). This keeps the M8 pool draw hermetic and per-request.
+
+/// One child call of a fan-out: the session its usage is recorded under, and a prompt.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct FanOutChild {
+    pub session: String,
+    pub prompt: String,
+}
+
+/// `POST /v1/fanout` — the fan-out request.
+///
+/// `children` is the list of child calls. The returned outcome has one result per child, in
+/// request order. Every child in a fan-out runs against **one** caller session (the first
+/// child's), which is the single-session contract of `crate::fanout::run_fan_out`.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct FanOutBody {
+    pub children: Vec<FanOutChild>,
+}
+
+/// The pool a fan-out draws from when none is named.
+///
+/// The pool name mirrors the default the agent run picks, so a fan-out caller that omits one
+/// draws from the pool the daemon would otherwise use rather than a surprise.
+fn default_fanout_pool() -> String {
+    "interactive".to_string()
+}
+
+/// `POST /v1/fanout` — run N child model calls across N distinct pool members.
+///
+/// The M8 exit criterion as an HTTP surface: every child is allocated a spec on a *distinct*
+/// healthy member before any runs, a short pool fails loudly (no child runs), and a member that
+/// dies mid-fan-out fails only its own child while the others complete. Each completed child's
+/// response names the member it ran on and its recorded usage; a dying member's error is already
+/// redacted at the fanout boundary (see `crate::fanout`).
+///
+/// The `Spawner` is built per request from `Config` plus the state's providers, secret stores
+/// and store. This is the same wiring `AppState::build` uses for the model path, and no new
+/// secret-resolution path — the pool's member credentials are resolved through the state's stores.
+async fn fanout(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<FanOutBody>,
+) -> Result<Json<crate::fanout::FanOutOutcome>, ApiError> {
+    // An empty fan-out is meaningless and is refused up front (a clear 400 rather than a
+    // 200 with nothing in it).
+    if body.children.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "a fan-out needs at least one child",
+        ));
+    }
+
+    // `run_fan_out` runs every child against a single caller session; the first child's is
+    // that session. This is the primitive's documented contract, not a guess.
+    let session = hx_core::ids::SessionId::from_raw(body.children[0].session.clone());
+
+    // `default_pool` carries the configured default, which may be empty/absent; fall back to a
+    // sensible name when it is. The pool the fan-out draws from is built per request from
+    // `Config` (the state carries no `Spawner`, and none is persisted between requests).
+    let pool_name = state.config.agent.default_pool.clone();
+    let pool_name = if pool_name.is_empty() {
+        default_fanout_pool()
+    } else {
+        pool_name
+    };
+
+    let pool = state.config.model_pool(&pool_name).map_err(|e| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("the model pool could not be built: {e}"),
+        )
+    })?;
+
+    let mut spawner = crate::spawn::Spawner::new(
+        pool,
+        state.providers.clone(),
+        state.secrets.clone(),
+        state.store.clone(),
+    );
+
+    let prompts: Vec<&str> = body.children.iter().map(|c| c.prompt.as_str()).collect();
+
+    let outcome = crate::fanout::run_fan_out(&mut spawner, &session, &prompts)
+        .await
+        .map_err(|e| {
+            let status = match &e {
+                // A shortage is the client's to fix (run fewer, retry later) — client error.
+                crate::fanout::FanOutError::NotEnoughMembers { .. } => {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                }
+                // An all-down/empty pool is a server-side capability problem.
+                crate::fanout::FanOutError::Draw(_) => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            ApiError::new(status, e.to_string())
+        })?;
+
+    Ok(Json(outcome))
 }
 
 /// Every event of a session, in order: what a client that just attached renders.
