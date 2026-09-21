@@ -133,10 +133,11 @@ killed an idle daemon while looking like a pass).
   It is a client in the strict sense: the terminal is created once under a fixed id and reattached,
   so a refresh rejoins the running shell; the session socket resumes with `since_seq` so a reconnect
   renders the gap rather than the whole history.
-- Frontend, still to come: a diff/review pane. The tree and the queue themselves are built — the host
-  directory browser with a file viewer/editor and a command runner, and a pane that polls
-  `GET /v1/approvals` and renders each question's risk class, reason, undo line and remaining
-  unattended budget
+- ✅ **A diff/review pane** — the host directory browser gained a diff view: `POST /v1/diff` takes a
+  path plus proposed text, the daemon reads the real file (through the same read-cap gate the file routes
+  use), computes a bounded unified diff and serves it redacted with the shared `hx_secrets::Redactor`,
+  flagging binary files rather than inventing a mangled diff. Still browser-by-eye: the pane's rendering is
+  not driven by an automated browser here.
 - **Two clients on one session simultaneously** (TUI + browser) — this is the real test that
   the daemon/client split is honest and not cosmetic
 

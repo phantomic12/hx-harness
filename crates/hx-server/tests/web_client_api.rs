@@ -365,3 +365,74 @@ async fn the_remaining_unattended_budget_travels_with_the_question_and_tracks_th
         "the page's approval card must read the field the daemon sends"
     );
 }
+
+/// The diff/review pane's data source: a diff is computed by the daemon from the real file on disk.
+///
+/// The tempting wrong test is a grep of the served page — which passes for a diff baked into the HTML.
+/// So this drives the route the way the pane does: a file is written to the local host, a proposed
+/// revision is posted to `/v1/diff`, and the diff the daemon returns is asserted to *name the real
+/// change* (an added line) and stay context-equal where nothing changed. A diff invented in the browser,
+/// or a route that echoed the proposed text without reading the file, cannot satisfy both.
+///
+/// The page half is weaker and stated as such: the browser is not driven here, so what is asserted is that
+/// the served page calls the exact `/v1/diff` endpoint — not that the pane renders.
+#[tokio::test]
+async fn the_diff_route_computes_the_change_against_the_real_file() {
+    let server = harness().await;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("review.rs");
+    let path = path.display().to_string();
+
+    // Put a real file on the local host through the file route, then diff a proposed edit to it.
+    let client = reqwest::Client::new();
+    let put = client
+        .put(format!("http://{}/v1/hosts/local/file", server.addr))
+        .json(&serde_json::json!({ "path": path, "contents": "fn a() {}\nfn b() {}\n" }))
+        .send()
+        .await
+        .expect("a response");
+    assert_eq!(put.status(), reqwest::StatusCode::OK);
+
+    let res = client
+        .post(format!("http://{}/v1/diff", server.addr))
+        .json(&serde_json::json!({
+            "path": path,
+            "proposed": "fn a() {}\nfn b() { todo!() }\n"
+        }))
+        .send()
+        .await
+        .expect("a response");
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = res.json().await.expect("json");
+    assert_eq!(body["exists"], true, "{body}");
+    assert_eq!(body["binary"], false, "{body}");
+
+    let diff = body["diff"].as_array().expect("diff is a list");
+    assert!(
+        diff.iter().any(|l| l["Removed"] == "fn b() {}"),
+        "the removed line is named: {body}"
+    );
+    assert!(
+        diff.iter().any(|l| l["Added"] == "fn b() { todo!() }"),
+        "the added line is named: {body}"
+    );
+    assert!(
+        diff.iter().any(|l| l["Context"] == "fn a() {}"),
+        "an untouched line stays context: {body}"
+    );
+
+    // And the page asks this endpoint for its data — under the same apiFetch wrapper, so it carries the
+    // token like every other call.
+    let page = reqwest::Client::new()
+        .get(format!("http://{}/", server.addr))
+        .send()
+        .await
+        .expect("a response")
+        .text()
+        .await
+        .expect("a body");
+    assert!(
+        page.contains("/v1/diff"),
+        "the pane must read the diff from the daemon, not invent it"
+    );
+}

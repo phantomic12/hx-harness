@@ -28,6 +28,7 @@ use hx_core::error::HxError;
 use hx_core::ids::SessionId;
 use hx_sandbox::SandboxSpec;
 use hx_search::{Recency, SearchQuery};
+use hx_secrets::Redactor;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -96,6 +97,9 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/terminals/{id}", delete(kill_terminal))
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{id}", post(answer_approval))
+        // The diff/review pane's data source. A diff of file changes is owned by the daemon (it is
+        // the only thing that can read the file), so the pane asks for it here rather than inventing it.
+        .route("/v1/diff", post(diff_file))
         .with_state(state)
         // Applied last, so it wraps every route including the WebSocket upgrades. `from_fn_with_state`
         // rather than `from_fn`: the token lives on `AppState`, and reading it from a request
@@ -731,6 +735,76 @@ async fn answer_approval(
             ),
         )),
     }
+}
+
+/// A diff of a proposed file change, computed from the real file on disk.
+///
+/// Body `{ "path": "...", "proposed": "..." }`. The current content is read from the local host (via
+/// the same read-capability gate the file routes use), and the diff between it and `proposed` is computed
+/// on the daemon. The pane never derives a diff from content it does not have: it asks for it and renders
+/// the daemon's answer.
+///
+/// `proposed` is returned as part of the response only redacted: a diff displays file contents, and a
+/// proposed edit that embeds a credential must not hand it to the model through the browser untouched. Content
+/// that is already on disk (context and removed lines) is left as-is, because it is not new information the
+/// diff is *introducing* — see [`crate::diff`] for the exact shapes tested.
+#[derive(Debug, Deserialize)]
+pub struct DiffBody {
+    pub path: String,
+    pub proposed: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiffReply {
+    pub path: String,
+    /// `true` whenever a diff is served. A missing file surfaces as the read error (matched to a 404 when
+    /// possible), exactly like the host file route — see [`host_read_file`].
+    pub exists: bool,
+    /// `true` when the current file is not valid UTF-8, in which case `diff` is empty and the pane
+    /// says why rather than inventing a mangled diff of binary bytes.
+    pub binary: bool,
+    pub diff: Vec<crate::diff::DiffLine>,
+}
+
+async fn diff_file(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<DiffBody>,
+) -> Result<Json<DiffReply>, ApiError> {
+    if body.path.trim().is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "a path is required for a diff",
+        ));
+    }
+    // The same read-capability gate the host file route uses — `local` is the daemon's own machine,
+    // and the reviews this pane serves are reviews of local file edits.
+    let host = resolve_for_use(
+        &state,
+        crate::hosts::LOCAL_HOST_ID,
+        hx_core::capability::Action::Read,
+    )
+    .await?;
+
+    let bytes = host.read_file(&body.path).await.map_err(ApiError::from)?;
+    // A binary file cannot be diffed as text — reporting that honestly beats inventing a diff of mangled
+    // bytes. `Some` here means the bytes are not valid UTF-8.
+    let binary = String::from_utf8(bytes.clone()).is_err();
+    let current = String::from_utf8(bytes).unwrap_or_default();
+
+    let rendered = if binary {
+        Vec::new()
+    } else {
+        let diff = crate::diff::unified_diff(&current, &body.proposed);
+        // Redacted here, on the way out — see `crate::diff` for which shapes this covers.
+        crate::diff::redact_diff(&diff, &Redactor::new())
+    };
+
+    Ok(Json(DiffReply {
+        path: body.path,
+        exists: true,
+        binary,
+        diff: rendered,
+    }))
 }
 
 /// Every event of a session, in order: what a client that just attached renders.

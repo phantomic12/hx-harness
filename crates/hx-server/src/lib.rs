@@ -17,6 +17,7 @@
 
 pub mod auth;
 pub mod chat;
+pub mod diff;
 pub mod fanout;
 pub mod hosts;
 pub mod remote_sandbox;
