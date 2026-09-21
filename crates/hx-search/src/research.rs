@@ -14,13 +14,19 @@
 //! 5. Observable accounting of paid API calls, structurally guaranteed to be zero when
 //!    running against the keyless backend set.
 //!
-//! ## Why no `hx-browser` dependency
+//! ## How the browser pool fits
 //!
-//! `hx-search` intentionally does not depend on `hx-browser`. Doing so would invert the system's
-//! dependency hierarchy: the browser pool is the heavy escalation layer *above* search extraction
-//! (for pages requiring full JavaScript execution or challenge solving), not a primitive underneath
-//! it. Extraction here operates via a minimal, in-crate [`Fetcher`] abstraction backed by `reqwest`
-//! and the synchronous [`crate::extract::Ladder`] parser.
+//! `hx-search` depends on `hx-browser` and uses it for one thing: [`BrowserFetcher`], which
+//! fetches a page through the pool's ladder — the plain HTTP rung first, escalation to real
+//! Chromium only when the site refuses. The pool is the escalation layer *for* the pages a plain
+//! fetch cannot read (full JavaScript execution, challenge solving), and the dependency is one-way and
+//! deliberate: search does not own the pool, it consumes it.
+//!
+//! The bulk of extraction still happens through the in-crate [`Fetcher`] abstraction; [`HttpFetcher`]
+//! is the plain path, and [`BrowserFetcher`] is a [`Fetcher`] the same research loop can be handed.
+//! The chromium tests that drive real Chromium run **locally** — the browser is installed on the developer
+//! host (`/usr/lib/chromium/chromium`) and not on the remote build host — and are `#[ignore]`d so
+//! they never run in the offload gate.
 //!
 //! ## Body cap and timeout
 //!
@@ -43,11 +49,14 @@
 //! successful report that found nothing, not an error.
 
 use crate::backend::{BackendKind, SearchBackend, SearchError};
-use crate::cache::{cache_key, CacheOutcome, UrlCache};
+use crate::cache::{cache_key, fnv1a, CacheOutcome, UrlCache};
 use crate::extract::{FetchedPage, Ladder, Rung};
 use crate::types::{FusedResult, SearchQuery};
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
+use hx_browser::profile::PoolRoot;
+use hx_browser::{BrowserPool, Ladder as RungLadder};
+use hx_core::ids::SessionId;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -217,6 +226,134 @@ impl Fetcher for HttpFetcher {
                 Ok(Some(FetchedPage::new(url, content_type.as_deref(), body)))
             }
         }
+    }
+}
+
+/// A `Fetcher` backed by the browser pool — the caller the interactive Chromium rung exists for.
+///
+/// ## Why this is the caller
+///
+/// The plain [`HttpFetcher`] reads what a `GET` returns. The pages the research task meets that
+/// a plain fetch cannot read — a JS-rendered page, or one served only after a client-side
+/// challenge — need a browser. This is that caller: its [`fetch`](Fetcher::fetch) runs the URL
+/// through a [`BrowserPool`], whose ladder tries the plain rung first and escalates to real Chromium
+/// only when the site refuses.
+///
+/// Every browser fetch runs in its **own session's profile** (see `hx-browser`'s `profile`
+/// for why that is a security boundary, not housekeeping): each URL is its own one-shot session, so a
+/// page a browser renders for one URL can never read another URL task's cookies. The session id is made
+/// from the URL's redacted form — a token in the query cannot reach a directory name.
+///
+/// ## The security properties survive the wiring
+///
+/// The caller does **not** weaken anything the rung holds:
+/// - **Admission still runs.** A [`BrowserPool`] admits every target before any rung runs; a caller
+///   cannot pass an unchecked target. (In fact the pool refuses loopback — including a local test
+///   stub — so the caller's decisions are driven with a browser-launching double, and only the one
+///   `#[ignore]`d live test drives real Chromium.)
+/// - **A refusal is a refusal.** The pool's [`FetchReport`] carries a [`Disposition`]: a wall, a
+///   challenge or an admission block. This fetcher turns one into [`SearchError::Refused`] — never an
+///   `Ok(Some(""))`, which would look to extraction exactly like a page the origin served.
+/// - **The body cap applies here too.** The rung's own cap refuses an oversized body [`Disposition::Stop`];
+///   that reaches this fetcher as an error and surfaces as a refusal sentence, never as a truncated body.
+/// - **No browser leaks.** The rung already reaps its child on every exit path. The pool runs each
+///   fetch under its own timeout, and this fetcher adds its own `tokio::time::timeout` around the
+///   whole call — both bounded, so a fetch that times out (or is dropped) cannot leave Chromium behind.
+///
+/// ## Where the chromium tests run
+///
+/// A real browser is at `/usr/lib/chromium/chromium` on the **developer host** and not on the
+/// remote build host, so any test of this fetcher that would touch the rung runs **locally**. The
+/// server-side tests below therefore drive the *decision* with a browser-launching double and serve all
+/// pages from a local stub — no test depends on a third-party site — and the one live run (real
+/// Chromium end to end) is `#[ignore]`d for the local host.
+pub struct BrowserFetcher {
+    pool: BrowserPool,
+    timeout: Duration,
+    max_body_bytes: usize,
+}
+
+impl std::fmt::Debug for BrowserFetcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserFetcher")
+            .field("pool", &self.pool)
+            .field("timeout", &self.timeout)
+            .field("max_body_bytes", &self.max_body_bytes)
+            .finish()
+    }
+}
+
+impl BrowserFetcher {
+    /// A browser-backed fetcher over `root` (the pool's profile root) with the default cap.
+    pub fn new(root: impl Into<std::path::PathBuf>) -> Result<Self, std::io::Error> {
+        let pool_root =
+            PoolRoot::new(root).map_err(|err| std::io::Error::other(err.to_string()))?;
+        let ladder = RungLadder::new(vec![
+            Arc::new(
+                hx_browser::HttpRung::new()
+                    .map_err(|_| std::io::Error::other("could not build the HTTP rung"))?,
+            ),
+            Arc::new(
+                hx_browser::ChromiumRung::new()
+                    .map_err(|_| std::io::Error::other("could not build the Chromium rung"))?,
+            ),
+        ]);
+        Ok(Self {
+            pool: BrowserPool::new(pool_root, ladder),
+            timeout: DEFAULT_FETCH_TIMEOUT,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+        })
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn with_max_body_bytes(mut self, max_body_bytes: usize) -> Self {
+        self.max_body_bytes = max_body_bytes;
+        self
+    }
+
+    /// The pool, for a test that wants to see which rung answered.
+    pub fn pool(&self) -> &BrowserPool {
+        &self.pool
+    }
+}
+
+#[async_trait]
+impl Fetcher for BrowserFetcher {
+    async fn fetch(&self, url: &str) -> Result<Option<FetchedPage>, SearchError> {
+        // The session id is a hash of the URL, *not* the URL: a URL (or a token in its query)
+        // must not become a directory name. Each URL is its own one-shot session, so a page a browser
+        // renders for one URL can never read another URL task's cookies.
+        let session = SessionId::from_raw(format!("browser_{:016x}", fnv1a(url)));
+        let report = match tokio::time::timeout(self.timeout, self.pool.fetch(&session, url)).await
+        {
+            Ok(report) => report,
+            Err(_) => {
+                return Err(SearchError::Refused {
+                    reason: format!("fetch timed out after {:.1}s", self.timeout.as_secs_f64()),
+                })
+            }
+        };
+
+        let page = report.page.ok_or_else(|| SearchError::Refused {
+            reason: report
+                .stop_reason
+                .unwrap_or_else(|| "no rung produced a page".to_string()),
+        })?;
+
+        let content_type = page.content_type().to_string();
+        if page.body_len() > self.max_body_bytes {
+            // Same policy as HttpFetcher: skip an oversized page rather than cite a truncated body.
+            return Ok(None);
+        }
+        Ok(Some(FetchedPage::new(
+            url,
+            Some(&content_type),
+            page.into_body_untrusted(),
+        )))
     }
 }
 
@@ -537,6 +674,223 @@ pub async fn research(
 ) -> ResearchReport {
     let task = ResearchTask::new(backends.to_vec(), client.clone(), fetcher);
     task.run(request).await
+}
+
+#[cfg(test)]
+mod browser_fetcher_tests {
+    use super::*;
+    use hx_browser::error::{FetchError, RefusalReason};
+    use hx_browser::rung::{FetchRequest, Fetcher as RungFetcher, RungKind, UntrustedPage};
+    use hx_browser::Admission;
+
+    /// A browser pool under the named policy whose single rung is a scripted double.
+    ///
+    /// The production [`BrowserFetcher::new`] ladder uses real rungs and the default (public-only)
+    /// admission; this builds the *same* fetcher shape the caller uses, over a scripted rung, so
+    /// the caller's decision and its caps can be asserted without touching real Chromium or the network.
+    fn fetcher_over(
+        root: std::path::PathBuf,
+        admission: Admission,
+        rung: Arc<dyn RungFetcher>,
+        timeout: Duration,
+    ) -> BrowserFetcher {
+        let pool_root = PoolRoot::new(root).expect("pool root");
+        let ladder = RungLadder::new(vec![rung]);
+        let pool = BrowserPool::new(pool_root, ladder).with_admission(admission);
+        BrowserFetcher {
+            pool,
+            timeout,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+        }
+    }
+
+    /// A rung whose behaviour is dictated per call, panicking when called with no script left so an
+    /// unexpected call is a loud failure rather than a silent one.
+    struct DictatedRung {
+        script: std::sync::Mutex<VecDequeue>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    enum Verdict {
+        Page(usize),
+        Refused(&'static str),
+        Hang,
+    }
+
+    struct VecDequeue(std::collections::VecDeque<Verdict>);
+
+    impl VecDequeue {
+        fn pop(&mut self) -> Verdict {
+            self.0
+                .pop_front()
+                .unwrap_or_else(|| panic!("dictated rung called with no verdict left"))
+        }
+    }
+
+    impl DictatedRung {
+        fn new(script: Vec<Verdict>) -> Arc<Self> {
+            Arc::new(Self {
+                script: std::sync::Mutex::new(VecDequeue(script.into())),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl RungFetcher for DictatedRung {
+        fn kind(&self) -> RungKind {
+            RungKind::Interactive
+        }
+        fn name(&self) -> &str {
+            "dictated"
+        }
+        async fn fetch(&self, request: &FetchRequest) -> Result<UntrustedPage, FetchError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let verdict = self.script.lock().expect("script lock").pop();
+            match verdict {
+                Verdict::Page(size) => Ok(UntrustedPage::new(
+                    request.target.clone(),
+                    200,
+                    "text/html",
+                    RungKind::Interactive,
+                    "x".repeat(size),
+                )),
+                Verdict::Refused(marker) => Err(FetchError::Refused {
+                    rung: RungKind::Interactive,
+                    reason: RefusalReason::Challenge {
+                        marker: marker.to_string(),
+                    },
+                }),
+                Verdict::Hang => std::future::pending::<Result<UntrustedPage, FetchError>>().await,
+            }
+        }
+    }
+
+    fn tmp_root() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("hx-browser-fetcher-test-{}", std::process::id()))
+    }
+
+    /// A plain page the plain fetch can read — the ordinary case — is fetched through the caller.
+    #[tokio::test]
+    async fn a_browser_fetcher_returns_an_ordinary_admitted_page() {
+        let rung = DictatedRung::new(vec![Verdict::Page(20)]);
+        let fetcher = fetcher_over(
+            tmp_root(),
+            Admission::AllowLocal,
+            rung.clone(),
+            Duration::from_secs(5),
+        );
+        // A local stub is loopback; the pool admits it under AllowLocal, and the rung answers.
+        let out = fetcher
+            .fetch("http://127.0.0.1:9/plain")
+            .await
+            .expect("a page");
+        let page = out.expect("a page, not a skip");
+        assert_eq!(page.body, "x".repeat(20));
+        assert_eq!(rung.calls(), 1);
+    }
+
+    /// Admission still runs: a URL the pool refuses is a refusal, and it is never an empty body.
+    #[tokio::test]
+    async fn a_browser_fetcher_never_skips_admission_and_a_refusal_is_a_refusal_not_an_empty_body()
+    {
+        // Default (public-only) admission: a loopback address is refused before any rung runs.
+        let rung = DictatedRung::new(vec![Verdict::Page(20)]);
+        let fetcher = fetcher_over(
+            tmp_root(),
+            Admission::PublicInternet,
+            rung.clone(),
+            Duration::from_secs(5),
+        );
+        let err = fetcher
+            .fetch("http://127.0.0.1:9/plain")
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, SearchError::Refused { .. }), "{err}");
+        assert!(
+            !matches!(err, SearchError::Parse { .. }),
+            "a refusal must not look like a body: {err}"
+        );
+        assert_eq!(rung.calls(), 0, "no rung may run for a refused target");
+    }
+
+    /// A rung refusal surfaces as a refusal, never as an `Ok(Some(""))`.
+    #[tokio::test]
+    async fn a_browser_fetcher_surfaces_a_refusal_as_a_refusal_not_an_empty_page() {
+        let rung = DictatedRung::new(vec![Verdict::Refused("cf-challenge")]);
+        let fetcher = fetcher_over(
+            tmp_root(),
+            Admission::AllowLocal,
+            rung.clone(),
+            Duration::from_secs(5),
+        );
+        let err = fetcher
+            .fetch("http://127.0.0.1:9/walled")
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, SearchError::Refused { .. }), "{err}");
+        assert!(err.to_string().contains("cf-challenge"), "{err}");
+        assert_eq!(rung.calls(), 1);
+    }
+
+    /// The body cap is enforced by the caller too: an oversized page is skipped, never truncated.
+    #[tokio::test]
+    async fn a_browser_fetcher_enforces_the_body_cap_at_the_caller() {
+        let rung = DictatedRung::new(vec![Verdict::Page(DEFAULT_MAX_BODY_BYTES + 1024)]);
+        let mut fetcher = fetcher_over(
+            tmp_root(),
+            Admission::AllowLocal,
+            rung.clone(),
+            Duration::from_secs(5),
+        );
+        fetcher.max_body_bytes = DEFAULT_MAX_BODY_BYTES;
+        let out = fetcher
+            .fetch("http://127.0.0.1:9/big")
+            .await
+            .expect("a skip, not an error");
+        assert!(
+            out.is_none(),
+            "an oversized page must be skipped, not truncated into a body"
+        );
+    }
+
+    /// A fetch that never answers times out and surfaces as a refusal, and makes no rung leak.
+    #[tokio::test]
+    async fn a_browser_fetcher_times_out_instead_of_hanging_or_returning_empty() {
+        let rung = DictatedRung::new(vec![Verdict::Hang]);
+        let fetcher = fetcher_over(
+            tmp_root(),
+            Admission::AllowLocal,
+            rung.clone(),
+            Duration::from_millis(100),
+        );
+        let err = fetcher
+            .fetch("http://127.0.0.1:9/hang")
+            .await
+            .expect_err("timeout");
+        assert!(matches!(err, SearchError::Refused { .. }), "{err}");
+        assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    /// The caller turns a report with no page into a refusal sentence, and never an empty body.
+    #[tokio::test]
+    async fn a_report_with_no_page_is_a_refusal_sentence_not_an_empty_body() {
+        let rung = DictatedRung::new(vec![Verdict::Refused("no page")]);
+        let fetcher = fetcher_over(
+            tmp_root(),
+            Admission::AllowLocal,
+            rung.clone(),
+            Duration::from_secs(5),
+        );
+        let err = fetcher
+            .fetch("http://127.0.0.1:9/x")
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, SearchError::Refused { .. }), "{err}");
+    }
 }
 
 #[cfg(test)]

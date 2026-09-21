@@ -546,8 +546,14 @@ command with a button, receive a cron digest in a separate pinned thread.
     the `--disable-features=Preconnect,SpeculativeServiceWorker,NavigationPredictor,NetworkPrediction`
     flag was tried and is insufficient, so the guarantee is pinned at the request line, and the rung's
     doc says why. The browser child is reaped on every exit path (success, transport failure, timeout,
-    future drop), with the timeout path asserted against a real `/proc` pid. **The pool still has no
-    production caller**: nothing in `hx-server` or `hx-search` launches a browser yet.
+    future drop), with the timeout path asserted against a real `/proc` pid. **It now has a caller**:
+    `hx-search`'s `BrowserFetcher` (`crates/hx-search/src/research.rs`) is a browser-backed
+    `Fetcher` — the caller the rung exists for — so research extraction and citation can run over
+    rendered HTML. The caller honours the rung's guarantees (admission still runs, a refusal surfaces
+    as `SearchError::Refused` not an empty body, the body cap and a caller-side timeout also apply,
+    and no browser child leaks on drop or timeout). It is exported from `hx-search` but no running
+    `hx-server` route selects it yet; until one does, a research task reaches the browser only when it is
+    constructed with a `BrowserFetcher`.
 - Search: SearXNG, DDG, Mojeek, Marginalia, Brave, Google PSE, Wikipedia, plus the
   extraction ladder and URL/ETag caching
   - ◐ **The extraction ladder.** `crates/hx-search/src/extract.rs` is a hand-rolled ladder — plain

@@ -55,6 +55,16 @@ pub enum SearchError {
     #[error("backend returned HTTP {status}")]
     Http { status: u16 },
 
+    /// The site refused the automated client — a bot wall, a challenge, or a 403/429/503.
+    ///
+    /// Added for the browser-backed [`Fetcher`](crate::research::Fetcher). A refusal is **not**
+    /// a transport failure: the plain fetch was blocked by a wall, and that is the event a caller
+    /// escalates on. It is also **not** an empty body — a caller that swallowed the wall into
+    /// `Ok(Some(""))` would hand the model a page that was never served. `reason` is a
+    /// credential-free sentence built from a rung's [`Disposition`], never the page body.
+    #[error("fetch refused: {reason}")]
+    Refused { reason: String },
+
     #[error("could not parse the response: {reason}")]
     Parse { reason: String },
 

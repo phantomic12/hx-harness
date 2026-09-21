@@ -8,6 +8,11 @@ publish.workspace = true
 [dependencies]
 hx-core.workspace = true
 hx-secrets.workspace = true
+# The browser pool is the escalation layer above search extraction, pointed at the pages the plain
+# fetch cannot read. It is a normal dependency (not a dev one) because it backs a real `Fetcher`
+# in `research.rs`; the chromium tests that drive real Chromium run locally (the browser is on the
+# developer host, not the build host) and are marked `#[ignore]` so they never run in the CI gate.
+hx-browser.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

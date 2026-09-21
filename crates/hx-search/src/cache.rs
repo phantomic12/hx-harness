@@ -500,8 +500,9 @@ fn entry_file_name(key: &str) -> String {
 ///
 /// Used only to keep two keys' filenames apart. It is not a security primitive, it is not treated
 /// as one, and nothing verifies anything with it — the `key` field in the document is the check
-/// that matters.
-fn fnv1a(input: &str) -> u64 {
+/// that matters. Also used by `research`'s browser-backed fetcher to derive a profile session id
+/// from a URL without ever putting the URL (or a token in it) on the filesystem.
+pub(crate) fn fnv1a(input: &str) -> u64 {
     const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
 

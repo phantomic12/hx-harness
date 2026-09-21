@@ -2584,6 +2584,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "futures",
+ "hx-browser",
  "hx-core",
  "hx-secrets",
  "regex",
