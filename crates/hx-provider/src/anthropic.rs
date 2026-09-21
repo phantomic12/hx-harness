@@ -240,6 +240,9 @@ impl Provider for AnthropicMessages {
         }
 
         let mut acc = crate::anthropic_stream::StreamAccumulator::default();
+        // Bytes are decoded incrementally: a multi-byte character split across two reads must
+        // decode whole rather than become U+FFFD scars on either side of the split.
+        let mut decoder = crate::sse::Utf8StreamDecoder::new();
         let mut pending = String::new();
         let mut bytes = response.bytes_stream();
 
@@ -247,7 +250,7 @@ impl Provider for AnthropicMessages {
             let part = part.map_err(|err| {
                 HxError::Provider(format!("{}: the stream was interrupted: {err}", self.id))
             })?;
-            pending.push_str(&String::from_utf8_lossy(&part));
+            pending.push_str(&decoder.push(&part));
 
             // Whole frames only: a frame split across two reads must not be parsed in halves.
             while let Some(split) = crate::anthropic_stream::take_sse_frame(&mut pending) {
@@ -258,8 +261,11 @@ impl Provider for AnthropicMessages {
             }
         }
 
-        // Anything left without a terminating blank line is still an event if it carries data:
-        // dropping it would lose the last frame of a stream that ended without a trailing newline.
+        // Flush the decoder (a truncated connection may end mid-character) before reading
+        // the tail: anything left without a terminating blank line is still an event if it
+        // carries data — dropping it would lose the last frame of a stream that ended without
+        // a trailing newline.
+        pending.push_str(&decoder.finish());
         if let Some((event_name, data)) = crate::anthropic_stream::take_trailing_frame(&mut pending)
         {
             for delta in crate::anthropic_stream::apply_event(&mut acc, &event_name, &data)? {

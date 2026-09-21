@@ -208,35 +208,43 @@ impl Provider for OpenAiCompatible {
 
         // Every `data:` line is one chunk; `data: [DONE]` closes the stream. A chunk may be
         // split across TCP segments, so each chunk object is accumulated whole before being parsed.
+        // Two details keep this loop honest rather than merely working against a local server:
+        // bytes are decoded incrementally (a multi-byte character split across reads must not
+        // become U+FFFD scars), and `done` propagates the terminal `[DONE]` marker out of the
+        // inner framing loop — a proxy that holds the connection open past `[DONE]` would
+        // otherwise hang this request until the 120 s timeout.
         let mut accumulator = StreamAccumulator::default();
+        let mut decoder = crate::sse::Utf8StreamDecoder::new();
         let mut raw = String::new();
         let mut bytes = response.bytes_stream();
-        while let Some(part) = bytes.next().await {
+        let mut done = false;
+        while !done {
+            let Some(part) = bytes.next().await else {
+                break;
+            };
             let part = part.map_err(|err| {
                 HxError::Provider(format!("{}: the stream was interrupted: {err}", self.id))
             })?;
-            raw.push_str(&String::from_utf8_lossy(&part));
+            raw.push_str(&decoder.push(&part));
             while let Some(event) = take_sse_event(&mut raw) {
-                let line = event.trim();
-                if line == "[DONE]" {
+                if feed_event(&mut accumulator, &self.id, event, on_delta)? {
+                    done = true;
                     break;
                 }
-                if line.is_empty() {
-                    continue;
-                }
-                let chunk: Value = match serde_json::from_str(line) {
-                    Ok(chunk) => chunk,
-                    Err(err) => {
-                        return Err(HxError::Provider(format!(
-                            "{}: a streamed chunk was not JSON ({err}): {}",
-                            self.id,
-                            truncate(line)
-                        )))
-                    }
-                };
-                for delta in apply_chunk(&mut accumulator, &chunk) {
-                    on_delta(delta)?;
-                }
+            }
+        }
+        // Flush the decoder (a vendor should not end mid-character, but a truncated connection
+        // might) and drain whatever framed or trailing events remain.
+        raw.push_str(&decoder.finish());
+        while let Some(event) = take_sse_event(&mut raw) {
+            if feed_event(&mut accumulator, &self.id, event, on_delta)? {
+                done = true;
+                break;
+            }
+        }
+        if !done {
+            if let Some(event) = take_trailing_sse_event(&mut raw) {
+                feed_event(&mut accumulator, &self.id, event, on_delta)?;
             }
         }
 
@@ -248,11 +256,14 @@ impl Provider for OpenAiCompatible {
 /// The request body for a streaming call: the non-streaming body with `stream: true`.
 ///
 /// Built from [`build_body`] rather than duplicated, so the two paths cannot drift on message
-/// shaping. The one deliberate difference is the stream flag; everything else — tool calls as
-/// strings, null assistant content — is shared.
+/// shaping. Two deliberate differences beyond the stream flag: `stream_options.include_usage`
+/// asks the vendor to send the terminal usage chunk — without it the stream carries no token
+/// counts at all and `finish_stream` can only report zeros, which silently breaks cost
+/// accounting and limiter reconciliation downstream.
 fn stream_body(req: &ChatRequest) -> Result<Value> {
     let mut body = build_body(req)?;
     body["stream"] = Value::Bool(true);
+    body["stream_options"] = json!({ "include_usage": true });
     Ok(body)
 }
 
@@ -271,11 +282,20 @@ pub struct StreamAccumulator {
     pub calls: Vec<Value>,
     /// Whether the turn ended with a tool call.
     pub tool_use: bool,
+    /// Token counts from the terminal usage chunk (`stream_options.include_usage` asks the
+    /// vendor to send one). Stays zero when the vendor never sends usage rather than failing
+    /// the turn — usage is reporting, and a provider that omits it should not fail a run.
+    pub usage: Usage,
 }
 
 /// Parse a vendor chunk and return the deltas it contributes.
 pub fn apply_chunk(acc: &mut StreamAccumulator, chunk: &Value) -> Vec<StreamDelta> {
     let mut out = Vec::new();
+    // The terminal usage chunk carries `usage` and usually *no* choices at all, so it is read
+    // before the early return below — otherwise `finish_stream` never sees any token counts.
+    if let Some(usage) = chunk.get("usage") {
+        acc.usage = merge_stream_usage(&acc.usage, usage);
+    }
     let Some(choice) = chunk.get("choices").and_then(|c| c.get(0)) else {
         return out;
     };
@@ -377,29 +397,152 @@ fn finish_stream(
 
     Ok(ChatResponse {
         message: Message::new(Role::Assistant, parts),
-        usage: Usage::default(),
+        usage: acc.usage,
         finish,
         model: requested_model.to_string(),
         raw: None,
     })
 }
 
-/// Pull the next complete SSE event (one `data:` line per the OpenAI stream) out of a buffer.
+/// Fold a streamed `usage` object into the running totals.
 ///
-/// The vendor separates events with a blank line (`\n\n`). A chunk split across TCP segments has
-/// no blank line yet in the buffer, so this waits for the terminator rather than halfway JSON. The
-/// buffer keeps any remainder, which is the next event waiting for its own terminator.
-fn take_sse_event(raw: &mut String) -> Option<String> {
-    let sep = raw.find("\n\n")?;
-    let event = raw[..sep].to_string();
-    raw.drain(..sep + 2);
-    let data = event
-        .lines()
-        .find_map(|line| line.strip_prefix("data:"))
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    Some(data)
+/// Field-by-field with "reported non-zero wins" rather than a wholesale overwrite: the usage
+/// chunk is normally terminal and complete, but a vendor that sends partial usage objects
+/// (prompt tokens on one chunk, completion tokens on another) must still end up with the full
+/// picture instead of the last partial object clobbering the earlier fields.
+fn merge_stream_usage(into: &Usage, reported: &Value) -> Usage {
+    // Each field keeps the largest value seen: the usage chunk is normally terminal and
+    // complete, but a vendor that splits usage across chunks (prompt tokens on one,
+    // completion tokens on another) must still end with the full picture rather than the
+    // last partial object clobbering earlier fields with zeros.
+    let best = |old: u64, fresh: u64| old.max(fresh);
+    let details = |obj: &str, field: &str| number(reported.get(obj).unwrap_or(&Value::Null), field);
+    Usage {
+        input_tokens: best(into.input_tokens, number(reported, "prompt_tokens")),
+        output_tokens: best(into.output_tokens, number(reported, "completion_tokens")),
+        // Detail objects nest the way the non-streaming response spells them
+        // (`prompt_tokens_details.cached_tokens`); a flat `cached_tokens` is accepted too
+        // because some gateways hoist it.
+        cached_input_tokens: into
+            .cached_input_tokens
+            .max(number(reported, "cached_tokens"))
+            .max(details("prompt_tokens_details", "cached_tokens")),
+        reasoning_tokens: into
+            .reasoning_tokens
+            .max(number(reported, "reasoning_tokens"))
+            .max(details("completion_tokens_details", "reasoning_tokens")),
+    }
+}
+
+/// One framed SSE event from an OpenAI-compatible stream.
+#[derive(Debug, PartialEq, Eq)]
+enum SseEvent {
+    /// A JSON payload to parse into a chunk.
+    Data(String),
+    /// The terminal `data: [DONE]` marker. The vendor will send nothing more after it, and the
+    /// outer read loop must stop on it rather than wait for EOF — a proxy that holds the
+    /// connection open past `[DONE]` would otherwise hang the request until the timeout.
+    Done,
+}
+
+/// Apply one framed event: parse a data payload into deltas, or report terminal state.
+///
+/// Returns `true` when the stream is over (`[DONE]`), which the caller propagates to the outer
+/// read loop. Keepalive comments arrive as empty data and are skipped, not parsed — asking
+/// serde for the meaning of nothing is an error nobody needs.
+fn feed_event(
+    acc: &mut StreamAccumulator,
+    id: &ProviderId,
+    event: SseEvent,
+    on_delta: &mut (dyn FnMut(StreamDelta) -> Result<()> + Send),
+) -> Result<bool> {
+    let line = match event {
+        SseEvent::Done => return Ok(true),
+        SseEvent::Data(line) => line,
+    };
+    if line.is_empty() {
+        return Ok(false);
+    }
+    let chunk: Value = match serde_json::from_str(&line) {
+        Ok(chunk) => chunk,
+        Err(err) => {
+            return Err(HxError::Provider(format!(
+                "{id}: a streamed chunk was not JSON ({err}): {}",
+                truncate(&line)
+            )))
+        }
+    };
+    for delta in apply_chunk(acc, &chunk) {
+        on_delta(delta)?;
+    }
+    Ok(false)
+}
+
+/// Pull the next complete SSE event out of a buffer.
+///
+/// Events end at a blank line, spelled `\n\n` or `\r\n\r\n` — a proxy that terminates lines
+/// with CRLF would otherwise buffer every event forever with no error at all. Within an event,
+/// comment lines (`: keepalive`) are skipped and multiple `data:` lines are joined with newlines,
+/// which is what the SSE spec says a multi-line data field means. A chunk split across TCP
+/// segments has no blank line yet in the buffer, so this returns `None` and waits rather than
+/// parsing halfway JSON; the buffer keeps the remainder for the next read.
+fn take_sse_event(raw: &mut String) -> Option<SseEvent> {
+    // `\r\n\r\n` contains no `\n\n`, so the two spellings need separate searches; the
+    // earlier terminator wins when both are present.
+    let lf = raw.find("\n\n");
+    let crlf = raw.find("\r\n\r\n");
+    let (sep, width) = match (lf, crlf) {
+        (Some(a), Some(b)) if a < b => (a, 2),
+        (Some(_), Some(b)) => (b, 4),
+        (Some(a), None) => (a, 2),
+        (None, Some(b)) => (b, 4),
+        (None, None) => return None,
+    };
+    let frame: String = raw.drain(..sep + width).collect();
+    Some(parse_sse_frame(&frame))
+}
+
+/// A final frame that never got its terminating blank line.
+///
+/// A stream that ends (or is cut) right after a data line with no trailing blank line would
+/// otherwise lose its last event — often the usage chunk. `None` when the remainder carries no
+/// `data:` at all, so trailing keepalive comments and empty tails stay silent.
+fn take_trailing_sse_event(raw: &mut String) -> Option<SseEvent> {
+    let rest = std::mem::take(raw);
+    if rest.lines().any(|line| {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        line.starts_with("data:")
+    }) {
+        Some(parse_sse_frame(&rest))
+    } else {
+        None
+    }
+}
+
+/// Read one framed event's text into its payload.
+///
+/// `data: [DONE]` (possibly padded with whitespace, as proxies do) is the terminal marker;
+/// anything else joins its `data:` lines. Comment-only frames carry no data and become empty
+/// payloads, which the caller skips.
+fn parse_sse_frame(frame: &str) -> SseEvent {
+    let mut data = Vec::new();
+    for line in frame.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.starts_with(':') {
+            continue; // a comment, which is what a keepalive is
+        }
+        if let Some((field, value)) = line.split_once(':') {
+            if field == "data" {
+                data.push(value.strip_prefix(' ').unwrap_or(value).to_string());
+            }
+        }
+    }
+    let payload = data.join("\n");
+    if payload.trim() == "[DONE]" {
+        SseEvent::Done
+    } else {
+        SseEvent::Data(payload)
+    }
 }
 
 /// The chat-completions URL for an API root.
@@ -1342,14 +1485,181 @@ mod tests {
         assert_eq!(take_sse_event(&mut raw), None, "nothing yet");
 
         raw.push_str("data: {\"a\":1}\n\n");
-        assert_eq!(take_sse_event(&mut raw).as_deref(), Some("{\"a\":1}"));
+        assert_eq!(
+            take_sse_event(&mut raw),
+            Some(SseEvent::Data("{\"a\":1}".into()))
+        );
 
         // A chunk split across segments has no blank line until the second segment arrives.
         raw.push_str("data: {\"b\":");
         assert_eq!(take_sse_event(&mut raw), None, "no terminator yet");
         raw.push_str("2}\n\n");
-        assert_eq!(take_sse_event(&mut raw).as_deref(), Some("{\"b\":2}"));
+        assert_eq!(
+            take_sse_event(&mut raw),
+            Some(SseEvent::Data("{\"b\":2}".into()))
+        );
         assert!(raw.is_empty(), "nothing left over: {raw:?}");
+    }
+
+    #[test]
+    fn a_stream_that_splits_a_multibyte_char_decodes_cleanly() {
+        // The failure mode behind the incremental decoder: an emoji split across two reads must
+        // decode whole. Per-chunk `from_utf8_lossy` would scar both halves with U+FFFD and the
+        // chunk would no longer parse as the JSON the vendor sent.
+        let text = "data: {\"choices\":[{\"delta\":{\"content\":\"hi 🌍\"}}]}\n\n";
+        let bytes = text.as_bytes();
+        let cut = text.find('🌍').unwrap() + 2; // inside the four-byte emoji
+
+        let mut decoder = crate::sse::Utf8StreamDecoder::new();
+        let mut raw = String::new();
+        raw.push_str(&decoder.push(&bytes[..cut]));
+        raw.push_str(&decoder.push(&bytes[cut..]));
+        raw.push_str(&decoder.finish());
+
+        let event = take_sse_event(&mut raw).expect("one complete event");
+        match event {
+            SseEvent::Data(line) => {
+                let chunk: serde_json::Value =
+                    serde_json::from_str(&line).expect("the reassembled chunk parses");
+                assert_eq!(
+                    chunk["choices"][0]["delta"]["content"], "hi 🌍",
+                    "no replacement scars"
+                );
+            }
+            SseEvent::Done => panic!("expected a data event"),
+        }
+    }
+
+    #[test]
+    fn crlf_separators_terminate_events_like_lf_does() {
+        // A proxy that terminates lines with CRLF must not cause every event to buffer forever
+        // with no error at all.
+        let mut raw = String::from("data: {\"a\":1}\r\n\r\n");
+        assert_eq!(
+            take_sse_event(&mut raw),
+            Some(SseEvent::Data("{\"a\":1}".into()))
+        );
+
+        // Mixed in one buffer: the earlier terminator wins and the later event waits its turn.
+        let mut mixed = String::from("data: {\"a\":1}\r\n\r\ndata: {\"b\":2}\n\n");
+        assert_eq!(
+            take_sse_event(&mut mixed),
+            Some(SseEvent::Data("{\"a\":1}".into()))
+        );
+        assert_eq!(
+            take_sse_event(&mut mixed),
+            Some(SseEvent::Data("{\"b\":2}".into()))
+        );
+    }
+
+    #[test]
+    fn comments_are_skipped_and_multiline_data_is_joined() {
+        // Keepalive comments carry nothing; multi-line data joins with newlines per the SSE spec.
+        let mut raw = String::from(": keepalive\n\n");
+        assert_eq!(
+            take_sse_event(&mut raw),
+            Some(SseEvent::Data(String::new()))
+        );
+
+        let mut multi = String::from("data: {\"a\":\ndata: 1}\n\n");
+        assert_eq!(
+            take_sse_event(&mut multi),
+            Some(SseEvent::Data("{\"a\":\n1}".into()))
+        );
+    }
+
+    #[test]
+    fn a_done_event_is_terminal_even_with_padding() {
+        // Proxies pad; the marker still ends the turn, and the caller propagates it to the outer
+        // read loop so a connection held open past `[DONE]` does not hang the request.
+        for frame in ["data: [DONE]\n\n", "data:  [DONE]  \r\n\r\n"] {
+            let mut raw = String::from(frame);
+            assert_eq!(take_sse_event(&mut raw), Some(SseEvent::Done), "{frame:?}");
+        }
+
+        let mut acc = StreamAccumulator::default();
+        let mut deltas = 0;
+        let mut on_delta = |_: StreamDelta| -> Result<()> {
+            deltas += 1;
+            Ok(())
+        };
+        assert!(
+            feed_event(&mut acc, &id(), SseEvent::Done, &mut on_delta).unwrap(),
+            "Done must report terminal state"
+        );
+        assert_eq!(deltas, 0, "the marker emits no delta");
+    }
+
+    #[test]
+    fn a_trailing_frame_without_a_blank_line_is_still_applied() {
+        // A stream cut right after a data line with no trailing blank line must not lose its
+        // last event — that tail is often the usage chunk.
+        let mut raw = String::from("data: {\"usage\":{\"prompt_tokens\":3}}\n");
+        assert_eq!(take_sse_event(&mut raw), None, "no terminator yet");
+        assert_eq!(
+            take_trailing_sse_event(&mut raw),
+            Some(SseEvent::Data("{\"usage\":{\"prompt_tokens\":3}}".into()))
+        );
+
+        // But a trailing keepalive comment or an empty tail stays silent.
+        let mut comment = String::from(": keepalive\n");
+        assert_eq!(take_trailing_sse_event(&mut comment), None);
+        let mut empty = String::new();
+        assert_eq!(take_trailing_sse_event(&mut empty), None);
+    }
+
+    #[test]
+    fn a_stream_body_asks_the_vendor_for_usage() {
+        // Without `stream_options.include_usage` the stream carries no token counts and
+        // `finish_stream` can only report zeros.
+        let req = ChatRequest::new("gpt-5", vec![Message::user("hi")]);
+        let streamed = stream_body(&req).unwrap();
+        assert_eq!(streamed["stream"], true);
+        assert_eq!(streamed["stream_options"]["include_usage"], true);
+        assert_eq!(streamed["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn a_terminal_usage_chunk_is_reported_by_finish_stream() {
+        // The usage chunk arrives last and carries no choices; it must still land in the
+        // accumulator, or the turn reports zeros and cost accounting silently breaks.
+        let mut acc = StreamAccumulator::default();
+        let deltas = apply_chunk(
+            &mut acc,
+            &json!({"choices": [{"delta": {"content": "hi"}}]}),
+        );
+        assert_eq!(deltas.len(), 1);
+        let usage_only = apply_chunk(
+            &mut acc,
+            &json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 3,
+                    "prompt_tokens_details": { "cached_tokens": 8 },
+                    "completion_tokens_details": { "reasoning_tokens": 1 }
+                }
+            }),
+        );
+        assert!(usage_only.is_empty(), "usage contributes no delta");
+
+        let response = finish_stream(&id(), &acc, "gpt-5").unwrap();
+        assert_eq!(response.message.text(), "hi");
+        assert_eq!(response.usage.input_tokens, 12);
+        assert_eq!(response.usage.output_tokens, 3);
+        assert_eq!(response.usage.cached_input_tokens, 8);
+        assert_eq!(response.usage.reasoning_tokens, 1);
+    }
+
+    #[test]
+    fn partial_usage_chunks_combine_rather_than_clobber() {
+        // A vendor that splits usage across chunks must still end with the full picture: a later
+        // partial object must not zero fields an earlier one reported.
+        let mut acc = StreamAccumulator::default();
+        apply_chunk(&mut acc, &json!({"usage": {"prompt_tokens": 10}}));
+        apply_chunk(&mut acc, &json!({"usage": {"completion_tokens": 4}}));
+        assert_eq!(acc.usage.input_tokens, 10);
+        assert_eq!(acc.usage.output_tokens, 4);
     }
 
     #[test]

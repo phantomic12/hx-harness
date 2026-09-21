@@ -52,6 +52,7 @@ pub mod openai;
 pub mod pool;
 pub mod provider;
 pub mod router;
+pub mod sse;
 
 pub use anthropic::AnthropicMessages;
 pub use limits::{Lease, LimitError, Limiter, TokenBucket};
