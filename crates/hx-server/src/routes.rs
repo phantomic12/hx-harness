@@ -879,15 +879,16 @@ pub struct FanOutChild {
 /// `POST /v1/fanout` — the fan-out request.
 ///
 /// `children` is the list of child calls. The returned outcome has one result per child, in
-/// request order. Every child in a fan-out runs against **one** caller session (the first
-/// child's), which is the single-session contract of `crate::fanout::run_fan_out`; the other
-/// children's `session` fields are accepted for shape and ignored, which
-/// `tests/fanout_merged.rs` pins.
+/// request order. Every child in a fan-out runs against **one** caller session, and the route
+/// refuses a request whose children name different sessions (400): silently billing one child's
+/// work to another child's session is exactly the surprise the per-row session inputs invite, so
+/// mixed sessions are a client error, not a silent re-bill.
 ///
 /// Refused before anything runs: an empty `children` array (400), a child whose prompt is blank
 /// (400 — the built-in web client refuses the same row, and a blank prompt is a model call that
-/// buys nothing), and the session the children will be recorded under when it does not exist (404).
-/// A refusal spends no provider call and writes nothing.
+/// buys nothing), children naming different sessions (400), and the session the children will be
+/// recorded under when it does not exist (404). A refusal spends no provider call and writes
+/// nothing.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct FanOutBody {
     pub children: Vec<FanOutChild>,
@@ -948,8 +949,21 @@ async fn fanout(
         }
     }
 
-    // `run_fan_out` runs every child against a single caller session; the first child's is
-    // that session. This is the primitive's documented contract, not a guess.
+    // `run_fan_out` runs every child against a single caller session. Mixed session ids used to
+    // be silently re-billed to the first child's session; now they are refused up front, before
+    // any provider call is spent — billing one child's work to another child's session is a
+    // client error, not a silent re-bill.
+    if body
+        .children
+        .iter()
+        .any(|c| c.session != body.children[0].session)
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "a fan-out runs every child against one session: \
+             all children must name the same session id",
+        ));
+    }
     let session = hx_core::ids::SessionId::from_raw(body.children[0].session.clone());
 
     // The session must already exist — every child's usage is recorded under it, and `hx fan`'s help

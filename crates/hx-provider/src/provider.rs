@@ -15,6 +15,7 @@ use hx_core::config::{Config, Price, ProviderKind};
 use hx_core::error::{HxError, Result};
 use hx_core::ids::ProviderId;
 use hx_core::message::{approximate_tokens, Message};
+use hx_core::pool::ReasoningEffort;
 use hx_secrets::Secret;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -70,6 +71,11 @@ pub enum FinishReason {
 }
 
 /// A request to a model.
+///
+/// `reasoning_effort` carries the pool-clamped value (see `hx_core::pool::Param`): the spawner
+/// sets it from the drawn member's effective params so a member that accepts the kind receives
+/// it and a member that rejects it never sees it on the wire. Adapters serialize it only where
+/// the vendor accepts it (OpenAI-compatible `reasoning_effort`); elsewhere it is held, not sent.
 #[derive(Clone, Debug)]
 pub struct ChatRequest {
     pub model: String,
@@ -78,6 +84,7 @@ pub struct ChatRequest {
     pub tools: Vec<ToolSpec>,
     pub max_tokens: u32,
     pub temperature: Option<f32>,
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl ChatRequest {
@@ -89,6 +96,7 @@ impl ChatRequest {
             tools: Vec::new(),
             max_tokens: 4096,
             temperature: None,
+            reasoning_effort: None,
         }
     }
 
@@ -109,6 +117,14 @@ impl ChatRequest {
 
     pub fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = Some(temperature);
+        self
+    }
+
+    /// WHY: the spawner clamps pool params at draw time; this is the hand-off that puts the
+    /// clamped value onto the request the provider is actually handed, instead of leaving it on
+    /// the spec where no adapter can see it.
+    pub fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(effort);
         self
     }
 

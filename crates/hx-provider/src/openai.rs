@@ -647,6 +647,18 @@ pub fn build_body(req: &ChatRequest) -> Result<Value> {
     if let Some(temperature) = req.temperature {
         body["temperature"] = json!(temperature);
     }
+    // WHY: a clamped `reasoning_effort` that stops at `ChatRequest` still never reaches the wire,
+    // which is the defect this field exists to close. The o-series/gpt-5 shape is `reasoning_effort`
+    // as a lowercase string; a member whose pool entry rejects the kind never gets here because the
+    // spawner only sets the field from effective (accepted) params.
+    if let Some(effort) = req.reasoning_effort {
+        let value = match effort {
+            hx_core::pool::ReasoningEffort::Low => "low",
+            hx_core::pool::ReasoningEffort::Medium => "medium",
+            hx_core::pool::ReasoningEffort::High => "high",
+        };
+        body["reasoning_effort"] = json!(value);
+    }
 
     Ok(body)
 }
@@ -1068,6 +1080,22 @@ mod tests {
         assert_eq!(body["max_tokens"], 1234);
         assert_eq!(body["temperature"], 0.25);
         assert_eq!(body["model"], "gpt-5");
+    }
+
+    #[test]
+    fn a_clamped_reasoning_effort_is_sent_and_an_unset_one_is_not() {
+        // WHY both halves: the spawner sets this field from the member's effective params, and a
+        // member that rejects the kind never gets it set — so "unset means absent on the wire" is
+        // the clamp's enforcement, and "set means present" is the fix for the defect where the
+        // clamp stopped at the spec and never reached the wire.
+        use hx_core::pool::ReasoningEffort as Effort;
+        let bare = build_body(&ChatRequest::new("gpt-5", vec![Message::user("hi")])).unwrap();
+        assert!(bare.get("reasoning_effort").is_none(), "{bare}");
+
+        let req =
+            ChatRequest::new("gpt-5", vec![Message::user("hi")]).with_reasoning_effort(Effort::Low);
+        let body = build_body(&req).unwrap();
+        assert_eq!(body["reasoning_effort"], "low", "{body}");
     }
 
     #[test]
