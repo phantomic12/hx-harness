@@ -16,12 +16,19 @@
 //!    success records a [`UsageRecord`] against the session whose `model` is the **drawn member** —
 //!    the "per-child model + cost in the audit chain" half. A call that fails marks the member down, so
 //!    the next draw comes from a healthy member.
+//! 3. [`Spawner::run_lane`] is the **re-route on member death across a running child**: it draws a
+//!    healthy member, makes **one** provider call against it, and if that member **dies** while running
+//!    (the pool's [`member_death`] rule: a 5xx/timeout/404, an exhausted quota, a refused
+//!    credential) it marks the member down and **re-draws onto the pool's next healthy member**, running
+//!    the same prompt there. It fails bounded when every member is down, and it records **both** the
+//!    members that died and the one that finished on the returned [`ChildRecord`] — a re-route is never
+//!    silent. A failure that is the child's own (a refused request, a policy denial) does **not**
+//!    re-route: it would be deterministic across every member.
 //!
 //! **What it does *not* run**, and which it names rather than claims: it does not start an agent
-//! loop, does not dispatch tools, and does not re-route a *running* lane when a member dies — that
-//! last one needs running children, which needs this spawner to exist first, and it is explicitly out of
-//! scope. `run_child` is a single provider call against the drawn member; it is the honest narrowest
-//! thing, not a fan-out.
+//! loop or dispatch tools. `run_child` is a single provider call against the drawn member; `run_lane`
+//! is a single prompt run that re-draws on member death. Neither is a fan-out — the spawner draws one
+//! lane, narrow and real.
 //!
 //! The pool, the clamp rule, and [`DrawError`] all live in `hx-core` (`pool.rs`); this module
 //! **reuses** them rather than inventing a second error type or a second clamp. A spec construction on
@@ -36,10 +43,10 @@
 //! proven to fail by a mutation.
 
 use chrono::Utc;
-use hx_core::error::Result;
+use hx_core::error::{HxError, Result};
 use hx_core::ids::{ProviderId, SessionId};
 use hx_core::message::Message;
-use hx_core::pool::{DrawError, ModelPool, Param, ParamClamp};
+use hx_core::pool::{member_death, DrawError, ModelPool, Param, ParamClamp};
 use hx_provider::{ChatRequest, ProviderRegistry};
 use hx_secrets::SecretStores;
 use hx_store::UsageRecord;
@@ -124,9 +131,8 @@ impl Spawner {
     /// The provider is resolved by the **drawn member's id** and the request is built with the
     /// **drawn member's** model, so the recorded [`UsageRecord`]'s `model` is the member this spec
     /// drew — not the first member, not a global. On a failed call the member is marked down, so the
-    /// next [`Self::build_spec`] draws from a healthy member. What is *not* done here — stated rather
-    /// than claimed — is re-routing a *running* lane; that needs running children and is out of scope
-    /// for the spawner that exists so far.
+    /// next [`Self::build_spec`] draws from a healthy member. This is the narrow one-shot form; for a
+    /// run that **re-routes onto a healthy member when the drawn one dies**, use [`Self::run_lane`].
     pub async fn run_child(
         &mut self,
         spec: &ChildSpec,
@@ -170,14 +176,139 @@ impl Spawner {
             clamps: spec.clamps.clone(),
             usage: record,
             base_url: spec.base_url.clone(),
+            dead_members: Vec::new(),
         })
+    }
+
+    /// Run a child that **re-routes on member death** and continues, rather than failing the lane.
+    ///
+    /// This is the half of M8 this module previously named out of scope ("needs running children").
+    /// It draws a healthy member from the pool, makes **one** provider call against it; if that member
+    /// **dies** while running — per [`member_death`], a 5xx/timeout/404, an exhausted quota, or a
+    /// refused credential — it marks the member down, **re-draws** onto the pool's next healthy member
+    /// and runs the same prompt there, and keeps going. It fails **bounded**: when the pool can draw
+    /// no healthy member it fails with the pool's own [`DrawError::AllDown`] (or `Empty`), exactly
+    /// as `build_spec` would — it never retries forever, and it never returns a success it did not
+    /// earn. The bound is "every member tried once each", stated as the loop's stop condition.
+    ///
+    /// **Audit.** The returned [`ChildRecord`] carries **both** sides of the re-route: the dying
+    /// members in [`ChildRecord::dead_members`] (each `id` with the reason it died) and the member
+    /// that **finished** as [`ChildRecord::model`], the one whose `UsageRecord` is persisted to the
+    /// store. A silent model switch — the audit showing the first member and nothing else — is the
+    /// failure mode this field exists to make impossible.
+    ///
+    /// **Only on death.** A failure that is the **child's own** — a [`HxError::ProviderRejected`]
+    /// 400/422 on the request, a policy denial, an unresolved credential reference, a missing route —
+    /// is deterministic: every member refuses it the same way. It **does not** trigger a re-route, and
+    /// it does **not** bench the member (the member is not down for a request it never saw); the run
+    /// returns that error directly. Re-routing a deterministic failure would turn one error into one per
+    /// member.
+    ///
+    /// The pool alone decides health: a member that dies here is marked down on the shared pool, so it
+    /// is gone for **subsequent** draws by other children, not just this one (`mark_down` is the
+    /// mechanism, not a lane-local flag).
+    ///
+    /// Hermetic: a scripted pool plus a scripted provider, no network; the only loop is over the
+    /// pool's own members, so it is bounded by construction and needs no wall-clock or sleep.
+    pub async fn run_lane(
+        &mut self,
+        session: &SessionId,
+        prompt: &str,
+        requested: &[Param],
+    ) -> Result<ChildRecord, hx_core::error::HxError> {
+        let mut dead_members: Vec<(String, String)> = Vec::new();
+        let mut spec = match self.build_spec(requested) {
+            Ok(spec) => spec,
+            Err(DrawError::Empty) => {
+                return Err(HxError::NoRoute(
+                    "the model pool has no members".to_string(),
+                ))
+            }
+            Err(DrawError::AllDown { members }) => {
+                let detail = members
+                    .iter()
+                    .map(|(id, reason)| format!("{id} ({reason})"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(HxError::Provider(format!(
+                    "every member of the model pool is down: {detail}"
+                )));
+            }
+        };
+        loop {
+            let provider = self
+                .providers
+                .resolve(&ProviderId::from(spec.member_id.clone()), spec.model())
+                .map_err(|err| hx_core::error::HxError::NoRoute(err.to_string()))?;
+            let key = self
+                .secrets
+                .resolve_str(&spec.credential)
+                .map_err(|err| hx_core::error::HxError::Secret(err.to_string()))?;
+
+            let request = ChatRequest::new(spec.model(), vec![Message::user(prompt)]);
+            match provider.complete(request, &key).await {
+                Ok(response) => {
+                    let usage = response.usage;
+                    let record = UsageRecord::new(
+                        spec.member_id.clone(),
+                        spec.credential.clone(),
+                        spec.model(),
+                        usage.input_tokens,
+                        usage.output_tokens,
+                    )
+                    .cached(usage.cached_input_tokens)
+                    .reasoning(usage.reasoning_tokens);
+                    self.store.record_usage(session, &record, Utc::now())?;
+                    return Ok(ChildRecord {
+                        model: spec.model().to_string(),
+                        credential: spec.credential.clone(),
+                        clamps: spec.clamps.clone(),
+                        usage: record,
+                        base_url: spec.base_url.clone(),
+                        dead_members,
+                    });
+                }
+                Err(err) => {
+                    if !member_death(&err) {
+                        // The child's own fault: deterministic across every member, so it must not
+                        // re-route and must not bench a member that never saw the bad request.
+                        return Err(err);
+                    }
+                    // The member died: mark it down (shared pool health, so later draws skip it) and,
+                    // if the pool still has a healthy member, re-draw and continue.
+                    self.pool
+                        .mark_down(&spec.member_id, err.to_string(), Utc::now());
+                    dead_members.push((spec.member_id.clone(), err.to_string()));
+                    // Re-draw onto a healthy member. AllDown / Empty means every member has been tried
+                    // once — the bound — so re-use the pool's own error rather than a second type.
+                    spec = match self.build_spec(requested) {
+                        Ok(next) => next,
+                        Err(DrawError::Empty) => {
+                            return Err(HxError::NoRoute(
+                                "the model pool has no members".to_string(),
+                            ))
+                        }
+                        Err(DrawError::AllDown { members }) => {
+                            let detail = members
+                                .iter()
+                                .map(|(id, reason)| format!("{id} ({reason})"))
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            return Err(HxError::Provider(format!(
+                                "every member of the model pool is down: {detail}"
+                            )));
+                        }
+                    };
+                }
+            }
+        }
     }
 }
 
 /// What a run produced and recorded for a child.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChildRecord {
-    /// The model (drawn member) this child ran on.
+    /// The model (drawn member) this child **finished** on.
     pub model: String,
     /// The credential **reference** that paid for it.
     pub credential: String,
@@ -187,6 +318,11 @@ pub struct ChildRecord {
     /// that is answerable after the fact.
     pub usage: UsageRecord,
     pub base_url: String,
+    /// The members that **died** while this child ran, in order, each `(member id, reason)`, before
+    /// the child re-routed and finished on [`ChildRecord::model`]. Empty when there was no re-route.
+    /// This is the audit half of a re-route: it shows both the member that died *and* the member that
+    /// finished, so a model switch is never silent.
+    pub dead_members: Vec<(String, String)>,
 }
 
 #[cfg(test)]
@@ -245,20 +381,37 @@ mod tests {
     }
 
     /// A provider that answers without a network. The id is the member it stands in for.
+    ///
+    /// `err` scripts *how* the member answers when it does not succeed, so tests can distinguish a
+    /// member death (a 5xx — worth re-routing) from a request the member refused (a 400 — not).
     struct ScriptedProvider {
         id: ProviderId,
-        fail: bool,
+        err: ScriptedErr,
+    }
+
+    /// The scripted answer a provider returns instead of a success.
+    #[derive(Clone, Copy)]
+    enum ScriptedErr {
+        /// Answer normally.
+        None,
+        /// A 5xx — the member itself failed, a death the re-route acts on.
+        Die,
+        /// A refused request — the child's fault, deterministic across every member.
+        Reject,
     }
 
     impl ScriptedProvider {
         fn new(id: &str) -> Self {
             Self {
                 id: ProviderId::from(id),
-                fail: false,
+                err: ScriptedErr::None,
             }
         }
         fn failing(self) -> Self {
-            Self { fail: true, ..self }
+            Self {
+                err: ScriptedErr::Die,
+                ..self
+            }
         }
     }
 
@@ -278,8 +431,18 @@ mod tests {
             _req: ChatRequest,
             _key: &hx_secrets::Secret,
         ) -> Result<hx_provider::ChatResponse> {
-            if self.fail {
-                return Err(HxError::Provider("upstream returned HTTP 500".to_string()));
+            match self.err {
+                ScriptedErr::Die => {
+                    return Err(HxError::Provider("upstream returned HTTP 500".to_string()))
+                }
+                ScriptedErr::Reject => {
+                    return Err(HxError::ProviderRejected {
+                        provider: self.id.to_string(),
+                        reason: "the request was rejected (HTTP 400): unknown parameter"
+                            .to_string(),
+                    })
+                }
+                ScriptedErr::None => {}
             }
             let usage = Usage {
                 input_tokens: 10,
@@ -448,5 +611,147 @@ mod tests {
             }
             other => panic!("must be AllDown, got {other:?}"),
         }
+    }
+
+    /// Build a registry with one scripted provider per `(id, err)` entry, so each member can be
+    /// scripted independently (die, reject, or succeed).
+    fn scripted_registry(specs: &[(&str, ScriptedErr)]) -> Arc<ProviderRegistry> {
+        let mut reg = ProviderRegistry::new();
+        for &(id, err) in specs {
+            reg.insert(Arc::new(ScriptedProvider {
+                id: ProviderId::from(id),
+                err,
+            }));
+        }
+        Arc::new(reg)
+    }
+
+    /// Secrets for a list of member ids, each under `vault:pool/<id>`.
+    fn scripted_secrets(ids: &[&str]) -> Arc<SecretStores> {
+        let mut built = FixedSecrets::new("vault");
+        for id in ids {
+            built = built.set(format!("pool/{id}"), format!("sentinel-{id}"));
+        }
+        Arc::new(SecretStores::new().with(Arc::new(built)))
+    }
+
+    /// A member that dies mid-flight is re-drawn onto a healthy member and the child continues — and the
+    /// audit shows **both**: the dying member in `dead_members`, the finishing member as the model.
+    #[tokio::test]
+    async fn a_member_that_dies_mid_flight_reroutes_and_records_both_members() {
+        let st = store();
+        let mut pen = Spawner::new(
+            ModelPool::new(vec![member("a", &[]), member("b", &[])]),
+            scripted_registry(&[("a", ScriptedErr::Die), ("b", ScriptedErr::None)]),
+            scripted_secrets(&["a", "b"]),
+            st.clone(),
+        );
+        let s = session(&st);
+        let rec = pen
+            .run_lane(s.id(), "hi", &[])
+            .await
+            .expect("the child re-routes and continues");
+
+        // The child finished on the healthy member…
+        assert_eq!(rec.model, "b", "the finish is on the healthy member");
+        assert_eq!(rec.usage.model, "b");
+        // …and the audit names the one that died and why — a model switch is never silent.
+        assert_eq!(rec.dead_members.len(), 1, "{:?}", rec.dead_members);
+        assert_eq!(rec.dead_members[0].0, "a");
+        assert!(
+            rec.dead_members[0].1.contains("500"),
+            "{:?}",
+            rec.dead_members
+        );
+        // Health is shared: a dead member stays down for a subsequent draw.
+        let spec = pen.build_spec(&[]).expect("b remains healthy");
+        assert_eq!(spec.model(), "b");
+    }
+
+    /// When every member dies, the run fails bounded with the pool's own AllDown error — it never retries
+    /// forever and never returns a success it did not earn.
+    #[tokio::test]
+    async fn a_run_where_every_member_dies_fails_bounded_and_names_each_member() {
+        let st = store();
+        let mut pen = Spawner::new(
+            ModelPool::new(vec![member("a", &[]), member("b", &[])]),
+            scripted_registry(&[("a", ScriptedErr::Die), ("b", ScriptedErr::Die)]),
+            scripted_secrets(&["a", "b"]),
+            st.clone(),
+        );
+        let s = session(&st);
+        let err = pen
+            .run_lane(s.id(), "hi", &[])
+            .await
+            .expect_err("every member is down");
+        let text = err.to_string();
+        assert!(
+            text.contains("every member of the model pool is down"),
+            "{text}"
+        );
+        assert!(text.contains("a") && text.contains("b"), "{text}");
+        // Bounded: exactly the pool's members were tried, once each.
+        assert_eq!(
+            pen.pool
+                .members
+                .iter()
+                .filter(|m| matches!(m.health, MemberHealth::Down { .. }))
+                .count(),
+            2
+        );
+    }
+
+    /// A failure that is the child's own — a refused request — does **not** re-route and does **not**
+    /// bench the member that refused it: retrying it across the pool would make one error into N.
+    #[tokio::test]
+    async fn a_refused_request_does_not_reroute_and_does_not_bench_the_member() {
+        let st = store();
+        let mut pen = Spawner::new(
+            ModelPool::new(vec![member("a", &[]), member("b", &[])]),
+            scripted_registry(&[("a", ScriptedErr::Reject), ("b", ScriptedErr::None)]),
+            scripted_secrets(&["a", "b"]),
+            st.clone(),
+        );
+        let s = session(&st);
+        let err = pen
+            .run_lane(s.id(), "hi", &[])
+            .await
+            .expect_err("the request is refused, not the member");
+        assert!(matches!(err, HxError::ProviderRejected { .. }), "{err:?}");
+        // a (which never actually failed) is still healthy — a refused request must not bench the member.
+        assert_eq!(
+            pen.pool.members[0].health,
+            MemberHealth::Healthy,
+            "a refused request must not bench the member"
+        );
+        // A subsequent draw reaches the healthy set (b, by the round-robin cursor) and can still run.
+        let spec = pen.build_spec(&[]).expect("a healthy member remains");
+        assert_eq!(spec.model(), "b");
+    }
+
+    /// No providers registered for the drawn member is a configuration fact (NoRoute), not a member death:
+    /// it must not re-route and must not bench.
+    #[tokio::test]
+    async fn a_missing_provider_route_is_not_a_member_death_and_does_not_reroute() {
+        let st = store();
+        // a draws, but no provider is registered for it.
+        let mut pen = Spawner::new(
+            ModelPool::new(vec![member("a", &[]), member("b", &[])]),
+            scripted_registry(&[("b", ScriptedErr::None)]),
+            scripted_secrets(&["a", "b"]),
+            st.clone(),
+        );
+        let s = session(&st);
+        let err = pen
+            .run_lane(s.id(), "hi", &[])
+            .await
+            .expect_err("no route to a is a config fact, not a death");
+        assert!(matches!(err, HxError::NoRoute(_)), "{err:?}");
+        // a is not benched: a missing provider route is a config fact, not a health one.
+        assert_eq!(
+            pen.pool.members[0].health,
+            MemberHealth::Healthy,
+            "a missing route is not a member death"
+        );
     }
 }
