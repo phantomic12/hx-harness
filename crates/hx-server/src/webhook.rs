@@ -91,7 +91,11 @@ pub struct WebhookRegistry {
 impl WebhookRegistry {
     /// Register a connector's push endpoint, handing back the receiver the `hx-gateway` connector is
     /// built from, with the default queue bound.
-    pub fn register(&mut self, id: &ConnectorId, token: ApiToken) -> (Sender<Inbound>, Receiver<Inbound>) {
+    pub fn register(
+        &mut self,
+        id: &ConnectorId,
+        token: ApiToken,
+    ) -> (Sender<Inbound>, Receiver<Inbound>) {
         self.register_with_capacity(id, token, DEFAULT_WEBHOOK_QUEUE_CAPACITY)
     }
 
@@ -128,7 +132,9 @@ impl WebhookRegistry {
                 // A panic while holding the map must not wedge every later registration into a
                 // refusal: the state behind the lock is driver handles, and losing one insert's
                 // atomicity is better than losing the whole webhook surface.
-                poisoned.into_inner().insert(id.to_string(), Arc::new(connector));
+                poisoned
+                    .into_inner()
+                    .insert(id.to_string(), Arc::new(connector));
             }
         }
     }
@@ -330,8 +336,12 @@ mod tests {
         let mut registry = WebhookRegistry::default();
         let id = ConnectorId::from("main-web");
         let (sender, _rx) = registry.register_with_capacity(&id, ApiToken::new("secret"), 2);
-        sender.try_send(test_push(&id, "one")).expect("the first push fits");
-        sender.try_send(test_push(&id, "two")).expect("the second push fits");
+        sender
+            .try_send(test_push(&id, "one"))
+            .expect("the first push fits");
+        sender
+            .try_send(test_push(&id, "two"))
+            .expect("the second push fits");
         let refused = sender.try_send(test_push(&id, "three"));
         assert!(
             matches!(refused, Err(TrySendError::Full(_))),
@@ -348,7 +358,9 @@ mod tests {
         let id = ConnectorId::from("main-web");
         let (sender, _rx) = registry.register_with_capacity(&id, ApiToken::new("secret"), 2);
         assert_eq!(registry.queue_depth("main-web"), Some(0));
-        sender.try_send(test_push(&id, "hi")).expect("an empty queue takes the push");
+        sender
+            .try_send(test_push(&id, "hi"))
+            .expect("an empty queue takes the push");
         assert_eq!(
             registry.queue_depths(),
             vec![WebhookQueueDepth {
@@ -369,7 +381,9 @@ mod tests {
         let id = ConnectorId::from("main-web");
         let (sender, _rx) = registry.register_with_capacity(&id, ApiToken::new("secret"), 0);
         assert_eq!(registry.connectors["main-web"].capacity, 1);
-        sender.try_send(test_push(&id, "hi")).expect("the clamped slot takes a push");
+        sender
+            .try_send(test_push(&id, "hi"))
+            .expect("the clamped slot takes a push");
     }
 
     #[tokio::test]
@@ -465,7 +479,12 @@ connectors:
         .await;
         let status = response.status();
         let headers = response.headers().clone();
-        let bytes = response.into_body().collect().await.expect("a body").to_bytes();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("a body")
+            .to_bytes();
         let json = serde_json::from_slice(&bytes).expect("a JSON refusal");
         (status, headers, json)
     }
@@ -484,9 +503,15 @@ connectors:
             serde_json::json!({ "chat": "777", "text": "list the repo" }),
         )
         .await;
-        assert_eq!((status, body), (StatusCode::OK, serde_json::json!({ "accepted": true })));
+        assert_eq!(
+            (status, body),
+            (StatusCode::OK, serde_json::json!({ "accepted": true }))
+        );
 
-        let driver = state.webhooks.driver("main-web").expect("build retains the driver");
+        let driver = state
+            .webhooks
+            .driver("main-web")
+            .expect("build retains the driver");
         let received = driver
             .receive(&hx_secrets::Secret::new(""))
             .await
@@ -515,7 +540,12 @@ connectors:
         let (status, headers, refused) =
             post(&state, "main-web", Some("test-supersecret"), body).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(headers.get(header::RETRY_AFTER).map(|v| v.to_str().unwrap()), Some("1"));
+        assert_eq!(
+            headers
+                .get(header::RETRY_AFTER)
+                .map(|v| v.to_str().unwrap()),
+            Some("1")
+        );
         assert_eq!(refused["retryable"], true);
         assert_eq!(state.webhooks.queue_depth("main-web"), Some(1));
 
