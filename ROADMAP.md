@@ -743,19 +743,21 @@ pure, self-contained module a future spawner will draw from. That is what has la
 
 The routing reasoning this milestone is about, restated for what remains: lanes could not differ because a fan-out
 has no per-child model to differ; one model's parameter set is not another's because a 400 for `reasoning_effort`
-is a 400; one upstream can take down every lane because all children share the model. The pool, the spawner and
-`run_lane` here remove the second ceiling (clamping), the shared-model property (members carry their own endpoint,
-credential, parameters and health), the per-child model + cost in the audit chain, and the re-route of a running
-child onto a healthy member when its member dies. What still is **not** built is a full subagent runtime: nothing in
-this repository yet spawns **N concurrent lanes** as a fan-out and drives them to a result — `run_lane` is a
-single prompt run that re-draws on death, not an orchestrator over many concurrent children.
+is a 400; one upstream can take down every lane because all children share the model. The pool, the spawner, the
+fan-out module and `run_lane` here remove the three ceilings: clamping, the shared-model property (members carry
+their own endpoint, credential, parameters and health), the per-child model + cost in the audit chain, the fan-out
+of N children across N distinct members, and the re-route of a running child onto a healthy member when its member
+dies. What still is **not** built is a full subagent runtime: nothing in this repository yet spawns **N concurrent
+lanes** as a fan-out and drives them to a result — `run_lane` is a single prompt run that re-draws on death, and
+the fan-out runs the children it allocates sequentially (a dead child stops its own lane and the rest continue).
 
-**Exit criteria** (mostly met by the spawner; the fan-out remains open): **a fan-out of N lanes runs across N
-members of a pool, each lane's model recorded in the audit chain** — still open, needs a runtime that spawns N
-concurrent children; **killing one member's upstream mid-run re-routes** — **met** for a single running child
-(`Spawner::run_lane` re-draws onto a healthy member, bounded by the pool's `AllDown`, with both the dying and
-the finishing member recorded, no operator action and no stall); a lane whose model rejects a configured parameter is
-clamped and runs instead of failing at spawn — **met** (`build_spec` clamps at spawn).
+**Exit criteria**: ✅ **a fan-out of N lanes runs across N members of a pool, each lane's model recorded in the
+audit chain** — met by the fan-out module (`crates/hx-server/src/fanout.rs`), tested over a scripted pool and a
+scripted provider with each assertion proven to fail by a mutation; **killing one member's upstream mid-run
+re-routes** — **met** for a single running child (`Spawner::run_lane` re-draws onto a healthy member, bounded by
+the pool's `AllDown`, with both the dying and the finishing member recorded, no operator action and no stall); a
+lane whose model rejects a configured parameter is clamped and runs instead of failing at spawn — **met**
+(`build_spec` clamps at spawn).
 
 ---
 

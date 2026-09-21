@@ -1,0 +1,497 @@
+//! A fan-out of N children across N **distinct** members of one pool (M8's exit criterion).
+//!
+//! ## What this module is, said plainly
+//!
+//! [`crates::spawn`] gives you a **narrowest real thing**: [`Spawner::build_spec`] draws one
+//! healthy member and clamps a parameter set to it, and [`Spawner::run_child`] makes one provider
+//! call against that drawn member and records a `UsageRecord` whose `model` is the member. A single
+//! spec is not a fan-out — and the whole point of M8 is that a fan-out runs **N children across N
+//! distinct members**, not N copies of one. That is what lives here.
+//!
+//! This module *consumes* the spawner's public API (`build_spec` + `run_child`); it does not touch
+//! `spawn.rs`. The sibling M8 lane (`feat/m8-reroute`) owns `spawn.rs` — re-route on member
+//! death across *running* lanes — so this lane deliberately builds its fan-out beside it, not inside it.
+//!
+//! ## Two phases, and why
+//!
+//! The fan-out is deliberately split into **allocate** then **execute**:
+//!
+//! 1. **Allocate** — draw N specs up front and check that they land on **N distinct members**. With
+//!    N healthy members the round-robin draw produces N distinct ids; with M < N healthy members it
+//!    repeats once the healthy set is exhausted, which is exactly how a short pool is *detected* rather
+//!    than guessed. If the drawn specs are not all distinct, the fan-out returns
+//!    [`FanOutError::NotEnoughMembers`] naming how many were wanted and how many distinct healthy
+//!    members exist — it does **not** silently run two children on one member.
+//! 2. **Execute** — run each allocated spec with [`Spawner::run_child`], collecting one result per
+//!    child. Because allocation is done in full before any run starts, every spec already targets its own
+//!    member; a member that dies *during* its own run fails that one child and is marked down, but the
+//!    other N-1 children run on their own distinct members and still complete. **A dead member
+//!    mid-fan-out does not kill the others.** (Full re-route of a *running* child onto a fresh
+//!    member is the sibling lane's job; this lane only guarantees the others are not cancelled by it.)
+//!
+//! ## Policy: a short pool fails loudly
+//!
+//! Item 3 of the brief — *"N children but only M < N healthy members: say what happens (queue? fail?
+//! run on fewer?) and test it."* This lane chooses **fail**: the exit criterion is specifically "N
+//! lanes across N members", so when the pool cannot supply N distinct members the criterion cannot be met,
+//! and running some lanes on fewer members would silently degrade the guarantee. Queuing would hide the
+//! shortage behind an unbounded wait. [`FanOutError::NotEnoughMembers`] says plainly what was wanted
+//! and what was available, and the caller decides (retry later, run a smaller fan-out, error to the
+//! user).
+//!
+//! ## Each child's model is recorded with that child
+//!
+//! [`FanOutOutcome::children`] carries, per child in request order, the [`ChildRecord`] `run_child`
+//! produced — whose `model` is the **drawn member** and whose `usage` already landed in the store's
+//! audit chain. "Which model did which piece of work, and at what cost" is answerable per child from
+//! the outcome without re-deriving it.
+//!
+//! ## Hermetic by construction
+//!
+//! The tests here use a **scripted pool and a scripted provider** — no network, no real model, no
+//! sleeps. The two phases are proven independently: the distinctness assertion can fail (drop it and the
+//! N-distinct test goes red), the short-pool detection can fail (remove it and the short-pool test goes
+//! red), and the run-all-children-despite-a-death property can fail (abort the fan-out on the first
+//! child error and the dead-member test goes red). Each mutation and the test it reddens is recorded in
+//! `TESTING.md`.
+
+use crate::spawn::{ChildRecord, Spawner};
+use hx_core::ids::SessionId;
+use std::collections::BTreeSet;
+
+/// A recognized way a fan-out can fail to meet its guarantee, before or during execution.
+///
+/// This is separate from the [`hx_core::error::HxError`] a single child's provider call returns so
+/// that the caller can tell "the fan-out as a whole could not be met" (allocation) from "one child
+/// failed" (execution, where the others still ran).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FanOutError {
+    /// The pool could not supply N distinct healthy members. `wanted` is the number of children
+    /// requested; `distinct` is how many distinct healthy members the pool actually offered.
+    NotEnoughMembers { wanted: usize, distinct: usize },
+
+    /// Building a spec failed because the pool is empty or every member is down. Carries the spawner's
+    /// own [`hx_core::pool::DrawError`], which names the condition and every member's reason.
+    Draw(hx_core::pool::DrawError),
+}
+
+impl std::fmt::Display for FanOutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FanOutError::NotEnoughMembers { wanted, distinct } => write!(
+                f,
+                "cannot fan out {wanted} children across {distinct} distinct healthy \
+                 members: the pool is too short to give each child its own member"
+            ),
+            FanOutError::Draw(e) => write!(f, "a spec could not be drawn: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for FanOutError {}
+
+/// The result of one child's run, in the same order as its input prompt.
+///
+/// Every child is attempted even if another dies; a dead member surfaces as [`ChildOutcome::Errored`]
+/// for that child only, and the others are [`ChildOutcome::Ran`] with their own recorded record.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChildOutcome {
+    /// The child completed. `record` names the **member** it ran on and its recorded usage.
+    Ran(ChildRecord),
+    /// The child failed. `member` is the member it was drawn to run on; `error` is the provider
+    /// failure that marked it down.
+    Errored { member: String, error: String },
+}
+
+/// The whole fan-out: one outcome per input prompt, plus the answer to "did the N-distinct guarantee
+/// hold".
+#[derive(Clone, Debug, PartialEq)]
+pub struct FanOutOutcome {
+    /// The members the fan-out actually drew, one per child (N of them, by construction distinct
+    /// unless the pool is short). The exit criterion's "N members, not N copies of one" is asserted
+    /// by [`FanOutOutcome::members_are_distinct`].
+    pub members: Vec<String>,
+    /// One outcome per prompt, in request order.
+    pub children: Vec<ChildOutcome>,
+}
+
+impl FanOutOutcome {
+    /// True when every child was drawn onto its own distinct member — the M8 exit criterion.
+    pub fn members_are_distinct(&self) -> bool {
+        let set: BTreeSet<&str> = self.members.iter().map(String::as_str).collect();
+        set.len() == self.members.len()
+    }
+
+    /// The members that actually completed, for callers that want "which model did the work".
+    pub fn completed_models(&self) -> Vec<&str> {
+        self.children
+            .iter()
+            .filter_map(|c| match c {
+                ChildOutcome::Ran(rec) => Some(rec.model.as_str()),
+                ChildOutcome::Errored { .. } => None,
+            })
+            .collect()
+    }
+}
+
+/// Run a fan-out of `prompts.len()` children across that many **distinct** members of one pool.
+///
+/// # Guarantees
+///
+/// 1. **N members, not N copies of one.** Every child is allocated a spec *before* any runs, and the
+///    drawn members are asserted distinct. If the pool cannot supply N distinct healthy members the call
+///    returns [`FanOutError::NotEnoughMembers`] and **no child runs** (nothing is half-done).
+/// 2. **Each child's model is recorded with that child.** A completed child's [`ChildRecord`] names its
+///    member and its recorded usage.
+/// 3. **A dead member mid-fan-out does not kill the others.** Every allocated child is still run; a
+///    failure marks its own member down and is reported as [`ChildOutcome::Errored`] for that child.
+///
+/// The spawner is taken by `&mut` because `build_spec` and `run_child` both need it (they own the
+/// pool's health state and the store). All children run against the single caller session.
+pub async fn run_fan_out(
+    spawner: &mut Spawner,
+    session: &SessionId,
+    prompts: &[&str],
+) -> Result<FanOutOutcome, FanOutError> {
+    let wanted = prompts.len();
+
+    // Phase 1 — allocate one spec per child, checking distinctness as we go.
+    let mut members = Vec::with_capacity(wanted);
+    let mut specs = Vec::with_capacity(wanted);
+    for _ in 0..wanted {
+        let spec = spawner.build_spec(&[]).map_err(FanOutError::Draw)?;
+        members.push(spec.member_id.clone());
+        specs.push(spec);
+    }
+
+    let distinct: BTreeSet<&str> = members.iter().map(String::as_str).collect();
+    if distinct.len() < wanted {
+        // The round-robin draw can only repeat once the healthy set is exhausted, so a repeat here
+        // means there are genuinely fewer than N distinct healthy members. Fail before any child runs.
+        return Err(FanOutError::NotEnoughMembers {
+            wanted,
+            distinct: distinct.len(),
+        });
+    }
+
+    // Phase 2 — run every allocated child, regardless of how its siblings fare.
+    let mut children = Vec::with_capacity(wanted);
+    for spec in &specs {
+        match spawner.run_child(spec, session, "fan-out child").await {
+            Ok(record) => children.push(ChildOutcome::Ran(record)),
+            Err(err) => children.push(ChildOutcome::Errored {
+                member: spec.member_id.clone(),
+                error: err.to_string(),
+            }),
+        }
+    }
+
+    Ok(FanOutOutcome { members, children })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use hx_core::config::ProviderKind;
+    use hx_core::error::{HxError, Result};
+    use hx_core::ids::ProviderId;
+    use hx_core::message::Message;
+    use hx_core::pool::{MemberHealth, PoolMember};
+    use hx_provider::{ChatRequest, ChatResponse, FinishReason, Provider, ProviderRegistry, Usage};
+    use hx_secrets::{FixedSecrets, Secret, SecretStores};
+    use hx_store::NewSession;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("fixed test timestamp")
+    }
+
+    fn member(id: &str) -> PoolMember {
+        PoolMember {
+            id: id.to_string(),
+            base_url: format!("https://{id}.example.test"),
+            credential: format!("vault:pool/{id}"),
+            accepts: Vec::new(),
+            health: MemberHealth::Healthy,
+        }
+    }
+
+    fn secrets_for(ids: &[&str]) -> Arc<SecretStores> {
+        let mut s = FixedSecrets::new("vault");
+        for id in ids {
+            s = s.set(format!("pool/{id}"), format!("sentinel-{id}"));
+        }
+        Arc::new(SecretStores::new().with(Arc::new(s)))
+    }
+
+    fn store() -> Arc<hx_store::Store> {
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let mut path = std::env::temp_dir();
+        path.push(format!("hx-fanout-{}-{n}.db", std::process::id()));
+        Arc::new(hx_store::Store::open(path).expect("test store opens"))
+    }
+
+    fn session(store: &hx_store::Store) -> hx_store::Session {
+        let rec = store
+            .create(NewSession::new(), now())
+            .expect("session created");
+        store.load(&rec.id).expect("session loads")
+    }
+
+    /// A provider that answers without a network. `id` is the member it stands in for; `fail` makes
+    /// its one call error (a dead member) so the fan-out can test non-cascade.
+    struct ScriptedProvider {
+        id: ProviderId,
+        fail: bool,
+    }
+
+    impl ScriptedProvider {
+        fn new(id: &str) -> Self {
+            Self {
+                id: ProviderId::from(id),
+                fail: false,
+            }
+        }
+        fn failing(self) -> Self {
+            Self { fail: true, ..self }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for ScriptedProvider {
+        fn id(&self) -> &ProviderId {
+            &self.id
+        }
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Openai
+        }
+        fn models(&self) -> &[String] {
+            &[]
+        }
+        async fn complete(&self, _req: ChatRequest, _key: &Secret) -> Result<ChatResponse> {
+            if self.fail {
+                return Err(HxError::Provider("upstream returned HTTP 500".to_string()));
+            }
+            Ok(ChatResponse {
+                message: Message::assistant("done"),
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+                finish: FinishReason::Stop,
+                model: self.id.to_string(),
+                raw: None,
+            })
+        }
+    }
+
+    fn registry_for(ids: &[&str]) -> Arc<ProviderRegistry> {
+        let mut reg = ProviderRegistry::new();
+        for id in ids {
+            reg.insert(Arc::new(ScriptedProvider::new(id)));
+        }
+        Arc::new(reg)
+    }
+
+    /// The M8 exit criterion as a test: a fan-out of N requests over a pool of N healthy members
+    /// reaches **N distinct** members, every child completes, and each completed child's record names the
+    /// member it drew — not a global, not a copy of the first.
+    #[tokio::test]
+    async fn a_fan_out_of_n_requests_reaches_n_distinct_members() {
+        let st = store();
+        let mut sp = Spawner::new(
+            hx_core::pool::ModelPool::new(vec![member("cheap"), member("strong"), member("mid")]),
+            registry_for(&["cheap", "strong", "mid"]),
+            secrets_for(&["cheap", "strong", "mid"]),
+            st.clone(),
+        );
+        let s = session(&st);
+        let prompts = ["do a", "do b", "do c"];
+
+        let out = run_fan_out(&mut sp, s.id(), &prompts)
+            .await
+            .expect("a fan-out across three healthy members must succeed");
+        assert_eq!(out.members.len(), 3);
+        assert!(
+            out.members_are_distinct(),
+            "N children must reach N distinct members, got {}",
+            out.members.join(", ")
+        );
+        assert_eq!(out.children.len(), 3);
+        // Every child completed.
+        let mut completed = out.completed_models();
+        completed.sort_unstable();
+        assert_eq!(completed, vec!["cheap", "mid", "strong"]);
+        // Per-child attribution: the record's model is that child's member.
+        let models: Vec<&str> = out
+            .children
+            .iter()
+            .map(|c| match c {
+                ChildOutcome::Ran(rec) => rec.model.as_str(),
+                ChildOutcome::Errored { .. } => panic!("all children ran"),
+            })
+            .collect();
+        assert_eq!(
+            models,
+            vec!["cheap", "strong", "mid"],
+            "child order maps to member"
+        );
+        // And each ran over a distinct member (the whole point — a different cost base per lane).
+        for rec in &out.children {
+            let rec = match rec {
+                ChildOutcome::Ran(r) => r,
+                _ => unreachable!(),
+            };
+            assert_eq!(rec.usage.model, rec.model);
+        }
+    }
+
+    /// Each child's model is recorded *with that child* and lands in the store's audit chain, so
+    /// "which model did which piece of work at what cost" is answerable per child.
+    #[tokio::test]
+    async fn every_children_model_is_recorded_with_that_child_in_the_audit_chain() {
+        let st = store();
+        let mut sp = Spawner::new(
+            hx_core::pool::ModelPool::new(vec![member("a"), member("b")]),
+            registry_for(&["a", "b"]),
+            secrets_for(&["a", "b"]),
+            st.clone(),
+        );
+        let s = session(&st);
+
+        let out = run_fan_out(&mut sp, s.id(), &["p1", "p2"])
+            .await
+            .expect("two healthy members");
+        let models = out.completed_models();
+        assert_eq!(models.len(), 2);
+
+        // The audit chain holds two provider calls with the drawn members, not N copies of one.
+        let totals = st.totals(s.id()).expect("totals read");
+        assert_eq!(totals.provider_calls, 2);
+        assert_eq!(totals.input_tokens, 20, "2 children * 10 input tokens");
+        // And the outcome names which member did which — the per-child model is carried on the record.
+        let mut seen = BTreeSet::new();
+        for c in &out.children {
+            if let ChildOutcome::Ran(rec) = c {
+                seen.insert(rec.model.clone());
+            }
+        }
+        assert_eq!(seen.len(), 2, "each child recorded a distinct member");
+    }
+
+    /// Item 3: a fan-out of N requests across a pool with M < N distinct healthy members fails loudly
+    /// (naming wanted vs distinct) and runs **no** child — it does not silently run two children on one
+    /// member.
+    #[tokio::test]
+    async fn a_short_pool_is_reported_honestly_and_runs_nothing() {
+        let st = store();
+        let mut sp = Spawner::new(
+            hx_core::pool::ModelPool::new(vec![member("a"), member("b")]),
+            registry_for(&["a", "b"]),
+            secrets_for(&["a", "b"]),
+            st.clone(),
+        );
+        let s = session(&st);
+
+        // Three requests, only two distinct healthy members.
+        let err = run_fan_out(&mut sp, s.id(), &["p1", "p2", "p3"])
+            .await
+            .expect_err("the pool cannot give three children three distinct members");
+        assert_eq!(
+            err,
+            FanOutError::NotEnoughMembers {
+                wanted: 3,
+                distinct: 2
+            }
+        );
+        // No child ran (allocation fails before execution), so the audit chain is empty.
+        let totals = st.totals(s.id()).expect("totals read");
+        assert_eq!(totals.provider_calls, 0);
+    }
+
+    /// Item 4: a dead member mid-fan-out does not kill the others. One of two members is scripted to
+    /// fail; the fan-out still runs the other and completes it with its record.
+    #[tokio::test]
+    async fn a_dead_member_mid_fan_out_does_not_kill_the_others() {
+        // Registry: "a" is scripted to fail, "b" succeeds.
+        let mut reg = ProviderRegistry::new();
+        reg.insert(Arc::new(ScriptedProvider::new("a").failing()));
+        reg.insert(Arc::new(ScriptedProvider::new("b")));
+        let st = store();
+        let mut sp = Spawner::new(
+            hx_core::pool::ModelPool::new(vec![member("a"), member("b")]),
+            Arc::new(reg),
+            secrets_for(&["a", "b"]),
+            st.clone(),
+        );
+        let s = session(&st);
+
+        let out = run_fan_out(&mut sp, s.id(), &["p1", "p2"])
+            .await
+            .expect("two children allocated across two distinct members");
+        // Both were attempted; the dead one errored, the other completed on its own member.
+        let mut saw_errored = false;
+        let mut saw_ran = false;
+        for c in &out.children {
+            match c {
+                ChildOutcome::Errored { member, .. } => {
+                    assert_eq!(member, "a", "the failing member is the one that errors");
+                    saw_errored = true;
+                }
+                ChildOutcome::Ran(rec) => {
+                    assert_eq!(rec.model, "b", "the healthy member completes");
+                    saw_ran = true;
+                }
+            }
+        }
+        assert!(
+            saw_errored && saw_ran,
+            "one errored, one completed — got {out:?}"
+        );
+    }
+
+    /// An all-down pool cannot even allocate the first spec: the spawner's own `DrawError` is named.
+    #[tokio::test]
+    async fn an_all_down_pool_fails_at_allocation_with_the_pools_error() {
+        let mut pool = hx_core::pool::ModelPool::new(vec![member("a"), member("b")]);
+        pool.mark_down("a", "boom-a", now());
+        pool.mark_down("b", "boom-b", now());
+        let st = store();
+        let mut sp = Spawner::new(
+            pool,
+            registry_for(&["a", "b"]),
+            secrets_for(&["a", "b"]),
+            st.clone(),
+        );
+        let s = session(&st);
+
+        match run_fan_out(&mut sp, s.id(), &["p1"]).await {
+            Err(FanOutError::Draw(hx_core::pool::DrawError::AllDown { members })) => {
+                assert_eq!(members.len(), 2);
+            }
+            other => panic!("must be Draw(AllDown), got {other:?}"),
+        }
+    }
+
+    /// An empty pool fails at allocation with the pool's `Empty` error.
+    #[tokio::test]
+    async fn an_empty_pool_fails_at_allocation() {
+        let st = store();
+        let mut sp = Spawner::new(
+            hx_core::pool::ModelPool::new(vec![]),
+            registry_for(&[]),
+            secrets_for(&[]),
+            st.clone(),
+        );
+        let s = session(&st);
+        assert_eq!(
+            run_fan_out(&mut sp, s.id(), &["p1"]).await,
+            Err(FanOutError::Draw(hx_core::pool::DrawError::Empty))
+        );
+    }
+}
