@@ -22,8 +22,8 @@
 //! encrypted vault, capability probing on connect, and binary-safe file transfer.
 
 use crate::host::{
-    BoundedOutput, caps_from_uname, caps_from_ver, check_cap, enrich_caps_from_posix_probe,
-    powershell_quote, shell_quote, ExecOutput, Host, HostCaps, RemoteEntry, RemoteOs, ShellKind,
+    caps_from_uname, caps_from_ver, check_cap, enrich_caps_from_posix_probe, powershell_quote,
+    shell_quote, BoundedOutput, ExecOutput, Host, HostCaps, RemoteEntry, RemoteOs, ShellKind,
     MAX_EXEC_STREAM_BYTES,
 };
 use crate::known_hosts::{HostKeyVerdict, KnownHosts};

@@ -42,7 +42,7 @@ use base64::Engine as _;
 use hx_core::error::{HxError, Result};
 
 use crate::host::{
-    BoundedOutput, check_cap, ExecOutput, Host, HostCaps, RemoteEntry, RemoteOs, ShellKind,
+    check_cap, BoundedOutput, ExecOutput, Host, HostCaps, RemoteEntry, RemoteOs, ShellKind,
     MAX_EXEC_STREAM_BYTES,
 };
 use crate::ntlm::{header_value, Auth};
