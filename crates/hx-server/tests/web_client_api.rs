@@ -4,7 +4,7 @@
 //! is unusable from a browser. This checks the one thing an API test cannot: that `GET /` returns
 //! HTML which actually contains *this* client — not an empty body and not a placeholder.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use hx_agent::{ApprovalQueue, ModelCall};
@@ -102,10 +102,12 @@ async fn harness_with_token(token: Option<&str>) -> Server {
     let state = AppState::from_parts(AppStateParts {
         config,
         router: Arc::new(Mutex::new(router)),
-        providers: Arc::new(providers),
+        providers: Arc::new(RwLock::new(providers)),
+        provider_configs: Default::default(),
+        config_path: None,
         secrets: Arc::new(SecretStores::new().with(Arc::new(EnvSecrets))),
         store: Arc::new(store),
-        models: Arc::new(Dead(Arc::new(DeadModel))),
+        models: Arc::new(RwLock::new(Arc::new(Dead(Arc::new(DeadModel))))),
         tools: Arc::new(hx_server::chat::default_tools(vec![], client)),
         approvals: ApprovalQueue::new(std::time::Duration::from_secs(1)),
         phone: None,

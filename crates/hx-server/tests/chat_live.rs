@@ -36,7 +36,7 @@ use hx_secrets::{EnvSecrets, SecretStores};
 use hx_server::{app, AppState, AppStateParts, ModelFactory};
 use hx_store::Store;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tower::ServiceExt;
 
 /// Answers from a script, and refuses once it runs out.
@@ -225,10 +225,12 @@ async fn harness() -> Option<(Arc<AppState>, std::path::PathBuf, tempfile::TempD
     let state = AppState::from_parts(AppStateParts {
         config,
         router: Arc::new(Mutex::new(router)),
-        providers: Arc::new(providers),
+        providers: Arc::new(RwLock::new(providers)),
+        provider_configs: Default::default(),
+        config_path: None,
         secrets: Arc::new(secrets),
         store: Arc::new(store),
-        models: Arc::new(Scripted(model)),
+        models: Arc::new(RwLock::new(Arc::new(Scripted(model)))),
         tools: Arc::new(hx_server::chat::default_tools(vec![], client)),
         approvals: ApprovalQueue::new(std::time::Duration::from_secs(1)),
         phone: None,

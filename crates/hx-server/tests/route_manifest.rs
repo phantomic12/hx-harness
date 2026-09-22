@@ -17,7 +17,7 @@ use hx_core::config::Config;
 use hx_search::BackendRegistry;
 use hx_server::{app, AppState, AppStateParts};
 use hx_store::Store;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tower::ServiceExt;
 
 fn now() -> chrono::DateTime<chrono::Utc> {
@@ -56,11 +56,11 @@ async fn harness() -> Arc<AppState> {
         providers: Arc::new(hx_provider::ProviderRegistry::new()),
         secrets: Arc::new(hx_secrets::SecretStores::new()),
         store,
-        models: Arc::new(hx_server::chat::RouterModels::new(
+        models: Arc::new(RwLock::new(Arc::new(hx_server::chat::RouterModels::new(
             router,
             Arc::new(hx_provider::ProviderRegistry::new()),
             Arc::new(hx_secrets::SecretStores::new()),
-        )),
+        )))),
         tools: Arc::new(hx_server::chat::default_tools(
             vec![],
             reqwest::Client::new(),

@@ -15,7 +15,7 @@ use hx_search::BackendRegistry;
 use hx_secrets::{EnvSecrets, SecretStores};
 use hx_server::{AppState, AppStateParts, ModelFactory};
 use hx_store::Store;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// A model that is never called: these tests never run the agent loop.
 struct NeverModel;
@@ -160,10 +160,12 @@ async fn state_without_local_sandboxes() -> Arc<AppState> {
     AppState::from_parts(AppStateParts {
         config,
         router: Arc::new(Mutex::new(router)),
-        providers: Arc::new(providers),
+        providers: Arc::new(RwLock::new(providers)),
+        provider_configs: Default::default(),
+        config_path: None,
         secrets: Arc::new(secrets),
         store: Arc::new(store),
-        models: Arc::new(NeverFactory),
+        models: Arc::new(RwLock::new(Arc::new(NeverFactory))),
         tools: Arc::new(hx_server::chat::default_tools(vec![], client)),
         approvals: ApprovalQueue::new(std::time::Duration::from_secs(1)),
         phone: None,

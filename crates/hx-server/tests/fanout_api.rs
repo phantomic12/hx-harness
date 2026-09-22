@@ -22,7 +22,7 @@ use hx_server::routes::{FanOutBody, FanOutChild};
 use hx_server::{app, AppState, AppStateParts};
 use hx_store::Store;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tower::ServiceExt;
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -182,11 +182,11 @@ async fn harness(
         providers: provider,
         secrets,
         store: store.clone(),
-        models: Arc::new(hx_server::chat::RouterModels::new(
+        models: Arc::new(RwLock::new(Arc::new(hx_server::chat::RouterModels::new(
             router,
             Arc::new(ProviderRegistry::new()),
             Arc::new(SecretStores::new()),
-        )),
+        )))),
         tools: Arc::new(hx_server::chat::default_tools(
             vec![],
             reqwest::Client::new(),

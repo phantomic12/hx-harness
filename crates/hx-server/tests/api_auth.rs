@@ -19,7 +19,7 @@
 //! read-side redaction that masks key-shaped literals in a file display would hide a key-shaped
 //! sentinel from the assertion and make the test pass for the wrong reason.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -84,7 +84,7 @@ async fn try_state(token: Option<&str>) -> hx_core::error::Result<Arc<AppState>>
     config.daemon.data_dir = dir.keep().display().to_string();
     std::env::remove_var(hx_core::api_auth::API_TOKEN_ENV);
     let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-    AppState::build(config, now).await
+    AppState::build(config, None, now).await
 }
 
 /// A GET with the `Authorization` header written out verbatim, for the shapes a caller reaches for
@@ -373,7 +373,7 @@ async fn a_config_naming_a_token_it_cannot_resolve_fails_to_build_rather_than_se
 
     // Matched rather than `expect_err`: `AppState` is not `Debug`, and making it one to satisfy a
     // test would be a test deciding the shape of production code.
-    let err = match AppState::build(config, chrono::Utc::now()).await {
+    let err = match AppState::build(config, None, chrono::Utc::now()).await {
         Ok(_) => panic!("an unresolvable token reference must not build"),
         Err(err) => err.to_string(),
     };

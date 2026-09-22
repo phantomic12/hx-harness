@@ -24,7 +24,7 @@ use hx_search::BackendRegistry;
 use hx_secrets::{EnvSecrets, SecretStores};
 use hx_server::{app, AppState, AppStateParts, LiveEvent, ModelFactory};
 use hx_store::{NewSession, Store};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message as TMessage;
 
 /// A model that refuses everything — none of these tests need a real run, they drive the event bus and the
@@ -152,7 +152,9 @@ async fn harness_with_token(models: Arc<dyn ModelFactory>, token: Option<&str>) 
     let state = AppState::from_parts(AppStateParts {
         config,
         router: Arc::new(Mutex::new(router)),
-        providers: Arc::new(providers),
+        providers: Arc::new(RwLock::new(providers)),
+        provider_configs: Default::default(),
+        config_path: None,
         secrets: Arc::new(SecretStores::new().with(Arc::new(EnvSecrets))),
         store: Arc::new(store),
         models,

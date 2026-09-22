@@ -13,7 +13,7 @@
 
 #![cfg(unix)]
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
@@ -178,10 +178,12 @@ hosts:
     let state = AppState::from_parts(AppStateParts {
         config,
         router: Arc::new(Mutex::new(router)),
-        providers: Arc::new(providers),
+        providers: Arc::new(RwLock::new(providers)),
+        provider_configs: Default::default(),
+        config_path: None,
         secrets: Arc::new(SecretStores::new().with(Arc::new(EnvSecrets))),
         store: Arc::new(store),
-        models: Arc::new(Dead(Arc::new(DeadModel))),
+        models: Arc::new(RwLock::new(Arc::new(Dead(Arc::new(DeadModel))))),
         tools: Arc::new(hx_server::chat::default_tools(vec![], client)),
         approvals: ApprovalQueue::new(std::time::Duration::from_secs(1)),
         phone: None,
