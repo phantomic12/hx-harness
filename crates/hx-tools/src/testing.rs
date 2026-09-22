@@ -44,6 +44,7 @@ impl FakeSandbox {
                 stderr: String::new(),
                 exit_code: Some(0),
                 duration_ms: 1,
+                truncated: false,
             })),
             label: "sandbox fake (l2, for tests)".to_string(),
         }
@@ -64,6 +65,7 @@ impl FakeSandbox {
             stderr: String::new(),
             exit_code: Some(exit_code),
             duration_ms: 3,
+            truncated: false,
         });
         sandbox
     }
@@ -201,6 +203,7 @@ impl FakeHost {
             stderr: stderr.to_string(),
             exit_code,
             duration_ms: 3,
+            truncated: false,
         });
         self
     }
@@ -303,6 +306,7 @@ impl Host for FakeHost {
             stderr: String::new(),
             exit_code: Some(0),
             duration_ms: 1,
+            truncated: false,
         })
     }
 

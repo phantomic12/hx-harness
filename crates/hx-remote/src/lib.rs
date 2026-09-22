@@ -50,8 +50,8 @@ pub mod ssh;
 pub mod winrm;
 
 pub use host::{
-    powershell_quote, shell_quote, ExecOutput, Host, HostCaps, PtySession, RemoteEntry, RemoteOs,
-    ShellKind,
+    powershell_quote, shell_quote, BoundedOutput, ExecOutput, Host, HostCaps, PtySession,
+    RemoteEntry, RemoteOs, ShellKind, MAX_EXEC_STREAM_BYTES,
 };
 pub use known_hosts::{HostKeyVerdict, KnownHosts};
 pub use local::LocalHost;

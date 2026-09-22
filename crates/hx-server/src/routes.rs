@@ -1578,6 +1578,8 @@ pub struct HostExecReply {
     pub stderr: String,
     pub exit_code: Option<i32>,
     pub duration_ms: u64,
+    /// Whether either stream hit the transport's per-stream byte cap and lost its middle.
+    pub truncated: bool,
 }
 
 async fn host_exec(
@@ -1610,6 +1612,7 @@ async fn host_exec(
         stderr: out.stderr,
         exit_code: out.exit_code,
         duration_ms: out.duration_ms,
+        truncated: out.truncated,
     }))
 }
 
