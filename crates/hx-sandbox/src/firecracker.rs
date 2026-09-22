@@ -47,11 +47,14 @@
 //!
 //! Firecracker's block API attaches host *files* as guest drives; handing it the spec's workspace
 //! directory would fail (a directory is not a block image) and would conflate the host working
-//! tree with guest block storage. So `create` provisions `<vm-dir>/workspace.ext4` — a sparse,
-//! bounded regular file sized from `spec.workspace_mb` — and attaches *that* as the writable
-//! drive. The guest mounts `/dev/vdb` where the boot args say (`hx_workspace=<path>`); the
-//! runtime remembers which host directory the sandbox's work lives in and exposes it via
-//! [`FirecrackerRuntime::host_workspace`], so an operator can map a guest write back to the host.
+//! tree with guest block storage. So `create` provisions `<vm-dir>/workspace.ext4` — a bounded
+//! sparse file formatted as a real ext4 filesystem and seeded with the host workspace's files —
+//! and attaches *that* as the writable drive. A zeroed file would leave the guest's mount of
+//! `/dev/vdb` with no superblock to mount; the format plus the seed is what makes the workspace
+//! both mountable and populated. The guest mounts `/dev/vdb` where the boot args say
+//! (`hx_workspace=<path>`); the runtime remembers which host directory the sandbox's work lives
+//! in and exposes it via [`FirecrackerRuntime::host_workspace`], so an operator can map a guest
+//! write back to the host.
 //!
 //! ## Security posture
 //!
@@ -178,6 +181,234 @@ fn workspace_image_bytes(workspace_mb: u64) -> u64 {
     workspace_mb
         .saturating_mul(1024 * 1024)
         .clamp(MIN_WORKSPACE_IMAGE_BYTES, MAX_WORKSPACE_IMAGE_BYTES)
+}
+
+/// Offset of the ext4 magic in the superblock: 1024-byte boot padding + 0x38.
+const EXT4_SUPER_MAGIC_OFFSET: u64 = 1024 + 0x38;
+/// The ext4 superblock magic (`0xEF53`): what a formatted image carries at the offset above.
+const EXT4_SUPER_MAGIC: [u8; 2] = [0x53, 0xEF];
+/// Volume label stamped on provisioned workspace images.
+const WORKSPACE_VOLUME_LABEL: &str = "hx-workspace";
+/// Seeding bounds: the guest image is bounded, so the host tree copied into it must be too.
+const MAX_SEED_ENTRIES: usize = 4096;
+const MAX_SEED_FILE_BYTES: u64 = 256 << 20;
+
+/// Whether `path` carries an ext4 superblock (magic `0xEF53` at byte 1080).
+///
+/// WHY a magic check and not a mount: mounting needs root and a loop device, neither of which
+/// a library (or CI) can assume. The magic is what `mount -t ext4` itself keys on before reading
+/// anything else — a zeroed sparse file fails it, a `mkfs.ext4` image passes it.
+fn workspace_image_has_ext4_superblock(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    if file.seek(SeekFrom::Start(EXT4_SUPER_MAGIC_OFFSET)).is_err() {
+        return false;
+    }
+    let mut magic = [0u8; 2];
+    matches!(file.read_exact(&mut magic), Ok(())) && magic == EXT4_SUPER_MAGIC
+}
+
+/// One host file to seed into the image: where it lives and where it lands in the guest.
+struct SeedEntry {
+    /// Absolute host path of the source file.
+    source: PathBuf,
+    /// Absolute guest path inside the image (`/hello.txt`, `/sub/dir/file`).
+    dest: String,
+    /// Source length, captured while walking so seeding can stay within the image budget.
+    len: u64,
+}
+
+/// Walk `host_workspace` collecting regular files to seed, bounded so a huge host tree cannot
+/// overflow the bounded image. Symlinks, sockets, devices, and oversized files are skipped: the
+/// guest gets the work's bytes, not a copy of the host's special files.
+fn collect_seed_entries(host_workspace: &str, image_bytes: u64) -> Vec<SeedEntry> {
+    let root = PathBuf::from(host_workspace);
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let mut entries = Vec::new();
+    let mut stack = vec![root.clone()];
+    let mut total: u64 = 0;
+    // Leave headroom for the filesystem itself: at most half the image carries seeded bytes.
+    let budget = image_bytes / 2;
+    while let Some(dir) = stack.pop() {
+        let read = match std::fs::read_dir(&dir) {
+            Ok(read) => read,
+            Err(_) => continue,
+        };
+        for child in read.flatten() {
+            if entries.len() >= MAX_SEED_ENTRIES || total >= budget {
+                return entries;
+            }
+            let file_type = match child.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = child.path();
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let len = child.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+            if len > MAX_SEED_FILE_BYTES || total.saturating_add(len) > budget {
+                continue;
+            }
+            let dest = match path.strip_prefix(&root) {
+                Ok(rel) => format!("/{}", rel.to_string_lossy()),
+                Err(_) => continue,
+            };
+            total += len;
+            entries.push(SeedEntry {
+                source: path,
+                dest,
+                len,
+            });
+        }
+    }
+    entries
+}
+
+/// Render the `debugfs` script that reproduces the seed entries inside the image: `mkdir` each
+/// parent (a missing parent makes `write` fail), then `write` each file.
+fn seed_script(entries: &[SeedEntry]) -> String {
+    use std::collections::HashSet;
+    let mut script = String::new();
+    let mut made_dirs = HashSet::new();
+    for entry in entries {
+        let parent_is_root = Path::new(&entry.dest)
+            .parent()
+            .is_none_or(|p| p.to_string_lossy() == "/");
+        if !parent_is_root {
+            let stripped = entry.dest.strip_prefix('/').unwrap_or(&entry.dest);
+            if let Some(rel_parent) = Path::new(stripped).parent() {
+                let mut prefix = String::new();
+                for component in rel_parent.components() {
+                    prefix.push('/');
+                    prefix.push_str(&component.as_os_str().to_string_lossy());
+                    if made_dirs.insert(prefix.clone()) {
+                        script.push_str(&format!("mkdir \"{}\"\n", prefix.replace('"', "\\\"")));
+                    }
+                }
+            }
+        }
+        let _ = entry.len;
+        script.push_str(&format!(
+            "write \"{}\" \"{}\"\n",
+            entry.source.to_string_lossy().replace('"', "\\\""),
+            entry.dest.replace('"', "\\\""),
+        ));
+    }
+    script
+}
+
+/// Provision the workspace block image at `image_path`: a bounded sparse file formatted as a
+/// real ext4 filesystem and seeded with the host workspace's files.
+///
+/// WHY format here: Firecracker's block API attaches host *files* as guest drives, and the
+/// guest mounts `/dev/vdb` where the boot args say. A zeroed sparse file has no superblock, so
+/// that mount fails and the sandbox's work has nowhere to live. Formatting with `mkfs.ext4`
+/// (a host requirement of this runtime, like the `firecracker` binary and KVM) gives the guest
+/// a filesystem it can actually mount; copying the host tree in with `debugfs` gives the guest
+/// the sandbox's work rather than an empty volume.
+///
+/// A missing host directory seeds nothing but still formats: the guest gets an empty but
+/// mountable workspace instead of a boot failure.
+async fn provision_workspace_image(
+    image_path: &Path,
+    image_bytes: u64,
+    host_workspace: &str,
+) -> Result<()> {
+    let image_file = std::fs::File::create(image_path).map_err(|e| {
+        HxError::Sandbox(format!(
+            "could not create workspace image {}: {e}",
+            image_path.display()
+        ))
+    })?;
+    image_file.set_len(image_bytes).map_err(|e| {
+        HxError::Sandbox(format!(
+            "could not size workspace image {}: {e}",
+            image_path.display()
+        ))
+    })?;
+    drop(image_file);
+
+    // Lazy table/journal init keeps even the 8 GiB ceiling image fast and sparse: the guest
+    // kernel completes the init on mount, which is the standard production behaviour.
+    let mkfs = tokio::process::Command::new("mkfs.ext4")
+        .arg("-F")
+        .arg("-q")
+        .arg("-L")
+        .arg(WORKSPACE_VOLUME_LABEL)
+        .arg("-E")
+        .arg("lazy_itable_init=1,lazy_journal_init=1")
+        .arg(image_path)
+        .output()
+        .await
+        .map_err(|e| {
+            HxError::Sandbox(format!(
+                "could not format workspace image {} (mkfs.ext4 required): {e}",
+                image_path.display()
+            ))
+        })?;
+    if !mkfs.status.success() {
+        let detail = String::from_utf8_lossy(&mkfs.stderr).trim().to_string();
+        return Err(HxError::Sandbox(format!(
+            "could not format workspace image {}: mkfs.ext4 failed{detail}",
+            image_path.display()
+        )));
+    }
+    // The format is verified, not assumed: a tool that exits 0 but leaves no superblock (a
+    // stub binary, a wrong device) must fail here, not as a guest mount failure later.
+    if !workspace_image_has_ext4_superblock(image_path) {
+        return Err(HxError::Sandbox(format!(
+            "could not format workspace image {}: no ext4 superblock after mkfs.ext4",
+            image_path.display()
+        )));
+    }
+
+    let entries = collect_seed_entries(host_workspace, image_bytes);
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let script = seed_script(&entries);
+    let script_path = image_path.with_extension("debugfs.cmds");
+    std::fs::write(&script_path, script).map_err(|e| {
+        HxError::Sandbox(format!(
+            "could not stage workspace seed script {}: {e}",
+            script_path.display()
+        ))
+    })?;
+    let seed = tokio::process::Command::new("debugfs")
+        .arg("-w")
+        .arg("-f")
+        .arg(&script_path)
+        .arg(image_path)
+        .output()
+        .await
+        .map_err(|e| {
+            HxError::Sandbox(format!(
+                "could not seed workspace image {} (debugfs required): {e}",
+                image_path.display()
+            ))
+        })?;
+    let _ = std::fs::remove_file(&script_path);
+    if !seed.status.success() {
+        let detail = String::from_utf8_lossy(&seed.stderr).trim().to_string();
+        return Err(HxError::Sandbox(format!(
+            "could not seed workspace image {} from {host_workspace}: debugfs failed{detail}",
+            image_path.display()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -487,25 +718,19 @@ impl SandboxRuntime for FirecrackerRuntime {
         let sock = dir.join("api.sock");
         let runtime_id = sock.to_string_lossy().to_string();
 
-        // The workspace block image: a bounded sparse file the block API can attach. The spec's
+        // The workspace block image: a bounded sparse file formatted as a real ext4 filesystem
+        // and seeded with the host workspace's files, which the block API can attach. The spec's
         // host path is a directory and can never be a `path_on_host` — Firecracker would reject
         // it, and even if it did not, guest block writes would land directly in the host tree.
+        // A zeroed file alone would be no better: the guest mounts `/dev/vdb` at the workspace
+        // path, and that mount needs a superblock.
         let image_path = dir.join(WORKSPACE_IMAGE_NAME);
-        let image_file = std::fs::File::create(&image_path).map_err(|e| {
-            HxError::Sandbox(format!(
-                "could not create workspace image {}: {e}",
-                image_path.display()
-            ))
-        })?;
-        image_file
-            .set_len(workspace_image_bytes(spec.workspace_mb))
-            .map_err(|e| {
-                HxError::Sandbox(format!(
-                    "could not size workspace image {}: {e}",
-                    image_path.display()
-                ))
-            })?;
-        drop(image_file);
+        provision_workspace_image(
+            &image_path,
+            workspace_image_bytes(spec.workspace_mb),
+            &spec.workspace_host_path,
+        )
+        .await?;
 
         // A CID no live microVM holds; two guests never share the vsock identity `exec` dials.
         let cid = self.alloc_cid();
@@ -1056,5 +1281,153 @@ mod tests {
         rt.remove("never-existed/api.sock")
             .await
             .expect("removing an unknown VM with no leftover dir is Ok");
+    }
+
+    /// Unique scratch dir for the provisioning tests (parallel-safe, unlike a fixed name).
+    fn provision_scratch_dir(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "hx-firecracker-provision-{name}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("provision scratch dir");
+        dir
+    }
+
+    /// `mkfs.ext4`/`debugfs` are host tools, not library code: skip (loudly) where they are
+    /// absent instead of failing a host that cannot provision Firecracker images anyway.
+    fn require_image_tools() -> bool {
+        for tool in ["mkfs.ext4", "debugfs"] {
+            let probe = std::process::Command::new(tool).arg("-V").output();
+            if probe.is_err() {
+                eprintln!("SKIP: provisioning test needs {tool} on PATH");
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Read a file back out of an image through `debugfs cat`, without mounting.
+    fn debugfs_cat(image: &Path, guest_path: &str) -> Option<String> {
+        let out = std::process::Command::new("debugfs")
+            .arg("-R")
+            .arg(format!("cat \"{guest_path}\""))
+            .arg(image)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8(out.stdout).ok()
+    }
+
+    #[test]
+    fn a_blank_zeroed_file_is_not_a_valid_workspace_filesystem() {
+        // Pins the original #58 bug: `File::create` + `set_len` alone is a blank file with no
+        // superblock, so the guest's mount of `/dev/vdb` has nothing to mount.
+        let dir = provision_scratch_dir("blank");
+        let blank = dir.join("blank.ext4");
+        let file = std::fs::File::create(&blank).expect("blank file");
+        file.set_len(MIN_WORKSPACE_IMAGE_BYTES).expect("size blank");
+        drop(file);
+        assert!(
+            !workspace_image_has_ext4_superblock(&blank),
+            "a zeroed sparse file must not pass as a filesystem"
+        );
+        assert!(
+            !workspace_image_has_ext4_superblock(&dir.join("missing.ext4")),
+            "a missing image must not pass as a filesystem"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_script_creates_parent_dirs_before_writes() {
+        // Pure check of the debugfs script: no host tools needed.
+        let entries = vec![
+            SeedEntry {
+                source: PathBuf::from("/host/top.txt"),
+                dest: "/top.txt".to_string(),
+                len: 3,
+            },
+            SeedEntry {
+                source: PathBuf::from("/host/sub/dir/nested.txt"),
+                dest: "/sub/dir/nested.txt".to_string(),
+                len: 6,
+            },
+        ];
+        let script = seed_script(&entries);
+        let mkdir = script.find("mkdir \"/sub\"").expect("mkdir /sub");
+        let mkdir_nested = script.find("mkdir \"/sub/dir\"").expect("mkdir /sub/dir");
+        let write_nested = script
+            .find("write \"/host/sub/dir/nested.txt\" \"/sub/dir/nested.txt\"")
+            .expect("nested write");
+        assert!(mkdir < mkdir_nested, "parents before children: {script}");
+        assert!(mkdir_nested < write_nested, "dirs before writes: {script}");
+        assert!(
+            script.starts_with("write \"/host/top.txt\" \"/top.txt\"\n"),
+            "a top-level file needs no mkdir: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provisioned_image_is_a_valid_filesystem_seeded_with_the_host_tree() {
+        if !require_image_tools() {
+            return;
+        }
+        let dir = provision_scratch_dir("seeded");
+        let host = dir.join("host-work");
+        std::fs::create_dir_all(host.join("sub/dir")).expect("host tree");
+        std::fs::write(host.join("hello.txt"), b"host bytes here").expect("host file");
+        std::fs::write(host.join("sub/dir/nested.txt"), b"nested bytes").expect("nested file");
+
+        let image = dir.join("workspace.ext4");
+        provision_workspace_image(&image, MIN_WORKSPACE_IMAGE_BYTES, &host.to_string_lossy())
+            .await
+            .expect("provision");
+
+        // The image is a real filesystem: the ext4 superblock magic is present.
+        assert!(
+            workspace_image_has_ext4_superblock(&image),
+            "provisioned image must carry an ext4 superblock"
+        );
+        // And the host tree reached it: seeded files read back out of the image.
+        assert_eq!(
+            debugfs_cat(&image, "/hello.txt").as_deref(),
+            Some("host bytes here"),
+            "top-level host file must be seeded into the image"
+        );
+        assert_eq!(
+            debugfs_cat(&image, "/sub/dir/nested.txt").as_deref(),
+            Some("nested bytes"),
+            "nested host file must be seeded into the image with its parents"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn provisioned_image_without_a_host_tree_is_still_a_valid_filesystem() {
+        if !require_image_tools() {
+            return;
+        }
+        // A configured-but-absent host dir (as in the hermetic suite) still formats: the guest
+        // gets an empty but mountable workspace instead of a boot failure.
+        let dir = provision_scratch_dir("empty");
+        let image = dir.join("workspace.ext4");
+        provision_workspace_image(
+            &image,
+            MIN_WORKSPACE_IMAGE_BYTES,
+            &dir.join("no-such-workspace").to_string_lossy(),
+        )
+        .await
+        .expect("provision without a host tree");
+        assert!(
+            workspace_image_has_ext4_superblock(&image),
+            "an unseeded image must still be a valid ext4 filesystem"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
