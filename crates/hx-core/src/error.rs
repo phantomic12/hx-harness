@@ -90,6 +90,11 @@ pub enum HxError {
     #[error("store error: {0}")]
     Store(String),
 
+    /// A Laya decision sidecar failure: an unreachable sidecar, a bad HTTP status, or a payload
+    /// that does not parse.
+    #[error("laya sidecar error: {0}")]
+    Decision(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

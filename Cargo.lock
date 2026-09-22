@@ -2455,8 +2455,10 @@ dependencies = [
 name = "hx-decision"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "hx-core",
  "indexmap 2.14.2",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
