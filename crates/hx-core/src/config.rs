@@ -116,13 +116,23 @@ pub struct ApiConfig {
     /// [`crate::api_auth::require_token_for_bind`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// Extra origins allowed to open a WebSocket on the daemon, as hostnames (`"ui.example.com"`).
+    ///
+    /// Empty by default: a WebSocket handshake is accepted only from a loopback origin (a local
+    /// page or dev UI) or from no origin at all (a non-browser client). A name listed here is
+    /// trusted the way the operator trusts that DNS name — it must never be one whose records an
+    /// attacker can flip, or the allowance is a DNS-rebinding hole. The request's own `Host`
+    /// header is deliberately *not* an allowlist: it is attacker-controlled under rebinding, so
+    /// "same origin as Host" proves nothing. See `crates/hx-server/src/auth.rs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_origins: Vec<String>,
 }
 
 impl std::fmt::Debug for ApiConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The *presence* of a token is configuration; the token is not. A reference is safe to
         // print and a literal is not, and this cannot tell them apart without resolving — so it
-        // prints neither.
+        // prints neither. The origin allowlist names hosts, not secrets, so it prints in full.
         f.debug_struct("ApiConfig")
             .field(
                 "token",
@@ -132,6 +142,7 @@ impl std::fmt::Debug for ApiConfig {
                     Some(_) => "Some(<redacted>)",
                 },
             )
+            .field("allowed_origins", &self.allowed_origins)
             .finish()
     }
 }
@@ -2137,7 +2148,8 @@ mcp_servers:
         assert!(format!(
             "{:?}",
             ApiConfig {
-                token: Some("  ".into())
+                token: Some("  ".into()),
+                allowed_origins: Vec::new(),
             }
         )
         .contains("<empty>"));

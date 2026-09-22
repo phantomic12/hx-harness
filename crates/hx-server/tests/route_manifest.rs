@@ -72,6 +72,7 @@ async fn harness() -> Arc<AppState> {
         sandbox_unavailable_reason: Some("no container engine in a test".to_string()),
         started_at: now(),
         api_token: None,
+        allowed_origins: Vec::new(),
         phone: None,
         webhooks: Default::default(),
     })

@@ -108,6 +108,13 @@ pub struct AppState {
     /// configuration that never starts on any other. The check that makes that true is
     /// [`hx_core::api_auth::require_token_for_bind`], called by `hxd` before it binds.
     pub api_token: Option<hx_core::api_auth::ApiToken>,
+    /// Hostnames allowed to open a WebSocket on the daemon, beyond loopback.
+    ///
+    /// A WebSocket handshake's `Origin` is accepted when it names a loopback host (the local dev
+    /// UI) or a name in this list. The request's own `Host` header is deliberately *not* an
+    /// allowlist — it is attacker-controlled under DNS rebinding, so "same origin as Host" proves
+    /// nothing. See [`crate::auth::ws_origin_allowed`] and `ApiConfig::allowed_origins`.
+    pub allowed_origins: Vec<String>,
     /// The generic webhook connectors' push endpoints and verification tokens, keyed by connector id.
     ///
     /// Populated from `config.connectors` with `kind: webhook`; each registers a token and the
@@ -144,6 +151,8 @@ pub struct AppStateParts {
     /// wants the authenticated surface passes one here; a test that does not passes `None`, which
     /// is the same thing a default-config daemon does.
     pub api_token: Option<hx_core::api_auth::ApiToken>,
+    /// Hosts (beyond loopback) allowed to open a WebSocket. See [`AppState::allowed_origins`].
+    pub allowed_origins: Vec<String>,
     /// The generic webhook connectors' push endpoints and verification tokens.
     ///
     /// Populated from `config.connectors` with `kind: webhook`: each registers a token and a channel
@@ -300,6 +309,7 @@ impl AppState {
             );
         }
 
+        let ws_allowed_origins = config.api.allowed_origins.clone();
         Ok(Self::from_parts(AppStateParts {
             config,
             router,
@@ -315,6 +325,7 @@ impl AppState {
             sandbox_unavailable_reason,
             started_at: now,
             api_token,
+            allowed_origins: ws_allowed_origins,
             webhooks,
         }))
     }
@@ -350,6 +361,7 @@ impl AppState {
             sandbox_unavailable_reason: parts.sandbox_unavailable_reason,
             vault_unlocked: false,
             api_token: parts.api_token,
+            allowed_origins: parts.allowed_origins,
             webhooks: parts.webhooks,
             webhook_sessions: Mutex::new(HashMap::new()),
         });

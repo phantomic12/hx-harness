@@ -167,6 +167,7 @@ async fn harness_with_token(models: Arc<dyn ModelFactory>, token: Option<&str>) 
         // token is optional. A test that needed one here would mean the rule, not the test, was
         // wrong.
         api_token: token.map(hx_core::api_auth::ApiToken::new),
+        allowed_origins: Vec::new(),
         webhooks: Default::default(),
     });
 
@@ -468,12 +469,12 @@ async fn a_real_chat_run_publishes_its_events_to_a_second_attached_client() {
 }
 
 #[tokio::test]
-async fn a_websocket_connect_authenticates_by_header_or_by_query_string_and_by_nothing_else() {
-    // The one request shape with no alternative. A browser cannot set an `Authorization` header on a
-    // WebSocket handshake, so the daemon accepts the token in `?token=` — but *only* on an upgrade
-    // request, which is why the same query string on a plain GET is worth nothing (asserted in
-    // `api_auth.rs`). This test is the browser's half: over a real socket, with a real
-    // tokio-tungstenite client, the query string opens the stream.
+async fn a_websocket_connect_authenticates_by_header_only_and_by_nothing_else() {
+    // A token in a URL ends up in logs and browser history, so #24 removed `?token=` as an upgrade
+    // credential. A browser cannot set an `Authorization` header on a WebSocket handshake either — the
+    // handshake has to stay cross-origin-safe — but the credential now lives *only* in the header, and
+    // a query string is worthless. This test is the daemon's half: over a real tokio-tungstenite
+    // client, the query string must not open the stream, and the header must.
     const TOKEN: &str = "hx-ws-sentinel-7c1d";
     let server = harness_with_token(Arc::new(Dead(Arc::new(DeadModel))), Some(TOKEN)).await;
     let plain = format!(
@@ -482,8 +483,7 @@ async fn a_websocket_connect_authenticates_by_header_or_by_query_string_and_by_n
         server.session.as_str()
     );
 
-    // No credential at all: the handshake is refused with the same 401 the HTTP routes give, rather
-    // than upgraded into a stream that then says nothing.
+    // No credential at all: the handshake is refused with the same 401 the HTTP routes give.
     let refused = tokio_tungstenite::connect_async(&plain).await;
     match refused {
         Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
@@ -496,18 +496,18 @@ async fn a_websocket_connect_authenticates_by_header_or_by_query_string_and_by_n
         other => panic!("an unauthenticated upgrade must be refused, got {other:?}"),
     }
 
-    // The token as a query parameter, which is what the embedded page sends.
-    let (socket, _) = tokio_tungstenite::connect_async(format!("{plain}?token={TOKEN}"))
-        .await
-        .expect("the query string opens the stream");
+    // The token as a query parameter is *not* a credential (#24): even a correct one is refused.
+    let via_query = tokio_tungstenite::connect_async(format!("{plain}?token={TOKEN}")).await;
+    assert!(
+        matches!(
+            via_query,
+            Err(tokio_tungstenite::tungstenite::Error::Http(ref response))
+                if response.status().as_u16() == 401
+        ),
+        "a query-string token must be refused, got {via_query:?}"
+    );
 
-    // And it is a real stream, not just an accepted socket: the stored events arrive.
-    push(&server.state, &server.session, 1).await;
-    let mut client = WsClient { socket };
-    let first = frame(&mut client).await;
-    assert_eq!(first["seq"], 1, "the replayed event arrived: {first}");
-
-    // A *wrong* token in the query string is refused exactly as a missing one is.
+    // A *wrong* token in the query string is refused too.
     let wrong = tokio_tungstenite::connect_async(format!("{plain}?token=not-the-token")).await;
     assert!(
         matches!(
@@ -518,7 +518,7 @@ async fn a_websocket_connect_authenticates_by_header_or_by_query_string_and_by_n
         "a wrong token must be refused, got {wrong:?}"
     );
 
-    // The header works too, which is what a non-browser client uses.
+    // The header is the only credential: with it, the stream opens and stored events arrive.
     let mut request =
         tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
             plain.as_str(),
@@ -528,7 +528,12 @@ async fn a_websocket_connect_authenticates_by_header_or_by_query_string_and_by_n
         "authorization",
         format!("Bearer {TOKEN}").parse().expect("a header value"),
     );
-    tokio_tungstenite::connect_async(request)
+    let (socket, _) = tokio_tungstenite::connect_async(request)
         .await
         .expect("the header opens the stream");
+
+    push(&server.state, &server.session, 1).await;
+    let mut client = WsClient { socket };
+    let first = frame(&mut client).await;
+    assert_eq!(first["seq"], 1, "the replayed event arrived: {first}");
 }

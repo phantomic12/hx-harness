@@ -134,7 +134,11 @@ pub async fn require_bearer(
         // below still runs: cross-origin protection does not depend on a token being set.
         if is_websocket_route(&path)
             && is_websocket_upgrade(request.headers())
-            && !ws_origin_allowed(request.headers(), host_of(request.headers()))
+            && !ws_origin_allowed(
+                request.headers(),
+                host_of(request.headers()),
+                &state.allowed_origins,
+            )
         {
             return forbidden_cross_origin();
         }
@@ -156,7 +160,11 @@ pub async fn require_bearer(
     // still not be able to open a shell. See `ws_origin_allowed`.
     if is_websocket_route(&path)
         && is_websocket_upgrade(request.headers())
-        && !ws_origin_allowed(request.headers(), host_of(request.headers()))
+        && !ws_origin_allowed(
+            request.headers(),
+            host_of(request.headers()),
+            &state.allowed_origins,
+        )
     {
         return forbidden_cross_origin();
     }
@@ -194,9 +202,6 @@ fn presented_token(request: &Request) -> Option<String> {
     if let Some(token) = bearer_from_headers(request.headers()) {
         return Some(token.to_string());
     }
-    if is_websocket_route(request.uri().path()) && is_websocket_upgrade(request.headers()) {
-        return query_param(request.uri().query(), "token");
-    }
     None
 }
 
@@ -232,12 +237,17 @@ fn bearer_from_headers(headers: &HeaderMap) -> Option<&str> {
 /// The rule, deliberately host-based rather than scheme-based so a Tauri/desktop webview
 /// (`tauri://localhost`) keeps working:
 /// - no `Origin` header (CLI, TUI, tests, non-browser clients) → allow;
-/// - `Origin` whose host equals the request's own `Host` (same-origin, any port) → allow;
 /// - `Origin` naming a loopback host (a local dev UI on another port) → allow;
-/// - anything else — including `Origin: null` and unparseable values → reject.
+/// - `Origin` naming a host in `allowed` (an operator-configured allowlist) → allow;
+/// - anything else — including `Origin: null`, unparseable values, and any origin that merely
+///   matches the request's own `Host` header → reject.
 ///
-/// `host` is the request's `Host` header value; `None` when absent.
-pub fn ws_origin_allowed(headers: &HeaderMap, host: Option<&str>) -> bool {
+/// The request's `Host` header is deliberately **not** an authority here: under DNS rebinding a
+/// malicious page controls both its own `Origin` and the `Host` it sends, so "same origin as
+/// `Host`" is a test the attacker passes whenever they can flip a record to 127.0.0.1. Only a
+/// literal loopback origin or an allowlist entry an operator wrote down is trusted.
+pub fn ws_origin_allowed(headers: &HeaderMap, host: Option<&str>, allowed: &[String]) -> bool {
+    let _ = host;
     let Some(raw) = headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
@@ -257,10 +267,9 @@ pub fn ws_origin_allowed(headers: &HeaderMap, host: Option<&str>) -> bool {
     if is_loopback_host(origin_host) {
         return true;
     }
-    match host.map(strip_port) {
-        Some(own) => origin_host.eq_ignore_ascii_case(own),
-        None => false,
-    }
+    allowed
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(origin_host))
 }
 
 /// The request's own host (the `Host` header, port stripped), for same-origin comparison.
@@ -335,57 +344,6 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
                 .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
         });
     upgrade && connection
-}
-
-/// The first value of a `key=value` pair in a query string, percent-decoded.
-///
-/// Hand-rolled, like the base64 helpers in [`crate::routes`], because the workspace keeps its
-/// dependency list small on purpose and this is one parameter read on one route shape. The decoding
-/// is the whole reason it is not a `split('=')`: a token may contain `%`-escaped characters, and a
-/// value that arrived escaped and was compared unescaped would fail to match for a reason nobody
-/// could see.
-fn query_param(query: Option<&str>, key: &str) -> Option<String> {
-    for pair in query?.split('&') {
-        let (name, value) = pair.split_once('=')?;
-        if name == key {
-            return percent_decode(value);
-        }
-    }
-    None
-}
-
-/// `%XX` and `+` decoding. Invalid escapes are left as written rather than erroring: the result is
-/// then simply a value that will not match, which is a refusal, not a crash.
-fn percent_decode(input: &str) -> Option<String> {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
-                match u8::from_str_radix(hex, 16) {
-                    Ok(byte) => {
-                        out.push(byte);
-                        i += 3;
-                    }
-                    Err(_) => {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
-                }
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            byte => {
-                out.push(byte);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8(out).ok()
 }
 
 /// The one refusal this module produces.
@@ -473,28 +431,29 @@ mod tests {
     }
 
     #[test]
-    fn a_query_parameter_is_percent_decoded_so_an_escaped_token_still_matches() {
+    fn the_query_string_is_not_a_credential_channel_anymore() {
+        // The old WebSocket handshake accepted ?token=… on upgrade; the daemon was also reached by
+        // that path from non-browser clients. A token in a URL ends up in logs and History, so the
+        // credential must live only in an `Authorization` header (#24). presented_token must not read the
+        // query string at all.
+        use axum::http::Request;
+        let req = Request::builder()
+            .uri("/v1/chat?token=secret-token")
+            .body(axum::body::Body::empty())
+            .unwrap();
         assert_eq!(
-            query_param(Some("token=abc%2Fdef"), "token").as_deref(),
-            Some("abc/def")
+            presented_token(&req),
+            None,
+            "a token in the query string is not a credential"
         );
-        assert_eq!(
-            query_param(Some("a=1&token=xyz&b=2"), "token").as_deref(),
-            Some("xyz")
-        );
-        // `+` is a space in a query string, which is what a form-encoded value means.
-        assert_eq!(
-            query_param(Some("token=a+b"), "token").as_deref(),
-            Some("a b")
-        );
-        assert_eq!(query_param(Some("other=1"), "token"), None);
-        assert_eq!(query_param(None, "token"), None);
-        // A malformed escape is left as written rather than panicking: it will not match, which is
-        // a refusal and not a crash.
-        assert_eq!(
-            query_param(Some("token=%zz"), "token").as_deref(),
-            Some("%zz")
-        );
+
+        // A bearer header still is.
+        let req = Request::builder()
+            .header(header::AUTHORIZATION, "Bearer some-token")
+            .uri("/v1/chat")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(presented_token(&req).as_deref(), Some("some-token"));
     }
 
     #[test]
@@ -566,29 +525,33 @@ mod tests {
     fn a_handshake_without_an_origin_is_not_a_browser_and_is_allowed() {
         // CLI, TUI and test clients send no Origin; refusing them would break every non-browser
         // client, including the existing WebSocket integration tests.
-        assert!(ws_origin_allowed(&HeaderMap::new(), None));
+        assert!(ws_origin_allowed(&HeaderMap::new(), None, &[]));
         assert!(ws_origin_allowed(
             &origin_headers(None, Some("127.0.0.1:7717")),
-            Some("127.0.0.1:7717")
+            Some("127.0.0.1:7717"),
+            &[]
         ));
     }
 
     #[test]
-    fn a_same_origin_handshake_is_allowed() {
-        assert!(ws_origin_allowed(
-            &origin_headers(Some("http://127.0.0.1:7717"), Some("127.0.0.1:7717")),
-            Some("127.0.0.1:7717")
+    fn an_origin_that_matches_the_host_header_is_not_trusted_under_rebinding() {
+        // The old rule allowed an origin whose host equals the request's Host header. Under DNS
+        // rebinding the attacker controls *both* values: they flip a record to 127.0.0.1 and
+        // send Origin: http://their.name and Host: their.name. Matching the Host proves nothing, so this
+        // is rejected — only a literal loopback origin or an allowlist entry is trusted (#24).
+        assert!(!ws_origin_allowed(
+            &origin_headers(
+                Some("http://attacker.example:3000"),
+                Some("attacker.example:7717"),
+            ),
+            Some("attacker.example:7717"),
+            &[]
         ));
-        // Same host, different port: the daemon serves the page and the socket from one port in
-        // practice, but a split deployment is still the operator's own origin.
-        assert!(ws_origin_allowed(
-            &origin_headers(Some("http://example.com:3000"), Some("example.com:7717")),
-            Some("example.com:7717")
-        ));
-        // Host comparison ignores case, as DNS does.
-        assert!(ws_origin_allowed(
+        // Case-insensitive self-match is equally worthless to allow.
+        assert!(!ws_origin_allowed(
             &origin_headers(Some("http://Example.COM"), Some("example.com")),
-            Some("example.com")
+            Some("example.com"),
+            &[]
         ));
     }
 
@@ -598,15 +561,35 @@ mod tests {
         // loopback pages, not attacker sites.
         assert!(ws_origin_allowed(
             &origin_headers(Some("http://localhost:3000"), Some("192.168.1.10:7717")),
-            Some("192.168.1.10:7717")
+            Some("192.168.1.10:7717"),
+            &[]
         ));
         assert!(ws_origin_allowed(
             &origin_headers(Some("tauri://localhost"), Some("127.0.0.1:7717")),
-            Some("127.0.0.1:7717")
+            Some("127.0.0.1:7717"),
+            &[]
         ));
         assert!(ws_origin_allowed(
             &origin_headers(Some("http://127.0.0.1:8080"), Some("example.com")),
-            Some("example.com")
+            Some("example.com"),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn an_allowlisted_origin_is_allowed() {
+        // The operator can name hosts that may open a WebSocket — a trusted UI on a real domain.
+        let allowed: Vec<String> = vec!["ui.example.com".to_string()];
+        assert!(ws_origin_allowed(
+            &origin_headers(Some("https://ui.example.com"), Some("127.0.0.1:7717")),
+            Some("127.0.0.1:7717"),
+            &allowed
+        ));
+        // An origin not on the list is still rejected even with a matching Host.
+        assert!(!ws_origin_allowed(
+            &origin_headers(Some("https://ui.example.com"), Some("ui.example.com")),
+            Some("ui.example.com"),
+            &[]
         ));
     }
 
@@ -623,14 +606,15 @@ mod tests {
             ("https://evil.example", "evil.example.attacker.com"),
         ] {
             assert!(
-                !ws_origin_allowed(&origin_headers(Some(origin), Some(host)), Some(host)),
+                !ws_origin_allowed(&origin_headers(Some(origin), Some(host)), Some(host), &[]),
                 "origin {origin:?} against host {host:?} must be rejected"
             );
         }
         // A foreign origin with no Host to compare against cannot prove same-origin either.
         assert!(!ws_origin_allowed(
             &origin_headers(Some("https://evil.example"), None),
-            None
+            None,
+            &[]
         ));
     }
 
