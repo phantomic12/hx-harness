@@ -19,7 +19,7 @@ use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use hx_agent::AnswerResult;
 use hx_core::approval::RiskClass;
@@ -71,6 +71,8 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/", get(web_client))
         .route("/v1/status", get(status))
         .route("/v1/pools", get(pools))
+        .route("/v1/providers", get(list_providers))
+        .route("/v1/providers/{name}", put(upsert_provider).delete(remove_provider))
         .route("/v1/hosts", get(hosts))
         // A host is a machine, not just a row: the detail route reports what it is (OS, shell, home,
         // whether it has a PTY), which is what a client needs before it offers to browse or run.
@@ -223,6 +225,65 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<crate::state::Status
 
 async fn pools(State(state): State<Arc<AppState>>) -> Json<Vec<hx_provider::PoolStatus>> {
     Json(state.router().status().pools)
+}
+
+/// List the providers the daemon is running with. Never includes a secret.
+async fn list_providers(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<crate::state::ProviderSummary>> {
+    Json(state.provider_summaries())
+}
+
+/// A request to add or edit a provider from the web UI.
+#[derive(Debug, Deserialize)]
+pub struct ProviderBody {
+    pub kind: hx_core::config::ProviderKind,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub routing: hx_core::config::Strategy,
+    /// Write-only: when present and non-empty, replaces the provider's key. A stored key is never
+    /// echoed back.
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+/// Add or edit a provider, swap the routing surface, and persist. A missing or blank api_key keeps the
+/// existing key; a malformed body or unknown kind is a 400.
+async fn upsert_provider(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(body): Json<ProviderBody>,
+) -> Result<Json<crate::state::ProviderSummary>, ApiError> {
+    state
+        .upsert_provider(
+            &name,
+            body.kind,
+            body.base_url,
+            body.models,
+            body.routing,
+            body.api_key,
+        )
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let summary = state
+        .provider_summaries()
+        .into_iter()
+        .find(|p| p.name == name)
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, format!("no provider '{name}'")))?;
+    Ok(Json(summary))
+}
+
+/// Remove a provider from the live registry and the config file.
+async fn remove_provider(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .remove_provider(&name)
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(serde_json::json!({ "removed": name })))
 }
 
 async fn hosts(State(state): State<Arc<AppState>>) -> Json<Vec<crate::state::HostSummary>> {
@@ -1075,7 +1136,7 @@ async fn fanout(
 
     let mut spawner = crate::spawn::Spawner::new(
         pool,
-        state.providers.clone(),
+        Arc::new(state.providers.read().expect("providers lock").clone()),
         state.secrets.clone(),
         state.store.clone(),
     );
@@ -1767,7 +1828,7 @@ search:
     async fn build_state(config: hx_core::config::Config) -> Arc<AppState> {
         std::env::remove_var(hx_core::api_auth::API_TOKEN_ENV);
         let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        AppState::build(config, now).await.expect("state builds")
+        AppState::build(config, None, now).await.expect("state builds")
     }
 
     async fn test_state() -> Arc<AppState> {

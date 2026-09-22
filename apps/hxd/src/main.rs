@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
     update_cfg
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid `update` configuration: {e}"))?;
-    let state = AppState::build(config, Utc::now())
+    let state = AppState::build(config, Some(args.config.clone()), Utc::now())
         .await
         .context("could not build the daemon state")?;
 

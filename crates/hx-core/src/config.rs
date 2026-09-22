@@ -185,6 +185,13 @@ impl Config {
         Ok(config)
     }
 
+    /// Serialize back to the on-disk YAML form, for persisting a runtime edit.
+    pub fn to_yaml(&self) -> Result<String> {
+        let yaml = serde_yaml::to_string(self)
+            .map_err(|e| HxError::Config(format!("could not serialize config to yaml: {e}")))?;
+        Ok(yaml)
+    }
+
     /// Resolve the pool a role should use, following `inherits` chains.
     ///
     /// Guards against cycles and dangling references, because a config loop here would
@@ -331,6 +338,20 @@ pub enum ProviderKind {
     Custom,
 }
 
+impl std::fmt::Display for ProviderKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Mirrors `#[serde(rename_all = "lowercase")]` so the wire name and the display name agree.
+        let s = match self {
+            Self::Openai => "openai",
+            Self::Anthropic => "anthropic",
+            Self::Google => "google",
+            Self::Ollama => "ollama",
+            Self::Custom => "custom",
+        };
+        f.write_str(s)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
@@ -414,6 +435,20 @@ pub enum Strategy {
     Priority,
     /// Pick the cheapest member that can serve the request at all.
     CheapestCapable,
+}
+
+impl std::fmt::Display for Strategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Mirrors `#[serde(rename_all = "snake_case")]` so the wire name and display name agree.
+        let s = match self {
+            Self::Weighted => "weighted",
+            Self::RoundRobin => "round_robin",
+            Self::LeastLoaded => "least_loaded",
+            Self::Priority => "priority",
+            Self::CheapestCapable => "cheapest_capable",
+        };
+        f.write_str(s)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
