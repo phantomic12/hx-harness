@@ -919,16 +919,27 @@ Closing it is a deliberate, reviewable change with its own test — not a doc ed
 
 Full-text search across session history (FTS5 is fine until it isn't) · skill marketplace
 with signing · multi-tenant auth · a graph memory backend · RL/replay tooling · voice
-(STT/TTS) — voice lands once the connector layer exists, since it's the same inbound pipeline. ·
-**Real-time computer use via Laya** (https://brainfunctioncollapse.com/laya) — an
-open-source (Apache-2.0), local, non-autoregressive System-1 decision engine (typed
-choice/score/noul answers with probabilities in ~20–30 ms on a laptop GPU, 0 tokens generated,
-~650 MB, 322M params) as the fast decision layer for real-time UI/OS control (driving a
-terminal, browser or remote desktop frame-per-frame where an LLM round-trip is too slow), and as a
-cheap classifier/re-router in front of slower rungs. Deferred by decision: it adds a runtime +
-model download, is orthogonal to the model-pool/fan-out spawner (it is not an LLM and speaks no
-chat API), and there is no consumer that needs a sub-100 ms decision yet. When one appears
-(human-in-the-loop browser pane, egress/approval triage, an agent that must react to a live
-screen), it slots in as a `hx-browser` rung or a `hx-core` decision helper rather than a
-provider. Exact integration (screen→state encoding, the typed-question schema, per-frame pipelining)
-is left to that milestone.
+(STT/TTS) — voice lands once the connector layer exists, since it's the same inbound pipeline.
+
+## M10 — Laya: a fast local decision layer (decision substrate)
+
+**Laya** (<https://brainfunctioncollapse.com/laya>) is the open-source (Apache-2.0) alternative to
+TypeSafe Jev: a 322M-param, non-autoregressive "System 1" decision model. It answers **typed
+questions** (choice/score/noul) about a piece of text and returns **probabilities** in ~21–35 ms on a
+laptop GPU, with 0 tokens generated, fully offline.
+
+What is **built in this milestone** (the *decision substrate* — see `docs/laya.md`):
+
+- **`crates/hx-decision`** — typed question/answer schema mirroring Laya's API, plus a `LayaClient`
+  that talks to a loopback HTTP **sidecar** (`examples/laya-sidecar.py`; hx never embeds Python).
+- **`crates/hx-core`** — a `decision` module: a threshold/confidence gate (`Decision::{Act, Escalate}`)
+  so Laya is the cheap first pass and only the unsure cases escalate to an LLM or a person (the cascade).
+- **`apps/hx` `hx decision`** — CLI that drives a running sidecar: load a question set, print typed
+  answers + probabilities + whether each cleared a threshold.
+- **`hx doctor`** — a Laya probe that reports `/health` when `HX_LAYA_URL` is configured.
+
+Deliberately **not** in this milestone — the *consumer* rung that uses Laya for real-time UI/OS control:
+driving a terminal, browser or remote desktop frame-per-frame, or a cheap classifier/re-router in front of
+slower rungs. That needs screen→state encoding and per-frame pipelining and is the explicit follow-up, as a
+`hx-browser` rung that consumes `hx-core`'s decision helper. Laya remains orthogonal to the
+model-pool/fan-out spawner (it is not an LLM and speaks no chat API).
