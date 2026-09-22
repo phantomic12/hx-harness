@@ -62,12 +62,23 @@ hx-core          ids, message/event types, errors, config model, capability toke
   ├─ hx-browser    browser session driver (CDP + Firecrawl-compatible HTTP)
   ├─ hx-tools      built-in tool implementations
   ├─ hx-agent      the loop: context, compaction, tool dispatch, approvals, subagents
+  ├─ hx-eval       Harbor task dirs → trials on hx sandboxes → scores in hx-store
   ├─ hx-mcp        rmcp host (consume MCP servers) + rmcp server (be one)
   ├─ hx-gateway    Connector trait + platform adapters + the approval loop-back
   └─ hx-server     axum: REST + WebSocket protocol + static web UI
        ├─ hxd      the daemon binary
        └─ hx       the TUI/CLI binary (a protocol client, not a special case)
 ```
+
+`hx-eval` owns Harbor-format eval trials: parsing task dirs (`task.toml` +
+`instruction.md`) into a `TaskSpec`, running one trial (spawn an hx sandbox,
+stage the task with `upload_dir`, drive the agent loop, run the verifier, persist
+the score), and recording jobs and trials through `hx-store`'s `eval_jobs` /
+`eval_trials`. It depends on `hx-sandbox` for isolation, `hx-agent` for the loop,
+`hx-tools` for the agent's file/shell tools, and `hx-store` for results — all
+downward arrows. It deliberately does not do RL rollouts, prompt optimization, or
+cloud sandboxes; the task format is the contract, Harbor-side features stay
+Harbor-side.
 
 Rule: **arrows only point down.** `hx-agent` never imports `hx-server`. If it did, the
 daemon-and-clients split would rot immediately.

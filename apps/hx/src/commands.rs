@@ -9,6 +9,9 @@ use hx_core::config::{Config, SandboxProfile};
 use hx_provider::ModelRouter;
 use hx_sandbox::SandboxSpec;
 use std::fmt::Write;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Render the routing table: pools, their routes, credential health, and role bindings.
 pub fn render_pools(router: &ModelRouter) -> String {
@@ -1457,6 +1460,154 @@ pub fn render_research(outcome: &serde_json::Value, json: bool) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------------------------
+// Eval: running Harbor tasks and listing past jobs
+// ---------------------------------------------------------------------------------------------
+
+/// How long the agent phase may run when the task names no `agent.timeout_sec`.
+///
+/// A trial must end somewhere even when the task declares no bound; ten minutes is the
+/// backstop, and the task's own timeout wins whenever it is set.
+const EVAL_DEFAULT_DEADLINE: Duration = Duration::from_secs(600);
+
+/// Run a Harbor task directory `n` times, sequentially, returning one outcome per trial.
+///
+/// Wiring, not policy: the model comes from the role's pool (the same
+/// [`hx_eval::RunnerModels`] resolution the daemon uses), the store is the daemon's own
+/// database (`Store::from_config`, so `hx eval results` reads what this wrote), and the
+/// sandboxes are built on the local Docker engine the way the daemon builds them — a
+/// missing engine is an error naming the missing runtime, never a panic.
+///
+/// One [`hx_eval::TrialOutcome`] per trial, in run order; the caller prints and exits.
+pub async fn run_eval_trials(
+    config: &Config,
+    path: &Path,
+    role: &str,
+    n: usize,
+    dataset: Option<&str>,
+) -> anyhow::Result<Vec<hx_eval::TrialOutcome>> {
+    use anyhow::Context as _;
+
+    if n == 0 {
+        anyhow::bail!("`--trials` must be at least 1");
+    }
+    let task = hx_eval::task::load_task(path)
+        .with_context(|| format!("loading the eval task at {}", path.display()))?;
+    let dataset = dataset.map(str::to_string).unwrap_or_else(|| {
+        task.root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| task.root.to_string_lossy().into_owned())
+    });
+
+    let models = hx_eval::RunnerModels::from_config(config, chrono::Utc::now())?;
+    let model = models
+        .for_role(role)
+        .with_context(|| format!("resolving role '{role}' to a model"))?;
+    let store = hx_store::Store::from_config(config)?;
+
+    // The daemon keeps `None` and serves without sandboxes; an eval run *is* sandboxes, so
+    // the same `docker_manager` failure is a refusal here rather than a degraded startup.
+    let sandboxes = match hx_sandbox::docker_manager(config.agent.max_concurrent_subagents as usize)
+        .await
+    {
+        Ok(manager) => Arc::new(manager),
+        Err(err) => anyhow::bail!(
+            "no container runtime is available ({err}); `hx eval run` needs Docker to spawn trial sandboxes"
+        ),
+    };
+    let driver: Arc<dyn hx_eval::AgentDriver> =
+        Arc::new(hx_eval::RealDriver::new(Arc::clone(&sandboxes)));
+
+    // The task's own bound wins; the backstop only covers a task that declares none.
+    let deadline = match task.config.agent.timeout_sec {
+        Some(secs) if secs.is_finite() && secs > 0.0 => Duration::from_secs_f64(secs),
+        _ => EVAL_DEFAULT_DEADLINE,
+    };
+
+    let agent = hx_core::ids::AgentId::new();
+    let mut outcomes = Vec::with_capacity(n);
+    for _ in 0..n {
+        let cfg = hx_eval::TrialConfig {
+            agent: agent.clone(),
+            task: task.clone(),
+            dataset: dataset.clone(),
+            role: role.to_string(),
+            model: Arc::clone(&model),
+            store: &store,
+            sandboxes: &sandboxes,
+            profile: SandboxProfile::default(),
+            max_turns: config.agent.max_turns,
+            deadline,
+            driver: Arc::clone(&driver),
+        };
+        outcomes.push(hx_eval::run_trial(cfg).await?);
+    }
+    Ok(outcomes)
+}
+
+/// One line per trial for `hx eval run`: the verdict first, so a failure is visible without
+/// reading the reason, then the ids that tie the trial row to its session.
+pub fn render_eval_run_line(n: usize, outcome: &hx_eval::TrialOutcome) -> String {
+    let verdict = if outcome.passed { "PASS" } else { "FAIL" };
+    let reason = outcome.reason.lines().next().unwrap_or("").trim();
+    format!(
+        "trial {n}: {verdict} (trial {}, session {}) — {reason}\n",
+        outcome.trial_id.as_str(),
+        outcome.session_id.as_str(),
+    )
+}
+
+/// The closing line of `hx eval run`: the score in one glance.
+pub fn render_eval_summary(passed: usize, total: usize) -> String {
+    format!("eval: {passed}/{total} trials passed\n")
+}
+
+/// Render every eval job with its trials, newest job first (the store's own order).
+///
+/// Jobs arrive paired with their trials because the store lists them separately
+/// (`list_eval_jobs` + `trials_for_job`); pairing is the caller's one line, not a second query
+/// hidden inside the renderer, so this stays a pure function of plain structs.
+pub fn render_eval_jobs(jobs: &[(hx_store::EvalJob, Vec<hx_store::EvalTrial>)]) -> String {
+    if jobs.is_empty() {
+        return "no eval jobs yet: `hx eval run -p <task-dir> --role <role>` starts one.\n"
+            .to_string();
+    }
+
+    let mut out = String::new();
+    for (job, trials) in jobs {
+        let _ = writeln!(
+            out,
+            "job {}  {} / {}  {}/{} passed  cost ${:.4}  {}",
+            job.id.as_str(),
+            job.dataset,
+            job.task,
+            job.passed,
+            job.trials,
+            job.total_cost,
+            job.created_at,
+        );
+        let _ = writeln!(out, "  role {}", job.role);
+        if trials.is_empty() {
+            let _ = writeln!(out, "  (no trials recorded)");
+        }
+        for trial in trials {
+            let verdict = if trial.passed { "PASS" } else { "FAIL" };
+            // The reason's first line: verifier output trails behind it, and the row is one line.
+            let reason = trial.reason.lines().next().unwrap_or("").trim();
+            let _ = writeln!(
+                out,
+                "  {verdict} {}  {}  {}ms  ${:.4}  {reason}",
+                trial.id.as_str(),
+                trial.task,
+                trial.duration_ms,
+                trial.cost_usd,
+            );
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod run_tests {
     use super::*;
@@ -1908,5 +2059,111 @@ mod run_tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&as_json).expect("the JSON mode emits JSON");
         assert_eq!(parsed["query"], "rust");
+    }
+}
+
+#[cfg(test)]
+mod eval_tests {
+    use super::*;
+
+    fn job() -> hx_store::EvalJob {
+        hx_store::EvalJob {
+            id: hx_core::ids::EvalJobId::from_raw("evj_test"),
+            dataset: "canary".to_string(),
+            role: "builder".to_string(),
+            task: "trivial".to_string(),
+            trials: 2,
+            passed: 1,
+            total_cost: 1.75,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn trial(passed: bool) -> hx_store::EvalTrial {
+        hx_store::EvalTrial {
+            id: hx_core::ids::EvalTrialId::from_raw(if passed { "evt_pass" } else { "evt_fail" }),
+            job_id: hx_core::ids::EvalJobId::from_raw("evj_test"),
+            session_id: Some("ses_1".to_string()),
+            task: "trivial".to_string(),
+            passed,
+            reason: if passed {
+                "verifier exited 0".to_string()
+            } else {
+                "verifier exited 1:\nassertion failed".to_string()
+            },
+            duration_ms: 1_200,
+            tokens_in: 100,
+            tokens_out: 50,
+            cost_usd: 0.5,
+            created_at: "2026-01-01T00:00:01Z".to_string(),
+        }
+    }
+
+    fn outcome(passed: bool) -> hx_eval::TrialOutcome {
+        hx_eval::TrialOutcome {
+            job_id: hx_core::ids::EvalJobId::from_raw("evj_test"),
+            trial_id: hx_core::ids::EvalTrialId::from_raw("evt_1"),
+            session_id: hx_core::ids::SessionId::from_raw("ses_1"),
+            passed,
+            reason: if passed {
+                "verifier exited 0".to_string()
+            } else {
+                "agent run failed: the model is unreachable".to_string()
+            },
+        }
+    }
+
+    #[test]
+    fn an_empty_history_says_so_rather_than_printing_nothing() {
+        let rendered = render_eval_jobs(&[]);
+        assert!(rendered.contains("no eval jobs yet"), "{rendered}");
+    }
+
+    #[test]
+    fn a_job_with_a_pass_and_a_fail_renders_counts_cost_and_both_trials() {
+        let rendered = render_eval_jobs(&[(job(), vec![trial(true), trial(false)])]);
+
+        assert!(
+            rendered.contains("1/2 passed"),
+            "the running score is the point of the list: {rendered}"
+        );
+        assert!(
+            rendered.contains("$1.7500"),
+            "the job's rolled-up cost: {rendered}"
+        );
+        assert!(
+            rendered.contains("PASS evt_pass") && rendered.contains("FAIL evt_fail"),
+            "both trial lines, verdict first: {rendered}"
+        );
+        assert!(
+            rendered.contains("verifier exited 0") && rendered.contains("verifier exited 1"),
+            "each trial names its reason: {rendered}"
+        );
+        assert!(
+            rendered.contains("canary") && rendered.contains("builder"),
+            "dataset and role identify the run: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_run_line_leads_with_the_verdict_and_a_summary_closes_the_run() {
+        let pass = render_eval_run_line(1, &outcome(true));
+        assert!(pass.contains("trial 1"), "{pass}");
+        assert!(pass.contains("PASS"), "{pass}");
+        assert!(
+            pass.contains("ses_1"),
+            "the session the trial ran in: {pass}"
+        );
+
+        let fail = render_eval_run_line(2, &outcome(false));
+        assert!(fail.contains("trial 2"), "{fail}");
+        assert!(fail.contains("FAIL"), "{fail}");
+        assert!(
+            fail.contains("the model is unreachable"),
+            "the reason travels with the line: {fail}"
+        );
+
+        let summary = render_eval_summary(1, 2);
+        assert!(summary.contains("1/2 trials passed"), "{summary}");
     }
 }

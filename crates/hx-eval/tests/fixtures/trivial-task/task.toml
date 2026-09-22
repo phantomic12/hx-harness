@@ -1,0 +1,14 @@
+[task]
+name = "trivial"
+version = "0.1.0"
+description = "Canary task: the agent is asked to do nothing, and the verifier always passes."
+
+[environment]
+docker_image = "docker.io/library/debian:stable-slim"
+
+[agent]
+timeout_sec = 300.0
+
+[verifier]
+command = "sh tests/check.sh"
+timeout_sec = 60.0

@@ -2396,11 +2396,13 @@ dependencies = [
  "futures",
  "hx-core",
  "hx-decision",
+ "hx-eval",
  "hx-provider",
  "hx-remote",
  "hx-sandbox",
  "hx-search",
  "hx-secrets",
+ "hx-store",
  "reqwest",
  "serde",
  "serde_json",
@@ -2486,6 +2488,29 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "hx-eval"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "hx-agent",
+ "hx-core",
+ "hx-provider",
+ "hx-remote",
+ "hx-sandbox",
+ "hx-secrets",
+ "hx-store",
+ "hx-tools",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "toml 1.1.6+spec-1.1.0",
+ "tracing",
 ]
 
 [[package]]

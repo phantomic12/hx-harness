@@ -914,6 +914,50 @@ and passes after (see `TESTING.md`):
 
 ---
 
+## M9 — Evals: Harbor tasks on hx sandboxes
+
+`hx-eval` (`crates/hx-eval`) runs Harbor-format eval tasks on the harness's own
+sandboxes, so a benchmark exercises the same isolation the agents ship with. It
+parses the Harbor task format; it does not invent one.
+
+- **Task parsing** — `load_task` (`crates/hx-eval/src/task.rs`) reads a task dir
+  (`task.toml` + `instruction.md`, optional `environment/`, `tests/`,
+  `solution/`) into a `TaskSpec`. Unknown TOML fields are ignored; a missing
+  `task.toml` or `instruction.md` is an error naming the file.
+  `to_sandbox_spec` maps the task's resource *request* onto a sandbox profile's
+  *policy*: a task that asks for more than the profile allows is refused, not
+  silently capped.
+- **One trial** — `run_trial` (`crates/hx-eval/src/runner.rs`) spawns a sandbox
+  from the spec, stages `instruction.md` + `tests/` with `upload_dir`, runs the
+  agent loop against the instruction under a workspace-scoped capability token,
+  runs the verifier (`[verifier] command`, else every file under `tests/` via
+  `sh`), and persists the outcome. Exit code 0 passes. Infrastructure failures
+  are recorded as failed trials, not lost ones; only store failures are `Err`.
+- **Results storage** — schema V3 (`crates/hx-store/src/schema.rs`) adds
+  `eval_jobs` / `eval_trials`: one job row owning many trial rows, with running
+  totals maintained in the same transaction as the trial insert
+  (`crates/hx-store/src/eval.rs`: `insert_eval_job`, `insert_eval_trial`,
+  `list_eval_jobs`, `trials_for_job`), so runs can be listed and compared later.
+- **CLI** — `hx eval run -p <task> --role <role> [--trials N] [--dataset <name>]`
+  runs the trials and prints one line each plus a summary, exiting non-zero if
+  any trial failed; `hx eval results` lists jobs with their trials
+  (`apps/hx/src/main.rs`, rendered in `apps/hx/src/commands.rs`). Both read and
+  write the daemon's own store, so a result is visible to the next command.
+
+**Exit criteria:** a canary trial runs green — **met** in the unit-test sense:
+`crates/hx-eval/tests/fixtures/trivial-task` (a do-nothing instruction plus an
+always-pass `tests/check.sh`) is driven through `run_trial` by the runner's
+unit tests over a scripted sandbox runtime and a scripted agent driver
+(`cargo test -p hx-eval` passes), and the pass is recorded and counted. Still
+**open**: a CI run of a real Terminal-Bench subset against a real engine — no
+workflow runs evals, and the fixture's own `check.sh` is never executed by the
+tests (they script the exit code instead).
+
+**Deliberately not here:** RL rollouts, GEPA/prompt optimization, cloud
+sandboxes (Daytona/Modal).
+
+---
+
 ## Open security items
 
 **A remote sandbox can reach the far host's own bridge address.** *(Open. Measured, pinned, not

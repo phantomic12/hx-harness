@@ -702,7 +702,7 @@ impl Store {
 
     // -- internals ------------------------------------------------------------------------------
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         // A poisoned lock means a previous holder panicked inside a transaction, which rolls back —
         // so the database is consistent and the honest thing is to keep serving.
         self.conn
@@ -710,7 +710,7 @@ impl Store {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn with_tx<T>(&self, work: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
+    pub(crate) fn with_tx<T>(&self, work: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
         let mut conn = self.lock();
         let tx = conn
             .transaction()

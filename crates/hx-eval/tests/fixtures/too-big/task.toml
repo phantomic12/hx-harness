@@ -1,0 +1,8 @@
+schema_version = "1.4"
+
+[task]
+name = "test/too-big"
+
+[environment]
+cpus = 64.0
+memory_mb = 999999

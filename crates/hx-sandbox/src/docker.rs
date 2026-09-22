@@ -17,8 +17,9 @@ use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::models::{ContainerCreateBody, HostConfig};
 use bollard::query_parameters::{
-    CreateContainerOptions, LogsOptions, RemoveContainerOptions, StartContainerOptions,
-    StopContainerOptions,
+    CreateContainerOptions, DownloadFromContainerOptionsBuilder, LogsOptions,
+    RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
+    UploadToContainerOptionsBuilder,
 };
 use bollard::Docker;
 use futures::StreamExt;
@@ -419,6 +420,33 @@ impl SandboxRuntime for DockerRuntime {
             stderr,
             exit_code: inspected.exit_code.unwrap_or(-1),
         })
+    }
+
+    async fn upload(&self, runtime_id: &str, path: &str, tar: Vec<u8>) -> Result<()> {
+        let options = UploadToContainerOptionsBuilder::default()
+            .path(path)
+            .build();
+        self.docker
+            .upload_to_container(runtime_id, Some(options), bollard::body_full(tar.into()))
+            .await
+            .map_err(|e| HxError::Sandbox(format!("could not upload to {runtime_id}: {path}: {e}")))
+    }
+
+    async fn download(&self, runtime_id: &str, path: &str) -> Result<Vec<u8>> {
+        let options = DownloadFromContainerOptionsBuilder::default()
+            .path(path)
+            .build();
+        let mut stream = self
+            .docker
+            .download_from_container(runtime_id, Some(options));
+        let mut out = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.map_err(|e| {
+                HxError::Sandbox(format!("could not download {runtime_id}: {path}: {e}"))
+            })?;
+            out.extend_from_slice(&bytes);
+        }
+        Ok(out)
     }
 }
 

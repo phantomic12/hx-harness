@@ -260,6 +260,12 @@ enum Command {
         #[command(subcommand)]
         command: SandboxCommand,
     },
+
+    /// Run eval tasks and show past results.
+    Eval {
+        #[command(subcommand)]
+        command: EvalCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -279,6 +285,35 @@ enum SandboxCommand {
         #[arg(long, default_value = "/workspace-src")]
         workspace: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum EvalCommand {
+    /// Run a Harbor task directory N times against a role's model, one sandbox per trial.
+    ///
+    /// Each trial spawns a sandbox, stages the task, runs the agent, scores the verifier, and
+    /// records the outcome in the daemon's store, so `hx eval results` reads what this wrote.
+    /// Exits non-zero if any trial failed, so a script can gate on it.
+    Run {
+        /// Path to the task directory (with `task.toml` and `instruction.md`).
+        #[arg(short, long)]
+        path: PathBuf,
+
+        /// Which role (and therefore which pool) runs the trials.
+        #[arg(long)]
+        role: String,
+
+        /// How many trials to run, sequentially.
+        #[arg(long, default_value_t = 1)]
+        trials: usize,
+
+        /// Dataset name recorded on the job rows. Defaults to the task directory's name.
+        #[arg(long)]
+        dataset: Option<String>,
+    },
+
+    /// List past eval jobs and their trials, newest job first.
+    Results,
 }
 
 #[tokio::main]
@@ -552,6 +587,41 @@ async fn main() -> Result<()> {
                     "{}",
                     commands::render_sandbox_spec(&profile, found, &workspace)
                 );
+            }
+        },
+        Command::Eval { command } => match command {
+            EvalCommand::Run {
+                path,
+                role,
+                trials,
+                dataset,
+            } => {
+                let outcomes =
+                    commands::run_eval_trials(&config, &path, &role, trials, dataset.as_deref())
+                        .await?;
+                let mut passed = 0usize;
+                for (index, outcome) in outcomes.iter().enumerate() {
+                    if outcome.passed {
+                        passed += 1;
+                    }
+                    print!("{}", commands::render_eval_run_line(index + 1, outcome));
+                }
+                print!("{}", commands::render_eval_summary(passed, outcomes.len()));
+
+                // A run where a trial failed is not a success. Exit 1 the way a fan-out with an
+                // errored child does, so `hx eval run` can gate a script without parsing prose.
+                if passed != outcomes.len() {
+                    std::process::exit(1);
+                }
+            }
+            EvalCommand::Results => {
+                let store = hx_store::Store::from_config(&config)?;
+                let mut rows = Vec::new();
+                for job in store.list_eval_jobs()? {
+                    let trials = store.trials_for_job(&job.id)?;
+                    rows.push((job, trials));
+                }
+                print!("{}", commands::render_eval_jobs(&rows));
             }
         },
     }

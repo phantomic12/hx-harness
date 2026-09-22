@@ -2,7 +2,7 @@
 use hx_core::config::Config;
 use hx_core::event::AgentEvent;
 use hx_core::ids::AgentId;
-use hx_store::{NewSession, Store};
+use hx_store::{schema::SCHEMA_VERSION, NewSession, Store};
 
 #[test]
 fn events_written_after_an_upgrade_are_chained() {
@@ -30,7 +30,7 @@ fn events_written_after_an_upgrade_are_chained() {
     let store = Store::from_config(&config).expect("opens and migrates");
     assert_eq!(
         store.schema_version().unwrap(),
-        2,
+        SCHEMA_VERSION,
         "the V1 database was upgraded"
     );
 

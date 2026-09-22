@@ -96,6 +96,12 @@ define_id!(
     "A granted capability, for audit correlation."
 );
 define_id!(ApprovalId, "apr", "A pending human approval request.");
+define_id!(
+    EvalJobId,
+    "evj",
+    "One eval run over a dataset, owning its trials."
+);
+define_id!(EvalTrialId, "evt", "One task attempt within an eval job.");
 
 #[cfg(test)]
 mod tests {

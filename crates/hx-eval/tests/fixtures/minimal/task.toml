@@ -1,0 +1,6 @@
+schema_version = "1.4"
+
+[task]
+name = "test/minimal"
+version = "1.0.0"
+description = "A minimal task"

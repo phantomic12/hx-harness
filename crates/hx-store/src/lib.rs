@@ -39,9 +39,12 @@
 //! happened is worse than one that contains a secret the vault already knows how to mask.
 
 pub mod audit;
+pub mod eval;
 pub mod schema;
 pub mod session;
 pub mod store;
+
+pub use eval::{EvalJob, EvalTrial, NewEvalJob, NewEvalTrial};
 
 pub use session::{
     ExportFormat, NewSession, Session, SessionRecord, SessionSummary, Totals, UsageRecord,

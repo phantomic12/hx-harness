@@ -112,6 +112,26 @@ pub trait SandboxRuntime: Send + Sync {
         command: &str,
         workdir: Option<&str>,
     ) -> Result<SandboxExecOutput>;
+
+    /// Stage a tar archive's contents into the sandbox at `path`.
+    ///
+    /// The default reports unsupported, so backends without a transfer
+    /// mechanism compile unchanged and fail honestly at the call site.
+    async fn upload(&self, runtime_id: &str, path: &str, _tar: Vec<u8>) -> Result<()> {
+        Err(HxError::Sandbox(format!(
+            "{runtime_id}: {path}: this sandbox backend does not support upload"
+        )))
+    }
+
+    /// Fetch `path` from the sandbox as a tar archive.
+    ///
+    /// The default reports unsupported, so backends without a transfer
+    /// mechanism compile unchanged and fail honestly at the call site.
+    async fn download(&self, runtime_id: &str, path: &str) -> Result<Vec<u8>> {
+        Err(HxError::Sandbox(format!(
+            "{runtime_id}: {path}: this sandbox backend does not support download"
+        )))
+    }
 }
 
 /// Owns the set of live sandboxes.
@@ -256,6 +276,44 @@ impl SandboxManager {
         self.runtime.exec(&runtime_id, command, workdir).await
     }
 
+    /// Stage a tar archive's contents into a running sandbox at `dest_path`.
+    pub async fn upload_dir(&self, sandbox_id: &str, dest_path: &str, tar: Vec<u8>) -> Result<()> {
+        let runtime_id = {
+            let live = self.live.lock().await;
+            let handle = live
+                .get(sandbox_id)
+                .ok_or_else(|| HxError::Sandbox(format!("no sandbox with id {sandbox_id}")))?;
+            if handle.state != SandboxState::Running {
+                return Err(HxError::Sandbox(format!(
+                    "sandbox {sandbox_id} is {:?}, not running",
+                    handle.state
+                )));
+            }
+            handle.runtime_id.clone()
+        };
+
+        self.runtime.upload(&runtime_id, dest_path, tar).await
+    }
+
+    /// Fetch `path` from a running sandbox as a tar archive.
+    pub async fn download_file(&self, sandbox_id: &str, path: &str) -> Result<Vec<u8>> {
+        let runtime_id = {
+            let live = self.live.lock().await;
+            let handle = live
+                .get(sandbox_id)
+                .ok_or_else(|| HxError::Sandbox(format!("no sandbox with id {sandbox_id}")))?;
+            if handle.state != SandboxState::Running {
+                return Err(HxError::Sandbox(format!(
+                    "sandbox {sandbox_id} is {:?}, not running",
+                    handle.state
+                )));
+            }
+            handle.runtime_id.clone()
+        };
+
+        self.runtime.download(&runtime_id, path).await
+    }
+
     /// Stop and remove a sandbox. Idempotent: destroying something already gone is not an error,
     /// because the caller almost always means "make sure this is not running".
     ///
@@ -357,6 +415,10 @@ mod tests {
         started: Mutex<Vec<String>>,
         stopped: Mutex<Vec<String>>,
         removed: Mutex<Vec<String>>,
+        uploaded: Mutex<Vec<(String, String, Vec<u8>)>>,
+        downloaded: Mutex<Vec<(String, String)>>,
+        /// Bytes `download` hands back, so a round-trip test can assert them.
+        download_bytes: Mutex<Vec<u8>>,
         fail_start: bool,
         fail_create: bool,
         fail_stop: bool,
@@ -447,6 +509,26 @@ mod tests {
                 stderr: String::new(),
                 exit_code: 0,
             })
+        }
+
+        async fn upload(&self, runtime_id: &str, path: &str, tar: Vec<u8>) -> Result<()> {
+            self.uploaded.lock().await.push((
+                runtime_id.to_string(),
+                path.to_string(),
+                tar.clone(),
+            ));
+            // What `download` hands back next: the fake stores rather than
+            // synthesizing, so a round-trip test asserts the stored bytes.
+            *self.download_bytes.lock().await = tar;
+            Ok(())
+        }
+
+        async fn download(&self, runtime_id: &str, path: &str) -> Result<Vec<u8>> {
+            self.downloaded
+                .lock()
+                .await
+                .push((runtime_id.to_string(), path.to_string()));
+            Ok(self.download_bytes.lock().await.clone())
         }
     }
 
@@ -720,6 +802,80 @@ mod tests {
         let manager = manager_with(Arc::new(FakeRuntime::new()), 4);
         let err = manager.exec("sbx_nope", "ls", None).await.unwrap_err();
         assert!(err.to_string().contains("no sandbox with id"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn upload_dir_on_an_unknown_sandbox_matches_the_exec_error() {
+        let manager = manager_with(Arc::new(FakeRuntime::new()), 4);
+        let exec_err = manager.exec("sbx_nope", "ls", None).await.unwrap_err();
+        let upload_err = manager
+            .upload_dir("sbx_nope", "/workspace", vec![1, 2, 3])
+            .await
+            .unwrap_err();
+        assert!(
+            upload_err.to_string().contains("no sandbox with id"),
+            "{upload_err}"
+        );
+        // Same class of error: both resolve through the same live-handle lookup.
+        assert_eq!(
+            std::mem::discriminant(&exec_err),
+            std::mem::discriminant(&upload_err)
+        );
+    }
+
+    #[tokio::test]
+    async fn download_file_on_an_unknown_sandbox_is_a_clear_error() {
+        let manager = manager_with(Arc::new(FakeRuntime::new()), 4);
+        let err = manager
+            .download_file("sbx_nope", "/workspace/out")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no sandbox with id"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn upload_dir_reaches_the_runtime_with_the_runtime_id_and_bytes() {
+        let runtime = Arc::new(FakeRuntime::new());
+        let manager = manager_with(runtime.clone(), 4);
+        let handle = manager.spawn(&spec(3600), t0()).await.unwrap();
+
+        let tar = vec![7u8, 8, 9, 10];
+        manager
+            .upload_dir(handle.id.as_str(), "/workspace", tar.clone())
+            .await
+            .unwrap();
+
+        let uploaded = runtime.uploaded.lock().await;
+        assert_eq!(uploaded.len(), 1);
+        assert_eq!(uploaded[0].0, handle.runtime_id);
+        assert_eq!(uploaded[0].1, "/workspace");
+        assert_eq!(uploaded[0].2, tar);
+    }
+
+    #[tokio::test]
+    async fn download_file_round_trips_the_bytes_the_fake_recorded() {
+        let runtime = Arc::new(FakeRuntime::new());
+        let manager = manager_with(runtime.clone(), 4);
+        let handle = manager.spawn(&spec(3600), t0()).await.unwrap();
+
+        // The fake stores whatever `upload` received and hands it back from
+        // `download`, so staging then pulling round-trips the exact bytes.
+        let tar = vec![42u8, 1, 2, 3, 4];
+        manager
+            .upload_dir(handle.id.as_str(), "/workspace", tar.clone())
+            .await
+            .unwrap();
+
+        let got = manager
+            .download_file(handle.id.as_str(), "/workspace/out.tar")
+            .await
+            .unwrap();
+        assert_eq!(got, tar);
+
+        let downloaded = runtime.downloaded.lock().await;
+        assert_eq!(downloaded.len(), 1);
+        assert_eq!(downloaded[0].0, handle.runtime_id);
+        assert_eq!(downloaded[0].1, "/workspace/out.tar");
     }
 
     #[tokio::test]

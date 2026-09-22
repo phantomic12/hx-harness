@@ -1,0 +1,25 @@
+[package]
+name = "hx-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+hx-core.workspace = true
+hx-sandbox.workspace = true
+hx-agent.workspace = true
+hx-provider.workspace = true
+hx-remote.workspace = true
+hx-secrets.workspace = true
+reqwest.workspace = true
+hx-tools.workspace = true
+hx-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+chrono.workspace = true

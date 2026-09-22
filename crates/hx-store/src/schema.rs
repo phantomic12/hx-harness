@@ -24,10 +24,10 @@ use hx_core::error::{HxError, Result};
 use rusqlite::Connection;
 
 /// The schema this build writes and understands.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// `(version, sql)`, applied in order. Never edit an applied migration: add another.
-pub(crate) const MIGRATIONS: &[(i64, &str)] = &[(1, V1), (2, V2)];
+pub(crate) const MIGRATIONS: &[(i64, &str)] = &[(1, V1), (2, V2), (3, V3)];
 
 /// Adding a column is what makes the chain retrofittable: a database written before this migration
 /// keeps its rows and gets a NULL digest for each, which `verify` reports as unchained rather than as
@@ -35,6 +35,42 @@ pub(crate) const MIGRATIONS: &[(i64, &str)] = &[(1, V1), (2, V2)];
 /// rejected: an audit log that disappears when the tool is upgraded is a worse audit log.
 const V2: &str = r#"
 ALTER TABLE events ADD COLUMN digest TEXT;
+"#;
+
+/// Eval runs: one job row owning many trial rows.
+///
+/// A trial carries its own outcome and cost, and the job row keeps running totals so `hx eval
+/// results` lists jobs without summing trials per row. The totals are maintained by the insert
+/// path in the same transaction, not recomputed — a job row is therefore a cache that trusts its
+/// writer, which is the store itself.
+const V3: &str = r#"
+CREATE TABLE eval_jobs (
+    id          TEXT PRIMARY KEY,
+    dataset     TEXT NOT NULL,
+    role        TEXT NOT NULL,
+    task        TEXT NOT NULL,
+    trials      INTEGER NOT NULL,
+    passed      INTEGER NOT NULL,
+    total_cost  REAL NOT NULL,
+    created_at  TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE eval_trials (
+    id          TEXT PRIMARY KEY,
+    job_id      TEXT NOT NULL REFERENCES eval_jobs (id),
+    session_id  TEXT,
+    task        TEXT NOT NULL,
+    passed      INTEGER NOT NULL,
+    reason      TEXT NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    tokens_in   INTEGER NOT NULL,
+    tokens_out  INTEGER NOT NULL,
+    cost_usd    REAL NOT NULL,
+    created_at  TEXT NOT NULL
+) STRICT;
+
+-- `trials_for_job` is the read path: every trial of one run, oldest first.
+CREATE INDEX eval_trials_by_job ON eval_trials (job_id);
 "#;
 
 const V1: &str = r#"
@@ -182,7 +218,14 @@ mod tests {
     fn every_table_exists_after_migrating() {
         let mut conn = open();
         migrate(&mut conn).unwrap();
-        for table in ["sessions", "messages", "events", "usage"] {
+        for table in [
+            "sessions",
+            "messages",
+            "events",
+            "usage",
+            "eval_jobs",
+            "eval_trials",
+        ] {
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
