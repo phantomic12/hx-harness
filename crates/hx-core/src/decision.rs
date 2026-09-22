@@ -22,6 +22,7 @@
 //! This crate stays IO-free: the trait is transport-agnostic and the gate is a
 //! pure function.
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -238,6 +239,7 @@ impl Answer {
 ///
 /// The HTTP sidecar client (`LayaClient` in the sibling `hx-decision` crate,
 /// when it lands) implements this trait; tests use an in-memory stub.
+#[async_trait]
 pub trait DecisionClient {
     /// Error type for transport / schema failures.
     type Error;

@@ -2440,6 +2440,7 @@ dependencies = [
 name = "hx-core"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "chrono",
  "indexmap 2.14.2",
  "serde",
