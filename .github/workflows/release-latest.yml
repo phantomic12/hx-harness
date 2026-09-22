@@ -1,0 +1,91 @@
+name: Release latest
+
+# Cut a release from the **latest** main commit, automatically.
+#
+# Why: a release must be built from the newest verified tree, not a stale snapshot. This workflow
+# waits for the CI run on a main push to be green, then tags that exact commit v<workspace version>.
+# The existing `release.yml` (triggered by a `v*` tag push) does the actual build, sign,
+# verify-install and publish — so every release artifact is byte-for-byte the commit that passed CI.
+#
+# Version truth stays in one place: Cargo.toml (`version = "x.y.z"`). The tag is named from
+# that version, so bump it in the same commit you want released. If a tag already points at the exact
+# commit, this is a no-op (no duplicate release).
+#
+# NB: with the workspace at a fixed version (e.g. 0.0.1), every main push re-tags that same
+# `v0.0.1` — force-moving it and re-releasing. To get one release per change instead, bump
+# Cargo.toml's version in each release commit. Both policies share this one workflow.
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: release-latest
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: tag latest main
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      tagged: ${{ steps.tag.outputs.tagged }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Wait for CI to finish green on this commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Poll the CI workflow runs for this SHA until one has a terminal conclusion.
+          for _ in $(seq 1 120); do
+            status=$(gh api \
+              "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=${{ github.sha }}" \
+              --jq '[.workflow_runs[] | select(.event != "workflow_dispatch")][0].conclusion')
+            if [ "$status" = "success" ]; then
+              echo "CI green on ${{ github.sha }}"
+              exit 0
+            fi
+            if [ "$status" = "failure" ] || [ "$status" = "timed_out" ] || [ "$status" = "cancelled" ]; then
+              echo "::error::CI on ${{ github.sha }} concluded $status; not releasing"
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "::error::timed out waiting for CI on ${{ github.sha }}"
+          exit 1
+
+      - name: Read version and tag HEAD
+        id: tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          tag="v${version}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building ${tag} from ${GITHUB_SHA}"
+
+          # If a tag already points at this exact commit, there is nothing to do.
+          existing=$(git rev-parse -q --verify "refs/tags/${tag}" || true)
+          if [ -n "$existing" ] && [ "$existing" = "$GITHUB_SHA" ]; then
+            echo "tagged=false" >> "$GITHUB_OUTPUT"
+            echo "tag ${tag} already points at ${GITHUB_SHA}; nothing to do"
+            exit 0
+          fi
+
+          # The tag names the latest main commit. Force-move so the newest verified tree wins.
+          git tag -f "${tag}" "${GITHUB_SHA}"
+          git push origin "${tag}" --force
+          echo "tagged=true" >> "$GITHUB_OUTPUT"
+          echo "tagged ${tag} at ${GITHUB_SHA}"
