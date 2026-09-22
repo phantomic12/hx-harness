@@ -290,7 +290,7 @@ async fn a_fan_out_over_http_reaches_n_distinct_members_and_records_each() {
         .map(|c| c["Ran"]["model"].as_str().unwrap())
         .collect();
     assert_eq!(
-        models,
+        models: Arc::new(RwLock::new(models)),
         vec!["cheap", "strong"],
         "child order maps to member: {out}"
     );

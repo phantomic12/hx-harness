@@ -172,7 +172,7 @@ async fn build_state(models: Arc<dyn ModelFactory>) -> Arc<AppState> {
         config_path: None,
         secrets: Arc::new(SecretStores::new().with(Arc::new(EnvSecrets))),
         store: Arc::new(store),
-        models,
+        models: Arc::new(RwLock::new(models)),
         tools: Arc::new(hx_server::chat::default_tools(vec![], client)),
         approvals: ApprovalQueue::new(std::time::Duration::from_secs(1)),
         phone: None,
