@@ -22,8 +22,8 @@
 //! encrypted vault, capability probing on connect, and binary-safe file transfer.
 
 use crate::host::{
-    caps_from_uname, caps_from_ver, enrich_caps_from_posix_probe, powershell_quote, shell_quote,
-    ExecOutput, Host, HostCaps, RemoteEntry, RemoteOs, ShellKind,
+    caps_from_uname, caps_from_ver, check_cap, enrich_caps_from_posix_probe, powershell_quote,
+    shell_quote, ExecOutput, Host, HostCaps, RemoteEntry, RemoteOs, ShellKind,
 };
 use crate::known_hosts::{HostKeyVerdict, KnownHosts};
 use crate::sftp::{SftpAvailability, SftpSession};
@@ -676,6 +676,59 @@ impl SshHost {
         decode_b64_loose(&output.stdout)
     }
 
+    /// Measure a remote file's size without reading it, so the capped read can reject an
+    /// over-limit file before a byte crosses the wire.
+    ///
+    /// `Ok(None)` when the size could not be measured — the read itself then reports whatever is
+    /// wrong (a missing file, permissions). This keeps a failed measure from becoming a veto on a
+    /// file the read could have served.
+    async fn remote_size(&self, path: &str) -> Result<Option<u64>> {
+        let output = self
+            .exec(&remote_size_script(path), Duration::from_secs(60))
+            .await?;
+        if !output.success() {
+            return Ok(None);
+        }
+        Ok(output
+            .stdout
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse::<u64>().ok()))
+    }
+
+    /// The shelled-out capped read: `head -c (cap+1)` piped through `base64`.
+    ///
+    /// `base64 < path` would base64 the whole file into a command's stdout before the cap is ever
+    /// checked; `head` bounds the remote side to `cap + 1` bytes, and the decode below is over a
+    /// stdout of proportional size. The trailing length check holds for a file that grew between
+    /// the measure and this read.
+    async fn read_file_capped_shell(&self, path: &str, cap: u64) -> Result<Vec<u8>> {
+        if !self.caps.is_unix() {
+            return Err(HxError::Remote(format!(
+                "reading files over SSH is only implemented for POSIX hosts; {} is {:?}",
+                self.address, self.caps.os
+            )));
+        }
+
+        let output = self
+            .exec(
+                &capped_head_script(path, cap.saturating_add(1)),
+                Duration::from_secs(60),
+            )
+            .await?;
+
+        if !output.success() {
+            return Err(HxError::Remote(format!(
+                "could not read {path}: {}",
+                output.stderr.trim()
+            )));
+        }
+
+        let bytes = decode_b64_loose(&output.stdout)?;
+        check_cap(path, bytes.len() as u64, cap)?;
+        Ok(bytes)
+    }
+
     /// The shelled-out write. Kept for servers without SFTP.
     async fn write_file_shell(&self, path: &str, contents: &[u8]) -> Result<()> {
         use base64::Engine;
@@ -869,6 +922,24 @@ pub fn decode_b64_loose(input: &str) -> Result<Vec<u8>> {
         .map_err(|e| HxError::Remote(format!("remote sent invalid base64: {e}")))
 }
 
+/// Measure a remote file's byte count without reading it.
+///
+/// `wc -c` rather than `stat -c %s`: GNU and BSD `stat` disagree on flags, while `wc -c` streams
+/// on the far side in O(1) memory on every POSIX host. The redirect keeps the filename out of the
+/// output, so the stdout is just the count (with padding `wc` callers trim).
+fn remote_size_script(path: &str) -> String {
+    format!("wc -c < {}", shell_quote(path))
+}
+
+/// The bounded shell read: the first `limit` bytes of the file, base64-encoded.
+///
+/// `head -c` is what bounds the remote side — without it the whole file is base64'd into a
+/// command's stdout before any cap is checked. Callers pass `cap + 1` so the decode can tell
+/// "exactly at the cap" from "over it".
+fn capped_head_script(path: &str, limit: u64) -> String {
+    format!("head -c {limit} -- {} | base64", shell_quote(path))
+}
+
 /// The portable listing script. POSIX `sh`, no GNU-only flags.
 fn list_script(path: &str) -> String {
     format!(
@@ -902,6 +973,26 @@ impl Host for SshHost {
             return self.open_sftp().await?.read_file(path).await;
         }
         self.read_file_shell(path).await
+    }
+
+    /// Measure, then stream at most `cap + 1` bytes — the override of
+    /// [`Host::read_file_capped`].
+    ///
+    /// The default would `read_file` the whole remote file into daemon memory and reject it only
+    /// afterwards. This measures first (an over-limit file is rejected before a byte crosses the
+    /// wire) and then reads bounded on both paths: shrinking SFTP READs on the subsystem path,
+    /// `head -c (cap + 1)` on the shell path. The trailing length checks hold for a file that grew
+    /// between the measure and the read.
+    async fn read_file_capped(&self, path: &str, cap: u64) -> Result<Vec<u8>> {
+        if self.caps.is_unix() {
+            if let Some(size) = self.remote_size(path).await? {
+                check_cap(path, size, cap)?;
+            }
+        }
+        if self.caps.has_sftp == Some(true) {
+            return self.open_sftp().await?.read_file_capped(path, cap).await;
+        }
+        self.read_file_capped_shell(path, cap).await
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> Result<()> {
@@ -1116,6 +1207,33 @@ mod tests {
     fn the_listing_script_quotes_its_path() {
         let script = list_script("/tmp/it's here");
         assert!(script.contains(r"'/tmp/it'\''s here'"), "{script}");
+    }
+
+    #[test]
+    fn the_size_probe_streams_on_the_far_side_and_quotes_its_path() {
+        // `wc -c` and not `stat`: GNU and BSD disagree on `stat` flags, and the redirect keeps the
+        // filename out of the output so the stdout is just the count.
+        let script = remote_size_script("/tmp/it's here");
+        assert!(script.starts_with("wc -c < "), "{script}");
+        assert!(script.contains(r"'/tmp/it'\''s here'"), "{script}");
+    }
+
+    #[test]
+    fn the_capped_shell_read_bounds_the_remote_side_to_cap_plus_one() {
+        // The whole point of #75: without `head -c`, the far side base64s the entire file into a
+        // command's stdout before any cap is checked. The byte count is `cap + 1` so the decode
+        // can distinguish "exactly at the cap" from "over it".
+        let script = capped_head_script("/tmp/big.bin", 524_289);
+        assert!(script.starts_with("head -c 524289 -- "), "{script}");
+        assert!(script.ends_with("| base64"), "{script}");
+        assert!(script.contains("'/tmp/big.bin'"), "{script}");
+    }
+
+    #[test]
+    fn the_capped_shell_read_quotes_a_hostile_path() {
+        let script = capped_head_script("/tmp/x'; rm -rf /; echo '", 11);
+        assert!(script.starts_with("head -c 11 -- '"), "{script}");
+        assert!(script.ends_with("' | base64"), "{script}");
     }
 
     #[test]

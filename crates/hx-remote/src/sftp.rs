@@ -380,6 +380,58 @@ impl SftpSession {
         Ok(out)
     }
 
+    /// Read a remote file with a hard byte cap, for the [`Host::read_file_capped`] override.
+    ///
+    /// Each READ asks only for the bytes still allowed (`cap + 1` total), so an over-limit file
+    /// is rejected after at most `cap + 1` bytes cross the wire — never the whole file. The
+    /// `TooLarge` size is the bytes known to exist when the cap tripped, a lower bound when the
+    /// file is larger still.
+    pub async fn read_file_capped(&mut self, path: &str, cap: u64) -> Result<Vec<u8>> {
+        let handle = self.open_handle(path, PFXF_READ, OpenedFor::Read).await?;
+
+        let mut out = Vec::new();
+        let mut offset: u64 = 0;
+        loop {
+            let id = self.next_id();
+            let req = Packet::new(READ, id)
+                .string(&handle)
+                .u64(offset)
+                .u32(next_read_len(out.len() as u64, cap));
+            self.send(&req.finish()).await?;
+
+            let reply = self.wait_reply(id).await?;
+            match reply.type_id() {
+                Some(DATA) => {
+                    let data = reply.string().to_vec();
+                    if out.len() as u64 + data.len() as u64 > cap {
+                        // Known to exist: everything already read plus this chunk. The file may
+                        // be larger; the cap is what stopped the read from finding out.
+                        let size = offset + data.len() as u64;
+                        let _ = self.close_handle(&handle).await;
+                        return Err(HxError::TooLarge {
+                            what: path.to_string(),
+                            size,
+                            limit: cap,
+                        });
+                    }
+                    offset += data.len() as u64;
+                    out.extend_from_slice(&data);
+                }
+                // A STATUS with EOF (code 1) is the normal way a read finishes past the end of the
+                // file; any other status is a real error.
+                Some(STATUS) if reply.status_code() == 1 => break,
+                Some(STATUS) => {
+                    let (code, msg) = reply.status();
+                    return Err(HxError::Remote(sftp_status_error(code, &msg)));
+                }
+                other => return Err(unexpected_packet("read", other)),
+            }
+        }
+
+        self.close_handle(&handle).await?;
+        Ok(out)
+    }
+
     /// Create (or truncate) a remote file and write `contents` into it.
     pub async fn write_file(&mut self, path: &str, contents: &[u8]) -> Result<()> {
         let handle = self
@@ -657,6 +709,18 @@ fn parse_name_packet(packet: &[u8], base: &str) -> Vec<RemoteEntry> {
     out
 }
 
+/// How many bytes the next SFTP READ may ask for without the buffer ever holding more than
+/// `cap + 1` bytes.
+///
+/// The wire chunk stays at the usual 32 KiB while the allowance lasts, then shrinks to exactly
+/// the bytes still permitted — the one extra byte is what distinguishes "exactly at the cap"
+/// (allowed) from "over it" (rejected). Never zero: a zero-length READ is legal but pointless.
+fn next_read_len(buffered: u64, cap: u64) -> u32 {
+    cap.saturating_add(1)
+        .saturating_sub(buffered)
+        .clamp(1, 32_768) as u32
+}
+
 /// Turn an SFTP STATUS code and message into the crate's error wording.
 fn sftp_status_error(code: u32, msg: &str) -> String {
     // The codes are the SSH_FX_* ones: 0 ok, 1 EOF, 2 no such file, 3 permission denied,
@@ -763,6 +827,29 @@ mod tests {
         assert_eq!(SftpAvailability::Available.as_bool(), Some(true));
         assert_eq!(SftpAvailability::Unavailable.as_bool(), Some(false));
         assert_eq!(SftpAvailability::Unknown.as_bool(), None);
+    }
+
+    #[test]
+    fn capped_reads_ask_for_at_most_cap_plus_one() {
+        // Full chunks while the allowance lasts, then exactly the remainder: the buffer can never
+        // hold more than `cap + 1` bytes no matter how large the remote file is.
+        assert_eq!(next_read_len(0, 512 * 1024), 32_768);
+        assert_eq!(
+            next_read_len(0, 10),
+            11,
+            "a small cap shrinks the very first READ"
+        );
+        assert_eq!(
+            next_read_len(512 * 1024, 512 * 1024),
+            1,
+            "the last permitted byte still has to be asked for"
+        );
+        assert_eq!(
+            next_read_len(512 * 1024 + 40, 512 * 1024),
+            1,
+            "never a zero-length READ, even past the cap"
+        );
+        assert_eq!(next_read_len(0, u64::MAX), 32_768, "no overflow at the top");
     }
 
     #[test]

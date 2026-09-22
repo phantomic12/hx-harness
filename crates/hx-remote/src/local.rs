@@ -1,7 +1,7 @@
 //! The machine the daemon itself runs on.
 
 use crate::host::{
-    caps_from_uname, caps_from_ver, enrich_caps_from_posix_probe, posix_probe_command,
+    caps_from_uname, caps_from_ver, check_cap, enrich_caps_from_posix_probe, posix_probe_command,
     windows_probe_command, ExecOutput, Host, HostCaps, RemoteEntry, RemoteOs, ShellKind,
 };
 use async_trait::async_trait;
@@ -253,13 +253,7 @@ impl Host for LocalHost {
             .await
             .map_err(|e| HxError::Remote(format!("could not read {path}: {e}")))?
             .len();
-        if size > cap {
-            return Err(HxError::TooLarge {
-                what: path.to_string(),
-                size,
-                limit: cap,
-            });
-        }
+        check_cap(path, size, cap)?;
         let file = tokio::fs::File::open(path)
             .await
             .map_err(|e| HxError::Remote(format!("could not read {path}: {e}")))?;
@@ -269,14 +263,7 @@ impl Host for LocalHost {
             .read_to_end(&mut bytes)
             .await
             .map_err(|e| HxError::Remote(format!("could not read {path}: {e}")))?;
-        let size = bytes.len() as u64;
-        if size > cap {
-            return Err(HxError::TooLarge {
-                what: path.to_string(),
-                size,
-                limit: cap,
-            });
-        }
+        check_cap(path, bytes.len() as u64, cap)?;
         Ok(bytes)
     }
 

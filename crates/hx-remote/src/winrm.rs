@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use hx_core::error::{HxError, Result};
 
-use crate::host::{ExecOutput, Host, HostCaps, RemoteEntry, RemoteOs, ShellKind};
+use crate::host::{check_cap, ExecOutput, Host, HostCaps, RemoteEntry, RemoteOs, ShellKind};
 use crate::ntlm::{header_value, Auth};
 use hx_core::ids::HostId;
 
@@ -568,6 +568,34 @@ impl WinRmHost {
             duration_ms: start.elapsed().as_millis() as u64,
         })
     }
+
+    /// The `%~zI` size probe, split out so the capped read can gate on the same measurement the
+    /// full read already pays for.
+    ///
+    /// The size test is its own `for` statement with no parenthesised block around it. Measured:
+    /// `%~zI` does not expand reliably inside `else (...)`, where it makes the whole line fail
+    /// with a bare exit code 1 and an empty stderr — which reads as a transport fault rather than
+    /// a bug in the command. Two flat statements avoid that.
+    async fn file_size(&self, path: &str) -> Result<u64> {
+        let out = self
+            .exec(
+                &format!("for %I in (\"{path}\") do @echo %~zI"),
+                Duration::from_secs(60),
+            )
+            .await?;
+        if !out.success() {
+            return Err(HxError::Remote(format!(
+                "could not measure '{path}': {}",
+                out.stderr.trim()
+            )));
+        }
+        out.stdout.trim().parse::<u64>().map_err(|_| {
+            HxError::Remote(format!(
+                "could not measure '{path}': unexpected size {:?}",
+                out.stdout.trim()
+            ))
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -611,24 +639,7 @@ impl Host for WinRmHost {
         // A zero-byte file is handled before `certutil` runs: `certutil -encode` refuses an empty
         // input with `ERROR_INVALID_DATA`, so an empty file read back as a failure rather than as
         // empty contents.
-        //
-        // The size test is its own `for` statement with no parenthesised block around it. Measured:
-        // `%~zI` does not expand reliably inside `else (...)`, where it makes the whole line fail
-        // with a bare exit code 1 and an empty stderr — which reads as a transport fault rather than
-        // a bug in the command. Two flat statements avoid that.
-        let out = self
-            .exec(
-                &format!("for %I in (\"{path}\") do @echo %~zI"),
-                Duration::from_secs(60),
-            )
-            .await?;
-        if !out.success() {
-            return Err(HxError::Remote(format!(
-                "could not measure '{path}': {}",
-                out.stderr.trim()
-            )));
-        }
-        if out.stdout.trim() == "0" {
+        if self.file_size(path).await? == 0 {
             return Ok(Vec::new());
         }
         let out = self
@@ -656,6 +667,41 @@ impl Host for WinRmHost {
         base64::engine::general_purpose::STANDARD
             .decode(cleaned.trim())
             .map_err(|e| HxError::Remote(format!("'{path}' did not decode as base64: {e}")))
+    }
+
+    /// Measure, then read at most `cap + 1` bytes — the override of
+    /// [`Host::read_file_capped`].
+    ///
+    /// The default would `read_file` the whole remote file into daemon memory and reject it only
+    /// afterwards. This gates on the `%~zI` size first (an over-limit file is rejected before
+    /// `certutil` materializes it) and then reads through a bounded PowerShell one-liner rather
+    /// than `certutil -encode`, which has no range mode. The trailing length check holds for a
+    /// file that grew between the measure and the read.
+    async fn read_file_capped(&self, path: &str, cap: u64) -> Result<Vec<u8>> {
+        check_path(path, "read")?;
+        let size = self.file_size(path).await?;
+        check_cap(path, size, cap)?;
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let out = self
+            .exec(
+                &capped_read_command(path, cap.saturating_add(1)),
+                Duration::from_secs(120),
+            )
+            .await?;
+        if !out.success() {
+            return Err(HxError::Remote(format!(
+                "could not read '{path}': {}",
+                out.stderr.trim()
+            )));
+        }
+        let cleaned: String = out.stdout.chars().filter(|c| !c.is_whitespace()).collect();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(cleaned.trim())
+            .map_err(|e| HxError::Remote(format!("'{path}' did not decode as base64: {e}")))?;
+        check_cap(path, (bytes.len() as u64).max(size), cap)?;
+        Ok(bytes)
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> Result<()> {
@@ -1023,6 +1069,27 @@ fn write_steps(path: &str, encoded: &str) -> Vec<String> {
         }
     }
     steps
+}
+
+/// The bounded read: base64 of at most `limit` bytes of the file, printed to stdout.
+///
+/// `certutil -encode` — what the full read uses — has no range mode, so it cannot serve a capped
+/// read: the whole file would be encoded before any cap is checked. This instead nests a
+/// PowerShell one-liner inside the `cmd` command line: `[IO.File]::OpenRead` streams from disk
+/// and `Read` is looped until `limit` bytes or EOF, so the far side never holds more than `limit`
+/// bytes. Callers pass `cap + 1` so the decode can tell "exactly at the cap" from "over it".
+///
+/// Quoting: the path sits in a PowerShell single-quoted string, where the escape is a doubled
+/// quote. The whole one-liner sits in `cmd` double quotes, which [`check_path`] keeps intact by
+/// rejecting `"` (and every `cmd` metacharacter) in paths before interpolation.
+fn capped_read_command(path: &str, limit: u64) -> String {
+    let escaped = path.replace('\'', "''");
+    format!(
+        "powershell -NoProfile -NonInteractive -Command \"$s=[IO.File]::OpenRead('{escaped}');\
+         try{{$b=New-Object byte[] ({limit});$t=0;\
+         while($t -lt $b.Length){{$r=$s.Read($b,$t,$b.Length-$t);if($r -le 0){{break}};$t+=$r}};\
+         [Convert]::ToBase64String($b,0,$t)}}finally{{$s.Close()}}\""
+    )
 }
 
 /// Reject a path this client cannot safely put inside a `cmd.exe` command line.
@@ -1607,5 +1674,43 @@ mod tests {
             message.contains("cmd.exe"),
             "the refusal must say why, and name the interpreter: {message}"
         );
+    }
+
+    #[test]
+    fn the_capped_read_bounds_the_remote_side_to_cap_plus_one() {
+        // The whole point of #75: `certutil -encode` has no range mode, so a capped read through
+        // it would encode the entire file before any cap is checked. The PowerShell one-liner
+        // allocates exactly `cap + 1` bytes on the far side and loops `Read` to EOF or that bound.
+        let command = capped_read_command(r"C:\tmp\big.bin", 524_289);
+        assert!(
+            command.contains("New-Object byte[] (524289)"),
+            "the far-side buffer is the bound: {command}"
+        );
+        assert!(
+            command.contains("[IO.File]::OpenRead('C:\\tmp\\big.bin')"),
+            "{command}"
+        );
+        assert!(
+            command.contains("[Convert]::ToBase64String"),
+            "the answer is base64, like the full read: {command}"
+        );
+        assert!(
+            !command.contains("certutil"),
+            "certutil cannot do ranges and must not appear here: {command}"
+        );
+    }
+
+    #[test]
+    fn the_capped_read_escapes_a_single_quote_and_stays_non_interactive() {
+        // PowerShell single-quoted strings escape `'` by doubling it; anything else would close the
+        // string the path sits in. And a PowerShell that can prompt can hang the daemon, so the
+        // flags the transport always uses must be present.
+        let command = capped_read_command(r"C:\tmp\it's here.bin", 11);
+        assert!(
+            command.contains("'C:\\tmp\\it''s here.bin'"),
+            "the quote must be doubled, not backslashed: {command}"
+        );
+        assert!(command.contains("-NonInteractive"), "{command}");
+        assert!(command.contains("-NoProfile"), "{command}");
     }
 }

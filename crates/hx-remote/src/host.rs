@@ -325,10 +325,10 @@ pub trait Host: Send + Sync {
     /// reads at its own layer (and reports them as failed tool calls, not errors), while the HTTP
     /// surface must refuse with a 413 before a multi-gigabyte file becomes a multi-gigabyte
     /// response. The default implementation reads then rejects, which bounds the *answer* on every
-    /// transport; transports that can stat first (local) override it to bound the *read* as well —
-    /// stat, reject, and stream with `take(cap + 1)` so a file that grows between the stat and the
-    /// read, or reports no size at all (`/dev/zero`, a pipe), still cannot push more than `cap + 1`
-    /// bytes into memory.
+    /// transport; transports that can bound the read itself (local, ssh, winrm) override it —
+    /// measure first, reject, and stream at most `cap + 1` bytes so a file that grows between the
+    /// measure and the read, or reports no size at all (`/dev/zero`, a pipe), still cannot push more
+    /// than `cap + 1` bytes into memory.
     async fn read_file_capped(&self, path: &str, cap: u64) -> Result<Vec<u8>> {
         let bytes = self.read_file(path).await?;
         let size = bytes.len() as u64;
@@ -381,6 +381,22 @@ pub trait Host: Send + Sync {
 
     /// A one-line description for status output.
     fn describe(&self) -> String;
+}
+
+/// Reject a measured file size over `cap` with the [`HxError::TooLarge`] the capped routes map
+/// to 413.
+///
+/// One shared gate so every transport reports the same error for the same over-limit file: the
+/// local, ssh, and winrm capped reads all measure first and call this before streaming a byte.
+pub(crate) fn check_cap(what: &str, size: u64, cap: u64) -> Result<()> {
+    if size > cap {
+        return Err(HxError::TooLarge {
+            what: what.to_string(),
+            size,
+            limit: cap,
+        });
+    }
+    Ok(())
 }
 
 /// Read `uname -s`-style output into caps, falling back to the Windows probe.
@@ -711,5 +727,25 @@ mod tests {
         assert_eq!(kind_of(&caps), HostKind::Winrm);
         caps.os = RemoteOs::Linux;
         assert_eq!(kind_of(&caps), HostKind::Ssh);
+    }
+
+    // ---- capped reads ----
+
+    #[test]
+    fn an_over_limit_size_is_rejected_with_its_measurements() {
+        // The contract every capped transport shares: over the cap is `TooLarge` carrying the
+        // measured size and the cap, so the routes map it to 413 with a message the caller can act
+        // on. Exactly at the cap is allowed — the limit is a size, not an off-by-one.
+        let err = check_cap("/tmp/big.bin", 1025, 1024).unwrap_err();
+        match err {
+            HxError::TooLarge { what, size, limit } => {
+                assert_eq!(what, "/tmp/big.bin");
+                assert_eq!(size, 1025);
+                assert_eq!(limit, 1024);
+            }
+            other => panic!("wrong error: {other:?}"),
+        }
+        assert!(check_cap("/tmp/exact.bin", 1024, 1024).is_ok());
+        assert!(check_cap("/tmp/small.bin", 3, 1024).is_ok());
     }
 }
