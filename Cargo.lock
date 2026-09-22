@@ -2451,6 +2451,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hx-decision"
+version = "0.0.1"
+dependencies = [
+ "hx-core",
+ "indexmap 2.14.2",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "hx-desktop"
 version = "0.0.1"
 dependencies = [
