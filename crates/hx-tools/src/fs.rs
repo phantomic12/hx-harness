@@ -3,6 +3,7 @@
 use crate::tool::{bound, parse_args, Requirement, Tool, ToolContext, ToolError, ToolOutcome};
 use async_trait::async_trait;
 use hx_core::capability::{Action, Resource};
+use hx_core::error::HxError;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -113,8 +114,21 @@ impl Tool for ReadFileTool {
         let mut parsed: ReadArgs = parse_args(&args)?;
         parsed.path = effective_path(ctx, &ctx.resolve(&parsed.path)).await;
 
-        let bytes = match ctx.host.read_file(&parsed.path).await {
+        let bytes = match ctx
+            .host
+            .read_file_capped(&parsed.path, MAX_READ_BYTES as u64)
+            .await
+        {
             Ok(bytes) => bytes,
+            // A read that would exceed the bound is refused at the source (a stale default that
+            // materialised first is the same refusal), rather than pulled into memory and then rejected.
+            Err(HxError::TooLarge { .. }) => {
+                return Ok(ToolOutcome::failed(format!(
+                    "{} is over the {MAX_READ_BYTES}-byte read limit. Read the part you need \
+                     with `shell` (for example `sed -n '1,200p' {}`).",
+                    parsed.path, parsed.path
+                )));
+            }
             Err(err) => return Ok(ToolOutcome::failed(format!("{err}"))),
         };
         let byte_len = bytes.len() as u64;
