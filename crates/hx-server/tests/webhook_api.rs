@@ -23,7 +23,7 @@ use hx_search::BackendRegistry;
 use hx_secrets::{EnvSecrets, Secret, SecretStores};
 use hx_server::{AppState, AppStateParts, ModelFactory};
 use hx_store::Store;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 struct DeadModel;
 #[async_trait]
@@ -99,10 +99,12 @@ async fn harness() -> Harness {
     let state = AppState::from_parts(AppStateParts {
         config,
         router: Arc::new(std::sync::Mutex::new(router)),
-        providers: Arc::new(providers),
+        providers: Arc::new(RwLock::new(providers)),
+        provider_configs: Default::default(),
+        config_path: None,
         secrets: Arc::new(secrets),
         store: Arc::new(store),
-        models: Arc::new(Dead(Arc::new(DeadModel))),
+        models: Arc::new(RwLock::new(Arc::new(Dead(Arc::new(DeadModel))))),
         tools: Arc::new(hx_server::chat::default_tools(vec![], client)),
         approvals: ApprovalQueue::new(std::time::Duration::from_secs(1)),
         search: Arc::new(search),

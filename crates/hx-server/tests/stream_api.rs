@@ -25,7 +25,7 @@ use hx_secrets::{EnvSecrets, SecretStores};
 use hx_server::{app, AppState, AppStateParts, LiveEvent, ModelFactory};
 use hx_store::Store;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tower::ServiceExt;
 
 /// Answers from a script, and refuses once it runs out — a short script must fail loudly rather
@@ -167,7 +167,9 @@ async fn build_state(models: Arc<dyn ModelFactory>) -> Arc<AppState> {
     AppState::from_parts(AppStateParts {
         config,
         router: Arc::new(Mutex::new(router)),
-        providers: Arc::new(providers),
+        providers: Arc::new(RwLock::new(providers)),
+        provider_configs: Default::default(),
+        config_path: None,
         secrets: Arc::new(SecretStores::new().with(Arc::new(EnvSecrets))),
         store: Arc::new(store),
         models,

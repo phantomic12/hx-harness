@@ -27,7 +27,7 @@ use hx_server::{app, AppState, AppStateParts, ModelFactory};
 use hx_store::Store;
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tower::ServiceExt;
 
 // -- the scripted model ---------------------------------------------------------------------------
@@ -501,10 +501,12 @@ async fn harness_with(config_yaml: &str, replies: Vec<Result<ChatResponse>>) -> 
     let state = AppState::from_parts(AppStateParts {
         config,
         router: Arc::new(Mutex::new(router)),
-        providers: Arc::new(providers),
+        providers: Arc::new(RwLock::new(providers)),
+        provider_configs: Default::default(),
+        config_path: None,
         secrets: Arc::new(secrets),
         store: Arc::new(store),
-        models: Arc::new(Scripted(Arc::clone(&model))),
+        models: Arc::new(RwLock::new(Arc::new(Scripted(Arc::clone(&model))))),
         tools: Arc::new(hx_server::chat::default_tools(vec![], client)),
         // Long enough for the test to answer from another request, which is the shape a real client
         // has: the run waits while the answer comes in over the same surface.
