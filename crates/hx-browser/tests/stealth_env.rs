@@ -32,9 +32,10 @@
 use hx_browser::profile::PoolRoot;
 use hx_browser::rung::{FetchRequest, Fetcher};
 use hx_browser::rungs::StealthRung;
-use hx_browser::target::{Admission, TargetUrl};
+use hx_browser::target::{Admission, HostResolver, TargetUrl};
 use hx_core::ids::SessionId;
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -85,6 +86,19 @@ fn parse_env_output(stdout: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// The rung's pre-spawn DNS gate judges `example.test` through this resolver: the
+/// hermetic hostname has no DNS home, and a test that depended on real DNS would own
+/// it. One public address, so the gate passes and the environment is what is under
+/// test.
+#[derive(Debug)]
+struct PublicTestResolver;
+
+impl HostResolver for PublicTestResolver {
+    fn resolve_host(&self, _host: &str) -> std::io::Result<Vec<IpAddr>> {
+        Ok(vec!["93.184.216.34".parse().expect("a test address")])
+    }
+}
+
 #[tokio::test]
 async fn a_stealth_browser_child_inherits_only_the_allowlist_and_never_the_daemon_environment() {
     let env_bin = Path::new("/usr/bin/env");
@@ -126,7 +140,7 @@ async fn a_stealth_browser_child_inherits_only_the_allowlist_and_never_the_daemo
         .session(&SessionId::from_raw("stealth-env-test"))
         .expect("a session profile");
 
-    let rung = StealthRung::new(env_bin);
+    let rung = StealthRung::new(env_bin).with_resolver(Arc::new(PublicTestResolver));
     let request = FetchRequest {
         target: TargetUrl::parse_with(Admission::AllowLocal, "https://example.test/page?q=1")
             .expect("an admitted target"),
