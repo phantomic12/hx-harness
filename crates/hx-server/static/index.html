@@ -88,6 +88,13 @@ button { cursor: pointer; }
   border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; font-family: var(--mono); font-size: 12px;
 }
 .token-panel input:focus { outline: none; border-color: var(--accent); }
+.token-panel input#login-user { flex: none; width: 160px; }
+.token-panel input#login-pass { flex: none; width: 220px; }
+.token-panel #token-status.err { color: var(--bad); }
+.token-panel details.adv { margin-left: auto; }
+.token-panel details.adv summary { cursor: pointer; color: var(--faint); font-size: 11px; font-family: var(--mono); }
+.token-panel details.adv summary:hover { color: var(--text); }
+.token-panel details.adv input { margin-top: 6px; }
 .token-panel button {
   background: transparent; color: var(--text); border: 1px solid var(--line);
   border-radius: 6px; padding: 5px 12px; font-size: 12px;
@@ -401,13 +408,19 @@ button { cursor: pointer; }
     <button data-view="providers" title="providers / settings">providers</button>
   </nav>
   <div class="spacer"></div>
-  <button id="token-button" class="token-button" title="API bearer token">token</button>
+  <button id="token-button" class="token-button" title="account — log in / out">login</button>
 </header>
 <div id="token-panel" class="token-panel" hidden>
-  <input id="token-input" type="password" placeholder="bearer token" autocomplete="off" spellcheck="false">
-  <button id="token-save">save</button>
-  <button id="token-clear">clear</button>
+  <span class="dim">account</span>
+  <input id="login-user" placeholder="username" autocomplete="username" spellcheck="false">
+  <input id="login-pass" type="password" placeholder="password" autocomplete="current-password" spellcheck="false">
+  <button id="token-save">log in</button>
+  <button id="token-clear">log out</button>
   <span id="token-status" class="dim"></span>
+  <details class="adv">
+    <summary>advanced: paste token</summary>
+    <input id="token-input" type="password" placeholder="bearer token" autocomplete="off" spellcheck="false">
+  </details>
 </div>
 <div class="app">
   <aside class="side" id="side">
@@ -544,9 +557,14 @@ button { cursor: pointer; }
     <p class="ob-sub">Three steps and you're talking to the agent: authenticate, connect a model provider, start prompting.</p>
     <div class="ob-steps"><i id="ob-s1" class="now"></i><i id="ob-s2"></i><i id="ob-s3"></i></div>
     <div class="ob-step" id="ob-step-1">
-      <h3>1 · Paste your API bearer token</h3>
-      <p>The daemon binds non-loopback, so every /v1/* call needs it. Stored only in this browser's localStorage.</p>
-      <input id="ob-token" type="password" placeholder="bearer token" autocomplete="off" spellcheck="false">
+      <h3>1 · Log in to your account</h3>
+      <p>The daemon binds non-loopback, so every /v1/* call needs auth. The token from login is stored only in this browser's localStorage.</p>
+      <input id="ob-username" placeholder="username" autocomplete="username" spellcheck="false">
+      <input id="ob-password" type="password" placeholder="password" autocomplete="current-password" spellcheck="false">
+      <details class="adv">
+        <summary style="cursor:pointer;color:var(--faint);font-size:11px;font-family:var(--mono)">advanced: paste token instead</summary>
+        <input id="ob-token" type="password" placeholder="bearer token" autocomplete="off" spellcheck="false">
+      </details>
     </div>
     <div class="ob-step" id="ob-step-2" hidden>
       <h3>2 · Add your first model provider</h3>
@@ -578,7 +596,7 @@ button { cursor: pointer; }
     </div>
     <div id="ob-msg"></div>
     <div class="ob-actions">
-      <button id="ob-next" class="primary">Save token · continue</button>
+      <button id="ob-next" class="primary">Log in · continue</button>
       <button id="ob-back" class="ghost" hidden>back</button>
       <button id="ob-skip" class="ghost">skip → main UI</button>
     </div>
@@ -613,10 +631,53 @@ const apiToken = () => localStorage.getItem(TOKEN_KEY) || "";
 const setToken = (value) => {
   if (value) localStorage.setItem(TOKEN_KEY, value);
   else localStorage.removeItem(TOKEN_KEY);
-  $("token-status").textContent = value ? "token set" : "no token";
+  refreshAuthUI();
 };
 
-// Every request goes through this. A 401 is the daemon saying "a token is required" — the body
+// Account login: POST /v1/login {username, password} -> {token}. Uses a raw fetch — never
+// apiFetch — so no stale bearer is attached and a 401 here does not trigger the global handler.
+async function doLogin(username, password) {
+  let res;
+  try {
+    res = await fetch(`${API}/v1/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+  } catch (_) {
+    throw new Error("daemon unreachable — is it running?");
+  }
+  if (res.status === 404) throw new Error("this daemon does not support account login (no POST /v1/login)");
+  if (!res.ok) {
+    let detail = "";
+    try { detail = (await res.json()).error || ""; } catch (_) {}
+    throw new Error(detail || (res.status === 401 ? "invalid username or password" : `login failed (HTTP ${res.status})`));
+  }
+  let data = null;
+  try { data = await res.json(); } catch (_) {}
+  if (!data || typeof data.token !== "string" || !data.token) throw new Error("login response missing token");
+  return data.token;
+}
+
+// Single place that reflects auth state: panel status text + top-bar account button.
+// Runs on load and on every setToken, so the button reads login/logout without a reload.
+function refreshAuthUI() {
+  const has = !!apiToken();
+  try {
+    const st = document.getElementById("token-status");
+    if (st) { st.textContent = has ? "logged in" : "not logged in"; st.classList.toggle("err", false); }
+  } catch (_) {}
+  try {
+    const btn = document.getElementById("token-button");
+    if (btn) {
+      btn.classList.toggle("has-token", has);
+      btn.textContent = has ? "account ✓" : "login";
+      btn.title = has ? "account — logged in (click to log out / switch)" : "account — log in";
+    }
+  } catch (_) {}
+}
+
+// Every request goes through this. A 401 is the daemon saying "auth is required" — the body
 // deliberately does not distinguish a missing token from a wrong one, so neither can this.
 async function apiFetch(path, init = {}) {
   const headers = Object.assign({}, init.headers || {});
@@ -624,7 +685,7 @@ async function apiFetch(path, init = {}) {
   if (token) headers["authorization"] = `Bearer ${token}`;
   const res = await fetch(path, Object.assign({}, init, { headers }));
   if (res.status === 401) {
-    showError("this daemon requires an API token — open the token panel and paste it");
+    showError("authentication required — log in (top-right account button)");
     $("token-panel").hidden = false;
   }
   return res;
@@ -1830,9 +1891,7 @@ async function deleteProvider(name) {
   })();
 
   // Token button reflects stored state without ever showing the secret.
-  try {
-    if (apiToken()) $("token-button").classList.add("has-token");
-  } catch (_) {}
+  try { refreshAuthUI(); } catch (_) {}
 
   // ---- onboarding ---------------------------------------------------------
   const OB_KEY = "hx.onboard.dismissed";
@@ -1851,10 +1910,10 @@ async function deleteProvider(name) {
     }
     $("ob-back").hidden = step === 1;
     $("ob-next").textContent =
-      step === 1 ? "Save token · continue" :
+      step === 1 ? "Log in · continue" :
       step === 2 ? "Save provider · continue" : "Open the transcript →";
     obMsg("");
-    if (step === 1) setTimeout(() => $("ob-token").focus(), 50);
+    if (step === 1) setTimeout(() => $("ob-username").focus(), 50);
     if (step === 2) setTimeout(() => $("ob-prov-name").focus(), 50);
   }
   function obDismiss() {
@@ -1864,12 +1923,33 @@ async function deleteProvider(name) {
   }
   async function obNext() {
     if (obStep === 1) {
-      const v = $("ob-token").value.trim();
-      if (!v) { obMsg("paste the bearer token first — or skip", false); return; }
-      // Reuse the exact token save path: localStorage + reload-free re-entry.
-      setToken(v);
-      try { $("token-button").classList.add("has-token"); } catch (_) {}
-      obMsg("token saved ✓", true);
+      // Advanced fallback: a pasted bearer token skips the login round-trip (also covers
+      // daemons without POST /v1/login).
+      const pasted = $("ob-token").value.trim();
+      const user = $("ob-username").value.trim();
+      const pass = $("ob-password").value;
+      if (!user && !pass && pasted) {
+        // Reuse the exact token save path: localStorage + reload-free re-entry.
+        setToken(pasted);
+        $("ob-token").value = "";
+        obMsg("token saved ✓", true);
+      } else {
+        if (!user || !pass) { obMsg("enter your username and password — or skip", false); return; }
+        const btn = $("ob-next");
+        btn.disabled = true;
+        try {
+          const token = await doLogin(user, pass);
+          // Reuse the exact token save path: localStorage + reload-free re-entry.
+          setToken(token);
+          $("ob-password").value = "";
+          obMsg("logged in ✓", true);
+        } catch (e) {
+          obMsg(String((e && e.message) || e), false);
+          return;
+        } finally {
+          btn.disabled = false;
+        }
+      }
       // Re-probe providers with the new credential before deciding step 2 vs 3.
       try {
         const res = await apiFetch(`${API}/v1/providers`);
@@ -1901,6 +1981,8 @@ async function deleteProvider(name) {
   $("ob-next").addEventListener("click", obNext);
   $("ob-back").addEventListener("click", () => obShow(Math.max(1, obStep - 1)));
   $("ob-skip").addEventListener("click", obDismiss);
+  $("ob-username").addEventListener("keydown", (e) => { if (e.key === "Enter") $("ob-password").focus(); });
+  $("ob-password").addEventListener("keydown", (e) => { if (e.key === "Enter") obNext(); });
   $("ob-token").addEventListener("keydown", (e) => { if (e.key === "Enter") obNext(); });
   $("ob-prov-name").addEventListener("keydown", (e) => { if (e.key === "Enter") obNext(); });
 
@@ -1925,27 +2007,58 @@ async function deleteProvider(name) {
 })();
 
 
-// ---- token panel wiring -----------------------------------------------------------------------
+// ---- account panel wiring -----------------------------------------------------------------------
 
 $("token-button").addEventListener("click", () => {
   $("token-panel").hidden = !$("token-panel").hidden;
-  if (!$("token-panel").hidden) $("token-input").focus();
+  if (!$("token-panel").hidden) ($("login-user").value ? $("login-pass") : $("login-user")).focus();
 });
-$("token-save").addEventListener("click", () => {
-  setToken($("token-input").value.trim());
-  $("token-input").value = "";
-  $("token-panel").hidden = true;
-  // A reload rather than a patch-up: the sockets already opened (or already refused) carry the
-  // previous credential, and every pane's first render depends on a request that has already
-  // happened. Reloading re-runs all of it against the new token, which is one code path instead of
-  // two that could disagree.
-  location.reload();
-});
+async function panelLogin() {
+  // Advanced fallback: a pasted bearer token is stored directly, no login round-trip.
+  const pasted = $("token-input").value.trim();
+  const user = $("login-user").value.trim();
+  const pass = $("login-pass").value;
+  const st = $("token-status");
+  st.classList.toggle("err", false);
+  if (!user && !pass && pasted) {
+    setToken(pasted);
+    $("token-input").value = "";
+    $("token-panel").hidden = true;
+    // A reload rather than a patch-up: the sockets already opened (or already refused) carry the
+    // previous credential, and every pane's first render depends on a request that has already
+    // happened. Reloading re-runs all of it against the new token, which is one code path instead of
+    // two that could disagree.
+    location.reload();
+    return;
+  }
+  if (!user || !pass) {
+    st.textContent = "enter username + password";
+    st.classList.toggle("err", true);
+    (user ? $("login-pass") : $("login-user")).focus();
+    return;
+  }
+  st.textContent = "logging in…";
+  try {
+    const token = await doLogin(user, pass);
+    setToken(token);
+    $("login-pass").value = "";
+    $("token-input").value = "";
+    $("token-panel").hidden = true;
+    // Same reload rationale as above: sockets + first renders already ran under the old credential.
+    location.reload();
+  } catch (e) {
+    st.textContent = String((e && e.message) || e);
+    st.classList.toggle("err", true);
+  }
+}
+$("token-save").addEventListener("click", panelLogin);
+$("login-pass").addEventListener("keydown", (e) => { if (e.key === "Enter") panelLogin(); });
+$("login-user").addEventListener("keydown", (e) => { if (e.key === "Enter") $("login-pass").focus(); });
 $("token-clear").addEventListener("click", () => {
   setToken("");
   location.reload();
 });
-$("token-status").textContent = apiToken() ? "token set" : "no token";
+refreshAuthUI();
 
 // ---------------------------------------------------------------------------------------------
 // Boot
