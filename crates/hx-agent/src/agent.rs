@@ -209,15 +209,12 @@ impl AgentLoop {
         Ok(())
     }
 
-    fn emit(&self, event: AgentEvent) {
+    /// Send an event to the writer, waiting (backpressure) if the channel is full so a
+    /// persisted event is never silently dropped. `send().await` only errors when the receiver has
+    /// closed, which is a configured shape (nobody listening), not a loss.
+    async fn emit(&self, event: AgentEvent) {
         if let Some(sender) = &self.events {
-            if sender.try_send(event).is_err() {
-                // Sink full. The event would otherwise be silently lost before the writer persisted
-                // it (in a daemon run the channel's reader is the event writer). Count it so the
-                // closing RunOutcome makes the audit-trail hole visible instead of hiding it. A *closed*
-                // channel is not counted: nobody listening is a configured shape, not a loss.
-                self.dropped.fetch_add(1, Ordering::SeqCst);
-            }
+            let _ = sender.send(event).await;
         }
     }
 
@@ -245,7 +242,8 @@ impl AgentLoop {
                         agent: self.agent.clone(),
                         turn,
                         stop: StopReason::BudgetExhausted,
-                    });
+                    })
+                    .await;
                     return Ok(RunOutcome {
                         stop: StopReason::BudgetExhausted,
                         turns: turn.saturating_sub(1),
@@ -269,7 +267,8 @@ impl AgentLoop {
                         agent: self.agent.clone(),
                         turn,
                         stop: StopReason::BudgetExhausted,
-                    });
+                    })
+                    .await;
                     return Ok(RunOutcome {
                         stop: StopReason::BudgetExhausted,
                         turns: turn.saturating_sub(1),
@@ -285,7 +284,8 @@ impl AgentLoop {
             self.emit(AgentEvent::TurnStarted {
                 agent: self.agent.clone(),
                 turn,
-            });
+            })
+            .await;
 
             // What goes on the wire is `ContextBuilder`'s decision, not the loop's: which transcript
             // (the audit trail is never shrunk here — a compacted *view* may be sent), whether tools
@@ -308,7 +308,8 @@ impl AgentLoop {
                                 agent: self.agent.clone(),
                                 turn,
                                 stop: StopReason::BudgetExhausted,
-                            });
+                            })
+                            .await;
                             return Ok(RunOutcome {
                                 stop: StopReason::BudgetExhausted,
                                 turns: turn.saturating_sub(1),
@@ -328,7 +329,8 @@ impl AgentLoop {
                     self.emit(AgentEvent::Error {
                         agent: self.agent.clone(),
                         message: err.to_string(),
-                    });
+                    })
+                    .await;
                     return Err(err);
                 }
             };
@@ -347,7 +349,8 @@ impl AgentLoop {
                 output_tokens: response.usage.output_tokens,
                 // Cost needs a price table, which belongs to the router rather than the loop.
                 cost_usd: 0.0,
-            });
+            })
+            .await;
 
             // One delta for the whole turn: there is no streaming yet, and pretending otherwise by
             // slicing the text would make the TUI's progress indicator a lie.
@@ -356,7 +359,8 @@ impl AgentLoop {
                 self.emit(AgentEvent::TextDelta {
                     agent: self.agent.clone(),
                     text: text.clone(),
-                });
+                })
+                .await;
             }
 
             let calls: Vec<(ToolCallId, String, serde_json::Value)> = response
@@ -379,7 +383,8 @@ impl AgentLoop {
                     agent: self.agent.clone(),
                     turn,
                     stop: StopReason::Completed,
-                });
+                })
+                .await;
                 return Ok(RunOutcome {
                     stop: StopReason::Completed,
                     turns: turn,
@@ -397,7 +402,8 @@ impl AgentLoop {
                     call: id.clone(),
                     name: name.clone(),
                     arguments: arguments.clone(),
-                });
+                })
+                .await;
 
                 let began = Instant::now();
                 let outcome = self.handle_call(&id, &name, arguments, ctx).await;
@@ -427,7 +433,8 @@ impl AgentLoop {
                     ok,
                     summary,
                     duration_ms: began.elapsed().as_millis() as u64,
-                });
+                })
+                .await;
             }
         }
 
@@ -435,7 +442,8 @@ impl AgentLoop {
             agent: self.agent.clone(),
             turn: self.limits.max_turns,
             stop: StopReason::MaxTurns,
-        });
+        })
+        .await;
 
         Ok(RunOutcome {
             stop: StopReason::MaxTurns,
@@ -573,7 +581,8 @@ impl AgentLoop {
                         // Cloned before the resolution moves on: this is the record of what the person
                         // was actually shown, and the queue drops the question the moment it is answered.
                         targets: action.targets.clone(),
-                    });
+                    })
+                    .await;
 
                     let decision: ApprovalDecision = self.approver.decide(&request, &action).await;
 
@@ -587,7 +596,8 @@ impl AgentLoop {
                         approval: approval_id,
                         approved: resolved.is_allowed(),
                         by: decision.by.clone(),
-                    });
+                    })
+                    .await;
 
                     match resolved {
                         Verdict::Allow { .. } => {}
