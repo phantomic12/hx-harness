@@ -15,6 +15,7 @@ pub mod api_auth;
 pub mod approval;
 pub mod capability;
 pub mod config;
+pub mod decision;
 pub mod error;
 pub mod event;
 pub mod ids;
