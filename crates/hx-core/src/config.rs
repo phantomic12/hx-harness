@@ -116,6 +116,20 @@ pub struct ApiConfig {
     /// [`crate::api_auth::require_token_for_bind`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// The account name accepted by `POST /v1/login`, as a literal.
+    ///
+    /// Absent or blank means `"admin"`. This is an identifier, not a secret, so it is never a
+    /// `store:name` reference — only the password below is resolved through `hx-secrets`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_username: Option<String>,
+    /// The password accepted by `POST /v1/login`, as a literal or as a `store:name` reference
+    /// resolved through `hx-secrets` (same pattern as the bearer token above).
+    ///
+    /// Absent or blank means there is nothing to log in with and the login route refuses every
+    /// attempt: a daemon whose operator never set a password must not have a password that can
+    /// be guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_password: Option<String>,
     /// Extra origins allowed to open a WebSocket on the daemon, as hostnames (`"ui.example.com"`).
     ///
     /// Empty by default: a WebSocket handshake is accepted only from a loopback origin (a local
@@ -128,15 +142,38 @@ pub struct ApiConfig {
     pub allowed_origins: Vec<String>,
 }
 
+impl ApiConfig {
+    /// The account name `POST /v1/login` checks against: the configured literal, or `"admin"`
+    /// when the config names nothing (or nothing but whitespace).
+    pub fn admin_username_or_default(&self) -> &str {
+        self.admin_username
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("admin")
+    }
+}
+
 impl std::fmt::Debug for ApiConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The *presence* of a token is configuration; the token is not. A reference is safe to
         // print and a literal is not, and this cannot tell them apart without resolving — so it
         // prints neither. The origin allowlist names hosts, not secrets, so it prints in full.
+        // The admin password gets the same treatment as the token; the username is an
+        // identifier, not a secret, so it prints in full.
         f.debug_struct("ApiConfig")
             .field(
                 "token",
                 &match self.token.as_deref() {
+                    None => "None",
+                    Some(value) if value.trim().is_empty() => "Some(<empty>)",
+                    Some(_) => "Some(<redacted>)",
+                },
+            )
+            .field("admin_username", &self.admin_username_or_default())
+            .field(
+                "admin_password",
+                &match self.admin_password.as_deref() {
                     None => "None",
                     Some(value) if value.trim().is_empty() => "Some(<empty>)",
                     Some(_) => "Some(<redacted>)",
@@ -2184,6 +2221,8 @@ mcp_servers:
             "{:?}",
             ApiConfig {
                 token: Some("  ".into()),
+                admin_username: None,
+                admin_password: None,
                 allowed_origins: Vec::new(),
             }
         )

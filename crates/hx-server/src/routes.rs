@@ -73,6 +73,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/pools", get(pools))
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/{name}", put(upsert_provider).delete(remove_provider))
+        .route("/v1/login", post(login))
         .route("/v1/hosts", get(hosts))
         // A host is a machine, not just a row: the detail route reports what it is (OS, shell, home,
         // whether it has a PTY), which is what a client needs before it offers to browse or run.
@@ -233,6 +234,42 @@ async fn list_providers(
 ) -> Json<Vec<crate::state::ProviderSummary>> {
     Json(state.provider_summaries())
 }
+
+/// A login attempt from the web UI: `{ "username": "...", "password": "..." }`.
+#[derive(Debug, Deserialize)]
+pub struct LoginBody {
+    pub username: String,
+    pub password: String,
+}
+
+/// `POST /v1/login` — an account-style login that hands back the API bearer token.
+///
+/// Exempt from the bearer token in [`crate::auth::is_exempt`] so a fresh browser can reach it.
+/// Verifies username + password against `api.admin_username` / `api.admin_password` (constant
+/// time), then returns `{ "token": "<the bearer token>" }` on success. A missing or wrong
+/// credential, or no configured password, all produce the same 401 so the response leaks nothing.
+async fn login(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<LoginBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // No daemon bearer token to hand out -> nothing to log in for.
+    let Some(api_token) = state.api_token.as_ref() else {
+        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized"));
+    };
+    // No configured password -> refuse every attempt (never compare to a blank).
+    let Some(admin_password) = hx_secrets::resolve_admin_password(&state.config, &state.secrets)
+        .unwrap_or(None)
+    else {
+        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized"));
+    };
+    let username_ok = hx_core::ApiToken::new(state.config.api.admin_username_or_default()).matches(&body.username);
+    let password_ok = admin_password.matches(&body.password);
+    if !(username_ok && password_ok) {
+        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    Ok(Json(serde_json::json!({ "token": api_token.expose() })))
+}
+
 
 /// A request to add or edit a provider from the web UI.
 #[derive(Debug, Deserialize)]
@@ -1911,6 +1948,46 @@ search:
     async fn healthz_is_served() {
         let (status, _) = get(test_state().await, "/healthz").await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn login_returns_the_bearer_token_for_a_valid_account() {
+        let mut config = hx_core::config::Config::from_yaml(CONFIG).expect("config parses");
+        config.api.token = Some("secret-token-123".into());
+        config.api.admin_username = Some("admin".into());
+        config.api.admin_password = Some("hunter2".into());
+        let state = build_state(config).await;
+
+        let (status, body) = post(
+            state.clone(),
+            "/v1/login",
+            serde_json::json!({ "username": "admin", "password": "hunter2" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "login with correct credentials succeeds");
+        assert_eq!(body["token"], "secret-token-123");
+
+        // A wrong password must be refused, and a wrong username too.
+        for attempt in [
+            serde_json::json!({ "username": "admin", "password": "wrong" }),
+            serde_json::json!({ "username": "nobody", "password": "hunter2" }),
+        ] {
+            let (status, _) = post(state.clone(), "/v1/login", attempt).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "bad credentials refused");
+        }
+    }
+
+    #[tokio::test]
+    async fn login_with_no_password_configured_is_refused() {
+        // No admin_password set: every login attempt must 401, never disclose the token.
+        let (status, body) = post(
+            test_state().await,
+            "/v1/login",
+            serde_json::json!({ "username": "admin", "password": "anything" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.get("token").is_none(), "no token when no password is set");
     }
 
     #[tokio::test]

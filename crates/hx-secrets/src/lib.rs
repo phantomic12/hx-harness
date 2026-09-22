@@ -17,6 +17,7 @@ pub mod vault;
 
 pub use redact::{Redaction, Redactor};
 pub use source::{
-    resolve_api_token, EnvSecrets, FixedSecrets, SecretSource, SecretStores, VaultSecrets,
+    resolve_admin_password, resolve_api_token, EnvSecrets, FixedSecrets, SecretSource,
+    SecretStores, VaultSecrets,
 };
 pub use vault::{KdfParams, Secret, Vault, VaultError};

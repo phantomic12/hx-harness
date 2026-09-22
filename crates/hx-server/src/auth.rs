@@ -68,7 +68,7 @@ use std::sync::Arc;
 
 /// Routes answered without a token. See the module doc for the reasoning behind each.
 pub fn is_exempt(path: &str) -> bool {
-    path == "/healthz" || path == "/" || is_phone_respond_route(path)
+    path == "/healthz" || path == "/" || path == "/v1/login" || is_phone_respond_route(path)
 }
 
 /// The phone/lock-screen respond route.

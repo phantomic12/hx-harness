@@ -310,6 +310,68 @@ fn env_api_token() -> Option<ApiToken> {
         .map(ApiToken::new)
 }
 
+/// The password `POST /v1/login` checks against, resolved the same way as the bearer token.
+///
+/// ## The rule
+///
+/// 1. `config.api.admin_password`, when it is set to something non-blank, wins. A value
+///    containing a `:` is a `store:name` reference and is resolved through the configured
+///    sources; a value with no `:` is a literal password.
+/// 2. Otherwise `None`: no password is configured, and the login route refuses every attempt.
+///    There is deliberately no environment-variable fallback here — unlike the bearer token,
+///    which a container must be able to inject, a login password with no configured value
+///    means the operator never set one, and guessing at one from the environment would be
+///    inventing a credential the operator never chose.
+///
+/// ## What it refuses
+///
+/// A reference naming a store that is not configured is an error rather than a literal, for the
+/// same reason as [`resolve_api_token`]: the value at this point is exactly the thing that must
+/// not be printed, so the refusal names the configured stores and never the value it refused.
+/// The login handler treats that error as a failed login rather than a 500, so the response
+/// cannot be used to learn anything about the configuration.
+pub fn resolve_admin_password(
+    config: &hx_core::config::Config,
+    secrets: &SecretStores,
+) -> hx_core::error::Result<Option<ApiToken>> {
+    let Some(configured) = config
+        .api
+        .admin_password
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    if !configured.contains(':') {
+        return Ok(Some(ApiToken::new(configured)));
+    }
+
+    let reference = SecretRef::parse(configured)?;
+    if !secrets.stores().contains(&reference.store.as_str()) {
+        let known = if secrets.is_empty() {
+            "none are configured".to_string()
+        } else {
+            format!("configured stores: {}", secrets.stores().join(", "))
+        };
+        return Err(HxError::Config(format!(
+            "`api.admin_password` is written as a `store:name` reference but '{}' is not a store this \
+             deployment has ({known}). Use one of those, or — if this is a literal password that \
+             happens to contain a colon — set it in a store and reference it instead.",
+            reference.store
+        )));
+    }
+
+    let secret = secrets.resolve(&reference).map_err(|err| {
+        HxError::Config(format!(
+            "`api.admin_password` could not be resolved: {err}. The login route refuses every \
+             attempt rather than checking against a password it cannot read."
+        ))
+    })?;
+    Ok(Some(ApiToken::new(secret.expose())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
