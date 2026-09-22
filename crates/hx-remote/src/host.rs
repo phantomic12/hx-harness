@@ -192,6 +192,12 @@ pub struct ExecOutput {
     /// `None` when the transport could not report one (some SSH servers, killed processes).
     pub exit_code: Option<i32>,
     pub duration_ms: u64,
+    /// Whether either stream hit [`MAX_EXEC_STREAM_BYTES`] and lost its middle. The strings
+    /// already carry a `... [N bytes omitted] ...` notice; this flag is for machine consumers
+    /// (`read_file` over a shell fallback decodes stdout as base64) that must fail loudly on
+    /// truncation rather than decode a hole as data. Defaulted so older payloads still parse.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 impl ExecOutput {
@@ -246,6 +252,150 @@ pub fn truncate_middle(text: &str, max_chars: usize) -> String {
 
     let omitted = total - head_chars - tail_chars;
     format!("{head}\n\n... [{omitted} characters omitted] ...\n\n{tail}")
+}
+
+/// Hard byte ceiling for one captured output stream of [`Host::exec`].
+///
+/// WHY a fixed constant rather than the runner's `max_output_chars`: that bound truncates the
+/// *display* after the bytes are already resident, so it cannot bound memory. This one bounds
+/// the *read*, per stream, on every transport. 256 KiB per stream (512 KiB per command) stays
+/// small even with concurrent execs, while dwarfing the 8 000-char display budget the runner
+/// renders — so a bounded stream still carries far more than any tool result shows.
+pub const MAX_EXEC_STREAM_BYTES: usize = 256 * 1024;
+
+/// A bounded byte accumulator for command output.
+///
+/// WHY this exists: every `Host::exec` used to collect the child's full stdout and stderr into
+/// memory before returning. `yes` produces ~1-4 GB/s, so tens of gigabytes could land in daemon
+/// memory long before any timeout fired. This keeps the first and the last bytes (a byte-level
+/// mirror of the head+tail promise [`truncate_middle`] makes for display) plus a dropped-byte
+/// counter, and never retains more than the cap — no matter how much the command emits.
+///
+/// The caller must keep *reading* into it until EOF: stopping early leaves the pipe full, which
+/// blocks the child and deadlocks the exec. Every transport below drains to EOF and lets the
+/// excess fall on the floor, so the process stays alive and consumable while memory stays flat.
+#[derive(Debug)]
+pub struct BoundedOutput {
+    head_cap: usize,
+    tail_cap: usize,
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    /// Bytes seen after the head filled — the tail holds the last `tail_cap` of these.
+    post_head_seen: u64,
+}
+
+impl BoundedOutput {
+    /// An accumulator capped at [`MAX_EXEC_STREAM_BYTES`].
+    pub fn new() -> Self {
+        Self::with_cap(MAX_EXEC_STREAM_BYTES)
+    }
+
+    /// An accumulator capped at `cap` bytes, for tests and callers with their own budget.
+    pub fn with_cap(cap: usize) -> Self {
+        // Tiny caps cannot hold both ends; keep everything in the head rather than a
+        // zero-length tail that would discard the whole stream.
+        let (head_cap, tail_cap) = if cap <= 64 {
+            (cap, 0)
+        } else {
+            let head_cap = cap * 3 / 5;
+            (head_cap, cap - head_cap)
+        };
+        Self {
+            head_cap,
+            tail_cap,
+            head: Vec::new(),
+            tail: std::collections::VecDeque::new(),
+            post_head_seen: 0,
+        }
+    }
+
+    /// Feed raw bytes — the SSH/local path, where output arrives as byte chunks.
+    pub fn push_bytes(&mut self, mut chunk: &[u8]) {
+        if chunk.is_empty() {
+            return;
+        }
+        if self.head.len() < self.head_cap {
+            let room = self.head_cap - self.head.len();
+            let n = room.min(chunk.len());
+            self.head.extend_from_slice(&chunk[..n]);
+            chunk = &chunk[n..];
+            if chunk.is_empty() {
+                return;
+            }
+        }
+        self.post_head_seen += chunk.len() as u64;
+        if self.tail_cap == 0 {
+            return;
+        }
+        self.tail.extend(chunk.iter().copied());
+        let excess = self.tail.len().saturating_sub(self.tail_cap);
+        if excess > 0 {
+            self.tail.drain(..excess);
+        }
+    }
+
+    /// Feed decoded text — the WinRM path, where chunks arrive as strings.
+    pub fn push_str(&mut self, chunk: &str) {
+        self.push_bytes(chunk.as_bytes());
+    }
+
+    /// Bytes retained right now. Never exceeds the cap.
+    pub fn retained_len(&self) -> usize {
+        self.head.len() + self.tail.len()
+    }
+
+    /// Bytes dropped from the middle so far.
+    pub fn dropped_bytes(&self) -> u64 {
+        self.post_head_seen.saturating_sub(self.tail.len() as u64)
+    }
+
+    /// Whether any output was dropped.
+    pub fn is_truncated(&self) -> bool {
+        self.dropped_bytes() > 0
+    }
+
+    /// The retained output with a dropped-byte notice spliced into the middle, mirroring the
+    /// `... [N omitted] ...` shape [`truncate_middle`] produces for display.
+    pub fn finish(self) -> String {
+        let dropped = self.dropped_bytes();
+        if dropped == 0 {
+            let mut all = self.head;
+            all.extend(self.tail);
+            return String::from_utf8_lossy(&all).into_owned();
+        }
+        let head = String::from_utf8_lossy(&self.head).into_owned();
+        let tail: Vec<u8> = self.tail.into_iter().collect();
+        let tail = String::from_utf8_lossy(&tail).into_owned();
+        format!("{head}\n\n... [{dropped} bytes omitted] ...\n\n{tail}")
+    }
+}
+
+impl Default for BoundedOutput {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Drain an async pipe to EOF into a bounded accumulator.
+///
+/// Returns promptly on a missing pipe; the loop otherwise reads until EOF so the writer is
+/// never blocked on a full pipe, however much it emits. Memory stays under `cap` throughout.
+pub async fn drain_pipe_bounded<R>(pipe: Option<R>, cap: usize) -> BoundedOutput
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut out = BoundedOutput::with_cap(cap);
+    let Some(mut pipe) = pipe else { return out };
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 32 * 1024];
+    loop {
+        match pipe.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => out.push_bytes(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    out
 }
 
 /// One directory entry.
@@ -614,6 +764,7 @@ mod tests {
             stderr: String::new(),
             exit_code: Some(0),
             duration_ms: 1,
+            truncated: false,
         };
         assert!(out.success());
         out.exit_code = Some(1);
@@ -629,6 +780,7 @@ mod tests {
             stderr: "err\n".into(),
             exit_code: Some(1),
             duration_ms: 1,
+            truncated: false,
         };
         assert_eq!(out.combined(), "out\nerr\n");
 
@@ -637,6 +789,7 @@ mod tests {
             stderr: "err".into(),
             exit_code: Some(1),
             duration_ms: 1,
+            truncated: false,
         };
         assert_eq!(only_err.combined(), "err");
     }
@@ -692,6 +845,7 @@ mod tests {
             stderr: String::new(),
             exit_code: Some(0),
             duration_ms: 1,
+            truncated: false,
         };
         assert_eq!(ok.bounded(1000), "fine");
 
@@ -700,6 +854,7 @@ mod tests {
             stderr: String::new(),
             exit_code: Some(127),
             duration_ms: 1,
+            truncated: false,
         };
         assert!(bad.bounded(1000).contains("[exit status 127]"));
     }
@@ -711,5 +866,93 @@ mod tests {
         assert_eq!(kind_of(&caps), HostKind::Winrm);
         caps.os = RemoteOs::Linux;
         assert_eq!(kind_of(&caps), HostKind::Ssh);
+    }
+
+    // ---- bounded output ----
+
+    #[test]
+    fn a_short_stream_passes_through_untouched() {
+        let mut out = BoundedOutput::with_cap(1024);
+        out.push_bytes(b"hello");
+        out.push_str(" world");
+        assert!(!out.is_truncated());
+        assert_eq!(out.dropped_bytes(), 0);
+        assert_eq!(out.finish(), "hello world");
+    }
+
+    #[test]
+    fn a_huge_stream_never_retains_more_than_the_cap() {
+        // 10 MiB through a 4 KiB cap, in pipe-sized chunks — the `yes`-scale shape.
+        let cap = 4096;
+        let mut out = BoundedOutput::with_cap(cap);
+        let chunk = vec![b'x'; 8192];
+        let total = 10 * 1024 * 1024;
+        let mut pushed = 0;
+        while pushed < total {
+            out.push_bytes(&chunk);
+            pushed += chunk.len();
+            assert!(
+                out.retained_len() <= cap,
+                "retained {} exceeds cap {cap}",
+                out.retained_len()
+            );
+        }
+        assert!(out.is_truncated());
+        assert_eq!(out.dropped_bytes(), (total - cap) as u64);
+        let text = out.finish();
+        assert!(text.contains("bytes omitted"), "{text:?}");
+        assert!(
+            text.len() <= cap + 128,
+            "finished text {} exceeds cap {cap} + notice slack",
+            text.len()
+        );
+    }
+
+    #[test]
+    fn a_truncated_stream_keeps_its_head_and_its_tail() {
+        let cap = 1000;
+        let mut out = BoundedOutput::with_cap(cap);
+        // Distinct head/middle/tail markers so each region is identifiable.
+        out.push_str(&"H".repeat(600));
+        out.push_str(&"M".repeat(5000));
+        out.push_str(&"T".repeat(400));
+        assert!(out.is_truncated());
+        let text = out.finish();
+        assert!(text.starts_with(&"H".repeat(600)), "head must survive");
+        assert!(text.ends_with(&"T".repeat(400)), "tail must survive");
+        assert!(!text.contains('M'), "the middle must be gone, not kept");
+        assert!(text.contains("bytes omitted"));
+    }
+
+    #[test]
+    fn tiny_caps_keep_what_fits_without_panicking() {
+        let mut out = BoundedOutput::with_cap(8);
+        out.push_bytes(b"0123456789abcdef");
+        assert!(out.retained_len() <= 8);
+        assert!(!out.finish().is_empty());
+    }
+
+    #[tokio::test]
+    async fn draining_a_pipe_stays_bounded_and_reaches_eof() {
+        // A `duplex` pipe stands in for the child-process pipe: the writer emits 4 MiB while the
+        // drain reads, so a bounded-but-blocking reader would deadlock here. The drain must
+        // consume everything (writer finishes) while retaining at most the cap.
+        let (mut writer, reader) = tokio::io::duplex(32 * 1024);
+        let total = 4 * 1024 * 1024;
+        let writer_task = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let chunk = vec![b'y'; 8192];
+            let mut written = 0;
+            while written < total {
+                writer.write_all(&chunk).await.unwrap();
+                written += chunk.len();
+            }
+            writer.shutdown().await.unwrap();
+        });
+        let out = drain_pipe_bounded(Some(reader), 4096).await;
+        writer_task.await.unwrap();
+        assert!(out.is_truncated());
+        assert_eq!(out.dropped_bytes(), (total - 4096) as u64);
+        assert!(out.retained_len() <= 4096);
     }
 }

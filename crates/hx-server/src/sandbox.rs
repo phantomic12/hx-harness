@@ -293,6 +293,8 @@ impl SandboxExec for SandboxFor {
             // `None` matches what a transport does when it cannot see one.
             exit_code: i32::try_from(output.exit_code).ok(),
             duration_ms: started.elapsed().as_millis() as u64,
+            // The sandbox engine bounds its own output; this layer truncates nothing.
+            truncated: false,
         })
     }
 

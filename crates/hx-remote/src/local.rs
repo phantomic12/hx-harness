@@ -1,8 +1,9 @@
 //! The machine the daemon itself runs on.
 
 use crate::host::{
-    caps_from_uname, caps_from_ver, enrich_caps_from_posix_probe, posix_probe_command,
-    windows_probe_command, ExecOutput, Host, HostCaps, RemoteEntry, RemoteOs, ShellKind,
+    caps_from_uname, caps_from_ver, drain_pipe_bounded, enrich_caps_from_posix_probe,
+    posix_probe_command, windows_probe_command, ExecOutput, Host, HostCaps, RemoteEntry, RemoteOs,
+    ShellKind, MAX_EXEC_STREAM_BYTES,
 };
 use async_trait::async_trait;
 use hx_core::error::{HxError, Result};
@@ -205,21 +206,44 @@ impl Host for LocalHost {
             .split_first()
             .ok_or_else(|| HxError::Remote("shell produced an empty argv".to_string()))?;
 
-        let child = spawn_detached(program, args)?;
-        // `wait_with_output` takes the child by value, so the pid for the timeout kill must
-        // be read before the wait below moves it.
+        let mut child = spawn_detached(program, args)?;
+        // `wait` borrows the child, so the pid for the timeout kill must be read first. The
+        // pipes are taken here so two drain tasks can consume them *while* the child runs: a
+        // child that emits more than the pipe buffer holds would otherwise block forever once
+        // nobody reads, which is exactly the deadlock `wait_with_output` avoids by reading
+        // itself — except it buffers everything it reads without bound.
         let pid = child.id();
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
 
         let started = Instant::now();
+        let stdout_drain = tokio::spawn(drain_pipe_bounded(stdout_pipe, MAX_EXEC_STREAM_BYTES));
+        let stderr_drain = tokio::spawn(drain_pipe_bounded(stderr_pipe, MAX_EXEC_STREAM_BYTES));
 
-        match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            Ok(Ok(output)) => Ok(ExecOutput {
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                exit_code: output.status.code(),
-                duration_ms: started.elapsed().as_millis() as u64,
-            }),
-            Ok(Err(err)) => Err(HxError::Remote(format!("failed to run command: {err}"))),
+        match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(Ok(status)) => {
+                // The shell is gone, so the drains reach EOF once reparented descendants (if
+                // any) close their copies — the same EOF semantics `wait_with_output` had.
+                let stdout = stdout_drain.await.map_err(|e| {
+                    HxError::Remote(format!("failed to collect command output: {e}"))
+                })?;
+                let stderr = stderr_drain.await.map_err(|e| {
+                    HxError::Remote(format!("failed to collect command output: {e}"))
+                })?;
+                let truncated = stdout.is_truncated() || stderr.is_truncated();
+                Ok(ExecOutput {
+                    stdout: stdout.finish(),
+                    stderr: stderr.finish(),
+                    exit_code: status.code(),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    truncated,
+                })
+            }
+            Ok(Err(err)) => {
+                stdout_drain.abort();
+                stderr_drain.abort();
+                Err(HxError::Remote(format!("failed to run command: {err}")))
+            }
             Err(_) => {
                 // WHY a tree kill, not just the shell: `kill_on_drop` (set in
                 // `spawn_detached`) kills the immediate child when `child` is dropped below,
@@ -228,6 +252,10 @@ impl Host for LocalHost {
                 // or GPUs long after the caller gave up. Killing the whole process group
                 // (Unix) or tree (Windows) is what makes "timed out" actually mean stopped.
                 kill_process_tree(pid).await;
+                // The tree is dead, but a descendant could still hold a pipe write-end open
+                // until it exits; abort the drains rather than wait on an EOF that may lag.
+                stdout_drain.abort();
+                stderr_drain.abort();
                 Err(HxError::Remote(format!(
                     "command timed out after {:.1}s",
                     timeout.as_secs_f64()
@@ -441,13 +469,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runs_a_command_and_captures_stdout() {
+    async fn enormous_output_stays_bounded_and_completes() {
+        // The regression test for unbounded buffering: ~2 MiB on stdout and ~1.3 MiB on
+        // stderr — over 8x the per-stream cap — must complete (no pipe deadlock: the drains
+        // consume while the child runs) with each stream capped at head+tail plus a
+        // dropped-byte counter, and the run flagged as truncated.
+        let out = host()
+            .exec("seq 1 300000; seq 1 200000 >&2", Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert!(out.success());
+        assert!(out.truncated, "over-cap output must be flagged");
+
+        for (name, stream) in [("stdout", &out.stdout), ("stderr", &out.stderr)] {
+            assert!(
+                stream.len() <= MAX_EXEC_STREAM_BYTES + 128,
+                "{name} is {} bytes, over cap {MAX_EXEC_STREAM_BYTES} + notice slack",
+                stream.len()
+            );
+            assert!(
+                stream.contains("bytes omitted"),
+                "{name} must carry the dropped-byte counter"
+            );
+        }
+        // Head … and tail both survive, on both streams.
+        assert!(
+            out.stdout.starts_with("1\n2\n"),
+            "head of stdout must survive"
+        );
+        assert!(
+            out.stdout.contains("300000"),
+            "tail of stdout must survive, where errors live"
+        );
+        assert!(
+            out.stderr.starts_with("1\n2\n"),
+            "head of stderr must survive"
+        );
+        assert!(
+            out.stderr.contains("200000"),
+            "tail of stderr must survive, where errors live"
+        );
+    }
+
+    #[tokio::test]
+    async fn small_output_is_verbatim_and_not_flagged() {
         let out = host()
             .exec("echo hello world", Duration::from_secs(10))
             .await
             .unwrap();
         assert_eq!(out.stdout.trim(), "hello world");
         assert!(out.success());
+        assert!(!out.truncated);
     }
 
     #[tokio::test]

@@ -41,7 +41,10 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use hx_core::error::{HxError, Result};
 
-use crate::host::{ExecOutput, Host, HostCaps, RemoteEntry, RemoteOs, ShellKind};
+use crate::host::{
+    BoundedOutput, ExecOutput, Host, HostCaps, RemoteEntry, RemoteOs, ShellKind,
+    MAX_EXEC_STREAM_BYTES,
+};
 use crate::ntlm::{header_value, Auth};
 use hx_core::ids::HostId;
 
@@ -502,8 +505,11 @@ impl WinRmHost {
         })?;
 
         let start = Instant::now();
-        let mut stdout = String::new();
-        let mut stderr = String::new();
+        // Bounded from the first chunk: the Receive loop still polls to Done so the server
+        // side is drained, but only head+tail per stream is retained (see `BoundedOutput`).
+        // Unbounded `push_str` here was the daemon-OOM path for `yes`-scale output.
+        let mut stdout = BoundedOutput::with_cap(MAX_EXEC_STREAM_BYTES);
+        let mut stderr = BoundedOutput::with_cap(MAX_EXEC_STREAM_BYTES);
         let mut exit_code = None;
 
         // Pull until the server says the command is done. `Receive` is a poll, not a stream: it
@@ -561,11 +567,13 @@ impl WinRmHost {
 
         // Output on Windows is UTF-16LE in the WSMan framing but arrives base64-encoded as bytes;
         // `extract_stream_text` decodes both.
+        let truncated = stdout.is_truncated() || stderr.is_truncated();
         Ok(ExecOutput {
-            stdout: normalise_newlines(&stdout),
-            stderr: normalise_newlines(&stderr),
+            stdout: normalise_newlines(&stdout.finish()),
+            stderr: normalise_newlines(&stderr.finish()),
             exit_code,
             duration_ms: start.elapsed().as_millis() as u64,
+            truncated,
         })
     }
 }
@@ -644,6 +652,15 @@ impl Host for WinRmHost {
             return Err(HxError::Remote(format!(
                 "could not read '{path}': {}",
                 out.stderr.trim()
+            )));
+        }
+        // The file returns *through* bounded exec output: anything over the per-stream cap
+        // arrives with its middle dropped, and decoding that as base64 would either fail
+        // confusingly or — worse — succeed as corrupt data. Refuse loudly.
+        if out.truncated {
+            return Err(HxError::Remote(format!(
+                "could not read '{path}': the file does not fit in the bounded exec output \
+                 (over {MAX_EXEC_STREAM_BYTES} bytes per stream)"
             )));
         }
         // `certutil -encode` wraps its output in a BEGIN/END banner and breaks the payload across

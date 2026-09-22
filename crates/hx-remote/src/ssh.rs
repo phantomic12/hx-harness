@@ -23,7 +23,8 @@
 
 use crate::host::{
     caps_from_uname, caps_from_ver, enrich_caps_from_posix_probe, powershell_quote, shell_quote,
-    ExecOutput, Host, HostCaps, RemoteEntry, RemoteOs, ShellKind,
+    BoundedOutput, ExecOutput, Host, HostCaps, RemoteEntry, RemoteOs, ShellKind,
+    MAX_EXEC_STREAM_BYTES,
 };
 use crate::known_hosts::{HostKeyVerdict, KnownHosts};
 use crate::sftp::{SftpAvailability, SftpSession};
@@ -670,6 +671,15 @@ impl SshHost {
                 output.stderr.trim()
             )));
         }
+        // The shell fallback returns file bytes *through* bounded exec output: a file larger
+        // than the per-stream cap arrives with its middle dropped, and decoding that as base64
+        // would either fail confusingly or — worse — succeed as corrupt data. Refuse loudly.
+        if output.truncated {
+            return Err(HxError::Remote(format!(
+                "could not read {path}: the file does not fit in the bounded exec output \
+                 (over {MAX_EXEC_STREAM_BYTES} bytes per stream); use SFTP instead"
+            )));
+        }
 
         // Base64 keeps the transfer binary-safe; a plain `cat` would mangle anything that is not
         // valid UTF-8 and silently corrupt a binary file.
@@ -784,17 +794,20 @@ impl SshHost {
             .map_err(|e| HxError::Remote(format!("could not start the remote command: {e}")))?;
 
         let collect = async move {
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
+            // Bounded from the first byte: the channel is drained to close whatever the
+            // command emits, but only head+tail per stream is retained (see `BoundedOutput`).
+            // Unbounded `extend_from_slice` here was the daemon-OOM path for `yes`-scale output.
+            let mut stdout = BoundedOutput::with_cap(MAX_EXEC_STREAM_BYTES);
+            let mut stderr = BoundedOutput::with_cap(MAX_EXEC_STREAM_BYTES);
             let mut exit_code = None;
 
             while let Some(message) = channel.wait().await {
                 match message {
-                    ChannelMsg::Data { data } => stdout.extend_from_slice(data.as_ref()),
+                    ChannelMsg::Data { data } => stdout.push_bytes(data.as_ref()),
                     ChannelMsg::ExtendedData { data, ext } => {
                         // Stream 1 is stderr; other extended streams are ignored.
                         if ext == 1 {
-                            stderr.extend_from_slice(data.as_ref());
+                            stderr.push_bytes(data.as_ref());
                         }
                     }
                     ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status as i32),
@@ -806,12 +819,16 @@ impl SshHost {
         };
 
         match tokio::time::timeout(timeout, collect).await {
-            Ok((stdout, stderr, exit_code)) => Ok(ExecOutput {
-                stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                exit_code,
-                duration_ms: started.elapsed().as_millis() as u64,
-            }),
+            Ok((stdout, stderr, exit_code)) => {
+                let truncated = stdout.is_truncated() || stderr.is_truncated();
+                Ok(ExecOutput {
+                    stdout: stdout.finish(),
+                    stderr: stderr.finish(),
+                    exit_code,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    truncated,
+                })
+            }
             Err(_) => Err(HxError::Remote(format!(
                 "remote command timed out after {:.1}s",
                 timeout.as_secs_f64()
