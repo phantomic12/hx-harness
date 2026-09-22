@@ -19,252 +19,388 @@
 -->
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
 <style>
-  :root {
-    --bg: #14161a;
-    --panel: #1c1f26;
-    --line: #2b3038;
-    --text: #d7dae0;
-    --dim: #8b93a3;
-    --accent: #6aa9ff;
-    --good: #7ddc8a;
-    --bad: #ff8080;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--text);
-    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-    height: 100vh; display: flex; flex-direction: column; overflow: hidden;
-  }
-  header {
-    display: flex; align-items: center; gap: 12px; padding: 8px 14px;
-    background: var(--panel); border-bottom: 1px solid var(--line); flex: none;
-  }
-  header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .3px; }
-  .status { font-size: 12px; color: var(--dim); display: flex; align-items: center; gap: 6px; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
-  .dot.on { background: var(--good); }
-  main { flex: 1; display: flex; min-height: 0; }
-  .pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; flex: 1; }
-  .pane + .pane { border-left: 1px solid var(--line); }
-  .pane > h2 {
-    font-size: 12px; text-transform: uppercase; letter-spacing: .8px; color: var(--dim);
-    margin: 0; padding: 6px 12px; border-bottom: 1px solid var(--line); flex: none;
-    font-weight: 600; display: flex; justify-content: space-between; align-items: center;
-  }
-  .pane > h2 button {
-    font: inherit; font-size: 11px; text-transform: none; letter-spacing: 0;
-    background: transparent; color: var(--dim); border: 1px solid var(--line);
-    border-radius: 4px; padding: 2px 7px; cursor: pointer;
-  }
-  .pane > h2 button:hover { color: var(--text); border-color: var(--accent); }
-  #terminal { flex: 1; min-height: 0; padding: 6px 0 6px 8px; }
-  #events { flex: 1; overflow-y: auto; padding: 10px 12px; font-size: 13px; }
-  .event { padding: 4px 0; border-bottom: 1px solid rgba(43,48,56,.5); }
-  .event .kind { color: var(--accent); font-weight: 600; }
-  .event .seq { color: var(--dim); font-size: 11px; margin-right: 6px; }
-  .event pre {
-    margin: 4px 0 0; white-space: pre-wrap; word-break: break-word;
-    font: 12px/1.5 ui-monospace, "SF Mono", Menlo, monospace; color: var(--dim);
-  }
-  .composer { display: flex; gap: 8px; padding: 8px 12px; border-top: 1px solid var(--line); flex: none; }
-  .composer input {
-    flex: 1; background: var(--bg); color: var(--text); border: 1px solid var(--line);
-    border-radius: 5px; padding: 7px 10px; font: inherit;
-  }
-  .composer input:focus { outline: none; border-color: var(--accent); }
-  .composer button {
-    background: var(--accent); color: #0b1220; border: 0; border-radius: 5px;
-    padding: 7px 14px; font: inherit; font-weight: 600; cursor: pointer;
-  }
-  .composer button:disabled { opacity: .5; cursor: default; }
-  .error { color: var(--bad); font-size: 12px; padding: 0 12px 8px; }
-  .scroll { flex: 1; overflow-y: auto; min-height: 0; }
-  .approval { border-bottom: 1px solid var(--line); padding: 10px 12px; }
-  .approval .risk {
-    display: inline-block; font-size: 10px; text-transform: uppercase; letter-spacing: .6px;
-    font-weight: 700; padding: 2px 6px; border-radius: 3px; margin-bottom: 6px;
-  }
-  .risk.low { background: rgba(125,220,138,.15); color: var(--good); }
-  .risk.medium { background: rgba(255,208,110,.15); color: #ffd06e; }
-  .risk.high, .risk.critical { background: rgba(255,128,128,.18); color: var(--bad); }
-  .approval .tool { font-weight: 600; }
-  .approval .summary { color: var(--text); margin: 4px 0; font-size: 13px; }
-  .approval .reason { color: var(--dim); font-size: 12px; }
-  .approval .undo { color: var(--dim); font-size: 12px; font-style: italic; margin-top: 3px; }
-  /* The rope left before the run checks in. Same weight as the undo line, because both are context
-     a person answers *with* rather than the question itself. */
-  .approval .unattended { color: var(--dim); font-size: 12px; margin-top: 3px; }
-  .approval .opts { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
-  .approval .opts button {
-    font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 4px; cursor: pointer;
-    background: transparent; color: var(--text); border: 1px solid var(--line);
-  }
-  .approval .opts button:hover { border-color: var(--accent); }
-  .approval .opts button.deny { color: var(--bad); }
-  .approval .opts button.deny:hover { border-color: var(--bad); }
-  .empty { color: var(--dim); font-size: 12px; padding: 12px; }
-  .sandbox {
-    padding: 6px 12px; font-size: 12px; color: var(--dim);
-    border-bottom: 1px solid var(--line); flex: none;
-  }
-  .sandbox .live { color: var(--good); }
-  .sandbox .off { color: var(--bad); }
-  #hosts { flex: 1; overflow-y: auto; padding: 8px 12px; font-size: 13px; }
-  .host { padding: 6px 0; border-bottom: 1px solid rgba(43,48,56,.5); }
-  .host .hid { font-weight: 600; color: var(--text); }
-  /* The row is the control that opens the browser, so it has to look clickable. */
-  .host .row { display: flex; align-items: baseline; gap: 8px; cursor: pointer; }
-  .host .row:hover .hid { color: var(--accent); }
-  .host .row .open { margin-left: auto; color: var(--dim); font-size: 11px; }
-  .host .kind {
-    display: inline-block; font-size: 10px; text-transform: uppercase; letter-spacing: .6px;
-    font-weight: 700; padding: 1px 5px; border-radius: 3px; margin-left: 6px;
-    background: rgba(106,169,255,.15); color: var(--accent);
-  }
-  .host .desc { color: var(--dim); font-size: 12px; margin-top: 2px; }
-  .host .unconf { color: var(--bad); font-size: 11px; margin-top: 2px; }
+:root {
+  --bg: #0b0d10;
+  --panel: #111419;
+  --panel-2: #161a21;
+  --line: #262c36;
+  --line-soft: rgba(38,44,54,.6);
+  --text: #d7dae0;
+  --dim: #8b93a3;
+  --faint: #5b6372;
+  --accent: #6aa9ff;
+  --accent-soft: rgba(106,169,255,.12);
+  --good: #7ddc8a;
+  --bad: #ff8080;
+  --warn: #ffd06e;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, sans-serif;
+  --serif: "Charter", "Bitstream Charter", Georgia, serif;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.55 var(--sans);
+  height: 100vh; display: flex; flex-direction: column; overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+::selection { background: rgba(106,169,255,.28); }
+button, input, select, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; }
+:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
 
-  /* ---- host browser ---------------------------------------------------- */
-  .modal {
-    position: fixed; inset: 0; z-index: 50;
-    background: rgba(10,12,16,.72);
-    display: flex; align-items: center; justify-content: center;
-  }
-  .modal[hidden] { display: none; }
-  .modal-box {
-    width: min(1100px, 94vw); height: min(760px, 88vh);
-    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
-    display: flex; flex-direction: column; overflow: hidden;
-  }
-  .modal-head {
-    display: flex; align-items: center; gap: 10px; padding: 10px 14px;
-    border-bottom: 1px solid var(--line);
-  }
-  .modal-head strong { font-size: 14px; }
-  /* Push the close button to the right without relying on the metadata being present. */
-  .modal-head #host-modal-close { margin-left: auto; }
-  .modal-path { display: flex; gap: 6px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
-  .modal-path input { flex: 1; }
-  .modal-body { flex: 1; display: flex; min-height: 0; }
-  .modal-list { width: 42%; overflow-y: auto; border-right: 1px solid var(--line); }
-  .entry {
-    padding: 5px 12px; cursor: pointer; font-size: 13px;
-    display: flex; align-items: baseline; gap: 8px;
-  }
-  .entry:hover { background: rgba(255,255,255,.05); }
-  .entry .ename { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .entry.dir .ename { color: var(--accent); }
-  .entry .esize { color: var(--dim); font-size: 11px; }
-  .entry.selected { background: rgba(90,150,255,.16); }
-  .modal-right { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-  .modal-right textarea {
-    flex: 1; resize: none; border: 0; border-bottom: 1px solid var(--line);
-    background: transparent; color: var(--text); padding: 10px 12px;
-    font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.5;
-  }
-  .modal-actions { display: flex; align-items: center; gap: 10px; padding: 6px 12px; }
-  .modal-actions #host-save { margin-left: auto; }
-  .modal-cmd { display: flex; gap: 6px; padding: 6px 12px; border-top: 1px solid var(--line); }
-  .modal-cmd input { flex: 1; }
-  .modal-out {
-    max-height: 34%; overflow: auto; margin: 0; padding: 8px 12px;
-    border-top: 1px solid var(--line); font-size: 12px; white-space: pre-wrap;
-  }
-  .dim { color: var(--dim); font-size: 11px; }
-  .token-button {
-    margin-left: auto; background: transparent; color: var(--dim);
-    border: 1px solid var(--line); border-radius: 4px; padding: 3px 9px; cursor: pointer;
-  }
-  .token-button:hover { color: var(--text); border-color: var(--accent); }
-  .token-panel {
-    display: flex; align-items: center; gap: 8px; padding: 6px 14px;
-    background: var(--panel); border-bottom: 1px solid var(--line); flex: none;
-  }
-  .token-panel input { flex: 1; max-width: 460px; }
+/* ---- top bar ---- */
+.top {
+  display: flex; align-items: center; gap: 12px; padding: 0 14px; height: 48px; flex: none;
+  background: rgba(17,20,25,.92); backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--line); z-index: 20;
+}
+.brand { display: flex; align-items: baseline; gap: 8px; user-select: none; }
+.brand b { font-size: 16px; font-weight: 700; letter-spacing: .4px; }
+.brand span { font-size: 11px; color: var(--faint); letter-spacing: 1.4px; text-transform: uppercase; }
+.status { font-size: 12px; color: var(--dim); display: flex; align-items: center; gap: 7px; font-family: var(--mono); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 0 3px rgba(255,128,128,.12); flex: none; }
+.dot.on { background: var(--good); box-shadow: 0 0 0 3px rgba(125,220,138,.12); }
+#instance-version { font-size: 11px; color: var(--faint); font-family: var(--mono); }
+.top-views { display: flex; gap: 4px; margin-left: 6px; }
+.top-views button {
+  background: transparent; color: var(--dim); border: 1px solid transparent; border-radius: 6px;
+  font-size: 12px; padding: 4px 9px;
+}
+.top-views button:hover { color: var(--text); background: rgba(255,255,255,.04); }
+.top-views button.active { color: var(--text); border-color: var(--line); background: var(--panel-2); }
+.spacer { flex: 1; }
+.token-button {
+  background: transparent; color: var(--dim);
+  border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; font-size: 12px;
+  font-family: var(--mono);
+}
+.token-button:hover { color: var(--text); border-color: var(--accent); }
+.token-button.has-token { color: var(--good); border-color: rgba(125,220,138,.4); }
+.token-panel {
+  display: flex; align-items: center; gap: 8px; padding: 8px 14px;
+  background: var(--panel); border-bottom: 1px solid var(--line); flex: none; font-size: 12px;
+}
+.token-panel[hidden] { display: none; }
+.token-panel input {
+  flex: 1; max-width: 460px; background: var(--bg); color: var(--text);
+  border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; font-family: var(--mono); font-size: 12px;
+}
+.token-panel input:focus { outline: none; border-color: var(--accent); }
+.token-panel button {
+  background: transparent; color: var(--text); border: 1px solid var(--line);
+  border-radius: 6px; padding: 5px 12px; font-size: 12px;
+}
+.token-panel button:hover { border-color: var(--accent); }
 
-  /* ---- diff/review pane ------------------------------------------------ */
-  .diff-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
-  .diff-input { display: flex; gap: 6px; padding: 6px 12px; }
-  .diff-input input { flex: 1; }
-  #diff-proposed {
-    flex: 1; min-height: 120px; resize: vertical; border: 0; border-bottom: 1px solid var(--line);
-    background: var(--bg); color: var(--text); padding: 8px 12px;
-    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; line-height: 1.5;
-  }
-  .diff-out { flex: 1; min-height: 0; }
-  .dline {
-    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; line-height: 1.5;
-    white-space: pre-wrap; word-break: break-word; padding: 0 12px;
-  }
-  .dline .mark { color: var(--dim); display: inline-block; width: 1.2em; user-select: none; }
-  .dline.add { background: rgba(125,220,138,.10); color: var(--good); }
-  .dline.del { background: rgba(255,128,128,.10); color: var(--bad); }
-  .dline.ctx { color: var(--dim); }
-  /* ---- fan-out pane ------------------------------------------------ */
-  .fanout-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
-  .fanout-input { display: flex; gap: 6px; padding: 6px 12px; }
-  .fanout-input button { margin-left: auto; }
-  .fanout-row { display: flex; gap: 6px; padding: 3px 12px; }
-  .fanout-row input { min-width: 0; }
-  .fanout-row .fanout-session { flex: 0 0 34%; }
-  .fanout-row .fanout-prompt { flex: 1; }
-  .fanout-out { flex: 1; min-height: 0; }
-  .child { border-bottom: 1px solid var(--line); padding: 8px 12px; font-size: 13px; }
-  .child .cmember { font-weight: 600; }
-  .child .cstatus {
-    display: inline-block; font-size: 10px; text-transform: uppercase; letter-spacing: .6px;
-    font-weight: 700; padding: 1px 5px; border-radius: 3px; margin-left: 6px;
-  }
-  .child .cstatus.ran { background: rgba(125,220,138,.15); color: var(--good); }
-  .child .cstatus.errored { background: rgba(255,128,128,.18); color: var(--bad); }
-  .child .cusage { color: var(--dim); font-size: 12px; margin-top: 2px; }
-  .child .cerror { color: var(--bad); font-size: 12px; margin-top: 2px; white-space: pre-wrap; word-break: break-word; }
-  /* ---- providers pane ------------------------------------------------ */
-  .prov-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
-  #providers { flex: 1; overflow-y: auto; padding: 8px 12px; font-size: 13px; }
-  .provider { padding: 6px 0; border-bottom: 1px solid rgba(43,48,56,.5); }
-  .provider .pname { font-weight: 600; }
-  .provider .pkind {
-    display: inline-block; font-size: 10px; text-transform: uppercase; letter-spacing: .6px;
-    font-weight: 700; padding: 1px 5px; border-radius: 3px; margin-left: 6px;
-    background: rgba(106,169,255,.15); color: var(--accent);
-  }
-  .provider .pmeta { color: var(--dim); font-size: 12px; margin-top: 2px; word-break: break-word; }
-  .provider .popts { display: flex; gap: 6px; margin-top: 6px; }
-  .provider .popts button {
-    font: inherit; font-size: 12px; padding: 3px 9px; border-radius: 4px; cursor: pointer;
-    background: transparent; color: var(--text); border: 1px solid var(--line);
-  }
-  .provider .popts button:hover { border-color: var(--accent); }
-  .provider .popts button.del { color: var(--bad); }
-  .provider .popts button.del:hover { border-color: var(--bad); }
-  .prov-form { display: flex; flex-direction: column; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--line); flex: none; }
-  .prov-form .row { display: flex; gap: 6px; }
-  .prov-form input, .prov-form select {
-    background: var(--bg); color: var(--text); border: 1px solid var(--line);
-    border-radius: 5px; padding: 6px 9px; font: inherit; font-size: 12px; min-width: 0;
-  }
-  .prov-form input:focus, .prov-form select:focus { outline: none; border-color: var(--accent); }
-  .prov-form #prov-name, .prov-form #prov-base-url, .prov-form #prov-models, .prov-form #prov-api-key { flex: 1; }
-  .prov-form .row select { flex: 1; }
-  .prov-form .actions { display: flex; gap: 6px; align-items: center; }
-  .prov-form .actions button {
-    background: var(--accent); color: #0b1220; border: 0; border-radius: 5px;
-    padding: 6px 12px; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
-  }
-  .prov-form .actions button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--line); font-weight: 400; }
-  .prov-form .actions button.ghost:hover { color: var(--text); border-color: var(--accent); }
-  #prov-msg { font-size: 12px; min-height: 1.2em; }
-  #prov-msg.ok { color: var(--good); }
-  #prov-msg.err { color: var(--bad); }
+/* ---- app grid ---- */
+.app { flex: 1; display: flex; min-height: 0; }
+.side {
+  width: 288px; flex: none; border-right: 1px solid var(--line); background: var(--panel);
+  display: flex; flex-direction: column; min-height: 0; overflow-y: auto;
+}
+.side[hidden] { display: none; }
+.card { border-bottom: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+.card > h2 {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 1.1px; color: var(--faint);
+  margin: 0; padding: 10px 14px 6px; font-weight: 700; display: flex; justify-content: space-between; align-items: center;
+}
+.card > h2 span { color: var(--dim); font-family: var(--mono); }
+#hosts { padding: 2px 14px 12px; font-size: 13px; }
+#approvals { padding: 2px 14px 12px; }
+.host { padding: 7px 0; border-bottom: 1px solid var(--line-soft); }
+.host:last-child { border-bottom: 0; }
+.host .hid { font-weight: 600; color: var(--text); font-family: var(--mono); font-size: 12.5px; }
+.host .row { display: flex; align-items: baseline; gap: 8px; cursor: pointer; }
+.host .row:hover .hid { color: var(--accent); }
+.host .row .open { margin-left: auto; color: var(--faint); font-size: 11px; }
+.host .kind {
+  display: inline-block; font-size: 10px; text-transform: uppercase; letter-spacing: .6px;
+  font-weight: 700; padding: 1px 5px; border-radius: 3px; margin-left: 6px;
+  background: var(--accent-soft); color: var(--accent);
+}
+.host .desc { color: var(--dim); font-size: 12px; margin-top: 2px; }
+.host .unconf { color: var(--bad); font-size: 11px; margin-top: 2px; }
+
+/* ---- center transcript ---- */
+.center { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg); }
+.thead {
+  display: flex; align-items: center; gap: 10px; padding: 10px 0 6px; flex: none;
+  width: min(820px, 100%); margin: 0 auto; padding-left: 20px; padding-right: 20px;
+}
+.tlabel { font-size: 11px; text-transform: uppercase; letter-spacing: 1.2px; color: var(--faint); font-weight: 700; }
+#session-label { font-family: var(--mono); font-size: 11px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#events { flex: 1; overflow-y: auto; min-height: 0; width: min(820px, 100%); margin: 0 auto; padding: 6px 20px 20px; font-size: 13.5px; }
+.empty { color: var(--faint); font-size: 12.5px; padding: 12px 0; }
+.dim { color: var(--dim); font-size: 11px; }
+
+/* Codex-style transcript cards. .event/.kind/.seq class names are kept for JS compat. */
+.event {
+  padding: 10px 14px; margin: 8px 0; border: 1px solid var(--line-soft); border-radius: 10px;
+  background: var(--panel); border-left: 2px solid var(--line);
+}
+.event.role-user { background: var(--panel-2); border-left-color: var(--accent); margin-left: 36px; }
+.event.role-agent { border-left-color: rgba(125,220,138,.55); }
+.event.role-tool { background: transparent; border-style: dashed; font-family: var(--mono); font-size: 12px; }
+.event.role-system { background: transparent; border: 0; color: var(--faint); font-size: 12px; padding: 4px 14px; }
+.event .meta { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+.event .kind { color: var(--accent); font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: .8px; font-family: var(--mono); }
+.event.role-user .kind { color: var(--text); }
+.event .seq { color: var(--faint); font-size: 10.5px; font-family: var(--mono); margin-right: 0; }
+.event .body { white-space: pre-wrap; word-break: break-word; }
+.event pre {
+  margin: 6px 0 0; white-space: pre-wrap; word-break: break-word;
+  font: 12px/1.55 var(--mono); color: var(--dim);
+  background: rgba(0,0,0,.28); border: 1px solid var(--line-soft); border-radius: 6px; padding: 8px 10px;
+  max-height: 320px; overflow: auto;
+}
+.event .thinking { color: var(--faint); font-style: italic; font-family: var(--serif); }
+
+/* composer pinned at bottom */
+.cwrap { flex: none; border-top: 1px solid var(--line); background: linear-gradient(to top, var(--bg) 70%, transparent); padding: 10px 0 8px; }
+.composer { display: flex; gap: 8px; width: min(820px, 100%); margin: 0 auto; padding: 0 20px; }
+.composer input {
+  flex: 1; background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+  border-radius: 10px; padding: 11px 14px; font-size: 13.5px;
+  box-shadow: 0 4px 24px rgba(0,0,0,.35);
+}
+.composer input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px rgba(106,169,255,.18); }
+.composer input::placeholder { color: var(--faint); }
+.composer button {
+  background: #e8e6df; color: #111; border: 0; border-radius: 10px;
+  padding: 0 18px; font-weight: 700; font-size: 13px;
+}
+.composer button:hover { background: #fff; }
+.composer button:disabled { opacity: .45; cursor: default; }
+.hint { width: min(820px,100%); margin: 4px auto 0; padding: 0 20px; font-size: 11px; color: var(--faint); font-family: var(--mono); }
+.error { color: var(--bad); font-size: 12px; padding: 4px 20px 8px; width: min(820px,100%); margin: 0 auto; }
+.error:empty { display: none; }
+.scroll { overflow-y: auto; }
+
+/* approvals */
+.sandbox { padding: 0 14px 8px; font-size: 12px; color: var(--dim); font-family: var(--mono); }
+.sandbox .live { color: var(--good); }
+.sandbox .off { color: var(--bad); }
+.approval { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 8px 0; background: var(--panel-2); }
+.approval .risk {
+  display: inline-block; font-size: 10px; text-transform: uppercase; letter-spacing: .6px;
+  font-weight: 700; padding: 2px 6px; border-radius: 3px; margin-bottom: 6px;
+}
+.risk.low { background: rgba(125,220,138,.15); color: var(--good); }
+.risk.medium { background: rgba(255,208,110,.15); color: var(--warn); }
+.risk.high, .risk.critical { background: rgba(255,128,128,.18); color: var(--bad); }
+.approval .tool { font-weight: 600; font-family: var(--mono); font-size: 12.5px; }
+.approval .summary { color: var(--text); margin: 4px 0; font-size: 13px; }
+.approval .reason { color: var(--dim); font-size: 12px; }
+.approval .undo { color: var(--dim); font-size: 12px; font-style: italic; margin-top: 3px; }
+.approval .unattended { color: var(--dim); font-size: 12px; margin-top: 3px; }
+.approval .opts { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.approval .opts button {
+  font-size: 12px; padding: 4px 10px; border-radius: 6px; cursor: pointer;
+  background: transparent; color: var(--text); border: 1px solid var(--line);
+}
+.approval .opts button:hover { border-color: var(--accent); }
+.approval .opts button.deny { color: var(--bad); }
+.approval .opts button.deny:hover { border-color: var(--bad); }
+
+/* ---- right drawer ---- */
+.drawer {
+  width: 430px; flex: none; border-left: 1px solid var(--line); background: var(--panel);
+  display: flex; flex-direction: column; min-height: 0;
+}
+.drawer[hidden] { display: none; }
+.tabs { display: flex; gap: 2px; padding: 8px 10px; border-bottom: 1px solid var(--line); flex: none; flex-wrap: wrap; }
+.tabs button {
+  background: transparent; border: 1px solid transparent; color: var(--dim);
+  font-size: 12px; border-radius: 6px; padding: 5px 10px; font-family: var(--mono);
+}
+.tabs button:hover { color: var(--text); }
+.tabs button.active { color: var(--text); background: var(--panel-2); border-color: var(--line); }
+.dpane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.dpane[hidden] { display: none; }
+.dpane > h2 {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 1.1px; color: var(--faint);
+  margin: 0; padding: 10px 14px 4px; font-weight: 700; display: flex; justify-content: space-between; align-items: center;
+}
+.dpane > h2 button {
+  font-size: 11px; background: transparent; color: var(--dim); border: 1px solid var(--line);
+  border-radius: 5px; padding: 2px 8px;
+}
+.dpane > h2 button:hover { color: var(--text); border-color: var(--accent); }
+#terminal { flex: 1; min-height: 220px; padding: 6px 0 6px 8px; background: #0a0c0f; }
+.diff-pane, .fanout-pane, .prov-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.diff-input, .fanout-input { display: flex; gap: 6px; padding: 8px 14px; }
+.diff-input input, .fanout-row input, .modal-path input, .modal-cmd input {
+  flex: 1; background: var(--bg); color: var(--text); border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 10px; font-size: 12.5px; min-width: 0;
+}
+.diff-input input:focus, .fanout-row input:focus { outline: none; border-color: var(--accent); }
+.diff-input button, .fanout-input button, .modal-path button, .modal-cmd button, .modal-actions button {
+  background: transparent; color: var(--text); border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 12px; font-size: 12px;
+}
+.diff-input button:hover, .fanout-input button:hover { border-color: var(--accent); }
+#diff-proposed {
+  margin: 0 14px; border: 1px solid var(--line); border-radius: 6px; min-height: 110px; resize: vertical;
+  background: var(--bg); color: var(--text); padding: 8px 10px;
+  font-family: var(--mono); font-size: 12px; line-height: 1.5;
+}
+.diff-out { flex: 1; min-height: 0; }
+.dline { font-family: var(--mono); font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; padding: 1px 14px; }
+.dline .mark { color: var(--dim); display: inline-block; width: 1.2em; user-select: none; }
+.dline.add { background: rgba(125,220,138,.10); color: var(--good); }
+.dline.del { background: rgba(255,128,128,.10); color: var(--bad); }
+.dline.ctx { color: var(--dim); }
+.fanout-row { display: flex; gap: 6px; padding: 3px 14px; }
+.fanout-row .fanout-session { flex: 0 0 32%; }
+.fanout-row .fanout-prompt { flex: 1; }
+.fanout-out { flex: 1; min-height: 0; }
+.child { border-bottom: 1px solid var(--line); padding: 8px 14px; font-size: 13px; }
+.child .cmember { font-weight: 600; font-family: var(--mono); font-size: 12px; }
+.child .cstatus {
+  display: inline-block; font-size: 10px; text-transform: uppercase; letter-spacing: .6px;
+  font-weight: 700; padding: 1px 5px; border-radius: 3px; margin-left: 6px;
+}
+.child .cstatus.ran { background: rgba(125,220,138,.15); color: var(--good); }
+.child .cstatus.errored { background: rgba(255,128,128,.18); color: var(--bad); }
+.child .cusage { color: var(--dim); font-size: 12px; margin-top: 2px; }
+.child .cerror { color: var(--bad); font-size: 12px; margin-top: 2px; white-space: pre-wrap; word-break: break-word; }
+#providers { flex: 1; overflow-y: auto; padding: 4px 14px; font-size: 13px; }
+.provider { padding: 8px 0; border-bottom: 1px solid var(--line-soft); }
+.provider .pname { font-weight: 600; font-family: var(--mono); font-size: 12.5px; }
+.provider .pkind {
+  display: inline-block; font-size: 10px; text-transform: uppercase; letter-spacing: .6px;
+  font-weight: 700; padding: 1px 5px; border-radius: 3px; margin-left: 6px;
+  background: var(--accent-soft); color: var(--accent);
+}
+.provider .pmeta { color: var(--dim); font-size: 12px; margin-top: 2px; word-break: break-word; }
+.provider .pkey { color: var(--faint); font-size: 11px; margin-top: 2px; font-family: var(--mono); }
+.provider .popts { display: flex; gap: 6px; margin-top: 6px; }
+.provider .popts button {
+  font-size: 12px; padding: 3px 9px; border-radius: 5px; cursor: pointer;
+  background: transparent; color: var(--text); border: 1px solid var(--line);
+}
+.provider .popts button:hover { border-color: var(--accent); }
+.provider .popts button.del { color: var(--bad); }
+.provider .popts button.del:hover { border-color: var(--bad); }
+.prov-form { display: flex; flex-direction: column; gap: 6px; padding: 10px 14px; border-top: 1px solid var(--line); flex: none; }
+.prov-form .row { display: flex; gap: 6px; }
+.prov-form input, .prov-form select {
+  background: var(--bg); color: var(--text); border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 9px; font-size: 12px; min-width: 0;
+}
+.prov-form input:focus, .prov-form select:focus { outline: none; border-color: var(--accent); }
+.prov-form #prov-name, .prov-form #prov-base-url, .prov-form #prov-models, .prov-form #prov-api-key { flex: 1; }
+.prov-form .row select { flex: 1; }
+.prov-form .actions { display: flex; gap: 6px; align-items: center; }
+.prov-form .actions button {
+  background: #e8e6df; color: #111; border: 0; border-radius: 6px;
+  padding: 6px 12px; font-size: 12px; font-weight: 700;
+}
+.prov-form .actions button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--line); font-weight: 400; }
+.prov-form .actions button.ghost:hover { color: var(--text); border-color: var(--accent); }
+#prov-msg { font-size: 12px; min-height: 1.2em; }
+#prov-msg.ok { color: var(--good); }
+#prov-msg.err { color: var(--bad); }
+
+/* ---- host browser modal ---- */
+.modal { position: fixed; inset: 0; z-index: 60; background: rgba(6,8,11,.72); display: flex; align-items: center; justify-content: center; }
+.modal[hidden] { display: none; }
+.modal-box {
+  width: min(1100px, 94vw); height: min(760px, 88vh);
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 24px 80px rgba(0,0,0,.6);
+}
+.modal-head { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.modal-head strong { font-size: 14px; font-family: var(--mono); }
+.modal-head #host-modal-close { margin-left: auto; background: transparent; color: var(--dim); border: 1px solid var(--line); border-radius: 6px; padding: 4px 12px; }
+.modal-head #host-modal-close:hover { color: var(--text); border-color: var(--accent); }
+.modal-path { display: flex; gap: 6px; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+.modal-body { flex: 1; display: flex; min-height: 0; }
+.modal-list { width: 42%; overflow-y: auto; border-right: 1px solid var(--line); }
+.entry { padding: 5px 12px; cursor: pointer; font-size: 13px; display: flex; align-items: baseline; gap: 8px; }
+.entry:hover { background: rgba(255,255,255,.05); }
+.entry .ename { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 12.5px; }
+.entry.dir .ename { color: var(--accent); }
+.entry .esize { color: var(--dim); font-size: 11px; }
+.entry.selected { background: rgba(90,150,255,.16); }
+.modal-right { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.modal-right textarea {
+  flex: 1; resize: none; border: 0; border-bottom: 1px solid var(--line);
+  background: transparent; color: var(--text); padding: 10px 12px;
+  font-family: var(--mono); font-size: 12px; line-height: 1.5;
+}
+.modal-actions { display: flex; align-items: center; gap: 10px; padding: 6px 12px; }
+.modal-actions #host-save { margin-left: auto; }
+.modal-cmd { display: flex; gap: 6px; padding: 6px 12px; border-top: 1px solid var(--line); }
+.modal-out { max-height: 34%; overflow: auto; margin: 0; padding: 8px 12px; border-top: 1px solid var(--line); font-size: 12px; white-space: pre-wrap; font-family: var(--mono); }
+
+/* ---- onboarding overlay ---- */
+.onboard { position: fixed; inset: 0; z-index: 80; display: flex; align-items: center; justify-content: center; background: rgba(6,8,11,.82); backdrop-filter: blur(6px); padding: 20px; }
+.onboard[hidden] { display: none; }
+.ob-card {
+  width: min(620px, 94vw); max-height: 90vh; overflow-y: auto;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+  padding: 34px 36px 28px; box-shadow: 0 32px 100px rgba(0,0,0,.65);
+}
+.ob-kicker { font-size: 11px; letter-spacing: 1.6px; text-transform: uppercase; color: var(--faint); font-weight: 700; }
+.ob-card h1 { margin: 8px 0 6px; font-size: 30px; line-height: 1.15; letter-spacing: -.4px; font-weight: 700; }
+.ob-card h1 em { font-family: var(--serif); font-style: italic; font-weight: 400; }
+.ob-sub { color: var(--dim); font-size: 13.5px; margin: 0 0 18px; }
+.ob-steps { display: flex; gap: 6px; margin: 0 0 18px; }
+.ob-steps i { flex: 1; height: 3px; border-radius: 2px; background: var(--line); font-style: normal; }
+.ob-steps i.done { background: var(--good); }
+.ob-steps i.now { background: var(--accent); }
+.ob-step { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin: 10px 0; background: var(--panel-2); }
+.ob-step[hidden] { display: none; }
+.ob-step h3 { margin: 0 0 4px; font-size: 14px; }
+.ob-step p { margin: 0 0 10px; color: var(--dim); font-size: 12.5px; }
+.ob-step input, .ob-step select {
+  width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--line);
+  border-radius: 8px; padding: 9px 12px; font-size: 13px; margin: 4px 0; font-family: var(--mono);
+}
+.ob-step input:focus, .ob-step select:focus { outline: none; border-color: var(--accent); }
+.ob-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.ob-actions { display: flex; gap: 8px; align-items: center; margin-top: 16px; }
+.ob-actions .primary {
+  background: #e8e6df; color: #111; border: 0; border-radius: 8px; padding: 9px 18px; font-weight: 700; font-size: 13px;
+}
+.ob-actions .primary:hover { background: #fff; }
+.ob-actions .primary:disabled { opacity: .5; }
+.ob-actions .ghost { background: transparent; color: var(--dim); border: 1px solid var(--line); border-radius: 8px; padding: 8px 14px; font-size: 13px; }
+.ob-actions .ghost:hover { color: var(--text); border-color: var(--accent); }
+.ob-note { font-size: 11.5px; color: var(--faint); margin-top: 8px; font-family: var(--mono); }
+#ob-msg { font-size: 12.5px; min-height: 1.4em; margin-top: 10px; }
+#ob-msg.ok { color: var(--good); }
+#ob-msg.err { color: var(--bad); }
+
+@media (max-width: 1100px) {
+  .drawer { width: 360px; }
+  .side { width: 240px; }
+}
+@media (max-width: 860px) {
+  .side { display: none; }
+  .drawer { position: fixed; right: 0; top: 48px; bottom: 0; z-index: 30; box-shadow: -16px 0 48px rgba(0,0,0,.5); }
+  .top-views button { padding: 4px 6px; }
+  .event.role-user { margin-left: 12px; }
+}
+
 </style>
 </head>
 <body>
-<header>
-  <h1>hx</h1>
+<header class="top">
+  <div class="brand"><b>hx</b><span>codex</span></div>
   <div class="status"><span class="dot" id="dot"></span><span id="status-text">connecting…</span></div>
-  <!-- The token panel. Present always, not only when the daemon refuses: a person who has just been
-       handed a token needs somewhere to put it before the first request fails. -->
+  <span id="instance-version" title="daemon instance / version"></span>
+  <nav class="top-views" aria-label="panels">
+    <button data-view="side" class="active" title="toggle hosts + approvals">library</button>
+    <button data-view="terminal" class="active" title="terminal">terminal</button>
+    <button data-view="diff" title="diff/review">diff</button>
+    <button data-view="fanout" title="fan-out">fan-out</button>
+    <button data-view="providers" title="providers / settings">providers</button>
+  </nav>
+  <div class="spacer"></div>
   <button id="token-button" class="token-button" title="API bearer token">token</button>
 </header>
 <div id="token-panel" class="token-panel" hidden>
@@ -273,134 +409,183 @@
   <button id="token-clear">clear</button>
   <span id="token-status" class="dim"></span>
 </div>
-<main>
-  <section class="pane">
-    <h2>hosts<span id="host-count"></span></h2>
-    <div id="hosts" class="scroll"></div>
-  </section>
-  <!-- The host browser: a directory listing, a file viewer/editor, and a command runner for one
-       machine. A dialog rather than a pane because it belongs to a *chosen* host, and leaving the
-       choice implicit in a corner of the screen is how a person edits a file on the wrong box. -->
-  <div id="host-modal" class="modal" hidden>
-    <div class="modal-box">
-      <div class="modal-head">
-        <strong id="host-modal-title">host</strong>
-        <span id="host-modal-meta" class="dim"></span>
-        <button id="host-modal-close">close</button>
-      </div>
-      <div class="modal-path">
-        <input id="host-path" placeholder="/" autocomplete="off" spellcheck="false">
-        <button id="host-go">open</button>
-        <button id="host-up">up</button>
-      </div>
-      <div class="modal-body">
-        <div id="host-entries" class="modal-list"></div>
-        <div class="modal-right">
-          <textarea id="host-file" spellcheck="false" placeholder="select a file to view or edit"></textarea>
-          <div class="modal-actions">
-            <span id="host-file-status" class="dim"></span>
-            <button id="host-save">save</button>
-          </div>
-          <div class="modal-cmd">
-            <input id="host-cmd" placeholder="run a command on this host" autocomplete="off">
-            <button id="host-run">run</button>
-          </div>
-          <pre id="host-out" class="modal-out"></pre>
-        </div>
-      </div>
-      <div class="error" id="host-error"></div>
-    </div>
-  </div>
-  <section class="pane">
-    <h2>terminal<span><button id="new-term">new</button></span></h2>
-    <div id="terminal"></div>
-  </section>
-  <section class="pane">
-    <h2>approvals<span id="approval-count"></span></h2>
-    <div id="sandbox-status" class="sandbox"></div>
-    <div id="approvals" class="scroll"></div>
-    <div class="error" id="approval-error"></div>
-  </section>
-  <!-- The diff/review pane. It shows what a proposed file change would do, and it always asks the daemon
-       for that diff rather than inventing it: the daemon is the only thing that owns the file's current
-       content. This is one self-contained page, so the pane is just inputs and a renderer around `POST /v1/diff`. -->
-  <section class="pane">
-    <h2>diff/review</h2>
-    <div class="diff-pane">
-      <div class="diff-input">
-        <input id="diff-path" placeholder="path to an existing file" autocomplete="off" spellcheck="false">
-        <button id="diff-run">diff</button>
-      </div>
-      <textarea id="diff-proposed" spellcheck="false" placeholder="proposed contents…"></textarea>
-      <div class="error" id="diff-error"></div>
-      <div id="diff-out" class="scroll diff-out"></div>
-    </div>
-  </section>
-  <!-- The fan-out pane. It runs N child prompts across N pool members and shows one outcome per
-       child. Like the diff pane it is just inputs and a renderer around one route — `POST /v1/fanout`
-       — and the daemon owns the pool, the run and the redaction; the pane only renders what it is
-       sent. Each row is one child: the session its usage is recorded under, and its prompt. -->
-  <section class="pane">
-    <h2>fan-out<span><button id="fanout-add">add row</button></span></h2>
-    <div class="fanout-pane">
-      <div id="fanout-rows"></div>
-      <div class="fanout-input">
-        <button id="fanout-run">run</button>
-      </div>
-      <div class="error" id="fanout-error"></div>
-      <div id="fanout-out" class="scroll fanout-out"></div>
-    </div>
-  </section>
-  <!-- The providers pane. It lists the daemon's configured model providers and lets the owner
-       add, edit or remove one at runtime. Like every other pane it is just inputs and a renderer
-       around the `/v1/providers` routes — the daemon owns the config, the persistence and the
-       secret; this pane never sees or shows a stored API key. -->
-  <section class="pane">
-    <h2>providers<span id="provider-count"></span></h2>
-    <div class="prov-pane">
-      <div id="providers" class="scroll"></div>
-      <div class="prov-form">
-        <div class="row">
-          <input id="prov-name" placeholder="name" autocomplete="off" spellcheck="false">
-          <select id="prov-kind" title="provider kind">
-            <option value="openai">openai</option>
-            <option value="anthropic">anthropic</option>
-            <option value="google">google</option>
-            <option value="ollama">ollama</option>
-            <option value="custom">custom</option>
-          </select>
-        </div>
-        <input id="prov-base-url" placeholder="base_url (optional)" autocomplete="off" spellcheck="false">
-        <input id="prov-models" placeholder="models, comma-separated (optional)" autocomplete="off" spellcheck="false">
-        <input id="prov-api-key" type="password" placeholder="leave blank to keep existing" autocomplete="off" spellcheck="false">
-        <div class="row">
-          <select id="prov-routing" title="routing strategy">
-            <option value="least_loaded">least_loaded</option>
-            <option value="priority">priority</option>
-            <option value="round_robin">round_robin</option>
-            <option value="weighted">weighted</option>
-            <option value="cheapest_capable">cheapest_capable</option>
-          </select>
-        </div>
-        <div class="actions">
-          <button id="prov-save">save</button>
-          <button id="prov-clear" class="ghost">clear</button>
-          <span id="prov-msg"></span>
-        </div>
-      </div>
-      <div class="error" id="prov-error"></div>
-    </div>
-  </section>
-  <section class="pane">
-    <h2>session<span id="session-label"></span></h2>
+<div class="app">
+  <aside class="side" id="side">
+    <section class="card">
+      <h2>hosts<span id="host-count"></span></h2>
+      <div id="hosts"></div>
+    </section>
+    <section class="card">
+      <h2>approvals<span id="approval-count"></span></h2>
+      <div id="sandbox-status" class="sandbox"></div>
+      <div id="approvals"></div>
+      <div class="error" id="approval-error" style="width:auto;margin:0;padding:4px 14px 10px"></div>
+    </section>
+  </aside>
+  <main class="center">
+    <div class="thead"><span class="tlabel">transcript</span><span id="session-label"></span></div>
     <div id="events"></div>
-    <div class="composer">
-      <input id="prompt" placeholder="Ask the agent…" autocomplete="off">
-      <button id="send">Send</button>
+    <div class="cwrap">
+      <div class="composer">
+        <input id="prompt" placeholder="Message the agent…  (Enter to send)" autocomplete="off">
+        <button id="send">Send</button>
+      </div>
+      <div class="hint">events stream live over the session socket · POST /v1/chat per message</div>
+      <div class="error" id="error"></div>
     </div>
-    <div class="error" id="error"></div>
-  </section>
-</main>
+  </main>
+  <aside class="drawer" id="drawer">
+    <div class="tabs" role="tablist">
+      <button data-tab="terminal" class="active">terminal</button>
+      <button data-tab="diff">diff</button>
+      <button data-tab="fanout">fan-out</button>
+      <button data-tab="providers">providers</button>
+    </div>
+    <section class="dpane" id="dp-terminal">
+      <h2>terminal<span><button id="new-term">new</button></span></h2>
+      <div id="terminal"></div>
+    </section>
+    <section class="dpane" id="dp-diff" hidden>
+      <h2>diff/review</h2>
+      <div class="diff-pane">
+        <div class="diff-input">
+          <input id="diff-path" placeholder="path to an existing file" autocomplete="off" spellcheck="false">
+          <button id="diff-run">diff</button>
+        </div>
+        <textarea id="diff-proposed" spellcheck="false" placeholder="proposed contents…"></textarea>
+        <div class="error" id="diff-error" style="width:auto;margin:0;padding:4px 14px"></div>
+        <div id="diff-out" class="scroll diff-out"></div>
+      </div>
+    </section>
+    <section class="dpane" id="dp-fanout" hidden>
+      <h2>fan-out</h2>
+      <div class="fanout-pane">
+        <div id="fanout-rows"></div>
+        <div class="fanout-input">
+          <button id="fanout-add">add row</button>
+          <button id="fanout-run">run</button>
+        </div>
+        <div class="error" id="fanout-error" style="width:auto;margin:0;padding:4px 14px"></div>
+        <div id="fanout-out" class="scroll fanout-out"></div>
+      </div>
+    </section>
+    <section class="dpane" id="dp-providers" hidden>
+      <h2>providers<span id="provider-count"></span></h2>
+      <div class="prov-pane">
+        <div id="providers" class="scroll"></div>
+        <div class="prov-form">
+          <div class="row">
+            <input id="prov-name" placeholder="name" autocomplete="off" spellcheck="false">
+            <select id="prov-kind" title="provider kind">
+              <option value="openai">openai</option>
+              <option value="anthropic">anthropic</option>
+              <option value="google">google</option>
+              <option value="ollama">ollama</option>
+              <option value="custom">custom</option>
+            </select>
+          </div>
+          <input id="prov-base-url" placeholder="base_url (optional)" autocomplete="off" spellcheck="false">
+          <input id="prov-models" placeholder="models, comma-separated (optional)" autocomplete="off" spellcheck="false">
+          <input id="prov-api-key" type="password" placeholder="leave blank to keep existing" autocomplete="off" spellcheck="false">
+          <div class="row">
+            <select id="prov-routing" title="routing strategy">
+              <option value="least_loaded">least_loaded</option>
+              <option value="priority">priority</option>
+              <option value="round_robin">round_robin</option>
+              <option value="weighted">weighted</option>
+              <option value="cheapest_capable">cheapest_capable</option>
+            </select>
+          </div>
+          <div class="actions">
+            <button id="prov-save">save</button>
+            <button id="prov-clear" class="ghost">clear</button>
+            <span id="prov-msg"></span>
+          </div>
+        </div>
+        <div class="error" id="prov-error" style="width:auto;margin:0;padding:4px 14px"></div>
+      </div>
+    </section>
+  </aside>
+</div>
+<div id="host-modal" class="modal" hidden>
+  <div class="modal-box">
+    <div class="modal-head">
+      <strong id="host-modal-title">host</strong>
+      <span id="host-modal-meta" class="dim"></span>
+      <button id="host-modal-close">close</button>
+    </div>
+    <div class="modal-path">
+      <input id="host-path" placeholder="/" autocomplete="off" spellcheck="false">
+      <button id="host-go">open</button>
+      <button id="host-up">up</button>
+    </div>
+    <div class="modal-body">
+      <div id="host-entries" class="modal-list"></div>
+      <div class="modal-right">
+        <textarea id="host-file" spellcheck="false" placeholder="select a file to view or edit"></textarea>
+        <div class="modal-actions">
+          <span id="host-file-status" class="dim"></span>
+          <button id="host-save">save</button>
+        </div>
+        <div class="modal-cmd">
+          <input id="host-cmd" placeholder="run a command on this host" autocomplete="off">
+          <button id="host-run">run</button>
+        </div>
+        <pre id="host-out" class="modal-out"></pre>
+      </div>
+    </div>
+    <div class="error" id="host-error" style="width:auto"></div>
+  </div>
+</div>
+<div id="onboard" class="onboard" hidden>
+  <div class="ob-card">
+    <div class="ob-kicker">hx · first run</div>
+    <h1>Ship work from <em>one prompt.</em></h1>
+    <p class="ob-sub">Three steps and you're talking to the agent: authenticate, connect a model provider, start prompting.</p>
+    <div class="ob-steps"><i id="ob-s1" class="now"></i><i id="ob-s2"></i><i id="ob-s3"></i></div>
+    <div class="ob-step" id="ob-step-1">
+      <h3>1 · Paste your API bearer token</h3>
+      <p>The daemon binds non-loopback, so every /v1/* call needs it. Stored only in this browser's localStorage.</p>
+      <input id="ob-token" type="password" placeholder="bearer token" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="ob-step" id="ob-step-2" hidden>
+      <h3>2 · Add your first model provider</h3>
+      <p>Same PUT /v1/providers flow as the providers pane. The key is write-only — it is sent, never displayed.</p>
+      <input id="ob-prov-name" placeholder="name (e.g. default)" autocomplete="off" spellcheck="false">
+      <div class="ob-grid">
+        <select id="ob-prov-kind" title="provider kind">
+          <option value="openai">openai</option>
+          <option value="anthropic">anthropic</option>
+          <option value="google">google</option>
+          <option value="ollama">ollama</option>
+          <option value="custom">custom</option>
+        </select>
+        <select id="ob-prov-routing" title="routing strategy">
+          <option value="least_loaded">least_loaded</option>
+          <option value="priority">priority</option>
+          <option value="round_robin">round_robin</option>
+          <option value="weighted">weighted</option>
+          <option value="cheapest_capable">cheapest_capable</option>
+        </select>
+      </div>
+      <input id="ob-prov-base-url" placeholder="base_url (optional)" autocomplete="off" spellcheck="false">
+      <input id="ob-prov-models" placeholder="models, comma-separated (optional)" autocomplete="off" spellcheck="false">
+      <input id="ob-prov-key" type="password" placeholder="api key (write-only)" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="ob-step" id="ob-step-3" hidden>
+      <h3>3 · You're in</h3>
+      <p>The transcript is live on the session socket. Ask for something small first — e.g. "list the hosts".</p>
+    </div>
+    <div id="ob-msg"></div>
+    <div class="ob-actions">
+      <button id="ob-next" class="primary">Save token · continue</button>
+      <button id="ob-back" class="ghost" hidden>back</button>
+      <button id="ob-skip" class="ghost">skip → main UI</button>
+    </div>
+    <div class="ob-note">never shows stored secrets · secret_set only · token lives in localStorage</div>
+  </div>
+</div>
+
 
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
@@ -594,15 +779,40 @@ let sessionId = null, eventSocket = null, lastSeq = 0, eventReconnectDelay = 250
 
 function renderEvent(frame) {
   const el = document.createElement("div");
-  el.className = "event";
   const event = frame.event || {};
   const kind = event.type || "event";
+  const k = kind.toLowerCase();
+  let role = "agent";
+  if (/(user|prompt|human|input)/.test(k)) role = "user";
+  else if (/(tool|exec|command|call|result|output)/.test(k)) role = "tool";
+  else if (/(system|status|notice|error)/.test(k)) role = "system";
+  el.className = `event role-${role}`;
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  const seq = document.createElement("span");
+  seq.className = "seq";
+  seq.textContent = frame.seq === undefined ? "" : `#${frame.seq}`;
+  const kk = document.createElement("span");
+  kk.className = "kind";
+  kk.textContent = kind;
+  meta.appendChild(seq);
+  meta.appendChild(kk);
+  el.appendChild(meta);
+  const text =
+    event.text || event.content || event.message || event.output ||
+    event.summary || event.value || "";
+  if (typeof text === "string" && text) {
+    const b = document.createElement("div");
+    b.className = "body";
+    b.textContent = text;
+    el.appendChild(b);
+  }
   const summary = summarize(event);
-  el.innerHTML =
-    `<span class="seq">#${frame.seq}</span><span class="kind"></span>` +
-    (summary ? `<pre></pre>` : "");
-  el.querySelector(".kind").textContent = kind;
-  if (summary) el.querySelector("pre").textContent = summary;
+  if (summary && (typeof text !== "string" || !text || summary !== JSON.stringify(text))) {
+    const pre = document.createElement("pre");
+    pre.textContent = summary;
+    el.appendChild(pre);
+  }
   return el;
 }
 
@@ -1478,6 +1688,12 @@ function renderProvider(p) {
     el.appendChild(m);
   }
 
+  if ("secret_set" in p) {
+    const key = document.createElement("div");
+    key.className = "pkey";
+    key.textContent = p.secret_set ? "api key: set (write-only)" : "api key: not set";
+    el.appendChild(key);
+  }
   const opts = document.createElement("div");
   opts.className = "popts";
   const edit = document.createElement("button");
@@ -1562,6 +1778,153 @@ async function deleteProvider(name) {
   }
 }
 
+// ---- Codex chrome: drawer tabs, panel toggles, version, onboarding (no API contract changes) ----
+(function codexChrome() {
+  const tabBtns = Array.from(document.querySelectorAll(".tabs button[data-tab]"));
+  const panes = { terminal: $("dp-terminal"), diff: $("dp-diff"), fanout: $("dp-fanout"), providers: $("dp-providers") };
+  function showTab(name) {
+    for (const [key, pane] of Object.entries(panes)) {
+      if (pane) pane.hidden = key !== name;
+    }
+    for (const b of tabBtns) b.classList.toggle("active", b.dataset.tab === name);
+    const drawer = $("drawer");
+    if (drawer) drawer.hidden = false;
+    document.querySelector('.top-views button[data-view="terminal"]')?.classList.add("active");
+    if (name === "terminal" && typeof fit !== "undefined" && fit) {
+      try { fit.fit(); } catch (_) {}
+    }
+  }
+  for (const b of tabBtns) b.addEventListener("click", () => showTab(b.dataset.tab));
+
+  const viewBtns = Array.from(document.querySelectorAll('.top-views button[data-view]'));
+  for (const b of viewBtns) {
+    b.addEventListener("click", () => {
+      const v = b.dataset.view;
+      if (v === "side") {
+        const side = $("side");
+        side.hidden = !side.hidden;
+        b.classList.toggle("active", !side.hidden);
+        return;
+      }
+      const drawer = $("drawer");
+      const pane = panes[v];
+      const willOpen = drawer.hidden || (pane && pane.hidden);
+      if (!willOpen) { drawer.hidden = true; b.classList.remove("active"); return; }
+      showTab(v);
+      b.classList.add("active");
+    });
+  }
+
+  // Instance / version in the top bar. Best-effort: never breaks boot.
+  (async () => {
+    try {
+      const res = await apiFetch(`${API}/v1/status`);
+      if (!res.ok) return;
+      const s = await res.json();
+      const bits = [];
+      if (s.instance) bits.push(s.instance);
+      if (s.version) bits.push(`v${s.version}`);
+      else if (s.hx_version) bits.push(`v${s.hx_version}`);
+      if (bits.length) $("instance-version").textContent = bits.join(" · ");
+    } catch (_) {}
+  })();
+
+  // Token button reflects stored state without ever showing the secret.
+  try {
+    if (apiToken()) $("token-button").classList.add("has-token");
+  } catch (_) {}
+
+  // ---- onboarding ---------------------------------------------------------
+  const OB_KEY = "hx.onboard.dismissed";
+  let obStep = 1;
+  const obMsg = (t, ok) => {
+    const el = $("ob-msg");
+    el.textContent = t || "";
+    el.className = t ? (ok ? "ok" : "err") : "";
+  };
+  function obShow(step) {
+    obStep = step;
+    for (let i = 1; i <= 3; i++) {
+      $("ob-step-" + i).hidden = i !== step;
+      const dot = $("ob-s" + i);
+      dot.className = i < step ? "done" : (i === step ? "now" : "");
+    }
+    $("ob-back").hidden = step === 1;
+    $("ob-next").textContent =
+      step === 1 ? "Save token · continue" :
+      step === 2 ? "Save provider · continue" : "Open the transcript →";
+    obMsg("");
+    if (step === 1) setTimeout(() => $("ob-token").focus(), 50);
+    if (step === 2) setTimeout(() => $("ob-prov-name").focus(), 50);
+  }
+  function obDismiss() {
+    try { localStorage.setItem(OB_KEY, "1"); } catch (_) {}
+    $("onboard").hidden = true;
+    setTimeout(() => $("prompt").focus(), 50);
+  }
+  async function obNext() {
+    if (obStep === 1) {
+      const v = $("ob-token").value.trim();
+      if (!v) { obMsg("paste the bearer token first — or skip", false); return; }
+      // Reuse the exact token save path: localStorage + reload-free re-entry.
+      setToken(v);
+      try { $("token-button").classList.add("has-token"); } catch (_) {}
+      obMsg("token saved ✓", true);
+      // Re-probe providers with the new credential before deciding step 2 vs 3.
+      try {
+        const res = await apiFetch(`${API}/v1/providers`);
+        const items = res.ok ? provListItems(await res.json()) : [];
+        if (res.ok && items.length) { await pollProviders(); obShow(3); return; }
+      } catch (_) {}
+      obShow(2);
+      return;
+    }
+    if (obStep === 2) {
+      // Reuse the provider PUT flow through the main form fields + saveProvider().
+      const name = $("ob-prov-name").value.trim();
+      if (!name) { obMsg("give the provider a name", false); return; }
+      $("prov-name").value = name;
+      $("prov-kind").value = $("ob-prov-kind").value;
+      $("prov-base-url").value = $("ob-prov-base-url").value;
+      $("prov-models").value = $("ob-prov-models").value;
+      $("prov-api-key").value = $("ob-prov-key").value;
+      await saveProvider();
+      const ok = ($("prov-msg").className || "").includes("ok");
+      if (!ok) { obMsg($("prov-msg").textContent || "could not save — see providers pane", false); showTab("providers"); return; }
+      $("ob-prov-key").value = "";
+      obMsg("");
+      obShow(3);
+      return;
+    }
+    obDismiss();
+  }
+  $("ob-next").addEventListener("click", obNext);
+  $("ob-back").addEventListener("click", () => obShow(Math.max(1, obStep - 1)));
+  $("ob-skip").addEventListener("click", obDismiss);
+  $("ob-token").addEventListener("keydown", (e) => { if (e.key === "Enter") obNext(); });
+  $("ob-prov-name").addEventListener("keydown", (e) => { if (e.key === "Enter") obNext(); });
+
+  // First-run detection: no token saved AND daemon reports no providers (or we
+  // cannot prove otherwise). Runs after boot's first poll so providers are known.
+  async function maybeOnboard() {
+    try {
+      if (localStorage.getItem(OB_KEY) === "1") return;
+      if (localStorage.getItem(TOKEN_KEY)) return;
+      let none = true;
+      try {
+        const res = await apiFetch(`${API}/v1/providers`);
+        if (res.ok) none = provListItems(await res.json()).length === 0;
+        else if (res.status === 401) none = true;
+        else none = true;
+      } catch (_) { none = true; }
+      if (none) { $("onboard").hidden = false; obShow(1); }
+    } catch (_) {}
+  }
+  // Expose for boot ordering; called after the first pollProviders().
+  window.__maybeOnboard = maybeOnboard;
+})();
+
+
 // ---- token panel wiring -----------------------------------------------------------------------
 
 $("token-button").addEventListener("click", () => {
@@ -1601,6 +1964,7 @@ $("token-status").textContent = apiToken() ? "token set" : "no token";
   // Polled for the page's lifetime: an approval can arrive with no other activity, so there is no
   // event to hang the refresh off.
   await Promise.all([pollApprovals(), pollSandboxes(), pollHosts(), pollProviders()]);
+  try { if (window.__maybeOnboard) await window.__maybeOnboard(); } catch (_) {}
   approvalTimer = setInterval(() => {
     pollApprovals();
     pollSandboxes();
