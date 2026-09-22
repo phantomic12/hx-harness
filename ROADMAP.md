@@ -156,6 +156,39 @@ sends). What is *not* yet exercised is a real TUI and a real browser against one
 moment: the browser stack was unavailable, so the page's protocol was driven directly rather than
 through a rendered page.
 
+- ✅ **A task list, Codex/Devin style** (`static/index.html`). The left rail lists sessions from
+`GET /v1/sessions` — title, age, workspace — and a click switches the open one. `localStorage`
+key `hx.session` remembers it, so a reload resumes the last task instead of `POST`ing a new empty
+one on every visit (the old `ensureSession` did exactly that). `+ new` is `POST /v1/sessions`, the
+header edits the title through `POST /v1/sessions/{id}/rename`, delete asks first. Composer is a
+textarea: Enter sends, Shift+Enter breaks the line.
+- ✅ **Per-task status and a live activity chip.** Each row carries a marker — amber when the task
+has an unanswered approval, green while a tool call is in flight. The approval marker comes from
+`GET /v1/approvals`, which now works because `ApprovalRequest` carries the `session` it was asked
+in (`hx-core`, stamped by `ApprovalQueue::decide_in_with_wait` from the session it already
+recorded), so one poll marks every row instead of one request per row. The running marker and the
+composer chip come from the session socket: `tool_call_started`/`tool_call_finished` collapse
+into "working · shell", and consecutive `text_delta` frames append into one card. That exposed a
+real bug — the page read `event.type`, but the daemon tags events with `event`
+(`#[serde(tag = "event")]`), so every card had been rendering as a generic "event".
+- **Still open, in this order:**
+1. Diff review inside the thread. Every product reviewed puts the diff in the conversation, not a
+   side tool. `POST /v1/diff` exists but nothing lists "files this session changed", so a review
+   pane needs a daemon route first. Until then a diff-shaped event should render inline.
+2. Plan-then-run (Devin's Ask mode): a read-only mode flag on a run. Needs a new daemon concept;
+   do not fake it in the page.
+3. Not worth copying: an embedded editor or browser (the PTY and the host modal already are the
+   takeover surfaces), automations, a commits drawer (no git state is exposed;
+   `GET /v1/sessions/{id}/export` covers taking a transcript elsewhere).
+- **Where it was left.** `hxd` rebuilt from this tree is what serves `127.0.0.1:8899` with
+`/tmp/hxweb.yaml` (data dir `~/.hx`, db `~/.hx/hx.db`). The web-client suite is green
+(`cargo test -p hx-server --test web_client_api`, 6 tests) and the approval queue suite is green
+(`cargo test -p hx-agent --lib queue::`, 7 tests). Not yet done: a rendered-browser check of the
+markers and the chip. A headless Chromium attempt died mid-setup; the probe files it left
+(`/tmp/hxprobe.html`, `/tmp/hxpage.js`) are throwaway and not part of the tree. One landmine: the
+`web_client_api` token test exempts `doLogin`'s raw `fetch` and only that — login has no token
+yet, so it must not go through `apiFetch`. A new raw `fetch(`${API}…`)` anywhere else fails it.
+
 ---
 
 ## M3 — Sandboxes + the capability model

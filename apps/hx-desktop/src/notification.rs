@@ -207,6 +207,9 @@ mod tests {
             reversible: true,
             undo: None,
             unattended: None,
+                // No session on a hand-built fixture: the field is what the queue stamps
+                // onto a real question, and this request was never asked.
+                session: None,
             confined: Confinement::Host,
             default_on_timeout: ApprovalOption::Deny,
             timeout_secs: None,

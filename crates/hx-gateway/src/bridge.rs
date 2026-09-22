@@ -480,6 +480,9 @@ mod tests {
             reversible: false,
             undo: None,
             unattended: None,
+                // No session on a hand-built fixture: the field is what the queue stamps
+                // onto a real question, and this request was never asked.
+                session: None,
             confined: Default::default(),
             default_on_timeout: ApprovalOption::Deny,
             timeout_secs: None,

@@ -323,6 +323,9 @@ async fn an_approval_is_posted_with_one_button_per_option() {
         reversible: false,
         undo: None,
         unattended: None,
+        // No session on a hand-built fixture: the field is what the queue stamps onto a real
+        // question, and this request was never asked.
+        session: None,
         confined: Default::default(),
         default_on_timeout: hx_core::approval::ApprovalOption::Deny,
         timeout_secs: None,
@@ -480,6 +483,9 @@ async fn a_token_never_reaches_an_error_message_not_even_the_url() {
         reversible: false,
         undo: None,
         unattended: None,
+        // No session on a hand-built fixture: the field is what the queue stamps onto a real
+        // question, and this request was never asked.
+        session: None,
         confined: Default::default(),
         default_on_timeout: hx_core::approval::ApprovalOption::Deny,
         timeout_secs: None,

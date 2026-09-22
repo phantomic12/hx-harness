@@ -1313,10 +1313,11 @@ async fn a_request_for_an_unknown_role_is_refused_by_name() {
 
 #[tokio::test]
 async fn post_sessions_opens_a_session_on_an_empty_store() {
-    // The embedded web client's first call on a fresh daemon: a bare `POST /v1/sessions`, no
-    // body, no content type (`ensureSession` in `static/index.html`). Before this route existed
-    // the call answered 405, the client fell back to "the most recent session", and an empty
-    // store meant "could not open a session" with no way forward.
+    // The embedded web client's way of opening a task: a bare `POST /v1/sessions`, no body, no
+    // content type (`createSession` in `static/index.html`, reached from "+ new" and from a first
+    // run against an empty store). Before this route existed the call answered 405, the client
+    // fell back to "the most recent session", and an empty store meant "could not open a session"
+    // with no way forward.
     let h = harness(vec![]).await;
 
     let (status, list) = get(Arc::clone(&h.state), "/v1/sessions?limit=50").await;

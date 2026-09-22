@@ -1680,6 +1680,17 @@ pub struct ApprovalRequest {
     /// zero, which cannot be configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unattended: Option<UnattendedBudget>,
+    /// The session this question was asked in.
+    ///
+    /// The queue already scopes a question to a session (`ApprovalQueue::outstanding(Some(id))`),
+    /// but that record lives in the queue and dies with the answer. A client that renders a list of
+    /// tasks has to mark the *row* whose task is waiting, and the only list it holds is
+    /// `GET /v1/approvals` — which, unfiltered, is every question on the machine. Carrying the
+    /// session on the request means one poll answers "which tasks need me" without a second request
+    /// per row. `None` for a question asked outside any session, which is the honest value rather
+    /// than an empty string a client might match against a real id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<crate::ids::SessionId>,
     /// Where the call will run, so the person answering knows whether the effect lands on their machine.
     #[serde(default, skip_serializing_if = "Confinement::is_host")]
     pub confined: Confinement,
@@ -2317,6 +2328,11 @@ impl ApprovalSession {
                     budget,
                     remaining: budget.saturating_sub(self.consecutive_auto),
                 }),
+            // The session is not known here — the approval session is per-run, and the queue is
+            // what knows which conversation asked. The queue fills this in when it records the
+            // question, so a client reading the queue sees it and a caller that built the request
+            // by hand sees `None`, which is the truth at this point.
+            session: None,
         };
         self.outstanding = Some(request.clone());
         request

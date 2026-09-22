@@ -380,6 +380,9 @@ risk = "destructive"
             // No budget on this fixture: the field is absent for a hand-built request, which is the
             // same shape a policy with no check-in cadence produces.
             unattended: None,
+            // No session on a hand-built fixture: the field is what the queue stamps onto a real
+            // question, and a grant is not one.
+            session: None,
             confined: crate::approval::Confinement::Host,
             default_on_timeout: crate::approval::ApprovalOption::Deny,
             timeout_secs: None,
@@ -417,6 +420,9 @@ risk = "destructive"
             // No budget on this fixture: the field is absent for a hand-built request, which is the
             // same shape a policy with no check-in cadence produces.
             unattended: None,
+            // No session on a hand-built fixture: the field is what the queue stamps onto a real
+            // question, and a grant is not one.
+            session: None,
             confined: crate::approval::Confinement::Host,
             default_on_timeout: crate::approval::ApprovalOption::Deny,
             timeout_secs: None,
@@ -443,6 +449,9 @@ risk = "destructive"
             // No budget on this fixture: the field is absent for a hand-built request, which is the
             // same shape a policy with no check-in cadence produces.
             unattended: None,
+            // No session on a hand-built fixture: the field is what the queue stamps onto a real
+            // question, and a grant is not one.
+            session: None,
             confined: crate::approval::Confinement::Host,
             default_on_timeout: crate::approval::ApprovalOption::Deny,
             timeout_secs: None,

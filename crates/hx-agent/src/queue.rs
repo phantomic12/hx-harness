@@ -197,7 +197,16 @@ impl ApprovalQueue {
             pending.insert(
                 request.id.as_str().to_string(),
                 Waiting {
-                    request: request.clone(),
+                    // The session rides on the request too, not only in the queue's private record:
+                    // `outstanding` hands clients the request, and a task list has to tell which
+                    // task a question belongs to from that alone.
+                    request: {
+                        let mut shown = request.clone();
+                        if shown.session.is_none() {
+                            shown.session = session.map(hx_core::ids::SessionId::from_raw);
+                        }
+                        shown
+                    },
                     session: session.map(str::to_string),
                     reply: Some(reply),
                 },

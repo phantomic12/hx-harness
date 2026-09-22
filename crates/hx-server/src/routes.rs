@@ -580,14 +580,16 @@ struct CreateSessionBody {
 
 /// Open a session without running a turn.
 ///
-/// WHY a route for doing nothing: the embedded web client starts from an empty session store by
-/// `POST`ing `/v1/sessions` (`ensureSession` in `static/index.html`). Sessions were otherwise
-/// created only implicitly by `POST /v1/chat`, so on a fresh daemon the create call answered 405,
-/// the client fell back to "the most recent session", and an empty store meant "could not open a
-/// session" with no way forward. An explicit create is also the honest primitive: a client that
-/// wants a titled, empty session to attach a WebSocket to should not have to send a fake first
-/// prompt to get one. The body is optional — a bare `POST` opens a session with defaults — and the
-/// answer carries the id under both `id` and `session`, the two fields clients read.
+/// WHY a route for doing nothing: the embedded web client opens a task with `POST /v1/sessions`
+/// (`createSession` in `static/index.html`) — on first run, when the store is empty, and whenever
+/// the user hits "+ new". A reload resumes the last open task instead (`localStorage` key
+/// `hx.session`), so a page load does not mint a session. Sessions were otherwise created only
+/// implicitly by `POST /v1/chat`, so on a fresh daemon the create call answered 405, the client
+/// fell back to "the most recent session", and an empty store meant "could not open a session"
+/// with no way forward. An explicit create is also the honest primitive: a client that wants a
+/// titled, empty session to attach a WebSocket to should not have to send a fake first prompt to
+/// get one. The body is optional — a bare `POST` opens a session with defaults — and the answer
+/// carries the id under both `id` and `session`, the two fields clients read.
 async fn create_session(
     State(state): State<Arc<AppState>>,
     body: Option<Json<CreateSessionBody>>,

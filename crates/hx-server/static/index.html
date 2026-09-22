@@ -105,9 +105,50 @@ button { cursor: pointer; }
 .app { flex: 1; display: flex; min-height: 0; }
 .side {
   width: 288px; flex: none; border-right: 1px solid var(--line); background: var(--panel);
-  display: flex; flex-direction: column; min-height: 0; overflow-y: auto;
+  display: flex; flex-direction: column; min-height: 0; overflow: hidden;
 }
 .side[hidden] { display: none; }
+.sessions-head {
+  display: flex; align-items: center; gap: 8px; padding: 10px 10px 6px; flex: none;
+}
+.sessions-head h2 {
+  margin: 0; flex: 1; font-size: 11px; text-transform: uppercase; letter-spacing: 1.1px;
+  color: var(--faint); font-weight: 700;
+}
+.sessions-head h2 span { color: var(--dim); font-family: var(--mono); }
+.new-task {
+  background: #e8e6df; color: #111; border: 0; border-radius: 6px;
+  font-size: 12px; font-weight: 700; padding: 4px 10px;
+}
+.new-task:hover { background: #fff; }
+.new-task:disabled { opacity: .45; cursor: default; }
+#sessions { flex: 1; overflow-y: auto; min-height: 0; padding: 2px 8px 8px; }
+.sess {
+  display: flex; flex-direction: column; gap: 1px; width: 100%; text-align: left;
+  background: transparent; border: 1px solid transparent; border-radius: 8px;
+  padding: 8px 10px; margin: 2px 0; color: var(--text);
+}
+.sess:hover { background: rgba(255,255,255,.04); }
+.sess.active { background: var(--accent-soft); border-color: rgba(106,169,255,.35); }
+.sess .stitle {
+  font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sess .srow { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.sess .srow .stitle { flex: 1; }
+.sess .mark {
+  flex: none; width: 7px; height: 7px; border-radius: 50%;
+}
+.sess .mark.wait { background: var(--warn); box-shadow: 0 0 0 3px rgba(255,208,110,.18); }
+.sess .mark.run { background: var(--good); box-shadow: 0 0 0 3px rgba(125,220,138,.15); }
+.sess .smeta { color: var(--faint); font-size: 11px; font-family: var(--mono); display: flex; gap: 8px; }
+.sess-actions { display: flex; gap: 4px; padding: 2px 10px 8px; flex: none; }
+.sess-actions button {
+  background: transparent; color: var(--dim); border: 1px solid var(--line);
+  border-radius: 5px; padding: 2px 8px; font-size: 11px;
+}
+.sess-actions button:hover { color: var(--text); border-color: var(--accent); }
+.sess-actions button.danger:hover { color: var(--bad); border-color: var(--bad); }
+.side-fold { border-top: 1px solid var(--line); flex: none; max-height: 42%; overflow-y: auto; }
 .card { border-bottom: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
 .card > h2 {
   font-size: 11px; text-transform: uppercase; letter-spacing: 1.1px; color: var(--faint);
@@ -137,7 +178,14 @@ button { cursor: pointer; }
   width: min(820px, 100%); margin: 0 auto; padding-left: 20px; padding-right: 20px;
 }
 .tlabel { font-size: 11px; text-transform: uppercase; letter-spacing: 1.2px; color: var(--faint); font-weight: 700; }
-#session-label { font-family: var(--mono); font-size: 11px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#session-label {
+  flex: 1; min-width: 0; background: transparent; border: 0; border-bottom: 1px solid transparent;
+  color: var(--text); font-size: 14px; font-weight: 600; padding: 2px 4px;
+  overflow: hidden; text-overflow: ellipsis;
+}
+#session-label:hover { border-bottom-color: var(--line); }
+#session-label:focus { outline: none; border-bottom-color: var(--accent); }
+#session-meta { font-family: var(--mono); font-size: 11px; color: var(--faint); flex: none; }
 #events { flex: 1; overflow-y: auto; min-height: 0; width: min(820px, 100%); margin: 0 auto; padding: 6px 20px 20px; font-size: 13.5px; }
 .empty { color: var(--faint); font-size: 12.5px; padding: 12px 0; }
 .dim { color: var(--dim); font-size: 11px; }
@@ -167,19 +215,33 @@ button { cursor: pointer; }
 /* composer pinned at bottom */
 .cwrap { flex: none; border-top: 1px solid var(--line); background: linear-gradient(to top, var(--bg) 70%, transparent); padding: 10px 0 8px; }
 .composer { display: flex; gap: 8px; width: min(820px, 100%); margin: 0 auto; padding: 0 20px; }
-.composer input {
+.composer textarea {
   flex: 1; background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
-  border-radius: 10px; padding: 11px 14px; font-size: 13.5px;
+  border-radius: 10px; padding: 11px 14px; font-size: 13.5px; resize: none;
+  min-height: 46px; max-height: 200px; line-height: 1.45;
   box-shadow: 0 4px 24px rgba(0,0,0,.35);
 }
-.composer input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px rgba(106,169,255,.18); }
-.composer input::placeholder { color: var(--faint); }
+.composer textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px rgba(106,169,255,.18); }
+.composer textarea::placeholder { color: var(--faint); }
 .composer button {
   background: #e8e6df; color: #111; border: 0; border-radius: 10px;
   padding: 0 18px; font-weight: 700; font-size: 13px;
 }
 .composer button:hover { background: #fff; }
 .composer button:disabled { opacity: .45; cursor: default; }
+.activity {
+  width: min(820px, 100%); margin: 0 auto 6px; padding: 0 20px;
+  font-size: 12px; color: var(--dim); font-family: var(--mono);
+  display: flex; align-items: center; gap: 8px; min-height: 0;
+}
+.activity:empty { display: none; }
+.activity .pulse {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--good); flex: none;
+  box-shadow: 0 0 0 3px rgba(125,220,138,.15);
+  animation: hx-pulse 1.4s ease-in-out infinite;
+}
+.activity.wait .pulse { background: var(--warn); box-shadow: 0 0 0 3px rgba(255,208,110,.18); }
+@keyframes hx-pulse { 50% { opacity: .35; } }
 .hint { width: min(820px,100%); margin: 4px auto 0; padding: 0 20px; font-size: 11px; color: var(--faint); font-family: var(--mono); }
 .error { color: var(--bad); font-size: 12px; padding: 4px 20px 8px; width: min(820px,100%); margin: 0 auto; }
 .error:empty { display: none; }
@@ -387,7 +449,8 @@ button { cursor: pointer; }
   .side { width: 240px; }
 }
 @media (max-width: 860px) {
-  .side { display: none; }
+  .side { position: fixed; left: 0; top: 48px; bottom: 0; z-index: 30; box-shadow: 16px 0 48px rgba(0,0,0,.5); }
+  .side[hidden] { display: none; }
   .drawer { position: fixed; right: 0; top: 48px; bottom: 0; z-index: 30; box-shadow: -16px 0 48px rgba(0,0,0,.5); }
   .top-views button { padding: 4px 6px; }
   .event.role-user { margin-left: 12px; }
@@ -401,7 +464,7 @@ button { cursor: pointer; }
   <div class="status"><span class="dot" id="dot"></span><span id="status-text">connecting…</span></div>
   <span id="instance-version" title="daemon instance / version"></span>
   <nav class="top-views" aria-label="panels">
-    <button data-view="side" class="active" title="toggle hosts + approvals">library</button>
+    <button data-view="side" class="active" title="toggle the task list">tasks</button>
     <button data-view="terminal" class="active" title="terminal">terminal</button>
     <button data-view="diff" title="diff/review">diff</button>
     <button data-view="fanout" title="fan-out">fan-out</button>
@@ -424,26 +487,41 @@ button { cursor: pointer; }
 </div>
 <div class="app">
   <aside class="side" id="side">
-    <section class="card">
-      <h2>hosts<span id="host-count"></span></h2>
-      <div id="hosts"></div>
-    </section>
-    <section class="card">
-      <h2>approvals<span id="approval-count"></span></h2>
-      <div id="sandbox-status" class="sandbox"></div>
-      <div id="approvals"></div>
-      <div class="error" id="approval-error" style="width:auto;margin:0;padding:4px 14px 10px"></div>
-    </section>
+    <div class="sessions-head">
+      <h2>tasks<span id="session-count"></span></h2>
+      <button id="new-session" class="new-task" title="open a new task">+ new</button>
+    </div>
+    <div id="sessions"></div>
+    <div class="sess-actions">
+      <button id="session-rename" title="rename the open task">rename</button>
+      <button id="session-delete" class="danger" title="delete the open task">delete</button>
+    </div>
+    <div class="side-fold">
+      <section class="card">
+        <h2>hosts<span id="host-count"></span></h2>
+        <div id="hosts"></div>
+      </section>
+      <section class="card">
+        <h2>approvals<span id="approval-count"></span></h2>
+        <div id="sandbox-status" class="sandbox"></div>
+        <div id="approvals"></div>
+        <div class="error" id="approval-error" style="width:auto;margin:0;padding:4px 14px 10px"></div>
+      </section>
+    </div>
   </aside>
   <main class="center">
-    <div class="thead"><span class="tlabel">transcript</span><span id="session-label"></span></div>
+    <div class="thead">
+      <input id="session-label" spellcheck="false" autocomplete="off" placeholder="untitled task" title="click to rename this task">
+      <span id="session-meta"></span>
+    </div>
     <div id="events"></div>
     <div class="cwrap">
+      <div class="activity" id="activity"></div>
       <div class="composer">
-        <input id="prompt" placeholder="Message the agent…  (Enter to send)" autocomplete="off">
+        <textarea id="prompt" rows="1" placeholder="Ask hx to do something…   Enter sends, Shift+Enter for a new line" autocomplete="off"></textarea>
         <button id="send">Send</button>
       </div>
-      <div class="hint">events stream live over the session socket · POST /v1/chat per message</div>
+      <div class="hint">one task per conversation · events stream on the session socket · Enter sends</div>
       <div class="error" id="error"></div>
     </div>
   </main>
@@ -837,11 +915,101 @@ function attachTerminal() {
 // Session events
 
 let sessionId = null, eventSocket = null, lastSeq = 0, eventReconnectDelay = 250;
+// The text card currently being appended to. Reset whenever a non-delta arrives, so two replies
+// never merge into one bubble.
+let streaming = null;
+
+function kindOf(event) {
+  // The daemon tags events with `event` (`#[serde(tag = "event", rename_all = "snake_case")]`).
+  // `type` is read first only so an older frame still renders rather than becoming a blank card.
+  return String((event && (event.event || event.type)) || "event");
+}
+
+// "wait" outranks "run": an unanswered question is the one state a person can act on.
+function taskState(id) {
+  if (waitingSessions.has(id)) return "wait";
+  const tools = runningTools.get(id);
+  if (tools && tools.size) return "run";
+  return "";
+}
+
+// Collapse a burst of tool events into one line. A start names the tool; the matching finish
+// removes it; the chip shows whatever is still open, which is what the agent is doing *now*.
+function noteActivity(id, event) {
+  const kind = kindOf(event);
+  if (kind === "tool_call_started") {
+    let tools = runningTools.get(id);
+    if (!tools) { tools = new Set(); runningTools.set(id, tools); }
+    tools.add(event.name || "tool");
+  } else if (kind === "tool_call_finished") {
+    const tools = runningTools.get(id);
+    if (tools) { tools.delete(event.name || "tool"); if (!tools.size) runningTools.delete(id); }
+  } else if (kind === "turn_finished" || kind === "error") {
+    runningTools.delete(id);
+  } else {
+    return;
+  }
+  renderSessions();
+  paintActivity();
+}
+
+function paintActivity() {
+  const host = $("activity");
+  if (!host) return;
+  const tools = sessionId ? runningTools.get(sessionId) : null;
+  const waiting = sessionId && waitingSessions.has(sessionId);
+  host.classList.toggle("wait", !!waiting);
+  if (waiting) {
+    host.innerHTML = "";
+    const dot = document.createElement("span");
+    dot.className = "pulse";
+    host.appendChild(dot);
+    host.appendChild(document.createTextNode("waiting on your approval"));
+    return;
+  }
+  if (tools && tools.size) {
+    host.innerHTML = "";
+    const dot = document.createElement("span");
+    dot.className = "pulse";
+    host.appendChild(dot);
+    const names = Array.from(tools);
+    const shown = names.slice(0, 3).join(", ");
+    const more = names.length > 3 ? ` +${names.length - 3}` : "";
+    host.appendChild(document.createTextNode("working · " + shown + more));
+    return;
+  }
+  host.textContent = "";
+}
+
+function appendDelta(seq, text) {
+  const host = $("events");
+  if (!streaming || !streaming.isConnected) {
+    const el = document.createElement("div");
+    el.className = "event role-agent";
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const s = document.createElement("span");
+    s.className = "seq";
+    s.textContent = seq === undefined ? "" : `#${seq}`;
+    const k = document.createElement("span");
+    k.className = "kind";
+    k.textContent = "text";
+    meta.appendChild(s);
+    meta.appendChild(k);
+    const body = document.createElement("div");
+    body.className = "body";
+    el.appendChild(meta);
+    el.appendChild(body);
+    host.appendChild(el);
+    streaming = body;
+  }
+  streaming.textContent += text;
+}
 
 function renderEvent(frame) {
   const el = document.createElement("div");
   const event = frame.event || {};
-  const kind = event.type || "event";
+  const kind = kindOf(event);
   const k = kind.toLowerCase();
   let role = "agent";
   if (/(user|prompt|human|input)/.test(k)) role = "user";
@@ -887,22 +1055,211 @@ function summarize(event) {
   return JSON.stringify(clone);
 }
 
-async function ensureSession() {
-  const res = await apiFetch(`${API}/v1/sessions`, { method: "POST" });
-  if (res.status === 200 || res.status === 201) {
+// ---------------------------------------------------------------------------------------------
+// Tasks (sessions)
+//
+// The left rail is a task list, the way Codex and Devin put one conversation per row. The daemon
+// already has the primitives — GET/POST /v1/sessions, POST /v1/sessions/{id}/rename, DELETE — so
+// this is a client of those, not a second store. localStorage remembers which task was open so a
+// reload resumes it instead of minting a new empty one on every visit (the old behaviour).
+
+const SESSION_KEY = "hx.session";
+let sessions = [];
+// Per-task liveness, derived from the event stream rather than polled. `running` holds the tool
+// names a task currently has in flight (a start with no matching finish); `waiting` is the set of
+// tasks with an approval nobody has answered. Both feed the row marker and the composer chip.
+const runningTools = new Map();
+let waitingSessions = new Set();
+
+const sidOf = (s) => (typeof s === "string" ? s : (s && (s.id || s.session))) || "";
+const titleOf = (s) => {
+  if (!s || typeof s === "string") return "untitled";
+  const t = (s.title || "").trim();
+  return t && t !== "untitled" ? t : "untitled";
+};
+const whenOf = (s) => {
+  const raw = s && (s.updated_at || s.created_at);
+  if (!raw) return "";
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return "";
+  const diff = Date.now() - d.getTime();
+  if (diff < 60_000) return "just now";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h`;
+  return `${Math.floor(diff / 86_400_000)}d`;
+};
+
+function paintTaskHeader() {
+  const s = sessions.find((x) => sidOf(x) === sessionId);
+  const label = $("session-label");
+  if (label && document.activeElement !== label) label.value = s ? titleOf(s) : "";
+  const meta = $("session-meta");
+  if (meta) {
+    const bits = [];
+    if (s && s.model) bits.push(s.model);
+    if (s && s.turns) bits.push(`${s.turns} turns`);
+    meta.textContent = bits.join(" · ");
+  }
+}
+
+function renderSessions() {
+  const host = $("sessions");
+  if (!host) return;
+  const count = $("session-count");
+  if (count) count.textContent = sessions.length ? ` ${sessions.length}` : "";
+  host.innerHTML = "";
+  if (!sessions.length) {
+    const p = document.createElement("div");
+    p.className = "empty";
+    p.textContent = "No tasks yet. + new starts one.";
+    host.appendChild(p);
+    paintTaskHeader();
+    return;
+  }
+  for (const s of sessions) {
+    const id = sidOf(s);
+    const btn = document.createElement("button");
+    btn.className = "sess" + (id === sessionId ? " active" : "");
+    btn.type = "button";
+    const title = document.createElement("span");
+    title.className = "stitle";
+    title.textContent = titleOf(s);
+    const row = document.createElement("span");
+    row.className = "srow";
+    // The mark answers "which task needs me" without opening it. Waiting outranks running: a
+    // question nobody has answered is the thing a person can act on, a running tool is not.
+    const state = taskState(id);
+    if (state) {
+      const mark = document.createElement("span");
+      mark.className = "mark " + state;
+      mark.title = state === "wait" ? "waiting on you" : "working";
+      row.appendChild(mark);
+    }
+    row.appendChild(title);
+    const meta = document.createElement("span");
+    meta.className = "smeta";
+    const bits = [];
+    const when = whenOf(s);
+    if (when) bits.push(when);
+    if (s && s.workspace) bits.push(String(s.workspace).split("/").filter(Boolean).pop() || "");
+    meta.textContent = bits.filter(Boolean).join(" · ");
+    btn.appendChild(row);
+    btn.appendChild(meta);
+    btn.addEventListener("click", () => openSession(id));
+    host.appendChild(btn);
+  }
+  paintTaskHeader();
+}
+
+async function refreshSessions() {
+  try {
+    const res = await apiFetch(`${API}/v1/sessions?limit=100`);
+    if (!res.ok) return;
     const body = await res.json();
-    sessionId = body.id || body.session;
-  }
-  if (!sessionId) {
-    // Not every daemon build may accept a bare POST; fall back to the most recent session so the
-    // pane still shows something real rather than an empty box.
-    const list = await apiFetch(`${API}/v1/sessions`).then((r) => r.json()).catch(() => ({}));
-    const items = list.sessions || list || [];
-    if (Array.isArray(items) && items.length) sessionId = items[0].id || items[0];
-  }
-  if (!sessionId) throw new Error("could not open a session");
-  $("session-label").textContent = sessionId;
+    const items = body.sessions || body || [];
+    sessions = Array.isArray(items) ? items : [];
+  } catch (_) {}
+  renderSessions();
+}
+
+// Open an existing task: clear the transcript, reset the resume floor, reattach the socket.
+// A no-op when it is already the open one, so a poll cannot wipe a live transcript.
+async function openSession(id) {
+  if (!id || id === sessionId) { renderSessions(); return; }
+  sessionId = id;
+  lastSeq = 0;
+  streaming = null;
+  try { localStorage.setItem(SESSION_KEY, id); } catch (_) {}
+  const events = $("events");
+  if (events) events.innerHTML = "";
+  showError("");
+  renderSessions();
+  paintActivity();
   attachSession();
+}
+
+async function createSession() {
+  const btn = $("new-session");
+  if (btn) btn.disabled = true;
+  try {
+    const res = await apiFetch(`${API}/v1/sessions`, { method: "POST" });
+    if (res.status !== 200 && res.status !== 201) {
+      throw new Error(`could not open a task: ${res.status} ${await res.text()}`);
+    }
+    const body = await res.json();
+    const id = body.id || body.session;
+    if (!id) throw new Error("create response had no id");
+    // The created record rides on the response; show it immediately, then reconcile with the list.
+    if (body.record) sessions.unshift(Object.assign({ messages: 0, turns: 0 }, body.record));
+    await openSession(id);
+    await refreshSessions();
+    $("prompt").focus();
+  } catch (e) {
+    showError(String(e.message || e));
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function renameSession(title) {
+  const next = (title || "").trim();
+  const current = sessions.find((x) => sidOf(x) === sessionId);
+  // Unchanged (including a blur that follows Enter) must not write. An empty field is "never
+  // mind", not a request to store a blank title the daemon would reject anyway.
+  if (!sessionId || !next || (current && titleOf(current) === next)) { paintTaskHeader(); return; }
+  try {
+    const res = await apiFetch(`${API}/v1/sessions/${sessionId}/rename`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: next }),
+    });
+    if (!res.ok) throw new Error(`rename failed: ${res.status} ${await res.text()}`);
+    const rec = await res.json();
+    const i = sessions.findIndex((s) => sidOf(s) === sessionId);
+    if (i >= 0) sessions[i] = Object.assign({}, sessions[i], rec);
+    renderSessions();
+  } catch (e) {
+    showError(String(e.message || e));
+    paintTaskHeader();
+  }
+}
+
+async function deleteSession() {
+  if (!sessionId) return;
+  const s = sessions.find((x) => sidOf(x) === sessionId);
+  const name = s ? titleOf(s) : sessionId;
+  if (!confirm(`Delete task “${name}”? The transcript goes with it.`)) return;
+  try {
+    const res = await apiFetch(`${API}/v1/sessions/${sessionId}`, { method: "DELETE" });
+    if (!res.ok && res.status !== 404) throw new Error(`delete failed: ${res.status} ${await res.text()}`);
+    const gone = sessionId;
+    sessions = sessions.filter((x) => sidOf(x) !== gone);
+    sessionId = null;
+    lastSeq = 0;
+    streaming = null;
+    runningTools.delete(gone);
+    try { localStorage.removeItem(SESSION_KEY); } catch (_) {}
+    $("events").innerHTML = "";
+    if (eventSocket) { try { eventSocket.close(); } catch (_) {} eventSocket = null; }
+    const next = sessions[0] && sidOf(sessions[0]);
+    if (next) await openSession(next);
+    else renderSessions();
+  } catch (e) {
+    showError(String(e.message || e));
+  }
+}
+
+// Boot: resume the last open task if it still exists, else the most recent, else make one.
+// Creating on every load was the bug — a reload minted an empty session and abandoned the last one.
+async function ensureSession() {
+  await refreshSessions();
+  let wanted = "";
+  try { wanted = localStorage.getItem(SESSION_KEY) || ""; } catch (_) {}
+  const known = new Set(sessions.map(sidOf));
+  if (wanted && known.has(wanted)) { await openSession(wanted); return; }
+  const first = sessions[0] && sidOf(sessions[0]);
+  if (first) { await openSession(first); return; }
+  await createSession();
 }
 
 function attachSession() {
@@ -923,7 +1280,16 @@ function attachSession() {
       if (frame.seq <= lastSeq) return;
       lastSeq = frame.seq;
     }
-    $("events").appendChild(renderEvent(frame));
+    const arrived = frame.event || {};
+    if (kindOf(arrived) === "text_delta" && typeof arrived.text === "string") {
+      // Deltas append. A card per token would be one bordered box per word, which is how a
+      // transcript becomes unreadable exactly when the model is busiest.
+      appendDelta(frame.seq, arrived.text);
+    } else {
+      streaming = null;
+      $("events").appendChild(renderEvent(frame));
+    }
+    noteActivity(sessionId, arrived);
     $("events").scrollTop = $("events").scrollHeight;
   };
   eventSocket.onclose = () => {
@@ -1018,6 +1384,16 @@ async function pollApprovals() {
 function renderApprovals(items) {
   const host = $("approvals");
   $("approval-count").textContent = items.length ? `${items.length}` : "";
+  // Which tasks are blocked on a person. The session rides on the request itself (the queue stamps
+  // it when the question is asked), so one unfiltered poll marks every row — a request per row
+  // would be one round trip per task for a fact the list already carries.
+  const waiting = new Set();
+  for (const req of items) {
+    const sid = req && (typeof req.session === "string" ? req.session : (req.session && req.session.id));
+    if (sid) waiting.add(sid);
+  }
+  const changed = waiting.size !== waitingSessions.size || [...waiting].some((s) => !waitingSessions.has(s));
+  waitingSessions = waiting;
   // Rebuilt wholesale: the list is small and every field can change, so a diff would be more
   // machinery than the thing it optimises.
   host.innerHTML = "";
@@ -1026,9 +1402,10 @@ function renderApprovals(items) {
     p.className = "empty";
     p.textContent = "Nothing waiting.";
     host.appendChild(p);
-    return;
+  } else {
+    for (const req of items) host.appendChild(renderApproval(req));
   }
-  for (const req of items) host.appendChild(renderApproval(req));
+  if (changed) { renderSessions(); paintActivity(); }
 }
 
 function renderApproval(req) {
@@ -2082,12 +2459,21 @@ refreshAuthUI();
     pollApprovals();
     pollSandboxes();
     pollHosts();
+    refreshSessions();
   }, APPROVAL_POLL_MS);
   window.addEventListener("beforeunload", () => clearInterval(approvalTimer));
 })();
 
-$("prompt").addEventListener("keydown", (e) => { if (e.key === "Enter") sendPrompt(); });
+$("prompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) sendPrompt(); });
 $("send").addEventListener("click", sendPrompt);
+$("new-session").addEventListener("click", createSession);
+$("session-delete").addEventListener("click", deleteSession);
+$("session-rename").addEventListener("click", () => { const el = $("session-label"); el.focus(); el.select(); });
+$("session-label").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); renameSession(e.target.value); e.target.blur(); }
+  if (e.key === "Escape") { paintTaskHeader(); e.target.blur(); }
+});
+$("session-label").addEventListener("blur", (e) => renameSession(e.target.value));
 $("new-term").addEventListener("click", async () => {
   // A *new* terminal, deliberately under a fresh id: the point of the `new` button is a second
   // shell, and reusing the id would just reattach to the first.

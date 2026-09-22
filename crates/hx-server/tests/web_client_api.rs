@@ -241,8 +241,22 @@ async fn the_page_carries_the_bearer_token_on_every_call_it_makes() {
         body.contains("?token=") || body.contains("token=${encodeURIComponent"),
         "and carry it on the WebSocket URLs, which cannot take a header"
     );
-    // The property that keeps this true as routes are added: every call goes through the one
-    // helper, so a new pane cannot forget the header.
+    // The property that keeps this true as routes are added: every authenticated call goes through
+    // the one helper, so a new pane cannot forget the header. The login call is the one exception,
+    // and it is one by construction — it has no token yet, and attaching a stale bearer (or letting
+    // its 401 open the login panel) is exactly what the comment above `doLogin` refuses.
+    let rest = body.as_str();
+    if let Some(login) = rest.find("async function doLogin") {
+        if let Some(end) = rest[login..].find("\nasync function ") {
+            let (before, after_and) = rest.split_at(login);
+            let after = &after_and[end..];
+            assert!(
+                !before.contains("await fetch(`${API}") && !after.contains("await fetch(`${API}"),
+                "a call site outside doLogin bypasses apiFetch, and would be sent without the token"
+            );
+            return;
+        }
+    }
     assert!(
         !body.contains("await fetch(`${API}"),
         "a call site bypasses apiFetch, and would be sent without the token"
