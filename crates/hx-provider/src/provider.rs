@@ -253,7 +253,7 @@ pub trait Provider: Send + Sync {
 }
 
 /// Providers available to the daemon, keyed by id.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ProviderRegistry {
     providers: IndexMap<ProviderId, Arc<dyn Provider>>,
 }

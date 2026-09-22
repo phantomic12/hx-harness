@@ -226,7 +226,11 @@ pub async fn run_chat_with_session_notify(
 
     // The model call a role resolves to, before anything is written: a role that does not exist is a
     // configuration mistake, and a request that cannot run should not leave a session behind for it.
-    let model = state.models.for_role(&role)?;
+    let model = state
+        .models
+        .read()
+        .expect("model factory lock")
+        .for_role(&role)?;
 
     // Resolve the requested boundary before persisting a prompt or calling the model. A failed
     // start must never turn a request for confinement into a host run.

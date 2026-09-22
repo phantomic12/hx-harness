@@ -20,9 +20,11 @@ use hx_store::Store;
 use hx_tools::ToolRegistry;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use tokio::sync::broadcast;
 use tokio::sync::Mutex as AsyncMutex;
+use indexmap::IndexMap;
 
 /// One event on the live bus, tagged with the session it belongs to and its store sequence.
 ///
@@ -49,15 +51,24 @@ pub struct AppState {
     /// read the same limiter state, or `hx status` reports headroom that does not exist. Nothing
     /// holds it across an `await`.
     pub router: Arc<Mutex<ModelRouter>>,
-    /// The adapters the router's routes resolve to.
-    pub providers: Arc<ProviderRegistry>,
+    /// The adapters the router's routes resolve to. Behind a read-write lock so a provider can be
+    /// added or edited at runtime (the web UI's providers pane) without restarting the daemon: the
+    /// sweep swaps in a freshly built [`ProviderRegistry`] and callers read the current one for the
+    /// duration of a single route.
+    pub providers: Arc<RwLock<ProviderRegistry>>,
+    /// The provider *configs* (kind, base_url, models, routing), kept in step with [`Self::providers`]
+    /// as the web UI adds and edits providers. Mirrors the subset of `config.providers` the daemon is
+    /// actually running with; persisted to the config file on every edit so a restart keeps them.
+    pub provider_configs: Arc<RwLock<IndexMap<String, hx_core::config::ProviderConfig>>>,
     /// Where a credential's key comes from, by reference. Vault-backed sources are added when the
     /// vault is unlocked; until then this resolves `env:` only, and says so.
     pub secrets: Arc<SecretStores>,
     /// Sessions, transcripts, events and usage. The daemon's only durable state.
     pub store: Arc<Store>,
     /// How a role becomes a model call. A trait so the HTTP surface can be tested without a provider.
-    pub models: Arc<dyn crate::chat::ModelFactory>,
+    /// Behind a read-write lock so a runtime provider edit can swap the model factory the same way it
+    /// swaps the registry.
+    pub models: Arc<RwLock<Arc<dyn crate::chat::ModelFactory>>>,
     /// The tools a run may call.
     pub tools: Arc<ToolRegistry>,
     /// Questions a run is waiting on, for a client that can answer them.
@@ -129,16 +140,19 @@ pub struct AppState {
     /// In-memory on purpose: it is routing, not history — the transcript itself is durable in the
     /// store, and a restarted daemon re-creates sessions rather than resurrecting stale ids.
     pub webhook_sessions: Mutex<HashMap<String, SessionId>>,
+    /// The on-disk config file, so a runtime provider edit can be persisted. See [`Self::provider_configs`].
+    pub config_path: Option<PathBuf>,
 }
 
 /// Everything [`AppState::build`] assembles, so a test can assemble it differently.
 pub struct AppStateParts {
     pub config: Config,
     pub router: Arc<Mutex<ModelRouter>>,
-    pub providers: Arc<ProviderRegistry>,
+    pub providers: Arc<RwLock<ProviderRegistry>>,
+    pub provider_configs: IndexMap<String, hx_core::config::ProviderConfig>,
     pub secrets: Arc<SecretStores>,
     pub store: Arc<Store>,
-    pub models: Arc<dyn crate::chat::ModelFactory>,
+    pub models: Arc<RwLock<Arc<dyn crate::chat::ModelFactory>>>,
     pub tools: Arc<ToolRegistry>,
     pub approvals: Arc<ApprovalQueue>,
     /// The phone approval push, or `None`. See [`AppState::phone`].
@@ -159,6 +173,10 @@ pub struct AppStateParts {
     /// that its `hx_gateway::WebhookConnector` reads from. A webhook connector with no configured
     /// secrets still registers — the [`crate::webhook`] route fails closed on an unknown id.
     pub webhooks: crate::webhook::WebhookRegistry,
+    /// The on-disk config file providers and other settings were read from, so a runtime edit
+    /// (the web UI's providers pane) can be persisted back to the same file. `None` when the daemon
+    /// was built without a file on disk (an in-memory test config), in which case edits cannot persist.
+    pub config_path: Option<PathBuf>,
 }
 
 impl AppState {
@@ -169,7 +187,11 @@ impl AppState {
     /// claiming to be running is worse than one that refuses to start. Everything else degrades:
     /// search with no backends is empty rather than fatal, and a missing container engine disables
     /// sandboxes while leaving the rest running.
-    pub async fn build(config: Config, now: DateTime<Utc>) -> Result<Arc<Self>> {
+    pub async fn build(
+        config: Config,
+        config_path: Option<PathBuf>,
+        now: DateTime<Utc>,
+    ) -> Result<Arc<Self>> {
         let router = ModelRouter::from_config(&config, now)?;
 
         let client = reqwest::Client::builder()
@@ -256,11 +278,12 @@ impl AppState {
         };
 
         let router = Arc::new(Mutex::new(router));
-        let models = Arc::new(crate::chat::RouterModels::new(
-            Arc::clone(&router),
-            Arc::clone(&providers),
-            Arc::clone(&secrets),
-        ));
+        let models: Arc<dyn crate::chat::ModelFactory> =
+            Arc::new(crate::chat::RouterModels::new(
+                Arc::clone(&router),
+                Arc::clone(&providers),
+                Arc::clone(&secrets),
+            ));
 
         // M5's webhook half: every `kind: webhook` connector is registered once here, so
         // `POST /v1/connectors/{id}/webhook` can authenticate against its own token and push into the
@@ -310,19 +333,24 @@ impl AppState {
         }
 
         let ws_allowed_origins = config.api.allowed_origins.clone();
+        let provider_configs = config.providers.clone();
+        let providers: Arc<RwLock<ProviderRegistry>> =
+            Arc::new(RwLock::new((*providers).clone()));
         Ok(Self::from_parts(AppStateParts {
             config,
             router,
             providers,
+            provider_configs,
             secrets,
             store,
-            models,
+            models: Arc::new(RwLock::new(models)),
             tools,
             approvals,
             phone,
             search,
             sandboxes,
             sandbox_unavailable_reason,
+            config_path,
             started_at: now,
             api_token,
             allowed_origins: ws_allowed_origins,
@@ -341,6 +369,7 @@ impl AppState {
             config: parts.config,
             router: parts.router,
             providers: parts.providers,
+            provider_configs: Arc::new(RwLock::new(parts.provider_configs)),
             secrets: parts.secrets,
             store: parts.store,
             models: parts.models,
@@ -364,6 +393,7 @@ impl AppState {
             allowed_origins: parts.allowed_origins,
             webhooks: parts.webhooks,
             webhook_sessions: Mutex::new(HashMap::new()),
+            config_path: parts.config_path,
         });
         crate::webhook_bridge::spawn_webhook_bridges(&state);
         state
@@ -740,7 +770,7 @@ impl AppState {
             search_backends: self.search.ids(),
             sandboxes,
             hosts: self.host_summaries(),
-            providers_configured: self.config.providers.len(),
+            providers_configured: self.providers.read().expect("providers lock").len(),
             secret_stores: self.secret_stores(),
             sessions,
             // WHY here: a webhook queue that only grows is a connector nobody drains, and the route
@@ -749,6 +779,229 @@ impl AppState {
             webhook_queues: self.webhooks.queue_depths(),
         }
     }
+
+    /// The providers the daemon is currently running with, for the web UI's providers pane.
+    pub fn provider_summaries(&self) -> Vec<ProviderSummary> {
+        self.provider_configs
+            .read()
+            .expect("provider config lock")
+            .iter()
+            .map(|(name, pc)| ProviderSummary {
+                name: name.clone(),
+                kind: pc.kind.to_string(),
+                base_url: pc.base_url.clone(),
+                models: pc.models.clone(),
+                routing: pc.routing.to_string(),
+                secret_set: !pc.credentials.is_empty(),
+            })
+            .collect()
+    }
+
+    /// Add or edit a provider at runtime, then swap the routing surface and persist the config file.
+    ///
+    /// `api_key`: when `Some`, replaces the provider's credentials with a single credential referencing
+    /// `env:HX_PROVIDER_<NAME>_KEY`, and writes that key to the sibling secrets file next to the
+    /// config. When `None` and the provider already exists, its existing credentials are kept.
+    pub fn upsert_provider(
+        &self,
+        name: &str,
+        kind: hx_core::config::ProviderKind,
+        base_url: Option<String>,
+        models: Vec<String>,
+        routing: hx_core::config::Strategy,
+        api_key: Option<String>,
+    ) -> Result<()> {
+        if name.is_empty() {
+            return Err(HxError::Config("provider name cannot be empty".into()));
+        }
+        if base_url.as_deref().map_or(true, |u| u.trim().is_empty()) {
+            return Err(HxError::Config(format!(
+                "provider '{name}' needs a base_url"
+            )));
+        }
+
+        // Build the new credential set, preserving the old secret when no new key was given.
+        let mut cfg = self
+            .provider_configs
+            .read()
+            .expect("provider config lock")
+            .clone();
+        let credentials = match api_key {
+            Some(key) if !key.trim().is_empty() => {
+                self.write_provider_key(name, &key)?;
+                vec![hx_core::config::CredentialConfig {
+                    id: hx_core::CredentialId::new(),
+                    secret: format!("env:HX_PROVIDER_{}_KEY", name.to_uppercase()),
+                    limits: Default::default(),
+                    weight: 1,
+                }]
+            }
+            _ => cfg
+                .get(name)
+                .map(|pc| pc.credentials.clone())
+                .unwrap_or_default(),
+        };
+
+        cfg.insert(
+            name.to_string(),
+            hx_core::config::ProviderConfig {
+                kind,
+                base_url,
+                credentials,
+                routing,
+                models,
+                price: None,
+                priority: 0,
+            },
+        );
+
+        self.rebuild_and_persist(&cfg)
+    }
+
+    /// Remove a provider and its key from the secrets file, then swap the routing surface and persist.
+    pub fn remove_provider(&self, name: &str) -> Result<()> {
+        let mut cfg = self
+            .provider_configs
+            .read()
+            .expect("provider config lock")
+            .clone();
+        if cfg.shift_remove(name).is_none() {
+            return Err(HxError::Config(format!("no provider named '{name}'")));
+        }
+        let _ = self.remove_provider_key(name);
+        self.rebuild_and_persist(&cfg)
+    }
+
+    /// Rebuild the live registry, router and model factory from an updated provider set, persist the config
+    /// file, and swap everything in.
+    fn rebuild_and_persist(
+        &self,
+        provider_configs: &IndexMap<String, hx_core::config::ProviderConfig>,
+    ) -> Result<()> {
+        let now = Utc::now();
+
+        // A full config for building the router/registry and for persisting: everything unchanged except
+        // the provider subsection we just edited.
+        let mut full = self.config.clone();
+        full.providers = provider_configs.clone();
+
+        let provider_client = reqwest::Client::builder()
+            .user_agent(concat!("hx/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|e| {
+                HxError::Config(format!("could not build the provider HTTP client: {e}"))
+            })?;
+
+        let registry: Arc<ProviderRegistry> =
+            Arc::new(hx_provider::ProviderRegistry::from_config(&full, provider_client)?);
+        let router = hx_provider::ModelRouter::from_config(&full, now)?;
+
+        // A model factory over the *new* registry and router, so a swap keeps all three consistent.
+        let models: Arc<dyn crate::chat::ModelFactory> =
+            Arc::new(crate::chat::RouterModels::new(
+                Arc::clone(&self.router),
+                Arc::clone(&registry),
+                Arc::clone(&self.secrets),
+            ));
+
+        // Swap the live surface: registry, router, model factory, then the visible provider configs.
+        *self.providers.write().expect("providers lock") = (*registry).clone();
+        *self.router.lock().expect("router lock") = router;
+        *self.models.write().expect("model factory lock") = models;
+        *self
+            .provider_configs
+            .write()
+            .expect("provider config lock") = provider_configs.clone();
+
+        // Persist, but only if there is a real file to write back to. A config assembled in memory
+        // (a test, or a `--check`) is not a file the daemon owns.
+        if let Some(path) = &self.config_path {
+            let yaml = full.to_yaml()?;
+            std::fs::write(path, yaml).map_err(|e| {
+                HxError::Config(format!("could not write config to {}: {e}", path.display()))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Append or replace the provider's key in the secrets file that sits beside the config.
+    fn write_provider_key(&self, name: &str, key: &str) -> Result<()> {
+        let Some(path) = &self.config_path else {
+            return Ok(());
+        };
+        let secrets_path = path.with_file_name("hx.secrets.env");
+        let mut entries: indexmap::IndexMap<String, String> = if secrets_path.exists() {
+            std::fs::read_to_string(&secrets_path)
+                .map(|s| {
+                    s.lines()
+                        .filter_map(|l| {
+                            let (k, v) = l.split_once('=')?;
+                            Some((k.trim().to_string(), v.trim().to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Default::default()
+        };
+        entries.insert(format!("HX_PROVIDER_{}_KEY", name.to_uppercase()), key.to_string());
+        let contents = entries
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&secrets_path, contents).map_err(|e| {
+            HxError::Config(format!(
+                "could not write secrets file {}: {e}",
+                secrets_path.display()
+            ))
+        })?;
+        // The whole point is that these are not world-readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &secrets_path,
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
+        Ok(())
+    }
+
+    fn remove_provider_key(&self, name: &str) -> Result<()> {
+        let Some(path) = &self.config_path else {
+            return Ok(());
+        };
+        let secrets_path = path.with_file_name("hx.secrets.env");
+        if !secrets_path.exists() {
+            return Ok(());
+        }
+        let contents = std::fs::read_to_string(&secrets_path).unwrap_or_default();
+        let key = format!("HX_PROVIDER_{}_KEY", name.to_uppercase());
+        let kept = contents
+            .lines()
+            .filter(|l| !l.starts_with(&format!("{key}=")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&secrets_path, kept).map_err(|e| {
+            HxError::Config(format!(
+                "could not write secrets file {}: {e}",
+                secrets_path.display()
+            ))
+        })
+    }
+}
+
+/// A provider, as the web UI lists it. Deliberately never carries a secret.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ProviderSummary {
+    pub name: String,
+    pub kind: String,
+    pub base_url: Option<String>,
+    pub models: Vec<String>,
+    pub routing: String,
+    pub secret_set: bool,
 }
 
 /// A host, as reported by status.
