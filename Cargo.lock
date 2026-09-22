@@ -2395,6 +2395,7 @@ dependencies = [
  "clap",
  "futures",
  "hx-core",
+ "hx-decision",
  "hx-provider",
  "hx-remote",
  "hx-sandbox",

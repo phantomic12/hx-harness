@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 hx-core.workspace = true
+hx-decision.workspace = true
 hx-provider.workspace = true
 hx-search.workspace = true
 hx-sandbox.workspace = true

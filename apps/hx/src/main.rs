@@ -195,6 +195,28 @@ enum Command {
         bind: Option<String>,
     },
 
+    /// Ask a fast local Laya (System-1) sidecar a set of typed questions and print the answers.
+    ///
+    /// Talks to a running Laya sidecar (`examples/laya-sidecar.py`) over loopback. Reads the
+    /// state (a string or file) and a question set from a JSON file, then prints each answer and
+    /// whether it cleared the confidence threshold.
+    Decision {
+        /// The sidecar base URL. Defaults to `HX_LAYA_URL`, then `http://127.0.0.1:8770`.
+        #[arg(long)]
+        url: Option<String>,
+
+        /// The text state the questions are about. If it starts with `@`, it is read from that file.
+        state: String,
+
+        /// Path to a JSON file defining the question set (see docs/laya.md for the shape).
+        #[arg(long)]
+        questions: String,
+
+        /// Confidence threshold in `[0,1]` for the "act" decision (default 0.8).
+        #[arg(long, default_value_t = 0.8)]
+        threshold: f32,
+    },
+
     /// Show the configured hosts.
     Hosts,
 
@@ -460,6 +482,19 @@ async fn main() -> Result<()> {
 
         Command::Doctor { json, bind } => {
             run_doctor(&cli.config, cli.daemon.as_deref(), bind.as_deref(), json).await;
+        }
+
+        Command::Decision {
+            url,
+            state,
+            questions,
+            threshold,
+        } => {
+            let base = url
+                .clone()
+                .or_else(|| std::env::var("HX_LAYA_URL").ok())
+                .unwrap_or_else(|| "http://127.0.0.1:8770".to_string());
+            commands::run_decision(&base, &state, &questions, threshold).await?;
         }
 
         Command::Hosts => print!("{}", commands::render_hosts(&config)),

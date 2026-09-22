@@ -478,6 +478,106 @@ pub fn render_search(report: &hx_search::SearchReport) -> String {
     out
 }
 
+pub async fn run_decision(
+    base_url: &str,
+    state: &str,
+    questions_path: &str,
+    threshold: f32,
+) -> anyhow::Result<()> {
+    use hx_decision::client::LayaClient;
+    use hx_decision::{AnswerKind, Question, QuestionSet};
+
+    // State: a bare string, or "@file" meaning read the file's contents.
+    let state_text = if let Some(path) = state.strip_prefix('@') {
+        std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("reading state file {}: {e}", path))?
+    } else {
+        state.to_string()
+    };
+
+    // Question set from a JSON document: an object mapping id -> question, or an array of
+    // questions each carrying its own id.
+    let raw = std::fs::read_to_string(questions_path)
+        .map_err(|e| anyhow::anyhow!("reading questions file {}: {e}", questions_path))?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| anyhow::anyhow!("parsing questions file {}: {e}", questions_path))?;
+    let mut questions: Vec<Question> = Vec::new();
+    match parsed {
+        serde_json::Value::Object(map) => {
+            for (id, qv) in map {
+                let q: Question = serde_json::from_value(qv)
+                    .map_err(|e| anyhow::anyhow!("question '{id}' is not valid: {e}"))?;
+                questions.push(q);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for qv in arr {
+                let q: Question = serde_json::from_value(qv)
+                    .map_err(|e| anyhow::anyhow!("question is not valid: {e}"))?;
+                questions.push(q);
+            }
+        }
+        _ => anyhow::bail!("questions file must be a JSON object or array of questions"),
+    }
+
+    let qs = QuestionSet::new(state_text, questions);
+    let client = LayaClient::new(base_url);
+    let res = client
+        .predict(&qs)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut out = String::new();
+    use std::fmt::Write;
+    for answer in &res.answers {
+        let id = &answer.id;
+        // The "top probability" is the decision's confidence on the winning pick.
+        let top = match &answer.kind {
+            AnswerKind::Choice { probabilities, .. } => {
+                probabilities.values().copied().fold(0.0_f32, f32::max)
+            }
+            AnswerKind::Score { probabilities, .. } => {
+                probabilities.iter().copied().fold(0.0_f32, f32::max)
+            }
+            AnswerKind::Noul { noul, .. } => (*noul).max(1.0 - *noul),
+        };
+        let verdict = if top >= threshold { "ACT" } else { "escalate" };
+        let _ = writeln!(out, "{id}: top={top:.3} threshold={threshold} -> {verdict}");
+        match &answer.kind {
+            AnswerKind::Choice {
+                choice,
+                probabilities,
+                ..
+            } => {
+                let _ = writeln!(out, "  choice: {choice}");
+                for (k, v) in probabilities {
+                    let _ = writeln!(out, "    {k}: {v:.3}");
+                }
+            }
+            AnswerKind::Score {
+                score,
+                probabilities,
+                legend,
+                ..
+            } => {
+                let _ = writeln!(out, "  score: {score:.3}");
+                for (i, v) in probabilities.iter().enumerate() {
+                    let label = legend.get(i).map(|l| l.as_str()).unwrap_or("");
+                    let _ = writeln!(out, "    [{i}] {label}: {v:.3}");
+                }
+            }
+            AnswerKind::Noul { noul, .. } => {
+                let _ = writeln!(out, "  noul: {noul:.3}");
+            }
+        }
+        let _ = writeln!(out, "  confidence: {:.3}", answer.confidence());
+        let _ = writeln!(out, "  act_probability: {:.3}", answer.act_probability);
+    }
+    let _ = writeln!(out, "input_tokens: {}", res.usage_input_tokens);
+    print!("{out}");
+    anyhow::Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

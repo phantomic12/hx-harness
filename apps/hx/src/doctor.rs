@@ -302,6 +302,8 @@ pub struct Facts {
     pub engine: Result<String, String>,
     /// Whether the configured data directory can be written, or why not.
     pub data_dir: Result<String, String>,
+    /// The Laya sidecar's health, when `HX_LAYA_URL` is set; `Ok("skipped")` otherwise.
+    pub laya: Result<String, String>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -318,6 +320,7 @@ const SEARCH: &str = "search backends";
 const SECRETS: &str = "secrets";
 const API_TOKEN: &str = "api token";
 const DATA_DIR: &str = "data dir";
+const LAYA: &str = "laya sidecar";
 
 /// The reason a check that needs the config carries when there is no config.
 ///
@@ -345,6 +348,7 @@ pub fn diagnose(facts: &Facts, now: DateTime<Utc>) -> Report {
             secrets_check(config, &facts.daemon),
             token_check(&facts.bind, facts.bind_source, &facts.token),
             data_dir_check(config, &facts.data_dir),
+            laya_check(&facts.laya),
         ],
     }
 }
@@ -1007,6 +1011,17 @@ fn names(items: impl IntoIterator<Item = impl AsRef<str>>) -> String {
 ///
 /// The only part of this module that touches the world. Everything it finds out is turned into a
 /// [`Facts`] so that the decisions stay testable; nothing here interprets what it reads.
+fn laya_check(probe: &Result<String, String>) -> Check {
+    match probe {
+        Ok(v) if v == "skipped" => Check::pass(
+            LAYA,
+            "not configured (no HX_LAYA_URL); no sidecar probe run",
+        ),
+        Ok(v) => Check::pass(LAYA, format!("reachable: {v}")),
+        Err(e) => Check::fail(LAYA, format!("unreachable: {e}")),
+    }
+}
+
 pub async fn gather(
     config_path: &Path,
     daemon_override: Option<&str>,
@@ -1062,7 +1077,21 @@ pub async fn gather(
         bind_source,
         token,
         engine: probe_engine().await,
+        laya: probe_laya().await,
     }
+}
+
+/// Probe the Laya sidecar's health when `HX_LAYA_URL` is set; skip otherwise.
+async fn probe_laya() -> Result<String, String> {
+    let Some(url) = std::env::var("HX_LAYA_URL").ok() else {
+        return Ok("skipped".to_string());
+    };
+    let client = hx_decision::client::LayaClient::new(&url);
+    client
+        .health()
+        .await
+        .map(|_| format!("ok ({url})"))
+        .map_err(|err| format!("{err}"))
 }
 
 /// Resolve the API token the way the daemon does, from the stores a CLI process has.
@@ -1242,6 +1271,7 @@ search:
             token: TokenFact::Absent,
             engine: Err("no Docker socket was found".to_string()),
             data_dir: Ok("it exists and accepted a probe file".to_string()),
+            laya: Ok("skipped".to_string()),
         }
     }
 
@@ -1285,13 +1315,34 @@ search:
     // -- the config ----------------------------------------------------------
 
     #[test]
+    fn the_laya_check_skips_when_not_configured_and_fails_when_unreachable() {
+        let report = diagnose(&facts(), Utc::now());
+        let rendered = report.render(false);
+        assert!(rendered.contains("PASS laya sidecar"), "{rendered}");
+
+        let facts = Facts {
+            laya: Err(
+                "sidecar unreachable at http://127.0.0.1:9999: connection refused".to_string(),
+            ),
+            ..facts()
+        };
+        let report = diagnose(&facts, Utc::now());
+        assert_eq!(report.failed(), 1);
+        assert!(
+            report.render(false).contains("FAIL laya sidecar"),
+            "{}",
+            report.render(false)
+        );
+    }
+
+    #[test]
     fn a_complete_config_passes_every_check() {
         let report = diagnose(&facts(), Utc::now());
         assert_eq!(report.failed(), 0, "{}", report.render(false));
         assert_eq!(report.warned(), 0, "{}", report.render(false));
         assert_eq!(report.exit_code(), 0);
         assert!(
-            report.render(false).contains("all 10 checks passed"),
+            report.render(false).contains("all 11 checks passed"),
             "{}",
             report.render(false)
         );
@@ -2337,7 +2388,7 @@ search:
         assert_eq!(report.failed(), 1);
         assert_eq!(report.exit_code(), 1);
         let rendered = report.render(false);
-        assert!(rendered.contains("1 of 10 check(s) FAILED"), "{rendered}");
+        assert!(rendered.contains("1 of 11 check(s) FAILED"), "{rendered}");
         assert!(
             rendered.contains("FAIL data dir"),
             "the failing line is one of the ten, labelled: {rendered}"
@@ -2372,11 +2423,11 @@ search:
         let parsed: serde_json::Value =
             serde_json::from_str(&rendered).expect("the JSON mode emits a document");
 
-        assert_eq!(parsed["checks_run"], 10);
+        assert_eq!(parsed["checks_run"], 11);
         assert_eq!(parsed["failed"], 1);
         assert_eq!(parsed["exit_code"], 1);
         let checks = parsed["checks"].as_array().expect("a list of checks");
-        assert_eq!(checks.len(), 10);
+        assert_eq!(checks.len(), 11);
         let token = checks
             .iter()
             .find(|c| c["name"] == "api token")
