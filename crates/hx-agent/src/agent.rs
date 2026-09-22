@@ -470,6 +470,11 @@ impl AgentLoop {
         // lands under a *different* grant must be measured against that grant's bound, not the
         // lexical one's — otherwise a wide grant at the target still trips a tight grant at the name.
         let mut enforced_resource: Option<(Resource, Action)> = None;
+        // The lexical filesystem path the model named, with the action and usage the pre-open
+        // checks approved. The check-after-open re-resolves *this* after the tool runs — not
+        // the substituted canonical path — so a link swapped between check and open is
+        // re-resolved rather than re-trusted.
+        let mut pre_open_path: Option<(String, Action, RequestUsage)> = None;
 
         // Phase 2: the capability. A denial here is auditable and not something a prompt can
         // approve away — that is the whole distinction between a capability and an approval.
@@ -487,17 +492,20 @@ impl AgentLoop {
             );
             if let Decision::Allow = decision {
                 enforced_resource = Some((requirement.resource.clone(), requirement.action));
+                if let Resource::FsPath { path } = &requirement.resource {
+                    pre_open_path = Some((path.clone(), requirement.action, usage));
+                }
 
                 // Phase 2b: the symlink re-check. The lexical check above compares strings; the
                 // host resolves what it would actually open, and the token is asked again about
                 // that. A path that reads as inside the grant but opens as outside it is refused
                 // here — closing the escape lexical containment leaves open.
                 //
-                // Residual risks, stated rather than hidden: a host that cannot resolve at all
-                // keeps the lexical decision (see `Host::canonicalize`), and a link swapped
-                // between this re-check and the open still wins its race. The tool opens the
-                // resolved path (`set_path`), so at least the checked and the opened path are the
-                // same string.
+                // This re-check alone does not close the race: a link swapped between this
+                // re-check and the open still redirects the effect, so the checked path is
+                // handed to the tool (`set_path`) *and* the lexical path is re-resolved and
+                // re-checked after the tool runs (Phase 4b). Either check refusing stops the
+                // call; only the post-open one observes the swap.
                 if let Resource::FsPath { path } = &requirement.resource {
                     if let Ok(canonical) = ctx.host.canonicalize(path).await {
                         let canonical_resource = Resource::FsPath {
@@ -628,6 +636,49 @@ impl AgentLoop {
         match prepared.run(ctx).await {
             Ok(outcome) => {
                 if outcome.ok {
+                    // Phase 4b: check-after-open. The pre-open re-check compared strings, then
+                    // the tool opened the path — and a link swapped in between redirects the
+                    // open without changing any string the earlier checks saw. Re-resolving
+                    // the *lexical* path now (rather than trusting the substituted canonical
+                    // one, which would re-resolve to itself and see nothing) observes the
+                    // swap, and the token is asked again about what is actually there.
+                    //
+                    // A read caught here leaks nothing: the bytes stay out of the transcript.
+                    // A mutation caught here may already have landed, and the refusal says so
+                    // rather than pretending otherwise.
+                    //
+                    // Residual risks, stated rather than hidden: a host that cannot resolve
+                    // at all keeps the lexical decision (see `Host::canonicalize`), and a
+                    // link swapped back before this re-resolution reads as legitimate — only
+                    // an open pinned to the already-open descriptor (fd-based resolution at
+                    // the host layer, which this trait's remote hosts cannot provide) would
+                    // observe that shape.
+                    if let Some((lexical, action, check_usage)) = &pre_open_path {
+                        if let Ok(canonical_now) = ctx.host.canonicalize(lexical).await {
+                            let after = Resource::FsPath {
+                                path: canonical_now.clone(),
+                            };
+                            if !self
+                                .capability
+                                .check_with_usage(&after, *action, chrono::Utc::now(), *check_usage)
+                                .is_allowed()
+                            {
+                                let landed = if action.is_mutating() {
+                                    " The effect may already have landed outside the grant; \
+                                     treat the target as untrusted and have the operator \
+                                     inspect it."
+                                } else {
+                                    ""
+                                };
+                                return CallOutcome::refused(format!(
+                                    "refused: {lexical} now resolves to {canonical_now}, \
+                                     outside the agent's filesystem grants (the path changed \
+                                     between check and open).{landed} This is not something \
+                                     you can retry — ask the operator to widen the grant."
+                                ));
+                            }
+                        }
+                    }
                     if let (Some((resource, action)), Some(moved)) =
                         (&byte_gate, outcome.bytes_moved)
                     {
@@ -931,6 +982,222 @@ mod tests {
                 requirement.resource,
                 requirement.action
             );
+        }
+    }
+
+    // -- symlink-escape check-after-open (issue #32) ----------------------------------
+
+    use crate::approver::AlwaysAllow;
+    use crate::model::ModelCall;
+    use hx_core::capability::{Capability, CapabilityToken};
+    use hx_core::error::Result as HxResult;
+    use hx_core::ids::{AgentId, CredentialId, HostId, ProviderId};
+    use hx_provider::{ChatRequest, ChatResponse};
+    use hx_remote::host::{ExecOutput, HostCaps, RemoteEntry};
+    use hx_remote::{Host, PtySession};
+    use hx_tools::testing::FakeHost;
+    use hx_tools::{ReadFileTool, ToolContext, ToolRegistry};
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+
+    /// `handle_call` never reaches the model, so the double only has to exist.
+    struct NoModel;
+
+    #[async_trait::async_trait]
+    impl ModelCall for NoModel {
+        async fn complete(&self, _req: ChatRequest) -> HxResult<ChatResponse> {
+            unreachable!("handle_call never calls the model")
+        }
+
+        fn model(&self) -> String {
+            "test-double".to_string()
+        }
+
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::new()
+        }
+
+        fn credential_id(&self) -> CredentialId {
+            CredentialId::new()
+        }
+    }
+
+    /// A host that re-links `/ws/link` to the outside world after the first resolution.
+    ///
+    /// The first `canonicalize` is the loop's pre-open check (sees the grant-internal
+    /// target, so the call is approved); every later resolution — the tool's open-time
+    /// one and the loop's check-after-open — sees the swapped target. That is exactly
+    /// the check-to-open race: the strings the early checks approved no longer name
+    /// what gets opened.
+    struct SwapBetweenCheckAndOpenHost {
+        inner: FakeHost,
+        canonical_calls: StdMutex<u32>,
+    }
+
+    impl SwapBetweenCheckAndOpenHost {
+        fn new(inner: FakeHost) -> Self {
+            Self {
+                inner,
+                canonical_calls: StdMutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Host for SwapBetweenCheckAndOpenHost {
+        fn id(&self) -> &HostId {
+            self.inner.id()
+        }
+
+        fn caps(&self) -> &HostCaps {
+            self.inner.caps()
+        }
+
+        async fn exec(&self, command: &str, timeout: Duration) -> HxResult<ExecOutput> {
+            self.inner.exec(command, timeout).await
+        }
+
+        async fn open_pty(
+            &self,
+            command: Option<&str>,
+            cols: u16,
+            rows: u16,
+        ) -> HxResult<std::sync::Arc<dyn PtySession>> {
+            self.inner.open_pty(command, cols, rows).await
+        }
+
+        async fn read_file(&self, path: &str) -> HxResult<Vec<u8>> {
+            self.inner.read_file(path).await
+        }
+
+        async fn write_file(&self, path: &str, contents: &[u8]) -> HxResult<()> {
+            self.inner.write_file(path, contents).await
+        }
+
+        async fn list_dir(&self, path: &str) -> HxResult<Vec<RemoteEntry>> {
+            self.inner.list_dir(path).await
+        }
+
+        async fn canonicalize(&self, path: &str) -> HxResult<String> {
+            let first = {
+                let mut calls = self.canonical_calls.lock().expect("call count lock");
+                *calls += 1;
+                *calls == 1
+            };
+            if !first {
+                self.inner
+                    .symlinks
+                    .lock()
+                    .unwrap()
+                    .insert("/ws/link".to_string(), "/etc".to_string());
+            }
+            self.inner.canonicalize(path).await
+        }
+
+        async fn rename(&self, from: &str, to: &str) -> HxResult<()> {
+            self.inner.rename(from, to).await
+        }
+
+        fn describe(&self) -> String {
+            self.inner.describe()
+        }
+    }
+
+    fn loop_with_tools(tools: ToolRegistry, capability: CapabilityToken) -> AgentLoop {
+        AgentLoop::new(
+            AgentId::new(),
+            std::sync::Arc::new(NoModel),
+            std::sync::Arc::new(tools),
+            capability,
+            ApprovalSession::new(ApprovalPolicy::at(AutonomyLevel::Balanced)),
+            std::sync::Arc::new(AlwaysAllow),
+        )
+    }
+
+    fn read_registry() -> ToolRegistry {
+        let mut tools = ToolRegistry::new();
+        tools.register(std::sync::Arc::new(ReadFileTool::new()));
+        tools
+    }
+
+    fn workspace_token() -> CapabilityToken {
+        CapabilityToken::issue(
+            AgentId::new(),
+            vec![Capability::workspace("/ws")],
+            chrono::Utc::now(),
+            3600,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_symlink_inside_the_grant_survives_the_canonical_recheck() {
+        // The control: a stable link to a grant-internal target reads normally, before
+        // and after the check-after-open. Fail-closed must not mean fail-on-links.
+        let host = FakeHost::unix()
+            .with_file("/ws/inside/secret.txt", "in-grant-data")
+            .with_symlink("/ws/link", "/ws/inside");
+        let ctx = ToolContext::new(std::sync::Arc::new(host));
+        let flats = loop_with_tools(read_registry(), workspace_token());
+
+        let outcome = flats
+            .handle_call(
+                &ToolCallId::new(),
+                "read_file",
+                serde_json::json!({"path": "/ws/link/secret.txt"}),
+                &ctx,
+            )
+            .await;
+
+        match outcome {
+            CallOutcome::Ran { ok, content } => {
+                assert!(ok, "a grant-internal link must read: {content}");
+                assert!(
+                    content.contains("in-grant-data"),
+                    "the link target's bytes must reach the model: {content}"
+                );
+            }
+            CallOutcome::Refused { content } => {
+                panic!("a grant-internal link must not be refused: {content}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_symlink_swapped_between_check_and_open_is_refused_after_open() {
+        // The attack: `/ws/link` points inside the grant at check time and outside it
+        // at open time. The pre-open re-check approves; the tool opens `/etc/secret.txt`
+        // ("classified"). Without the check-after-open those bytes reach the transcript
+        // as a successful read — with it the call is refused and they do not.
+        let inner = FakeHost::unix()
+            .with_file("/ws/inside/secret.txt", "in-grant-data")
+            .with_file("/etc/secret.txt", "classified")
+            .with_symlink("/ws/link", "/ws/inside");
+        let ctx = ToolContext::new(std::sync::Arc::new(SwapBetweenCheckAndOpenHost::new(inner)));
+        let flats = loop_with_tools(read_registry(), workspace_token());
+
+        let outcome = flats
+            .handle_call(
+                &ToolCallId::new(),
+                "read_file",
+                serde_json::json!({"path": "/ws/link/secret.txt"}),
+                &ctx,
+            )
+            .await;
+
+        match outcome {
+            CallOutcome::Refused { content } => {
+                assert!(
+                    content.contains("outside the agent's"),
+                    "the refusal must name the escape: {content}"
+                );
+                assert!(
+                    !content.contains("classified"),
+                    "the outside-grant bytes must not reach the transcript, even in a refusal: {content}"
+                );
+            }
+            CallOutcome::Ran { ok, content } => {
+                panic!("a link swapped between check and open must not read: ok={ok} {content}")
+            }
         }
     }
 }
