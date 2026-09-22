@@ -9,6 +9,7 @@ members = [
     "crates/hx-remote",
     "crates/hx-sandbox",
     "crates/hx-browser",
+    "crates/hx-decision",
     "crates/hx-mcp",
     "crates/hx-tools",
     "crates/hx-agent",
@@ -43,6 +44,7 @@ hx-search = { path = "crates/hx-search" }
 hx-remote = { path = "crates/hx-remote" }
 hx-sandbox = { path = "crates/hx-sandbox" }
 hx-browser = { path = "crates/hx-browser" }
+hx-decision = { path = "crates/hx-decision" }
 hx-mcp = { path = "crates/hx-mcp" }
 hx-tools = { path = "crates/hx-tools" }
 hx-agent = { path = "crates/hx-agent" }
