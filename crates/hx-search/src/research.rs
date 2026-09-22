@@ -57,7 +57,10 @@
 //! successful report that found nothing, not an error.
 
 use crate::backend::{BackendKind, SearchBackend, SearchError};
-use crate::cache::{cache_key, fnv1a, CacheOutcome, UrlCache};
+use crate::cache::{
+    admit_initial, admit_redirect_from, cache_key, fnv1a, hop_client, is_followable_status,
+    CacheOutcome, UrlCache, MAX_REDIRECTS,
+};
 use crate::extract::{FetchedPage, Ladder, Rung};
 use crate::types::{FusedResult, SearchQuery};
 use async_trait::async_trait;
@@ -103,8 +106,14 @@ pub trait Fetcher: Send + Sync {
 }
 
 /// A `reqwest`-backed HTTP fetcher with timeout, body cap, and optional URL caching.
+///
+/// Both paths admit every target before connecting: the cache-backed path through
+/// [`UrlCache::fetch`], the uncached path through the same admission helpers directly
+/// (initial admission plus DNS pinning, `redirect::Policy::none`, and per-hop re-admission
+/// of every redirect). A fetcher built with the default [`Admission`] refuses loopback,
+/// private, link-local and metadata targets; [`HttpFetcher::with_admission`] is the named
+/// hatch that widens it, mirroring [`BrowserFetcher::with_admission`].
 pub struct HttpFetcher {
-    client: reqwest::Client,
     timeout: Duration,
     max_body_bytes: usize,
     cache: Option<Arc<UrlCache>>,
@@ -122,9 +131,17 @@ impl std::fmt::Debug for HttpFetcher {
 }
 
 impl HttpFetcher {
-    pub fn new(client: reqwest::Client) -> Self {
+    /// A plain fetcher with the default timeout, body cap, no cache, and the default
+    /// ([`Admission::PublicInternet`]) policy.
+    ///
+    /// `client` is accepted so every construction site — [`select_fetcher`], the tests —
+    /// keeps sharing the daemon's connection pool for the *backend* searches; the fetcher
+    /// itself never sends through it. Each admitted hop builds its own `Policy::none`
+    /// client (pinned to the DNS answers admission approved for hostnames), because a
+    /// shared client follows redirects on its own and the next URL would be connected to
+    /// before admission could judge it.
+    pub fn new(_client: reqwest::Client) -> Self {
         Self {
-            client,
             timeout: DEFAULT_FETCH_TIMEOUT,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             cache: None,
@@ -192,69 +209,105 @@ impl Fetcher for HttpFetcher {
                 CacheOutcome::Miss304 => Ok(None),
             }
         } else {
-            let request = self
-                .client
-                .get(url)
-                .header(reqwest::header::USER_AGENT, crate::backends::USER_AGENT);
+            // The uncached production path admits exactly like the cache path: the initial
+            // target is admitted and DNS-pinned before anything connects, every hop goes
+            // through a `Policy::none` client so `reqwest` cannot follow a redirect on its
+            // own, and each redirect destination is re-admitted before the next send. A
+            // public-looking result URL that points at loopback/private/metadata space — or
+            // redirects there — is refused rather than fetched.
+            let mut current = admit_initial(self.admission, url).await?;
+            let mut hops = 0usize;
+            loop {
+                let hop = hop_client(&current)?;
+                let request = hop
+                    .get(current.target().request_url())
+                    .header(reqwest::header::USER_AGENT, crate::backends::USER_AGENT);
 
-            let response = match tokio::time::timeout(self.timeout, request.send()).await {
-                Ok(Ok(res)) => res,
-                // `SearchError::Transport` would echo the request URL, and a URL can carry a token in its
-                // query string. `without_url` drops the URL so a `?token=`/`key=` credential cannot reach
-                // an error the research report (and so the model) reads.
-                Ok(Err(err)) => return Err(transport_error(err)),
-                Err(_) => {
-                    return Err(SearchError::TransportRedacted {
-                        reason: format!("fetch timed out after {:.1}s", self.timeout.as_secs_f64()),
+                let response = match tokio::time::timeout(self.timeout, request.send()).await {
+                    Ok(Ok(res)) => res,
+                    // `SearchError::Transport` would echo the request URL, and a URL can carry a token in its
+                    // query string. `without_url` drops the URL so a `?token=`/`key=` credential cannot reach
+                    // an error the research report (and so the model) reads.
+                    Ok(Err(err)) => return Err(transport_error(err)),
+                    Err(_) => {
+                        return Err(SearchError::TransportRedacted {
+                            reason: format!(
+                                "fetch timed out after {:.1}s",
+                                self.timeout.as_secs_f64()
+                            ),
+                        });
+                    }
+                };
+
+                let status = response.status();
+                if is_followable_status(status) {
+                    if hops >= MAX_REDIRECTS {
+                        return Err(SearchError::Http {
+                            status: status.as_u16(),
+                        });
+                    }
+                    let location = response.headers().get(reqwest::header::LOCATION).ok_or(
+                        SearchError::Http {
+                            status: status.as_u16(),
+                        },
+                    )?;
+                    let location = location
+                        .to_str()
+                        .map_err(|_| SearchError::Http {
+                            status: status.as_u16(),
+                        })?
+                        .to_string();
+                    // Admitted before the next send, so nothing connects to an unadmitted hop.
+                    current = admit_redirect_from(self.admission, &current, &location).await?;
+                    hops += 1;
+                    continue;
+                }
+
+                if !status.is_success() {
+                    return Err(SearchError::Http {
+                        status: status.as_u16(),
                     });
                 }
-            };
 
-            let status = response.status();
-            if !status.is_success() {
-                return Err(SearchError::Http {
-                    status: status.as_u16(),
-                });
-            }
-
-            if let Some(content_length) = response.content_length() {
-                if content_length as usize > self.max_body_bytes {
-                    return Ok(None);
+                if let Some(content_length) = response.content_length() {
+                    if content_length as usize > self.max_body_bytes {
+                        return Ok(None);
+                    }
                 }
+
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+
+                // The same bounded reader the cache uses: `Content-Length` above is only a fast
+                // path — a missing or dishonest header must not buy an unbounded allocation — so the
+                // body is still consumed chunk by chunk and aborted past the cap before any `String`
+                // is built.
+                let body = match tokio::time::timeout(
+                    self.timeout,
+                    crate::cache::read_bounded_text(response, self.max_body_bytes),
+                )
+                .await
+                {
+                    Ok(Ok(Some(body))) => body,
+                    Ok(Ok(None)) => return Ok(None),
+                    // Same as above: the body-read error's `Display` echoes the request URL, which can carry a
+                    // `?token=`/`key=` credential. Strip the URL so it cannot reach an error the model reads.
+                    Ok(Err(err)) => return Err(transport_error(err)),
+                    Err(_) => {
+                        return Err(SearchError::TransportRedacted {
+                            reason: format!(
+                                "reading body timed out after {:.1}s",
+                                self.timeout.as_secs_f64()
+                            ),
+                        });
+                    }
+                };
+
+                return Ok(Some(FetchedPage::new(url, content_type.as_deref(), body)));
             }
-
-            let content_type = response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
-
-            // The same bounded reader the cache uses: `Content-Length` above is only a fast
-            // path — a missing or dishonest header must not buy an unbounded allocation — so the
-            // body is still consumed chunk by chunk and aborted past the cap before any `String`
-            // is built.
-            let body = match tokio::time::timeout(
-                self.timeout,
-                crate::cache::read_bounded_text(response, self.max_body_bytes),
-            )
-            .await
-            {
-                Ok(Ok(Some(body))) => body,
-                Ok(Ok(None)) => return Ok(None),
-                // Same as above: the body-read error's `Display` echoes the request URL, which can carry a
-                // `?token=`/`key=` credential. Strip the URL so it cannot reach an error the model reads.
-                Ok(Err(err)) => return Err(transport_error(err)),
-                Err(_) => {
-                    return Err(SearchError::TransportRedacted {
-                        reason: format!(
-                            "reading body timed out after {:.1}s",
-                            self.timeout.as_secs_f64()
-                        ),
-                    });
-                }
-            };
-
-            Ok(Some(FetchedPage::new(url, content_type.as_deref(), body)))
         }
     }
 }
@@ -1396,6 +1449,27 @@ mod fetch_router_tests {
             assert!(browser_mode.is_err());
         }
     }
+
+    /// The plain fetchers the selector hands out admit their targets: `select_fetcher`
+    /// builds `HttpFetcher::new(client)` with no cache — the production uncached path — so
+    /// the fetcher it returns must still refuse a loopback target rather than `GET` it.
+    #[tokio::test]
+    async fn the_plain_fetchers_the_selector_hands_out_admit_their_targets() {
+        for mode in [FetchMode::Http, FetchMode::Auto] {
+            let selection = select_fetcher_by(&client(), mode, pool_root(), || false)
+                .expect("http/auto never fail without a browser");
+            assert_eq!(selection.kind, SelectedFetcher::Http);
+            let err = selection
+                .fetcher()
+                .fetch("http://127.0.0.1:9/ssrf")
+                .await
+                .expect_err("a loopback target must be refused, not fetched");
+            assert!(
+                matches!(err, SearchError::Refused { .. }),
+                "{mode:?} handed out a fetcher that did not refuse loopback: {err}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1918,7 +1992,9 @@ mod tests {
     async fn citations_carry_title_and_url_and_rung_names_the_extraction_pass() {
         let cluster = Cluster::start().await;
         let client = reqwest::Client::new();
-        let fetcher = Arc::new(HttpFetcher::new(client.clone()));
+        // The cluster serves on loopback, which the default policy refuses: the named hatch.
+        let fetcher =
+            Arc::new(HttpFetcher::new(client.clone()).with_admission(Admission::AllowLocal));
 
         let backends = cluster.keyless_backends();
         let report = research(
@@ -2059,7 +2135,12 @@ mod tests {
 
         let client = reqwest::Client::new();
         // Set body cap to 2000 bytes: small page is ~600 bytes (< 2000), big page is 10,000 bytes (> 2000).
-        let fetcher = Arc::new(HttpFetcher::new(client.clone()).with_max_body_bytes(2000));
+        // The pages are served on loopback, which the default policy refuses: the named hatch.
+        let fetcher = Arc::new(
+            HttpFetcher::new(client.clone())
+                .with_max_body_bytes(2000)
+                .with_admission(Admission::AllowLocal),
+        );
         let backends: Vec<Arc<dyn SearchBackend>> =
             vec![Arc::new(SearxngBackend::new(searxng_server.base_url()))];
 
@@ -2093,7 +2174,10 @@ mod tests {
         // streams. Over the cap the page is skipped without ever assembling the body; under the
         // cap the chunks still assemble exactly.
         let big = ChunkedServer::serve(vec![b'A'; 32 * 1024]).await;
-        let fetcher = HttpFetcher::new(reqwest::Client::new()).with_max_body_bytes(1024);
+        // Chunked bodies are served on loopback, which the default policy refuses.
+        let fetcher = HttpFetcher::new(reqwest::Client::new())
+            .with_max_body_bytes(1024)
+            .with_admission(Admission::AllowLocal);
 
         let skipped = fetcher.fetch(&big.url()).await.unwrap();
         assert!(
@@ -2258,7 +2342,11 @@ mod tests {
         drop(listener); // now nothing listens; connecting fails with a transport error
         let url = format!("http://{addr}/page?token={token}");
 
-        let fetcher = HttpFetcher::new(reqwest::Client::new());
+        // `AllowLocal`: the dead port is on loopback, and this test needs the *transport*
+        // error (connection refused) rather than the admission refusal the default policy
+        // would produce before connecting.
+        let fetcher =
+            HttpFetcher::new(reqwest::Client::new()).with_admission(Admission::AllowLocal);
         let err = fetcher
             .fetch(&url)
             .await
@@ -2270,5 +2358,259 @@ mod tests {
             "the query token must not reach the error: {display}"
         );
         assert!(display.contains("transport error"), "{display}");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // SSRF: the uncached production path admits like the cache path
+    // -----------------------------------------------------------------------------------------
+    //
+    // `select_fetcher` hands the production route an `HttpFetcher` with no cache, so this is
+    // the path `POST /v1/research` actually fetches through. It used to `GET` whatever URL a
+    // backend returned with `reqwest`'s default redirect-following and no admission — a
+    // result pointing at loopback, private space or the metadata service reached the local
+    // network, and a public-looking URL could redirect there. These tests pin the fix: the
+    // initial target is admitted and DNS-pinned before anything connects, redirects go
+    // through a `Policy::none` client, and every redirect destination is re-admitted.
+
+    #[tokio::test]
+    async fn uncached_default_policy_refuses_a_loopback_target_before_connecting() {
+        // A result URL pointing at the local machine is not public internet: admission runs
+        // before the socket is touched, so the origin never hears a byte.
+        let origin = TestServer::serve_sync(|_| {
+            (
+                200u16,
+                vec![("content-type", "text/html".to_string())],
+                b"<html><body><p>never served</p></body></html>".to_vec(),
+            )
+        })
+        .await;
+        let fetcher = HttpFetcher::new(reqwest::Client::new());
+
+        match fetcher.fetch(&origin.url("/private")).await {
+            Err(SearchError::Refused { reason }) => {
+                assert!(
+                    reason.contains("loopback"),
+                    "the reason should name the private address: {reason}"
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        assert_eq!(
+            origin.connection_count(),
+            0,
+            "admission refuses before any byte reaches the origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn uncached_default_policy_refuses_the_cloud_metadata_endpoint() {
+        // 169.254.169.254 is link-local: the metadata service that turns an SSRF into
+        // credential theft. Refused by the literal rule, so no connection is attempted.
+        let fetcher = HttpFetcher::new(reqwest::Client::new()).with_timeout(Duration::from_secs(5));
+
+        match fetcher
+            .fetch("http://169.254.169.254/latest/meta-data/")
+            .await
+        {
+            Err(SearchError::Refused { reason }) => {
+                assert!(
+                    reason.contains("not on the public internet"),
+                    "the reason should name the refusal: {reason}"
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn uncached_refuses_a_non_http_scheme_without_a_request() {
+        // `file://` is not a page; it is this process opening a local file. Refused under
+        // either policy, before anything is opened.
+        let fetcher = HttpFetcher::new(reqwest::Client::new());
+
+        match fetcher.fetch("file:///etc/hostname").await {
+            Err(SearchError::Refused { reason }) => {
+                assert!(
+                    reason.contains("scheme"),
+                    "the reason should name the scheme rule: {reason}"
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn uncached_refuses_a_local_hostname_without_resolving_it() {
+        // `localhost` is refused by the name rule — no DNS lookup is needed to know it is
+        // not the public internet.
+        let origin = TestServer::serve_sync(|_| {
+            (
+                200u16,
+                vec![("content-type", "text/html".to_string())],
+                b"<html><body><p>never served</p></body></html>".to_vec(),
+            )
+        })
+        .await;
+        let url = format!("http://localhost:{}/page", origin.addr.port());
+        let fetcher = HttpFetcher::new(reqwest::Client::new());
+
+        match fetcher.fetch(&url).await {
+            Err(SearchError::Refused { reason }) => {
+                assert!(
+                    reason.contains("localhost"),
+                    "the reason should name the refused host: {reason}"
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        assert_eq!(
+            origin.connection_count(),
+            0,
+            "a refused name is never resolved nor connected to"
+        );
+    }
+
+    #[tokio::test]
+    async fn uncached_allow_local_reaches_a_loopback_origin() {
+        // The positive control for the named hatch: `AllowLocal` admits the loopback stub,
+        // so a widened fetcher still reads the page. Without this, every hermetic caller of
+        // the uncached path would have no honest way to test against a local server.
+        let origin = TestServer::serve_sync(|_| {
+            (
+                200u16,
+                vec![("content-type", "text/html".to_string())],
+                b"SENTINEL-BYTES".to_vec(),
+            )
+        })
+        .await;
+        let fetcher =
+            HttpFetcher::new(reqwest::Client::new()).with_admission(Admission::AllowLocal);
+
+        let page = fetcher
+            .fetch(&origin.url("/page"))
+            .await
+            .expect("an admitted target must fetch")
+            .expect("a 200 with a body must not be skipped");
+        assert!(
+            page.body.contains("SENTINEL-BYTES"),
+            "the body must be the served bytes: {}",
+            page.body
+        );
+        assert_eq!(origin.connection_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn uncached_does_not_follow_a_redirect_it_has_not_admitted() {
+        // The page a caller reached may point onward at a non-fetchable target. The hop
+        // client follows nothing on its own (`Policy::none`), so the `Location` is admitted
+        // before the next send — and refused here — instead of being connected to.
+        let origin = TestServer::serve_sync(|head| {
+            let path = head.split_whitespace().nth(1).unwrap_or("/");
+            if path.starts_with("/start") {
+                (
+                    302u16,
+                    vec![("location", "file:///etc/hostname".to_string())],
+                    Vec::new(),
+                )
+            } else {
+                (
+                    200u16,
+                    vec![("content-type", "text/html".to_string())],
+                    b"never".to_vec(),
+                )
+            }
+        })
+        .await;
+        let fetcher =
+            HttpFetcher::new(reqwest::Client::new()).with_admission(Admission::AllowLocal);
+
+        match fetcher.fetch(&origin.url("/start")).await {
+            Err(SearchError::Refused { reason }) => {
+                assert!(
+                    reason.contains("scheme"),
+                    "the redirect refusal should name the scheme rule: {reason}"
+                );
+            }
+            other => panic!("expected a redirect refusal, got {other:?}"),
+        }
+
+        assert_eq!(
+            origin.connection_count(),
+            1,
+            "exactly the initial hop was sent; the redirect was judged, not followed"
+        );
+    }
+
+    #[tokio::test]
+    async fn uncached_redirect_to_an_unresolvable_host_is_refused_not_followed() {
+        // The DNS leg of the redirect check: a `Location` whose host resolves to nothing is
+        // refused — there is nothing admission looked at — rather than retried or followed.
+        // `.invalid` never resolves (RFC 2606), so this needs no network to be decisive.
+        let origin = TestServer::serve_sync(|head| {
+            let path = head.split_whitespace().nth(1).unwrap_or("/");
+            if path.starts_with("/start") {
+                (
+                    302u16,
+                    vec![("location", "http://no-such-host.invalid/".to_string())],
+                    Vec::new(),
+                )
+            } else {
+                (
+                    200u16,
+                    vec![("content-type", "text/html".to_string())],
+                    b"never".to_vec(),
+                )
+            }
+        })
+        .await;
+        let fetcher =
+            HttpFetcher::new(reqwest::Client::new()).with_admission(Admission::AllowLocal);
+
+        match fetcher.fetch(&origin.url("/start")).await {
+            Err(SearchError::Refused { reason }) => {
+                assert!(
+                    reason.contains("did not resolve"),
+                    "the redirect refusal should name the unresolvable host: {reason}"
+                );
+            }
+            other => panic!("expected a redirect refusal, got {other:?}"),
+        }
+
+        assert_eq!(
+            origin.connection_count(),
+            1,
+            "exactly the initial hop was sent; the redirect was judged, not followed"
+        );
+    }
+
+    #[tokio::test]
+    async fn uncached_redirect_loop_is_cut_off_after_max_redirects() {
+        // Two pages that keep redirecting into each other must not spin forever: the hop
+        // counter caps the chain. The loop is on loopback, so `AllowLocal` reaches it — the
+        // point here is the budget, not the admission.
+        let origin = TestServer::serve_sync(|head| {
+            let path = head.split_whitespace().nth(1).unwrap_or("/");
+            let next = if path.starts_with("/a") { "/b" } else { "/a" };
+            (302u16, vec![("location", next.to_string())], Vec::new())
+        })
+        .await;
+        let fetcher =
+            HttpFetcher::new(reqwest::Client::new()).with_admission(Admission::AllowLocal);
+
+        // Whatever the outcome, the fetch must return — a redirect loop that never
+        // terminated would hang the test (and the harness).
+        let _ = fetcher.fetch(&origin.url("/a")).await;
+
+        let hops = origin.connection_count();
+        assert!(
+            hops <= MAX_REDIRECTS + 1,
+            "redirect loop exceeded the hop budget: {hops} connections"
+        );
+        assert!(
+            hops >= 2,
+            "the loop should have been followed at least once: {hops}"
+        );
     }
 }

@@ -15,7 +15,7 @@
 //! | Path | Assertion |
 //! |---|---|
 //! | browser-first `BrowserFetcher`, through the research pipeline | the citation's snippet **contains** the JS-inserted token |
-//! | plain `HttpFetcher`, through `research_with_fetch_mode(FetchMode::Http)` | the same page's citation snippet **does not contain** the token, and **does** contain a static sentinel from the page's prose (so it really read the page, rather than failing to) |
+//! | plain `HttpFetcher` with the named `AllowLocal` hatch, through the research pipeline | the same page's citation snippet **does not contain** the token, and **does** contain a static sentinel from the page's prose (so it really read the page, rather than failing to) |
 //!
 //! The token is assembled by the page's script from parts, so it is not a substring of the bytes
 //! the server sends — asserted directly on the served HTML, before anything fetches it. The
@@ -30,8 +30,9 @@
 //! **named** [`BrowserFetcher::with_admission`] hatch. That widening is not a workaround for a
 //! broken selector: `select_fetcher(FetchMode::Browser, …)` is asserted here to choose the browser
 //! fetcher on this host, and *its* product is asserted to **refuse** the loopback stub — admission
-//! still runs. The plain side goes through the real running path end to end
-//! (`research_with_fetch_mode(FetchMode::Http, …)`), which is a plain fetch and needs no hatch.
+//! still runs. The plain side is built by hand around an `HttpFetcher` widened with the
+//! same named hatch (`FetchMode::Http` through the selector would refuse the loopback stub
+//! under the default policy, which is the secured behaviour, not a page read).
 //!
 //! ## Running it
 //!
@@ -54,8 +55,8 @@ use hx_core::ids::SessionId;
 use hx_search::backends::USER_AGENT;
 use hx_search::{
     browser_available, research, research_with_fetch_mode, select_fetcher, BackendOutcome,
-    BrowserFetcher, FetchMode, ResearchReport, ResearchRequest, SearchBackend, SearxngBackend,
-    SelectedFetcher,
+    BrowserFetcher, FetchMode, HttpFetcher, ResearchReport, ResearchRequest, ResearchTask,
+    SearchBackend, SearxngBackend, SelectedFetcher,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -345,15 +346,20 @@ async fn the_browser_rung_reads_what_a_plain_fetch_cannot() {
     // ---------------------------------------------------------------------------------------
     // The plain rung: the same page, the same pipeline, no browser
     // ---------------------------------------------------------------------------------------
-    let plain_report = research_with_fetch_mode(
-        &backends,
-        &client,
-        FetchMode::Http,
-        pool_root.path().join("plain-path"),
-        &canary_request(),
-    )
-    .await
-    .expect("http mode never fails");
+    //
+    // Built by hand rather than through `research_with_fetch_mode(FetchMode::Http, …)`: the
+    // selector's product carries the default admission policy, which refuses the loopback
+    // stub (admission still runs — asserted for the browser side above), while this half
+    // needs to *read* the page to prove the negative control. The named `AllowLocal` hatch
+    // is the honest widening, the same one the browser half uses.
+    let plain_fetcher = Arc::new(
+        HttpFetcher::new(client.clone())
+            .with_admission(Admission::AllowLocal)
+            .with_timeout(CANARY_TIMEOUT),
+    );
+    let plain_report = ResearchTask::new(backends.clone(), client.clone(), plain_fetcher)
+        .run(&canary_request())
+        .await;
     let plain_snippet = citation_for(&plain_report, &page_url);
 
     assert!(
