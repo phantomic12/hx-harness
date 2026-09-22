@@ -468,7 +468,7 @@ connectors:
         let dir = tempfile::tempdir().expect("temp dir");
         // The store must not touch the real workspace: `build` opens SQLite under `data_dir`.
         config.daemon.data_dir = dir.path().join("data").display().to_string();
-        let state = crate::state::AppState::build(config, chrono::Utc::now())
+        let state = crate::state::AppState::build(config, None, chrono::Utc::now())
             .await
             .expect("build keeps a configured webhook alive");
         // `dir` must outlive the state: dropping it deletes the store under a live daemon.

@@ -344,10 +344,14 @@ search:
         let state = AppState::from_parts(crate::state::AppStateParts {
             config,
             router: Arc::new(std::sync::Mutex::new(router)),
-            providers: Arc::new(providers),
+            providers: Arc::new(std::sync::RwLock::new(providers)),
+            provider_configs: Default::default(),
+            config_path: None,
             secrets: Arc::new(secrets),
             store: Arc::clone(&store),
-            models: Arc::new(Dead(Arc::new(DeadModel))),
+            models: Arc::new(std::sync::RwLock::new(Arc::new(Dead(
+                Arc::new(DeadModel),
+            )))),
             tools: Arc::new(crate::chat::default_tools(vec![], client)),
             approvals: hx_agent::ApprovalQueue::new(std::time::Duration::from_secs(1)),
             phone: None,
