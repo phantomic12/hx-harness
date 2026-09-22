@@ -1,8 +1,8 @@
 //! `POST /v1/research` end to end over the real router.
 //!
 //! What is **real** here: the `AppState`, the axum router and its bearer-token middleware, the
-//! route's own `select_fetcher` call, the `ResearchTask` pipeline, the extraction `Ladder`, and an
-//! `HttpFetcher` reading a page over a real loopback socket.
+//! route's own `select_fetcher` call, the `ResearchTask` pipeline, the extraction `Ladder`, and
+//! the admission policy the route's `HttpFetcher` enforces.
 //!
 //! What is **scripted**: the search backends, and only them. They are the part of the pipeline that
 //! would otherwise scrape third-party sites, and scripting them is what lets a test assert *which
@@ -11,8 +11,11 @@
 //! The page server is deliberately a real HTTP server rather than an injected `Fetcher`: the M6
 //! route's job is to reach the pipeline through the fetch selection, so a test that handed the
 //! route a scripted fetcher would prove the wiring while saying nothing about whether the route's
-//! own fetch path can read a page. This one serves real HTML over loopback and lets the ladder
-//! extract it for real.
+//! own fetch path admits what it is pointed at. This one serves real HTML over loopback — which
+//! the route's default admission policy **refuses** — and asserts the refusal end to end: the
+//! sources are still cited (honestly, with empty snippets), and the page server sees zero
+//! connections. Real page reads through the ladder live in `hx-search`'s own tests, where the
+//! named `AllowLocal` hatch admits the loopback stub.
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -110,6 +113,7 @@ impl SearchBackend for ScriptedBackend {
 /// holding a task forever.
 struct PageServer {
     addr: std::net::SocketAddr,
+    connections: Arc<AtomicUsize>,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -126,6 +130,8 @@ impl PageServer {
             .into_iter()
             .map(|(path, body)| (path.to_string(), body))
             .collect();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counted = connections.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -133,6 +139,7 @@ impl PageServer {
                     // The listener was closed: nothing left to serve.
                     return;
                 };
+                counted.fetch_add(1, Ordering::SeqCst);
                 let pages = pages.clone();
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -166,7 +173,15 @@ impl PageServer {
             }
         });
 
-        Self { addr, handle }
+        Self {
+            addr,
+            connections,
+            handle,
+        }
+    }
+
+    fn connection_count(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
     }
 
     fn url(&self, path: &str) -> String {
@@ -293,10 +308,10 @@ async fn post(state: Arc<AppState>, body: &str) -> (StatusCode, serde_json::Valu
     (status, json)
 }
 
-/// The milestone's whole claim over HTTP: a research request reaches the fan-out, the extraction
-/// ladder reads the pages a *scripted* backend pointed at, and the response carries the citations,
-/// each backend's outcome, and the fetcher that was chosen — all through the route, with nothing
-/// asserted about a fixture the code under test did not produce.
+/// The milestone's whole claim over HTTP: a research request reaches the fan-out, the route's
+/// fetch selection admits every cited URL under the default policy, and the response carries
+/// the citations, each backend's outcome, and the fetcher that was chosen — all through the
+/// route, with nothing asserted about a fixture the code under test did not produce.
 #[tokio::test]
 async fn a_research_request_over_http_returns_citations_and_names_the_fetcher() {
     let pages = PageServer::serve(vec![
@@ -383,8 +398,11 @@ async fn a_research_request_over_http_returns_citations_and_names_the_fetcher() 
         "the failure names what went wrong: {failed}"
     );
 
-    // The citations came from the real pages the loopback server sent, extracted by the ladder the
-    // route's own fetch path runs.
+    // The citations name the searched URLs, but the route's default admission policy refuses
+    // the loopback page server — so the sources are cited honestly (backend titles, empty
+    // snippets, the plain rung) rather than read, and the server sees zero connections.
+    // This is the SSRF property end to end: a result URL pointing at the local network is
+    // never fetched. Real page reads through the ladder live in `hx-search`'s own tests.
     let sources = body["sources"].as_array().expect("sources is a list");
     assert_eq!(sources.len(), 2, "both searched URLs must be cited: {body}");
 
@@ -393,46 +411,38 @@ async fn a_research_request_over_http_returns_citations_and_names_the_fetcher() 
         .find(|s| s["url"].as_str().is_some_and(|url| url.ends_with("/alpha")))
         .expect("the alpha page is cited");
     assert_eq!(
-        alpha["title"], "Alpha Article",
-        "the title must come from the served page's <title>, not from the backend: {alpha}"
+        alpha["title"], "Alpha from the backend",
+        "a refused fetch falls back to the backend's title, never the page's: {alpha}"
     );
-    assert!(
-        alpha["snippet"]
-            .as_str()
-            .is_some_and(|snippet| snippet.contains(SENTINEL)),
-        "the snippet must carry the bytes the page server sent: {alpha}"
+    assert_eq!(
+        alpha["snippet"], "",
+        "a refused fetch is an empty snippet, not extracted text: {alpha}"
     );
-    let snippet_len = alpha["snippet"]
-        .as_str()
-        .map(str::chars)
-        .map(Iterator::count)
-        .unwrap_or(0);
-    assert!(
-        snippet_len <= hx_search::DEFAULT_SNIPPET_MAX_CHARS + 1,
-        "the snippet cap must bite over HTTP too ({snippet_len} chars): {alpha}"
-    );
-    assert!(
-        matches!(alpha["rung"].as_str(), Some("plain") | Some("readability")),
-        "the citation names the rung that produced it: {alpha}"
+    assert_eq!(
+        alpha["rung"], "plain",
+        "a refused fetch names no extraction rung: {alpha}"
     );
 
-    // Both pages were really fetched. `beta` is the second result, so it is the one that proves the
-    // pipeline followed every URL it cited rather than only the first.
+    // Both pages were refused, not merely the first: the pipeline judges every URL it cites.
     let beta = sources
         .iter()
         .find(|s| s["url"].as_str().is_some_and(|url| url.ends_with("/beta")))
         .expect("the beta page is cited");
-    assert_eq!(beta["title"], "Beta Article", "{beta}");
-    assert!(
-        beta["snippet"]
-            .as_str()
-            .is_some_and(|snippet| snippet.contains("SENTINEL-BETA")),
-        "the second source is extracted too, not merely listed: {beta}"
+    assert_eq!(beta["title"], "Beta from the backend", "{beta}");
+    assert_eq!(
+        beta["snippet"], "",
+        "the second source is refused too, not merely listed: {beta}"
     );
 
     // Ranks come from the fusion, not from the order the JSON happened to be built in.
     assert_eq!(alpha["rank"], 0, "{alpha}");
     assert_eq!(beta["rank"], 1, "{beta}");
+
+    assert_eq!(
+        pages.connection_count(),
+        0,
+        "admission refuses before any byte reaches the loopback page server"
+    );
 }
 
 /// A query that is empty or only whitespace is the caller's mistake, and the answer is a 400 that
