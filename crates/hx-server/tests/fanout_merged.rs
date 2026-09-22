@@ -286,8 +286,9 @@ async fn harness(
     ));
     AppState::from_parts(AppStateParts {
         router: Arc::clone(&router),
-        providers: provider,
-        secrets,
+        providers: Arc::new(RwLock::new(provider)),
+        provider_configs: Default::default(),
+        config_path: None,        secrets,
         store: store.clone(),
         models: Arc::new(RwLock::new(Arc::new(hx_server::chat::RouterModels::new(
             router,
