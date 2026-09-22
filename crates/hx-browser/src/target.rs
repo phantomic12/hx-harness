@@ -449,6 +449,32 @@ impl PinnedTarget {
         &self.addrs
     }
 
+    /// Chromium `--host-resolver-rules` pinning this target's hostname to its approved
+    /// addresses, or `None` when there is nothing to pin.
+    ///
+    /// `None` for IP literals: the literal *is* the address, judged by admission itself,
+    /// with no name a rebinding could change. For a hostname it is one `MAP` rule per
+    /// approved address (`MAP host addr, ...`), tried in order, so the browser's socket
+    /// can only go where admission looked — which is what closes the check-then-connect
+    /// (rebinding) gap for a client whose DNS this crate does not otherwise control.
+    /// Every address carried here was judged public (or explicitly allowed) by
+    /// [`TargetUrl::pin`], so mapping to any of them is safe; the first rule wins, and
+    /// the first address is the first approved.
+    pub fn host_resolver_rules(&self) -> Option<String> {
+        let name = self.target.dns_name()?;
+        if self.addrs.is_empty() {
+            return None;
+        }
+        let mut rules: Vec<String> = self
+            .addrs
+            .iter()
+            .map(|ip| format!("MAP {name} {ip}"))
+            .collect();
+        rules.sort();
+        rules.dedup();
+        Some(rules.join(", "))
+    }
+
     /// Take the admitted target back out.
     pub fn into_target(self) -> TargetUrl {
         self.target
@@ -980,5 +1006,33 @@ mod tests {
             pinned.pinned_addrs(),
             &["93.184.216.34".parse::<std::net::IpAddr>().unwrap()]
         );
+    }
+
+    #[test]
+    fn pinned_hostnames_render_chromium_resolver_rules_and_literals_render_none() {
+        // The rules are what the Chromium rung passes as `--host-resolver-rules`: the
+        // hostname mapped to exactly the approved addresses, so the browser's socket
+        // can only go where admission looked.
+        let resolver = ScriptResolver::answering("cdn.test", vec!["93.184.216.34", "1.1.1.1"]);
+        let pinned = TargetUrl::pin_with(
+            Admission::PublicInternet,
+            "https://cdn.test/page",
+            &resolver,
+        )
+        .expect("an all-public resolution is admitted");
+        assert_eq!(
+            pinned.host_resolver_rules().as_deref(),
+            Some("MAP cdn.test 1.1.1.1, MAP cdn.test 93.184.216.34")
+        );
+
+        // An IP literal needs no rules: the literal *is* the address, with no name a
+        // rebinding could change.
+        let literal = TargetUrl::pin_with(
+            Admission::PublicInternet,
+            "http://93.184.216.34/page",
+            &ScriptResolver::default(),
+        )
+        .expect("a public literal is admitted");
+        assert_eq!(literal.host_resolver_rules(), None);
     }
 }

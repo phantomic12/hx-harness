@@ -23,6 +23,19 @@
 //! - If admitted, the request is continued with `Fetch.continueRequest`.
 //! - If refused, the request is failed immediately with `Fetch.failRequest` (`errorReason: AccessDenied`).
 //!
+//! ### Hostnames are resolved once, judged, and pinned
+//!
+//! Admitting the URL's spelling is not enough: a public-looking hostname can resolve to
+//! loopback or private space (`http://127.0.0.1.nip.io/`), and the browser resolves names
+//! itself, independently of any check this crate runs. So the target's hostname is resolved
+//! once through a controlled [`HostResolver`](crate::target::HostResolver) *before the browser
+//! is launched* — a privately-resolving name launches nothing — and judged, with *any*
+//! non-public address refusing the fetch. The approved addresses are then pinned into the
+//! browser via `--host-resolver-rules`, so the initial navigation's socket can only go where
+//! admission looked, and every intercepted subresource URL is resolved and judged the same
+//! way at the request boundary (first approved resolution wins; a rebinding answer is never
+//! consulted). An IP literal needs none of this: the literal *is* the address.
+//!
 //! ### The wire guarantee: request boundary vs. socket boundary
 //!
 //! **No HTTP request is delivered to a refused target.**
@@ -66,8 +79,12 @@
 
 use crate::error::{FetchError, RefusalReason};
 use crate::rung::{FetchRequest, Fetcher, RungKind, UntrustedPage};
-use crate::target::{Admission, BlockReason, TargetRefusal, TargetUrl};
+use crate::target::{
+    Admission, BlockReason, HostResolver, PinnedTarget, SystemResolver, TargetRefusal, TargetUrl,
+};
 use async_trait::async_trait;
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -87,6 +104,7 @@ pub const BROWSER_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct ChromiumRung {
     path: PathBuf,
     admission: Admission,
+    resolver: Arc<dyn HostResolver>,
     last_pid: Arc<AtomicU32>,
 }
 
@@ -109,8 +127,20 @@ impl ChromiumRung {
         Ok(Self {
             path: path.into(),
             admission,
+            resolver: Arc::new(SystemResolver),
             last_pid: Arc::new(AtomicU32::new(0)),
         })
+    }
+
+    /// The rung resolving hostnames through `resolver` instead of the system resolver.
+    ///
+    /// The production path is [`SystemResolver`]; this hatch exists so a test can dictate
+    /// resolutions (loopback, mixed, empty) without owning DNS. The resolution the rung
+    /// judges is the resolution it pins into `--host-resolver-rules`, so the test double
+    /// exercises the same check-then-pin path production takes.
+    pub fn with_resolver(mut self, resolver: Arc<dyn HostResolver>) -> Self {
+        self.resolver = resolver;
+        self
     }
 
     /// The configured binary path.
@@ -160,6 +190,29 @@ impl Fetcher for ChromiumRung {
     }
 
     async fn fetch(&self, request: &FetchRequest) -> Result<UntrustedPage, FetchError> {
+        // Pin the target's hostname resolution BEFORE anything is launched: a
+        // public-looking hostname can resolve to loopback or private space, and the
+        // browser would otherwise resolve it independently of admission. A refusal
+        // here launches nothing — there is no browser to reap and no socket to
+        // account for. Resolution is a blocking `getaddrinfo` call, so it runs off
+        // the async runtime.
+        let target = request.target.clone();
+        let admission = self.admission;
+        let resolver = Arc::clone(&self.resolver);
+        let pinned = tokio::task::spawn_blocking(move || target.pin(admission, &*resolver))
+            .await
+            .map_err(|_| FetchError::Transport {
+                rung: RungKind::Interactive,
+                reason: "the admission task did not complete".to_string(),
+            })?
+            .map_err(FetchError::Blocked)?;
+
+        // The browser resolves hostnames itself, so the approved addresses are pinned
+        // into its resolver: with these rules the socket for the target hostname can
+        // only go where admission looked, closing the check-then-connect (rebinding)
+        // gap for the initial navigation. `None` for IP literals, which need no pin.
+        let resolver_rules = pinned.host_resolver_rules();
+
         let user_data_dir = request.profile.user_data_dir();
         std::fs::create_dir_all(&user_data_dir).map_err(|err| FetchError::Unavailable {
             rung: RungKind::Interactive,
@@ -169,8 +222,8 @@ impl Fetcher for ChromiumRung {
         let dt_file = user_data_dir.join("DevToolsActivePort");
         let _ = std::fs::remove_file(&dt_file);
 
-        let child = Command::new(&self.path)
-            .arg("--headless=new")
+        let mut cmd = Command::new(&self.path);
+        cmd.arg("--headless=new")
             .arg("--remote-debugging-port=0")
             .arg(format!("--user-data-dir={}", user_data_dir.display()))
             .arg("--no-first-run")
@@ -178,7 +231,14 @@ impl Fetcher for ChromiumRung {
             .arg("--disable-gpu")
             .arg("--disable-dev-shm-usage")
             .arg("--disable-background-networking")
-            .arg("--disable-features=Preconnect,SpeculativeServiceWorker,NavigationPredictor,NetworkPrediction")
+            .arg("--disable-features=Preconnect,SpeculativeServiceWorker,NavigationPredictor,NetworkPrediction");
+        // Pinned DNS for the target hostname (absent for IP literals). Without this
+        // the browser resolves the name itself, independently of the resolution
+        // admission judged — a public-looking hostname reaching private space.
+        if let Some(rules) = resolver_rules {
+            cmd.arg(format!("--host-resolver-rules={rules}"));
+        }
+        let child = cmd
             .kill_on_drop(true)
             .spawn()
             .map_err(|err| FetchError::Unavailable {
@@ -236,12 +296,13 @@ impl Fetcher for ChromiumRung {
         };
 
         let ws_url = format!("ws://127.0.0.1:{port}{path}");
-        let target = request.target.clone();
         let admission = self.admission;
+        let resolver = Arc::clone(&self.resolver);
         let timeout = request.timeout;
 
-        let cdp_task =
-            tokio::task::spawn_blocking(move || drive_cdp(ws_url, target, admission, timeout));
+        let cdp_task = tokio::task::spawn_blocking(move || {
+            drive_cdp(ws_url, pinned, admission, resolver, timeout)
+        });
 
         let result = match tokio::time::timeout(request.timeout, cdp_task).await {
             Ok(Ok(outcome)) => outcome,
@@ -271,10 +332,21 @@ impl Fetcher for ChromiumRung {
 /// Drives the Chromium DevTools Protocol over a WebSocket.
 fn drive_cdp(
     ws_url: String,
-    target: TargetUrl,
+    pinned: PinnedTarget,
     admission: Admission,
+    resolver: Arc<dyn HostResolver>,
     timeout: Duration,
 ) -> Result<UntrustedPage, FetchError> {
+    let target = pinned.target().clone();
+    // Hostnames this navigation has already judged, to their approved addresses. Seeded
+    // with the initial target's pins, so the check-then-connect gap stays closed for
+    // every hostname the page then reaches: the first approved resolution is reused
+    // rather than re-resolved (rebinding), and a hostname resolving to private space
+    // is refused at the request boundary, never at the socket.
+    let mut approved: HashMap<String, Vec<IpAddr>> = HashMap::new();
+    if let Some(name) = pinned.target().dns_name() {
+        approved.insert(name, pinned.pinned_addrs().to_vec());
+    }
     let (mut ws, _) =
         tokio_tungstenite::tungstenite::connect(&ws_url).map_err(|err| FetchError::Transport {
             rung: RungKind::Interactive,
@@ -436,16 +508,22 @@ fn drive_cdp(
                         let req_url = json_find_str(&text, "url").unwrap_or_default();
                         let resource_type = json_find_str(&text, "resourceType");
 
-                        let is_admitted =
-                            if !initial_nav_admitted && req_url == target.request_url() {
-                                initial_nav_admitted = true;
-                                true
-                            } else {
-                                TargetUrl::parse_with(admission, &req_url).is_ok()
-                            };
+                        // The initial navigation was pinned before launch; everything
+                        // else is admitted here, at the request boundary: lexical
+                        // admission AND the hostname's resolution, judged against the
+                        // approved addresses. A public-looking hostname resolving to
+                        // private space is refused before its socket exists.
+                        let admission_result = if !initial_nav_admitted
+                            && req_url == target.request_url()
+                        {
+                            initial_nav_admitted = true;
+                            Ok(())
+                        } else {
+                            admit_intercepted_url(admission, &*resolver, &mut approved, &req_url)
+                        };
 
                         msg_id += 1;
-                        if is_admitted {
+                        if admission_result.is_ok() {
                             let cont = format!(
                                 r#"{{"id":{},"sessionId":"{}","method":"Fetch.continueRequest","params":{{"requestId":"{}"}}}}"#,
                                 msg_id, session_id, req_id
@@ -462,7 +540,7 @@ fn drive_cdp(
                             if resource_type.as_deref() == Some("Document")
                                 || req_url == target.request_url()
                             {
-                                if let Err(refusal) = TargetUrl::parse_with(admission, &req_url) {
+                                if let Err(refusal) = admission_result {
                                     let relabelled_reason = match refusal.reason {
                                         BlockReason::PrivateHost { host, reason } => {
                                             BlockReason::Redirected { host, reason }
@@ -624,6 +702,37 @@ fn is_wall_status(status: u16) -> bool {
     matches!(status, 403 | 429 | 503)
 }
 
+/// Admit one URL the browser tried to reach, at the request boundary.
+///
+/// Lexical admission first ([`TargetUrl::parse_with`]), then the hostname's resolution:
+/// an IP literal was already judged by the parse itself, while a hostname is resolved
+/// once through `resolver` and every address judged — a public-looking name resolving
+/// to loopback or private space (`http://127.0.0.1.nip.io/`) is refused here, before
+/// any socket exists. The first approved resolution is remembered in `approved` and
+/// reused, so a DNS answer that changes mid-navigation (rebinding) cannot move an
+/// admitted hostname onto an address admission never saw.
+///
+/// Runs on the CDP thread, where blocking `getaddrinfo` is legitimate.
+pub(crate) fn admit_intercepted_url(
+    admission: Admission,
+    resolver: &dyn HostResolver,
+    approved: &mut HashMap<String, Vec<IpAddr>>,
+    req_url: &str,
+) -> Result<(), TargetRefusal> {
+    let target = TargetUrl::parse_with(admission, req_url)?;
+    let Some(name) = target.dns_name() else {
+        // An IP literal: the parse judged the exact address the socket will use, and
+        // there is no name a rebinding could change.
+        return Ok(());
+    };
+    if approved.contains_key(&name) {
+        return Ok(());
+    }
+    let pinned = target.pin(admission, resolver)?;
+    approved.insert(name, pinned.pinned_addrs().to_vec());
+    Ok(())
+}
+
 fn json_find_str(json: &str, key: &str) -> Option<String> {
     let pattern = format!("\"{key}\"");
     let key_pos = json.find(&pattern)?;
@@ -680,4 +789,268 @@ fn json_find_u16(json: &str, key: &str) -> Option<u16> {
         .take_while(|c| c.is_ascii_digit())
         .collect();
     digits.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::{PoolRoot, SessionProfile};
+    use hx_core::ids::SessionId;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    /// A scripted resolver: every hostname answers from a queue, in order.
+    ///
+    /// WHY a queue rather than a map: the rebinding test needs *consecutive answers for
+    /// one hostname to differ* — the first resolution approved, the second private —
+    /// which a map cannot express. A hostname nobody scripted is a test bug, not an
+    /// empty answer.
+    #[derive(Debug, Default)]
+    struct ScriptResolver {
+        answers: Mutex<VecDeque<Vec<IpAddr>>>,
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl ScriptResolver {
+        fn answering(host_answers: Vec<Vec<&str>>) -> Self {
+            let answers = host_answers
+                .into_iter()
+                .map(|addrs| {
+                    addrs
+                        .iter()
+                        .map(|addr| addr.parse().expect("a test address"))
+                        .collect()
+                })
+                .collect();
+            Self {
+                answers: Mutex::new(answers),
+                asked: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().expect("the asked lock").clone()
+        }
+    }
+
+    impl HostResolver for ScriptResolver {
+        fn resolve_host(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
+            self.asked
+                .lock()
+                .expect("the asked lock")
+                .push(host.to_string());
+            self.answers
+                .lock()
+                .expect("the answers lock")
+                .pop_front()
+                .ok_or_else(|| std::io::Error::other("the test resolver has no more answers"))
+        }
+    }
+
+    /// A resolver that panics when asked: proving an IP literal is admitted without
+    /// touching DNS, since there is no name a rebinding could change.
+    #[derive(Debug)]
+    struct PanickingResolver;
+
+    impl HostResolver for PanickingResolver {
+        fn resolve_host(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
+            panic!("DNS must not be consulted for {host}");
+        }
+    }
+
+    fn approvals() -> HashMap<String, Vec<IpAddr>> {
+        HashMap::new()
+    }
+
+    #[test]
+    fn a_hostname_resolving_to_loopback_is_refused_at_the_request_boundary() {
+        // The `127.0.0.1.nip.io` shape: lexically public, resolving to loopback. The
+        // old lexical-only interception admitted this; the recheck must refuse it.
+        let resolver = ScriptResolver::answering(vec![vec!["127.0.0.1"]]);
+        let mut approved = approvals();
+        let err = admit_intercepted_url(
+            Admission::PublicInternet,
+            &resolver,
+            &mut approved,
+            "http://public.test/page",
+        )
+        .expect_err("a loopback resolution must be refused");
+        assert!(
+            matches!(err.reason, BlockReason::PrivateHost { .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("127.0.0.1"), "{err}");
+        assert!(approved.is_empty(), "a refused name approves nothing");
+    }
+
+    #[test]
+    fn a_hostname_with_one_private_address_among_public_ones_is_refused() {
+        // DNS answers rotate: one private address among public ones refuses the whole
+        // name, or the next rotation admits loopback.
+        let resolver = ScriptResolver::answering(vec![vec!["93.184.216.34", "10.0.0.5"]]);
+        let mut approved = approvals();
+        let err = admit_intercepted_url(
+            Admission::PublicInternet,
+            &resolver,
+            &mut approved,
+            "http://mixed.test/page",
+        )
+        .expect_err("a mixed resolution must be refused");
+        assert!(
+            matches!(
+                err.reason,
+                BlockReason::PrivateHost { ref host, .. } if host == "10.0.0.5"
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_hostname_resolving_only_to_public_addresses_is_approved_and_remembered() {
+        let resolver = ScriptResolver::answering(vec![vec!["93.184.216.34"]]);
+        let mut approved = approvals();
+        admit_intercepted_url(
+            Admission::PublicInternet,
+            &resolver,
+            &mut approved,
+            "http://cdn.test/page",
+        )
+        .expect("an all-public resolution is admitted");
+        assert_eq!(
+            approved.get("cdn.test"),
+            Some(&vec!["93.184.216.34".parse::<IpAddr>().unwrap()])
+        );
+        assert_eq!(resolver.asked(), vec!["cdn.test".to_string()]);
+    }
+
+    #[test]
+    fn a_rebinding_answer_is_never_consulted_once_a_hostname_is_approved() {
+        // The second resolution turns private: the request is still admitted, on the
+        // first approved addresses, because the rebinding answer is never consulted.
+        let resolver = ScriptResolver::answering(vec![vec!["93.184.216.34"], vec!["127.0.0.1"]]);
+        let mut approved = approvals();
+        admit_intercepted_url(
+            Admission::PublicInternet,
+            &resolver,
+            &mut approved,
+            "http://flapping.test/a",
+        )
+        .expect("the first, public resolution is admitted");
+        admit_intercepted_url(
+            Admission::PublicInternet,
+            &resolver,
+            &mut approved,
+            "http://flapping.test/b",
+        )
+        .expect("the rebinding answer must not move an approved hostname");
+        assert_eq!(
+            approved.get("flapping.test"),
+            Some(&vec!["93.184.216.34".parse::<IpAddr>().unwrap()])
+        );
+        // Asked once: the second request reused the pins rather than re-resolving.
+        assert_eq!(resolver.asked(), vec!["flapping.test".to_string()]);
+    }
+
+    #[test]
+    fn an_ip_literal_is_admitted_without_touching_dns() {
+        let mut approved = approvals();
+        admit_intercepted_url(
+            Admission::PublicInternet,
+            &PanickingResolver,
+            &mut approved,
+            "http://93.184.216.34/page",
+        )
+        .expect("a public literal is admitted without DNS");
+        assert!(approved.is_empty());
+    }
+
+    #[test]
+    fn a_lexically_refused_url_is_refused_without_touching_dns() {
+        // The lexical rules run first: a private literal or a non-http scheme never
+        // reaches the resolver, so this also pins the check order.
+        for raw in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1/",
+            "file:///etc/passwd",
+        ] {
+            let mut approved = approvals();
+            let err = admit_intercepted_url(
+                Admission::PublicInternet,
+                &PanickingResolver,
+                &mut approved,
+                raw,
+            )
+            .expect_err(&format!("{raw} must be refused lexically"));
+            assert!(
+                !matches!(err.reason, BlockReason::Unresolvable { .. }),
+                "{raw}: lexical refusal must not become a DNS question: {err:?}"
+            );
+        }
+    }
+
+    fn profile() -> (tempfile::TempDir, Arc<SessionProfile>) {
+        let temp = tempfile::tempdir().expect("a temp directory");
+        let root = PoolRoot::new(temp.path().join("pool")).expect("a pool root");
+        let session = root
+            .session(&SessionId::from_raw("chromium-pin-test"))
+            .expect("a session profile");
+        (temp, Arc::new(session))
+    }
+
+    fn request(profile: Arc<SessionProfile>, url: &str) -> FetchRequest {
+        FetchRequest {
+            target: TargetUrl::parse_with(Admission::PublicInternet, url)
+                .expect("a lexically admitted target"),
+            profile,
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_privately_resolving_hostname_launches_no_browser() {
+        // Lexically public, resolving to loopback: the pin gate refuses before any
+        // child is spawned. The binary path does not exist, so `Unavailable` would
+        // mean the gate did not run first — and `last_pid` staying empty means no
+        // browser was launched at a target admission never saw.
+        let (_temp, profile) = profile();
+        let rung = ChromiumRung::with_path_and_admission(
+            "/nonexistent/hx-chromium-that-is-not-installed",
+            Admission::PublicInternet,
+        )
+        .expect("a rung")
+        .with_resolver(Arc::new(ScriptResolver::answering(vec![vec!["127.0.0.1"]])));
+        let err = rung
+            .fetch(&request(profile, "http://public.test/page"))
+            .await
+            .expect_err("a loopback resolution must be blocked");
+        let is_private_block = match &err {
+            FetchError::Blocked(refusal) => {
+                matches!(&refusal.reason, BlockReason::PrivateHost { .. })
+            }
+            _ => false,
+        };
+        assert!(is_private_block, "{err:?}");
+        assert_eq!(rung.last_pid(), None);
+    }
+
+    #[tokio::test]
+    async fn a_publicly_resolving_hostname_reaches_launch() {
+        // The control for the test above: with a public resolution the pin gate passes
+        // and the fetch fails at launch (`Unavailable`), proving the refusal above
+        // came from DNS pinning rather than from the missing binary.
+        let (_temp, profile) = profile();
+        let rung = ChromiumRung::with_path_and_admission(
+            "/nonexistent/hx-chromium-that-is-not-installed",
+            Admission::PublicInternet,
+        )
+        .expect("a rung")
+        .with_resolver(Arc::new(ScriptResolver::answering(vec![vec![
+            "93.184.216.34",
+        ]])));
+        let err = rung
+            .fetch(&request(profile, "http://public.test/page"))
+            .await
+            .expect_err("a missing binary is not a page");
+        assert!(matches!(err, FetchError::Unavailable { .. }), "{err:?}");
+    }
 }

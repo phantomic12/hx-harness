@@ -18,6 +18,22 @@
 //! 4. the budget in seconds
 //! ```
 //!
+//! ## The hostname is judged before the URL leaves this process
+//!
+//! Admitting the URL's spelling is not enough: a public-looking hostname can resolve to
+//! loopback or private space (`http://127.0.0.1.nip.io/`), and the tool resolves names
+//! itself, independently of any check this crate runs. So the target's hostname is resolved
+//! once through a controlled [`HostResolver`](crate::target::HostResolver) after the child
+//! is spawned but before stdin is written — a privately-resolving name is refused with
+//! [`FetchError::Blocked`] and the child is killed before it ever reads the URL. The spawn
+//! runs first so a deployment without a stealth browser still reports `Unavailable` rather
+//! than a DNS verdict about a tool that was never there. An IP literal needs no gate: the
+//! literal *is* the address.
+//!
+//! The tool's own subresource fetches are the tool's DNS, not this rung's: this gate judges
+//! the navigation the rung was pointed at — the one request this crate hands over — and says
+//! so, rather than claiming a control over the tool's internals it does not have.
+//!
 //! **exit code** — the verdict:
 //!
 //! ```text
@@ -56,9 +72,11 @@
 
 use crate::error::{FetchError, RefusalReason};
 use crate::rung::{FetchRequest, Fetcher, RungKind, UntrustedPage};
+use crate::target::{Admission, HostResolver, SystemResolver};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
 /// The exit code that means "the body is on stdout".
@@ -92,6 +110,8 @@ pub struct StealthRung {
     command: PathBuf,
     args: Vec<String>,
     name: String,
+    admission: Admission,
+    resolver: Arc<dyn HostResolver>,
 }
 
 impl StealthRung {
@@ -103,7 +123,34 @@ impl StealthRung {
             command,
             args: Vec::new(),
             name,
+            admission: Admission::default(),
+            resolver: Arc::new(SystemResolver),
         }
+    }
+
+    /// The rung under an explicit admission policy.
+    ///
+    /// The same **named** escape hatch the other rungs document: the hermetic suite
+    /// serves its pages on `127.0.0.1`, which the default policy refuses.
+    pub fn with_admission(mut self, admission: Admission) -> Self {
+        self.admission = admission;
+        self
+    }
+
+    /// The rung resolving hostnames through `resolver` instead of the system resolver.
+    ///
+    /// The production path is [`SystemResolver`]; this hatch exists so a test can dictate
+    /// resolutions (loopback, mixed, empty) without owning DNS. The resolution the rung
+    /// judges is the resolution it refuses to hand to the tool, so the test double
+    /// exercises the same check-then-gate path production takes.
+    pub fn with_resolver(mut self, resolver: Arc<dyn HostResolver>) -> Self {
+        self.resolver = resolver;
+        self
+    }
+
+    /// The policy the pre-spawn DNS gate judges resolutions under.
+    pub fn admission(&self) -> Admission {
+        self.admission
     }
 
     /// The rung with the operator's arguments.
@@ -271,6 +318,37 @@ impl Fetcher for StealthRung {
                 },
             })?;
 
+        // Pin the target's hostname resolution BEFORE the URL leaves this process: a
+        // public-looking hostname can resolve to loopback or private space, and the
+        // tool resolves it independently of admission. The spawn above runs first so a
+        // deployment without a stealth browser still reports `Unavailable` (which
+        // escalates) rather than a DNS verdict about a tool that was never there; a
+        // refusal here kills the child before stdin is written, so the URL is never
+        // handed to a fetcher admission never saw. Resolution is a blocking
+        // `getaddrinfo` call, so it runs off the async runtime.
+        //
+        // The tool's own subresource fetches are the tool's DNS, not this rung's: this
+        // gate judges the navigation the rung was pointed at, which is the request
+        // this crate hands over. An IP literal needs no gate: the literal *is* the
+        // address, judged by admission itself.
+        let target = request.target.clone();
+        let admission = self.admission;
+        let resolver = Arc::clone(&self.resolver);
+        if let Err(refusal) = tokio::task::spawn_blocking(move || target.pin(admission, &*resolver))
+            .await
+            .map_err(|_| FetchError::Transport {
+                rung,
+                reason: format!(
+                    "{} could not be waited on: the admission task did not complete",
+                    self.name
+                ),
+            })?
+        {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(FetchError::Blocked(refusal));
+        }
+
         if let Some(mut stdin) = child.stdin.take() {
             // A tool that answers without reading its input closes the pipe under this write, so an
             // EPIPE here is a legitimate thing for a tool to do rather than this rung's failure — the
@@ -347,10 +425,73 @@ impl Fetcher for StealthRung {
 mod tests {
     use super::*;
     use crate::profile::{PoolRoot, SessionProfile};
-    use crate::target::{Admission, TargetUrl};
+    use crate::target::{Admission, BlockReason, HostResolver, TargetUrl};
     use hx_core::ids::SessionId;
-    use std::sync::Arc;
+    use std::collections::VecDeque;
+    use std::net::IpAddr;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    /// The resolver the `shell()` tools resolve through: every hostname is one public
+    /// address.
+    ///
+    /// WHY scripted rather than the system resolver: the hermetic suite's `example.test`
+    /// hostname has no DNS home, and a test that depended on real DNS would own it. The
+    /// pin gate judges real resolutions in production; here the answer is fixed so the
+    /// tool-launching behaviour is what is under test.
+    #[derive(Debug)]
+    struct PublicTestResolver;
+
+    impl HostResolver for PublicTestResolver {
+        fn resolve_host(&self, _host: &str) -> std::io::Result<Vec<IpAddr>> {
+            Ok(vec!["93.184.216.34".parse().expect("a test address")])
+        }
+    }
+
+    /// A scripted resolver answering from a queue, in order, remembering what it was
+    /// asked — so the rebinding test can make consecutive answers for one hostname
+    /// differ, which a map cannot express.
+    #[derive(Debug, Default)]
+    struct ScriptResolver {
+        answers: Mutex<VecDeque<Vec<IpAddr>>>,
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl ScriptResolver {
+        fn answering(host_answers: Vec<Vec<&str>>) -> Self {
+            let answers = host_answers
+                .into_iter()
+                .map(|addrs| {
+                    addrs
+                        .iter()
+                        .map(|addr| addr.parse().expect("a test address"))
+                        .collect()
+                })
+                .collect();
+            Self {
+                answers: Mutex::new(answers),
+                asked: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().expect("the asked lock").clone()
+        }
+    }
+
+    impl HostResolver for ScriptResolver {
+        fn resolve_host(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
+            self.asked
+                .lock()
+                .expect("the asked lock")
+                .push(host.to_string());
+            self.answers
+                .lock()
+                .expect("the answers lock")
+                .pop_front()
+                .ok_or_else(|| std::io::Error::other("the test resolver has no more answers"))
+        }
+    }
 
     fn profile() -> (tempfile::TempDir, Arc<SessionProfile>) {
         let temp = tempfile::tempdir().expect("a temp directory");
@@ -371,7 +512,9 @@ mod tests {
     }
 
     fn shell(script: &str) -> StealthRung {
-        StealthRung::new("/bin/sh").with_args(["-c", script])
+        StealthRung::new("/bin/sh")
+            .with_args(["-c", script])
+            .with_resolver(Arc::new(PublicTestResolver))
     }
 
     #[test]
@@ -457,6 +600,75 @@ mod tests {
         assert!(page
             .body_untrusted()
             .contains("the page the tool retrieved"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hostname_resolving_off_the_public_internet_is_blocked_before_handoff() {
+        // The `127.0.0.1.nip.io` shape: lexically public, resolving to loopback or
+        // private space. The old rung handed this URL to the tool on stdin; the gate
+        // refuses it first, so the tool never reads a target admission never saw.
+        for (host, addr) in [("loopback.test", "127.0.0.1"), ("private.test", "10.7.8.9")] {
+            let (_temp, profile) = profile();
+            let rung = StealthRung::new("/bin/sh")
+                .with_args(["-c", "printf 'the tool must never fetch this'"])
+                .with_resolver(Arc::new(ScriptResolver::answering(vec![vec![addr]])));
+
+            let req = FetchRequest {
+                target: TargetUrl::parse_with(
+                    Admission::PublicInternet,
+                    &format!("http://{host}/page"),
+                )
+                .expect("a lexically admitted target"),
+                profile,
+                timeout: Duration::from_secs(5),
+            };
+            let err = rung
+                .fetch(&req)
+                .await
+                .expect_err(&format!("{addr} must be blocked"));
+            let is_private_block = match &err {
+                FetchError::Blocked(refusal) => {
+                    matches!(&refusal.reason, BlockReason::PrivateHost { .. })
+                }
+                _ => false,
+            };
+            assert!(is_private_block, "{host} -> {addr}: {err:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rebinding_answer_is_never_consulted_because_the_target_is_resolved_once() {
+        // The second resolution turns private: the fetch still succeeds, because the
+        // gate judged the first approved resolution and never asks again — the target
+        // is pinned to the first approved addresses.
+        let resolver = Arc::new(ScriptResolver::answering(vec![
+            vec!["93.184.216.34"],
+            vec!["127.0.0.1"],
+        ]));
+        let (_temp, profile) = profile();
+        let rung = StealthRung::new("/bin/sh")
+            .with_args(["-c", "printf 'the page the tool retrieved'"])
+            .with_resolver(Arc::clone(&resolver) as Arc<dyn HostResolver>);
+
+        let req = FetchRequest {
+            target: TargetUrl::parse_with(Admission::PublicInternet, "http://flapping.test/page")
+                .expect("a lexically admitted target"),
+            profile,
+            timeout: Duration::from_secs(5),
+        };
+        let page = rung
+            .fetch(&req)
+            .await
+            .expect("the first, public resolution is admitted");
+        assert!(
+            page.body_untrusted()
+                .contains("the page the tool retrieved"),
+            "{}",
+            page.body_untrusted()
+        );
+        assert_eq!(resolver.asked(), vec!["flapping.test".to_string()]);
     }
 
     #[cfg(unix)]
