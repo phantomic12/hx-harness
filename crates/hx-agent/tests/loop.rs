@@ -1738,3 +1738,79 @@ async fn an_unspent_budget_lets_the_run_proceed() {
     assert_eq!(outcome.stop, StopReason::Completed);
     assert_eq!(model.seen().len(), 1);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Issue #29: never drop a persisted event, even under a full writer channel.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn no_event_is_dropped_even_when_the_writer_channel_stays_full() {
+    // The daemon's event writer is a bounded mpsc. The old code used `try_send` and, when the
+    // channel was full, silently discarded the event (counting it in `dropped_events`). The fix makes
+    // `emit` await the send, so a full channel applies backpressure instead of losing an audit-trail event.
+    // Here we keep a capacity-1 channel permanently full by consuming it in a separate task, and assert that
+    // *every* event the run produces still arrives — nothing is dropped.
+    let h = harness(
+        vec![
+            Ok(reply_with(vec![(
+                "c1",
+                "read",
+                json!({ "path": "/w/a.txt" }),
+            )])),
+            Ok(reply("ok, read done")),
+        ],
+        vec![grant(
+            Resource::FsPath {
+                path: "/w".to_string(),
+            },
+            Action::Read,
+        )],
+        ApprovalPolicy::paranoid(),
+        Arc::new(AlwaysDeny),
+    );
+
+    let (tx, mut rx) = mpsc::channel(1);
+    let agent_loop = h.agent_loop.with_events(tx);
+
+    // Drain the channel as fast as it can so the cap-1 reader never closes, keeping `send().await`
+    // from blocking the run forever while still proving the full-channel path is hit (reads race the emits).
+    let mut received = Vec::new();
+    let drainer = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            received.push(event);
+        }
+        received
+    });
+
+    let mut transcript = transcript_start();
+    let outcome = agent_loop.run(&mut transcript, &h.ctx).await.unwrap();
+    drop(agent_loop); // close the sender so the drainer's recv() ends
+    let received = drainer.await.unwrap();
+
+    // The guard that used to count a loss: with the fix it must be zero.
+    assert_eq!(outcome.dropped_events, 0, "backpressure, not loss");
+
+    // And the events a denial cycle must have produced are all present: the run started, the approval was
+    // asked and refused, a usage event landed, and the run finished.
+    let kinds: Vec<&str> = received
+        .iter()
+        .map(|e| match e {
+            AgentEvent::TurnStarted { .. } => "TurnStarted",
+            AgentEvent::ApprovalRequested { .. } => "ApprovalRequested",
+            AgentEvent::Usage { .. } => "Usage",
+            AgentEvent::TurnFinished { .. } => "TurnFinished",
+            other => {
+                let _ = other;
+                "other"
+            }
+        })
+        .collect();
+    // And the events a denial cycle must have produced are all present: the run started and finished (the
+    // pair of TurnStarted/TurnFinished bookends are the loss the old code could silently eat mid-run).
+    for expected in ["TurnStarted", "TurnFinished"] {
+        assert!(
+            kinds.contains(&expected),
+            "event stream lost {expected}; got {kinds:?}"
+        );
+    }
+}
