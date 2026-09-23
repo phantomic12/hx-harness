@@ -114,6 +114,9 @@ pub fn app(state: Arc<AppState>) -> Router {
         // The diff/review pane's data source. A diff of file changes is owned by the daemon (it is
         // the only thing that can read the file), so the pane asks for it here rather than inventing it.
         .route("/v1/diff", post(diff_file))
+        // What one session changed, reconstructed from its own transcript and diffed against the
+        // files as they are now. See `session_review` for why this is not a directory walk.
+        .route("/v1/sessions/{id}/review", get(session_review))
         // The M8 fan-out surface: N child model calls across N distinct pool members, run one at a
         // time, answered per child. This is the first production caller of the spawner that draws from
         // the model pool (see `crate::fanout`). It is gated by the same bearer token as everything
@@ -1039,6 +1042,55 @@ async fn diff_file(
         binary,
         diff: rendered,
     }))
+}
+
+/// One session's changes, reconstructed from its transcript and diffed against the files now.
+///
+/// `GET /v1/sessions/{id}/review`. The list is the session's own successful `write_file` and `patch`
+/// calls — not a walk of the workspace, which cannot tell the agent's edit from the operator's.
+/// Each file carries the diff between the text the agent last proposed and the file as it reads
+/// now, redacted on the way out. A session with no recorded edits answers with an empty list,
+/// which is the honest "nothing to review" rather than an error.
+///
+/// A file that is not valid UTF-8 is left out: the diff engine renders text, and a mangled diff of
+/// binary bytes would be a review of a file that is not there.
+async fn session_review(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<crate::review::ReviewedFile>>, ApiError> {
+    let session = SessionId::from_raw(id);
+    // `record` is what turns an unknown id into a 404. `messages` on a missing session answers an
+    // empty list, which would read as "this session changed nothing".
+    state.store.record(&session)?;
+    let messages = state.store.messages(&session)?;
+
+    let host = resolve_for_use(
+        &state,
+        crate::hosts::LOCAL_HOST_ID,
+        hx_core::capability::Action::Read,
+    )
+    .await?;
+
+    // Read each path the transcript names, then diff. A binary file is skipped; a missing one
+    // diffs against empty, which renders as all additions.
+    let redactor = Redactor::new();
+    let mut files = Vec::new();
+    for edit in crate::review::proposed(&messages) {
+        let current = match host.read_file_capped(&edit.path, FILE_READ_CAP).await {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => Some(text),
+                Err(_) => continue,
+            },
+            Err(HxError::NotFound(_)) => Some(String::new()),
+            // A read that failed for any other reason is a file the review cannot show. Skipping
+            // it beats inventing an empty "before", which would render every line as an addition.
+            Err(_) => continue,
+        };
+        if let Some(rendered) = crate::review::render(&edit, current.as_deref(), &redactor) {
+            files.push(rendered);
+        }
+    }
+    Ok(Json(files))
 }
 
 // ---------------------------------------------------------------------------

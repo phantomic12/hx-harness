@@ -171,23 +171,33 @@ composer chip come from the session socket: `tool_call_started`/`tool_call_finis
 into "working · shell", and consecutive `text_delta` frames append into one card. That exposed a
 real bug — the page read `event.type`, but the daemon tags events with `event`
 (`#[serde(tag = "event")]`), so every card had been rendering as a generic "event".
-- **Still open, in this order:**
-1. Diff review inside the thread. Every product reviewed puts the diff in the conversation, not a
-   side tool. `POST /v1/diff` exists but nothing lists "files this session changed", so a review
-   pane needs a daemon route first. Until then a diff-shaped event should render inline.
-2. Plan-then-run (Devin's Ask mode): a read-only mode flag on a run. Needs a new daemon concept;
-   do not fake it in the page.
-3. Not worth copying: an embedded editor or browser (the PTY and the host modal already are the
+- ✅ **Diff review of what this task changed.** `GET /v1/sessions/{id}/review` replays the session's
+  own transcript — a `write_file` or `patch` whose tool result says it succeeded — into the text the
+  agent last proposed, and diffs that against the file as it reads now. A denied call is not a
+  change, a shell's effect is not recoverable from its arguments and is left out rather than
+  invented, and a patch whose anchor no longer appears is reported on the file instead of skipped.
+  The review tab renders one file per object the route returns. Proven in
+  `the_review_route_diffs_the_transcripts_edits_against_the_file_now`: the served diff names the
+  line the transcript added and keeps the line the file already had.
+- ✅ **Plan, then act.** The composer carries an `act`/`plan` toggle, remembered per task. `plan`
+  sends `autonomy: "read_only"` on `POST /v1/chat`, which the approval policy answers by refusing
+  every write — so the agent can look and report, and nothing on disk moves. `act` sends no field,
+  which is the daemon's default and must stay the default.
+- **Still open:**
+1. A rendered-browser check of the row markers, the activity chip, the review tab and the plan
+   toggle. The web-client suite drives the routes and asserts the page *contains* the wiring; it
+   does not render the page. A headless Chromium attempt died mid-setup, and no browser stack is
+   installed here.
+2. Not worth copying: an embedded editor or browser (the PTY and the host modal already are the
    takeover surfaces), automations, a commits drawer (no git state is exposed;
    `GET /v1/sessions/{id}/export` covers taking a transcript elsewhere).
-- **Where it was left.** `hxd` rebuilt from this tree is what serves `127.0.0.1:8899` with
-`/tmp/hxweb.yaml` (data dir `~/.hx`, db `~/.hx/hx.db`). The web-client suite is green
-(`cargo test -p hx-server --test web_client_api`, 6 tests) and the approval queue suite is green
-(`cargo test -p hx-agent --lib queue::`, 7 tests). Not yet done: a rendered-browser check of the
-markers and the chip. A headless Chromium attempt died mid-setup; the probe files it left
-(`/tmp/hxprobe.html`, `/tmp/hxpage.js`) are throwaway and not part of the tree. One landmine: the
-`web_client_api` token test exempts `doLogin`'s raw `fetch` and only that — login has no token
-yet, so it must not go through `apiFetch`. A new raw `fetch(`${API}…`)` anywhere else fails it.
+- **Where it was left.** The web-client suite is green
+(`cargo test -p hx-server --test web_client_api`, 7 tests) and the review unit suite is green
+(`cargo test -p hx-server --lib review::`, 8 tests). The route is pinned in the manifest
+(`GET /v1/sessions/no-such-session/review` answers the handler's 404, not the fallback's empty
+body). One landmine: the `web_client_api` token test exempts `doLogin`'s raw `fetch` and only
+that — login has no token yet, so it must not go through `apiFetch`. A new raw
+`fetch(`${API}…`)` anywhere else fails it.
 
 ---
 

@@ -229,6 +229,33 @@ button { cursor: pointer; }
 }
 .composer button:hover { background: #fff; }
 .composer button:disabled { opacity: .45; cursor: default; }
+.mode {
+  display: flex; background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  overflow: hidden; flex: none;
+}
+.mode button {
+  background: transparent; color: var(--dim); border: 0; border-radius: 0;
+  padding: 0 12px; font-weight: 600; font-size: 12px;
+}
+.mode button + button { border-left: 1px solid var(--line); }
+.mode button.active { background: var(--accent-soft); color: var(--text); }
+.mode button:hover { color: var(--text); }
+.review-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.review-head { display: flex; align-items: center; gap: 8px; padding: 8px 14px; flex: none; }
+.review-head button {
+  background: transparent; color: var(--text); border: 1px solid var(--line);
+  border-radius: 6px; padding: 5px 12px; font-size: 12px;
+}
+.review-head button:hover { border-color: var(--accent); }
+.review-note { color: var(--faint); font-size: 11px; font-family: var(--mono); }
+.rfile { border-bottom: 1px solid var(--line); }
+.rfile > summary {
+  cursor: pointer; padding: 8px 14px; font-family: var(--mono); font-size: 12px;
+  display: flex; gap: 8px; align-items: baseline;
+}
+.rfile > summary .rpath { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rfile > summary .rcount { color: var(--faint); flex: none; }
+.rfile .runapplied { color: var(--warn); font-size: 11px; padding: 0 14px 6px; font-family: var(--mono); }
 .activity {
   width: min(820px, 100%); margin: 0 auto 6px; padding: 0 20px;
   font-size: 12px; color: var(--dim); font-family: var(--mono);
@@ -467,6 +494,7 @@ button { cursor: pointer; }
     <button data-view="side" class="active" title="toggle the task list">tasks</button>
     <button data-view="terminal" class="active" title="terminal">terminal</button>
     <button data-view="diff" title="diff/review">diff</button>
+    <button data-view="review" title="what this task changed">review</button>
     <button data-view="fanout" title="fan-out">fan-out</button>
     <button data-view="providers" title="providers / settings">providers</button>
   </nav>
@@ -518,6 +546,10 @@ button { cursor: pointer; }
     <div class="cwrap">
       <div class="activity" id="activity"></div>
       <div class="composer">
+        <div class="mode" role="group" aria-label="how this prompt runs">
+          <button type="button" data-mode="act" class="active" title="the agent may edit files">act</button>
+          <button type="button" data-mode="plan" title="read-only: the agent looks, it does not change anything">plan</button>
+        </div>
         <textarea id="prompt" rows="1" placeholder="Ask hx to do something…   Enter sends, Shift+Enter for a new line" autocomplete="off"></textarea>
         <button id="send">Send</button>
       </div>
@@ -529,6 +561,7 @@ button { cursor: pointer; }
     <div class="tabs" role="tablist">
       <button data-tab="terminal" class="active">terminal</button>
       <button data-tab="diff">diff</button>
+      <button data-tab="review">review</button>
       <button data-tab="fanout">fan-out</button>
       <button data-tab="providers">providers</button>
     </div>
@@ -546,6 +579,18 @@ button { cursor: pointer; }
         <textarea id="diff-proposed" spellcheck="false" placeholder="proposed contents…"></textarea>
         <div class="error" id="diff-error" style="width:auto;margin:0;padding:4px 14px"></div>
         <div id="diff-out" class="scroll diff-out"></div>
+      </div>
+    </section>
+
+    <section class="dpane" id="dp-review" hidden>
+      <h2>review<span id="review-count"></span></h2>
+      <div class="review-pane">
+        <div class="review-head">
+          <button id="review-run">refresh</button>
+          <span class="review-note" id="review-note">files this task's agent wrote or patched</span>
+        </div>
+        <div class="error" id="review-error" style="width:auto;margin:0;padding:4px 14px"></div>
+        <div id="review-out" class="scroll diff-out"></div>
       </div>
     </section>
     <section class="dpane" id="dp-fanout" hidden>
@@ -1175,6 +1220,7 @@ async function openSession(id) {
   showError("");
   renderSessions();
   paintActivity();
+  paintMode();
   attachSession();
 }
 
@@ -1312,7 +1358,16 @@ async function sendPrompt() {
     const res = await apiFetch(`${API}/v1/chat`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ session: sessionId, prompt, stream: false }),
+      body: JSON.stringify({
+        session: sessionId,
+        prompt,
+        stream: false,
+        // "plan" is the read-only autonomy: the policy refuses every write, so the agent can look
+        // and say what it would change without changing it. "act" sends nothing, which is the
+        // daemon's default and must stay the default — an older daemon that does not know the
+        // field would otherwise reject the whole request.
+        autonomy: modeOf(sessionId) === "plan" ? "read_only" : undefined,
+      }),
     });
     if (!res.ok) throw new Error(`chat failed: ${res.status} ${await res.text()}`);
     // The answer's events arrive on the session socket like any other, so there is nothing to
@@ -1893,6 +1948,141 @@ async function runDiff() {
   } catch (e) {
     $("diff-out").innerHTML = "";
     diffError(`cannot diff ${path}: ${e.message || e}`);
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Session review
+//
+// What *this task* changed, as opposed to the diff pane, which diffs whatever text a person pastes
+// against whatever path they type. The list comes from the session's own transcript — the daemon
+// replays the write and patch calls and diffs each against the file as it is now — so a shell
+// command's effect, which the transcript does not record, is named rather than silently missing.
+
+function reviewError(msg) {
+  const host = $("review-error");
+  if (host) host.textContent = msg || "";
+}
+
+function renderReview(body) {
+  const out = $("review-out");
+  out.innerHTML = "";
+  // The route answers with one object per file, not a wrapper: `{path, edits, unapplied, diff}`.
+  // `unapplied` is the list of patch anchors that could not be replayed, carried on the file they
+  // belong to — a patch that failed to land is the edit most worth seeing, so it stays with the file.
+  const files = Array.isArray(body) ? body : [];
+  const count = $("review-count");
+  const unapplied = files.reduce((n, f) => n + ((f.unapplied || []).length), 0);
+  if (count) count.textContent = files.length ? ` ${files.length}` : "";
+  if (files.length === 0) {
+    const p = document.createElement("div");
+    p.className = "empty";
+    p.textContent = "This task has not written or patched a file.";
+    out.appendChild(p);
+    return;
+  }
+  for (const file of files) out.appendChild(renderReviewedFile(file));
+  if (unapplied) {
+    const note = document.createElement("div");
+    note.className = "runapplied";
+    note.textContent = `${unapplied} patch${unapplied === 1 ? "" : "es"} could not be replayed — shown on the file`;
+    out.appendChild(note);
+  }
+}
+
+function renderReviewedFile(file) {
+  const details = document.createElement("details");
+  details.className = "rfile";
+  details.open = true;
+  const summary = document.createElement("summary");
+  const path = document.createElement("span");
+  path.className = "rpath";
+  path.textContent = file.path || "";
+  const count = document.createElement("span");
+  count.className = "rcount";
+  const lines = file.diff || [];
+  const added = lines.filter((l) => typeof l.Added === "string").length;
+  const removed = lines.filter((l) => typeof l.Removed === "string").length;
+  count.textContent = file.binary ? "binary" : `+${added} −${removed}`;
+  summary.appendChild(path);
+  summary.appendChild(count);
+  details.appendChild(summary);
+  if (file.binary) {
+    const p = document.createElement("div");
+    p.className = "empty";
+    p.textContent = "binary — not shown as text";
+    details.appendChild(p);
+    return details;
+  }
+  if (!lines.length) {
+    const p = document.createElement("div");
+    p.className = "empty";
+    p.textContent = "matches the file on disk";
+    details.appendChild(p);
+    return details;
+  }
+  for (const line of lines) {
+    const el = document.createElement("div");
+    let mark = " ", cls = "ctx", text = "";
+    if (typeof line.Added === "string") { mark = "+"; cls = "add"; text = line.Added; }
+    else if (typeof line.Removed === "string") { mark = "-"; cls = "del"; text = line.Removed; }
+    else if (typeof line.Context === "string") { text = line.Context; }
+    el.className = `dline ${cls}`;
+    const m = document.createElement("span");
+    m.className = "mark";
+    m.textContent = mark;
+    el.appendChild(m);
+    el.appendChild(document.createTextNode(text));
+    details.appendChild(el);
+  }
+  return details;
+}
+
+async function runReview() {
+  if (!sessionId) { reviewError("open a task first"); return; }
+  reviewError("");
+  const note = $("review-note");
+  if (note) note.textContent = "reading the transcript…";
+  try {
+    const res = await apiFetch(`${API}/v1/sessions/${sessionId}/review`);
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error || `${res.status}`);
+    renderReview(body);
+    if (note) note.textContent = "files this task's agent wrote or patched";
+  } catch (e) {
+    $("review-out").innerHTML = "";
+    if (note) note.textContent = "";
+    reviewError(`cannot review: ${e.message || e}`);
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Plan / act
+//
+// Two ways to send a prompt. "act" is what the daemon does by default: the agent may edit. "plan"
+// asks for `read_only`, which the approval policy answers by refusing every write — so the agent
+// can look and report, and nothing on disk moves. The choice is remembered per task, because a
+// plan that silently becomes an edit on the next send is worse than no toggle at all.
+
+const MODE_KEY = "hx.mode";
+const modeOf = (id) => {
+  try {
+    const all = JSON.parse(localStorage.getItem(MODE_KEY) || "{}");
+    return all[id] === "plan" ? "plan" : "act";
+  } catch (_) { return "act"; }
+};
+const setMode = (id, mode) => {
+  let all = {};
+  try { all = JSON.parse(localStorage.getItem(MODE_KEY) || "{}"); } catch (_) {}
+  if (mode === "plan") all[id] = "plan";
+  else delete all[id];
+  try { localStorage.setItem(MODE_KEY, JSON.stringify(all)); } catch (_) {}
+  paintMode();
+};
+function paintMode() {
+  const mode = sessionId ? modeOf(sessionId) : "act";
+  for (const btn of document.querySelectorAll(".mode button[data-mode]")) {
+    btn.classList.toggle("active", btn.dataset.mode === mode);
   }
 }
 
@@ -2541,6 +2731,12 @@ $("prov-clear").addEventListener("click", clearProviderForm);
 // ---- diff/review wiring ---------------------------------------------------------------------
 
 $("diff-run").addEventListener("click", runDiff);
+$("review-run").addEventListener("click", runReview);
+// The mode is per task and remembered, so switching tasks (openSession) repaints it. Clicking here
+// only records the choice; the next send is what acts on it.
+for (const btn of document.querySelectorAll(".mode button[data-mode]")) {
+  btn.addEventListener("click", () => { if (sessionId) setMode(sessionId, btn.dataset.mode); });
+}
 $("diff-path").addEventListener("keydown", (e) => {
   if (e.key === "Enter") runDiff();
 });

@@ -501,3 +501,109 @@ async fn the_fanout_pane_posts_children_to_the_fanout_route_and_reads_the_outcom
         "the pane must read the outcome's Ran/Errored halves rather than a field nobody sends"
     );
 }
+
+/// The review pane's data source: what a session changed, read off its own transcript.
+///
+/// The tempting wrong test is a grep of the served page for the word "review", which passes for a
+/// list typed into the HTML. So this writes a transcript the way a run does — a `write_file` call
+/// and its result, on a real session — writes the file the call names, and asks the route the pane
+/// asks. The diff that comes back has to name the line the transcript added and the line the file
+/// still has. A route that walked the directory, or one that echoed the proposed text without
+/// reading the file, cannot satisfy both.
+#[tokio::test]
+async fn the_review_route_diffs_the_transcripts_edits_against_the_file_now() {
+    use hx_core::ids::ToolCallId;
+    use hx_core::message::{Message, Part, Role};
+
+    let server = harness().await;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("notes.txt");
+    let path = path.display().to_string();
+
+    let session = server
+        .state
+        .store
+        .create(
+            hx_store::NewSession::new()
+                .titled("review")
+                .in_workspace("local"),
+            chrono::Utc::now(),
+        )
+        .expect("a session");
+    let call = Message {
+        role: Role::Assistant,
+        parts: vec![Part::ToolCall {
+            id: ToolCallId::from_raw("tc_review"),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({ "path": path, "content": "kept\nadded by the agent\n" }),
+        }],
+    };
+    server
+        .state
+        .store
+        .append(&session.id, &call, chrono::Utc::now())
+        .expect("the call is recorded");
+    let result = Message::tool_result(ToolCallId::from_raw("tc_review"), true, "wrote");
+    server
+        .state
+        .store
+        .append(&session.id, &result, chrono::Utc::now())
+        .expect("the result is recorded");
+
+    let client = reqwest::Client::new();
+    let put = client
+        .put(format!("http://{}/v1/hosts/local/file", server.addr))
+        .json(&serde_json::json!({ "path": path, "contents": "kept\n" }))
+        .send()
+        .await
+        .expect("a response");
+    assert_eq!(put.status(), reqwest::StatusCode::OK, "the file is written");
+
+    let res = client
+        .get(format!(
+            "http://{}/v1/sessions/{}/review",
+            server.addr, session.id
+        ))
+        .send()
+        .await
+        .expect("a response");
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = res.json().await.expect("json");
+
+    // One object per file: `{path, edits, unapplied, diff}`. Not a wrapper — a wrapper would be a
+    // second shape for a list that already carries everything a file has to say about itself.
+    let files = body.as_array().expect("the review is a list of files");
+    assert_eq!(files.len(), 1, "one call, one file: {body}");
+    assert_eq!(files[0]["path"], path, "{body}");
+    assert_eq!(files[0]["edits"], 1, "{body}");
+    assert!(
+        files[0]["unapplied"].as_array().unwrap().is_empty(),
+        "the write applied cleanly: {body}"
+    );
+    let diff = files[0]["diff"].as_array().expect("a diff");
+    assert!(
+        diff.iter().any(|l| l["Added"] == "added by the agent"),
+        "the line the transcript added is named: {body}"
+    );
+    assert!(
+        diff.iter().any(|l| l["Context"] == "kept"),
+        "the line the file already had stays context: {body}"
+    );
+
+    let page = client
+        .get(format!("http://{}/", server.addr))
+        .send()
+        .await
+        .expect("a response")
+        .text()
+        .await
+        .expect("a body");
+    assert!(
+        page.contains("/review"),
+        "the pane must read the review from the daemon, not invent it"
+    );
+    assert!(
+        page.contains("data-mode=\"plan\""),
+        "the composer must offer the read-only mode"
+    );
+}

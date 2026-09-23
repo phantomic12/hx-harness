@@ -55,7 +55,8 @@ async fn harness() -> Arc<AppState> {
         router: Arc::clone(&router),
         providers: Arc::new(RwLock::new(hx_provider::ProviderRegistry::new())),
         provider_configs: Default::default(),
-        config_path: None,        secrets: Arc::new(hx_secrets::SecretStores::new()),
+        config_path: None,
+        secrets: Arc::new(hx_secrets::SecretStores::new()),
         store,
         models: Arc::new(RwLock::new(Arc::new(hx_server::chat::RouterModels::new(
             router,
@@ -243,6 +244,12 @@ async fn every_other_public_endpoint_is_mounted() {
             "POST",
             "/v1/approvals/no-such-approval",
             Some(r#"{"option":"deny","ceiling":"read"}"#),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "GET",
+            "/v1/sessions/no-such-session/review",
+            None,
             StatusCode::NOT_FOUND,
         ),
     ];

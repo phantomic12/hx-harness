@@ -22,6 +22,7 @@ pub mod fanout;
 pub mod hosts;
 pub mod phone;
 pub mod remote_sandbox;
+pub mod review;
 pub mod routes;
 pub mod sandbox;
 pub mod spawn;
