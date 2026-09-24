@@ -207,7 +207,7 @@ jobs:
       # identity of THIS workflow run (`id-token: write`), so no private key or secret
       # is involved.
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3.8.2
+        uses: sigstore/cosign-installer@v4.1.2
 
       - name: Sign artifacts (Sigstore keyless)
         shell: bash
@@ -250,7 +250,7 @@ jobs:
       # present and SHA256SUMS.sig in dist/, verify-release.sh requires the
       # install log to show the signature verification running.
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3.8.2
+        uses: sigstore/cosign-installer@v4.1.2
 
       - uses: actions/download-artifact@v8
         with:
