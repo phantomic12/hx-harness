@@ -198,11 +198,326 @@ Three findings are recorded here because each looks like a broken transport and 
 - **The daemon pins host keys against its own file**, not `~/.ssh/known_hosts`, so reaching a real
   sshd requires seeding `<data_dir>/known_hosts` — `ssh-keyscan` into it, as an operator would.
 
+**A terminal inside a sandbox, end to end** (`crates/hx-sandbox/tests/docker_live.rs`,
+`crates/hx-server/tests/terminal_sandbox_live.rs`)
+
+Against a real Docker daemon, with the image provided by `HX_DOCKER_TEST_IMAGE` (the tests never pull:
+a missing image fails rather than hanging on a network). The engine-level suite drives the session API
+directly; the server suite is the one that matters, because it goes through every layer — the HTTP
+route, the adapter, the engine attach, the pty inside the container, the pump, the broadcast and the
+WebSocket:
+
+| What ran | Observed |
+|---|---|
+| **A shell inside a container is typed into** | `echo hx-pty-echo-9f3c` came back with the marker **twice** — the pty's echo and the shell's own output. Asserting on one occurrence would pass against a session that echoes and executes nothing |
+| Resizing reaches the pty | `stty size` reported `33 101` at open and `47 137` after a resize: the client's frame, the manager, the engine's `exec resize` and the pty itself, not a field on this side |
+| An interactive session is not a way out | L2: `id -u` is `1000`, the read-only root refuses a `touch /`, and `/workspace` stays writable. A shell is the same unprivileged user with a prompt |
+| Closing ends it | The engine's attach stream **cannot be half-closed** (`tokio::io::split` shares the socket, so dropping the write half closes nothing — measured: the session stayed alive and `read()` never returned), so `close()` sends EOT, which the pty's line discipline turns into end-of-input and the shell exits on |
+| **Through the daemon** | `POST /v1/terminals {"sandbox": …}` → WebSocket → typed `echo hx-inbox-4b71` arrives twice, `pwd` is `/workspace`. Driven in a real browser too: the pane read `in sbx_…`, `hostname` printed the container's id, and the terminal label turned amber |
+| **A box that goes away takes its shells with it** | `DELETE /v1/sandboxes/{id}` on an attached session sends the client `exited` and deregisters the terminal. Found by running it, not by reasoning: the first version left the pane attached over a container that no longer existed, because the engine does not end the exec's stream when the container is removed |
+| A backend with no way to attach | `409` naming the limit, from a runtime that creates and execs but cannot carry a byte stream — never a client waiting on a terminal that will never speak |
+| `host` and `sandbox` together | `400`, before the host capability gate: refusing one of two targets on behalf of a caller who has not said which they meant is not an answer |
+
 One defect was found by running the live suite rather than the unit tests, and it is the reason that
 suite exists: `Terminal::write` is synchronous and ran the remote session's future with
 `block_in_place` + `block_on`, which **deadlocks** from inside the WebSocket task — the SSH write
 needs the connection's own task to progress. It failed 6 of 8 runs. Fixed with async twins
 (`write_async`/`resize_async`) that await instead.
+
+**A live screen** (`crates/hx-browser/tests/screen_live.rs`, `crates/hx-server/tests/screen_api.rs`)
+
+The screen is a browser the daemon runs and streams: JPEG frames down a WebSocket, mouse, wheel and
+keys back up. Every claim in this section was measured against a real Chrome on the host, and the
+input half is measured *by the page it drives* — a click that the browser ignored produces no request,
+and the tests wait for one:
+
+| What ran | Observed |
+|---|---|
+| `POST /v1/screens` | Launches and lists: `{"created":true,"screen":{"id":"probe","pid":46528,"url":"http://127.0.0.1:7721/","width":1024,"height":768}}` |
+| Frames | The bytes are a JPEG passed through untouched (SOI `ff d8 ff`, EOI `ff d9`, ~100 KB of a real page), with the frame's **own** dimensions — `800x600` for a request of `800x600`, which only holds because the driver overrides the viewport metrics rather than trusting `--window-size` (`--window-size=800,600` under `--headless=new` renders `782x504`) |
+| A click a watcher dispatches | The page's own `onclick` ran: the test's stub records the `GET /clicked` that only the page could have issued. Clicking in the **browser pane** end to end (the daemon's web client, a `data:` page that turns red on click): corner pixel `[255,255,255]` before, `[250,3,0]` after |
+| Typing | `keyDown` with `text` inserts a character and `Input.insertText` appends at the caret (`?q=h` then `?q=hi`); `Ctrl+A` arrives with `ctrlKey` true (`/key?ctrl=true`) rather than as a plain letter, which is what the modifier mask is for |
+| A navigation | `Page.frameNavigated` reaches the client as `{"type":"navigated","url":…}` and the address bar and the pane's caption follow it |
+| No browser on the host | `503` naming every path searched and the config key that would fix it: `no Chromium-class browser was found (looked for ["/usr/lib/chromium/chromium", …]); name one with the screen.browser config key`. 503 rather than 502 because that is a fact about the host, not a failure of the request |
+| An id that would escape the profile root | `400` for `../../escape`, `..`, `.`, `a/b` and `""`: the id names the browser profile directory, so it cannot be a path. Nothing is registered |
+| A screen that does not exist | `404` **before** the upgrade, and `DELETE` on one is `404` too — a socket to a screen that was never there must not look connected |
+| Closing | `DELETE` returns 200, `GET /v1/screens` is `[]`, and **zero** `chrome.exe` processes remain (checked by command line, not by image name) |
+| `scripts/check_web_client.py` against a live daemon | All seven of the pane's own checks pass: `POST /v1/screens`, the listing, a JPEG frame at the requested `800x600`, a click and a key that leave the screen live, `DELETE`, and `GET /v1/screens` back to `[]`. The script reads `HX_WEB_CHECK_HOST`/`HX_WEB_CHECK_PORT` because the address it defaults to is a *convention* — a machine where `8899` is already taken (a colleague's daemon, another walk of this harness on `7721`) made it unrunnable, and a check that cannot be pointed at the daemon you are running is a check nobody runs |
+| The daemon's own log | Two lines per screen, and neither is decoration: `launched a browser to watch screen=… url=… viewport=… profile=…`, where the profile is printed as an **absolute** path resolved the same way the browser resolves it (a relative `profile_root` is resolved against the daemon's working directory, which no one reading a log can see), and `closed the screen and took its browser with it`, emitted *after* the wait for the browser so the line is true when it appears |
+
+**Three defects were found by running this rather than by reading it**, and each one is now a
+test:
+
+1. **A relative `screen.profile_root` made every screen refuse to start**, with a message that named
+the one thing that was not wrong (`did not write DevToolsActivePort within 20.0s`). Chrome treats a
+*relative* `--user-data-dir` as the default profile and refuses remote debugging outright
+(`DevTools remote debugging requires a non-default data directory`), and the driver was nulling the
+browser's stderr, so the only sentence that explained it was thrown away. The path is now resolved to
+absolute before the browser sees it (`a_relative_profile_directory_still_starts_a_browser`), and the
+browser's stderr is kept — bounded to 2 KiB and drained continuously so a long-lived browser cannot
+fill a pipe — and quoted in the failure: `… within 20.0s; the browser said: …`.
+2. **Keyboard input was dropped whenever the browser did not hold the operating system's focus.**
+Found as an intermittent test failure under load (1 of 9, then 3 of 6 runs), not as an obvious bug:
+a target created over CDP is attached but never *activated*, and Chromium routes keyboard input to the
+active frame — so a watcher's typing reached the page only by luck. Clicks were unaffected because
+they are dispatched at coordinates, which is exactly the asymmetry the failures showed. Fixed with
+`Target.activateTarget` + `Page.bringToFront` after the navigation and `Emulation.setFocusEmulationEnabled`,
+after which 10 consecutive full runs were green at ~1.2s each.
+3. **A refused setup call was silently swallowed.** Every setup request was `let _ = …`, so a screen
+that lost a capability (a rejected emulation call, say) looked exactly like a page with nothing to say.
+A setup step that does not work is a screen that failed; the calls are propagated now.
+
+The tests also gained a precondition rather than a sleep: the page announces itself (`fetch('/ready')`)
+before any test clicks at a coordinate, because "a frame arrived" only says the browser painted
+*something*, and an empty document paints too.
+
+**Not covered by any run**, and stated so it is not mistaken for covered: a screen is **not** behind
+the ladder's admission (a page can navigate and fetch anywhere the daemon's machine can reach — see
+`crates/hx-browser/src/screen.rs`), the browser is **not** confined to a sandbox (it runs on the daemon
+host; a box's own pixels need a browser inside the box and a way to reach its port, neither of which
+exists yet), and no run watches a screen for longer than a test's lifetime, so the frame throttle
+(`SCREEN_FRAME_BUFFER`, 2) is asserted by construction rather than by a soak.
+
+**A person at the last rung** (`crates/hx-server/src/pane.rs`, `crates/hx-server/tests/challenge_api.rs`)
+
+`hx-browser`'s ladder ends with a person: the plain rung is refused, the browser rung is refused, and the
+wall is handed to a `HumanPane`. Until now the only implementation of that trait was `NoPane` — the pane
+that is not there — so the contract was real and the loop was open. It is closed here, and it is driven
+end to end over HTTP against a stub that refuses and a **real browser**:
+
+| What ran | Observed |
+|---|---|
+| A stub answering `403` to everything, through a pool built with `with_pane` | `769ms over 3 attempts: http -> chromium -> interactive-cdp`, measured rung by rung: `1ms http -> the http rung was refused: the site answered HTTP 403`; `523ms chromium -> the interactive rung was refused: the site answered HTTP 403` (a real browser launched and read the stub's refusal); `244ms interactive-cdp -> the interactive rung stopped: screen-pane cleared the challenge; the session's profile is now unblocked, so re-run the ladder in this session`. The same run on a host with no browser at the rung's old hardcoded path instead read `1ms chromium -> the interactive rung is unavailable: /usr/lib/chromium/chromium is not installed` — a capability gap rather than a wall, which is what the shared search below removes |
+| The person's view | `GET /v1/challenges` lists it while the fetch waits: `{id, screen, session, url, reason, seconds_left}` — the site in **redacted** form, the session that is blocked, why the automated rungs gave up, and the budget the rung enforces counting down |
+| Answering | `POST /v1/challenges/{id} {"outcome":"solved"}` → `200 {"answered":true}`, and the fetch is told what happened |
+| A second click | `409` — *the challenge is over*, which is a different fact from `404` *no such challenge*, and a person who clicked a second too late is owed the first |
+| The browser | Gone before the rung is told anything: `GET /v1/screens` is `[]` after the answer, because the pane waits for the process rather than reporting an outcome over a renderer that is still exiting |
+| No pane at all | The same ladder without `with_pane` still carries the rung and fails closed: `stop_reason` names it, `no human pane is attached, so the interactive rung fails closed rather than waiting for a person who will never arrive`, and no browser is launched |
+| The web client, in a real browser | The banner over the screen pane read `browser_final is blocked on http://example.test/verify` · `90s left` · the reason, with the rail and drawer `screen` tabs marked. `it is cleared` posted `{"outcome":"solved"}` and hid it; `give up` with an empty note showed the daemon's own refusal verbatim and **kept the banner up** (so the person can supply the reason the daemon asked for); `give up` with a note posted it |
+| `scripts/check_web_client.py` against a live daemon | Six checks pass on any host, no browser needed: the listing is a listing, an unknown id is a `404`, a reasonless decline is a `400` (not the `404` that would hide the real mistake), and the served page carries the banner's markup |
+
+**Cancellation is the property the contract names as the one a pane gets wrong**, so it is measured
+rather than argued, at both levels:
+
+- `pane::tests::a_dropped_wait_withdraws_the_challenge_and_hands_the_screen_back` drops `present`'s
+future — which is exactly what the rung's budget does — and asserts the challenge is gone and the screen
+was handed back **synchronously**.
+- `a_challenge_nobody_answers_leaves_no_browser_and_no_question_behind` drives it for real: a 1.2s budget
+through the daemon's own pane, and afterwards the fetch reports `nobody answered within 1.2s, so the
+challenge was abandoned`, `GET /v1/screens` is `[]`, `GET /v1/challenges` is `[]`, and **zero `chrome.exe`
+processes remain** (checked by process, after the run). A person arriving late to the id they were shown
+gets `409`, not `404`.
+
+That synchronous path is the design, not a shortcut. `Drop` cannot await, and the obvious alternative —
+taking a runtime handle and spawning the close — panics on a runtime that is shutting down, which is
+precisely when a daemon tears a fetch down. The browser dies instead because dropping the last handle to a
+screen kills its child, so `Screens::forget` — the sync half of `remove` — is the whole job.
+
+**Four defects were found by running this rather than by reading it**, and each one is now a test:
+
+1. **A second click on an answered challenge reported "no such challenge"** — a lie, and one that sends
+a person looking for a mistake they did not make. The registry now remembers finished challenges (bounded
+at 64) so *too late* and *never existed* are different answers, which is what makes the route's `409`
+reachable at all rather than a race nobody can hit.
+2. **The pane reconnected forever to a screen the daemon did not have.** A closed screen is not a failed
+attachment — that is what reconnecting is for — but the browser's `WebSocket` API does not expose the
+`404`, so the pane retried with a backoff for as long as the tab was open. It now asks the daemon, and
+distinguishes carefully: a *successful* listing without the id ends the attempt with `screen closed: the daemon
+no longer has it`, while a listing that **fails** keeps retrying, because an unreachable daemon is the case
+recovery exists for. Measured both ways: one socket opened against a missing screen, ten in four seconds
+against a daemon that was down.
+3. **The caption kept a stale claim while reconnecting.** With the fix above, the pane could be quietly
+retrying to `hx-screen` while the caption still said the previous screen was gone. It now says
+`reconnecting to hx-screen…`, because a caption is a statement about now.
+4. **The contract's own refusal message had gone stale.** A `Solved` outcome ended the rung saying
+`no CDP driver is wired yet`, which stopped being true when the screen landed — the pane it just used *is*
+the driver. The reason and the module docs now say what the rung actually did: it presents the wall and
+takes an answer, and reading the cleared page is the ladder's job on a re-run.
+
+**The browser the ladder drives is the browser the screen finds** (`crates/hx-browser/src/browser.rs`)
+
+Until this change the run above reached the person through the Chromium rung's **capability gap**:
+`hx-search`'s `browser_available()` and `ChromiumRung` each spelled `/usr/lib/chromium/chromium`, while the
+screen searched the platform's real places. On a host whose browser is elsewhere — this one, where it is
+Chrome under `Program Files` — the daemon could open a screen on a real page and still never *select* a
+browser rung, so the chromium attempt above was `1ms … /usr/lib/chromium/chromium is not installed` rather
+than a browser reading a wall. One search now lives in one place and answers for all three askers —
+`ChromiumRung`, `hx_browser::screen`, `hx_search::browser_available` — so a fetch and a screen on one host
+cannot disagree. Measured after the change, on the same host:
+
+| What ran | Observed |
+|---|---|
+| The same refusing stub, rung by rung | `523ms chromium -> the interactive rung was refused: the site answered HTTP 403`: a real browser launched, read the stub's `403` and refused it, and the person was asked *because of the wall* rather than because nothing was installed |
+| `POST /v1/research`, `fetch_mode: browser` | `200 {"fetcher":"browser","fetch_note":"browser: explicit opt-in, driving Chromium for every page"}` — this was the `503` naming `/usr/lib/chromium/chromium` |
+| `POST /v1/research`, `fetch_mode: auto` | `200 {"fetcher":"browser","fetch_note":"auto: browser available, escalating plain-HTTP-then-Chromium"}` — this was `"auto: no browser on this host, degraded to plain fetch (honest default)"` |
+| `POST /v1/research`, `fetch_mode: http` | Unchanged: `200 {"fetcher":"http"}` — a host finding its browser must not make a plain fetch launch one |
+| `crates/hx-search/tests/browser_rung_canary.rs` (ignored), now running on this host | `browser_rung_canary: driving C:\Program Files\Google\Chrome\Application\chrome.exe`, `selection: auto=Browser, browser=Browser`, and the browser path's citation contains the token the page's own script inserts (`JS_RENDERED_CANARY_…`) while the plain path's does not. It used to skip here, keyed on the Linux path |
+| `hx.example.yaml` / `examples/dogfood.yaml` comments | The `screen.browser` key and the usual-places search are now described as one search, since that is what they are |
+
+Two things are deliberately *not* the same as before, and both are honest rather than merely narrower.
+The rung resolves the binary **when the fetch runs**, not when it is built, because whether a host has a
+browser is a fact about the host and a ladder has to be buildable anywhere — so `BrowserFetcher::new`
+succeeds on a machine with no browser and only the *fetch* refuses, naming every path searched. And the
+`Browser`-mode refusal is the search's own message rather than a second, thinner one about a binary this
+crate never went looking for.
+
+**A wall *through* the research route, with the fetch path configured** (`crates/hx-core/src/config.rs`'s
+`fetch:` section, `hx_search::FetchPolicy`, `crates/hx-server/tests/research_api.rs`)
+
+The join above was the one thing that could not be driven, and two config keys were what it was missing:
+`fetch.admission` says who a target may be and `fetch.browser` names the binary to drive. Both become one
+`FetchPolicy` in one place — `FetchPolicy::from_config`, the single mapping between `hx-core`'s vocabulary
+and `hx-browser`'s, because the config model cannot depend on the fetcher crate (the dependency runs the
+other way) and a second mapping anywhere else would be a second answer to *"may this fetch reach
+loopback"*.
+
+| What ran | Observed |
+|---|---|
+| `POST /v1/research {"fetch_mode":"auto"}` at a loopback stub that answers `403` to everything, with `fetch.admission: allow_local` and `fetch.browser` naming this host's Chrome | The climb is http → chromium → interactive-cdp, a challenge appears at `GET /v1/challenges` carrying the stub's URL, the blocked session (`browser_…`) and the reason, and the stub was reached **twice** (plain rung, then browser) — the person is asked because the *site* refused both rungs, not because one could not run |
+| The person's answer, `POST /v1/challenges/{id} {"outcome":"solved"}` | `200 {"answered":true}`, and the research POST then returns `200 {"fetcher":"browser"}` with the source cited and an **empty** snippet — the run ended at the person, so the page itself was never read. Afterwards `GET /v1/challenges` and `GET /v1/screens` are both `[]` |
+| The same route at a wall that refuses anything whose user agent is not Chrome's | The citation's snippet carries the page's sentinel — text only a real browser is served — and the wall was *asked* twice. This is the assertion that the config key reached the rung: a policy that stopped at the selector would leave one request and an empty snippet |
+| The **default** policy, same stub, `fetch_mode: browser` | Unchanged and still a refusal: the loopback page is refused before any socket (`0` connections at the stub), the citation is empty, and **no challenge is opened** — a person is never asked to solve hx's own policy |
+| A policy naming a binary that is not there | The gate becomes the path itself rather than the host's search, so a named-but-missing browser is refused with that path in the message, and the rung built from the policy is the one that tries *that* binary (`hx-search`'s own tests, no host needed) |
+| The same walk against a **real daemon** (`hxd` with a `fetch:` section, a SearXNG-shaped stub, plain `curl` over real HTTP) | A challenge appeared **1s** into the run — `chal-0`, session `browser_f8232989ba863d69`, url `http://127.0.0.1:8873/wall`, `seconds_left: 29` — with **11 `chrome.exe` processes** alive while it waited (the browser rung's child plus the pane's screen); `POST /v1/challenges/chal-0 {"outcome":"solved"}` → `200 {"answered":true}`; the research POST returned `200`, `"fetcher":"browser", "fetch_note":"auto: browser available, escalating plain-HTTP-then-Chromium"`, the source cited with an empty snippet; afterwards `GET /v1/challenges` and `GET /v1/screens` are both `[]` and **zero** `chrome.exe` remain. The stub's own log is the climb by user agent: `/search … Chrome/131` (the backend), `/wall ua=hx-browser/0.0.1` (the plain rung), `/wall ua=… HeadlessChrome/153…` (the browser rung — the binary `fetch.browser` named), then the same pair again for the pane's screen |
+| The same daemon with `fetch.admission: public_internet`, same stub, same request | The stub was asked for `/search` and **never for `/wall`**: the refusal is hx's own policy rather than the site's, the citation is empty, and `GET /v1/challenges` is `[]` — nobody is asked to clear a target admission refused |
+
+One defect came out of running this, and it was not in the new keys. **A waiting person lost to the
+fetcher's own clock:** `BrowserFetcher::fetch` bounds the whole climb with `DEFAULT_FETCH_TIMEOUT` (10s),
+which is *shorter* than any sane `challenge_budget_secs` — so the promise the screen section makes ("a
+refused page opens a screen on this machine and waits" that long) was broken by a timeout ten seconds in,
+and the report blamed the fetch instead of saying a person was still deciding. `with_pane` now widens the
+bound to clear the budget plus `PANE_TIMEOUT_GRACE` (30s, the rungs' own work either side of the wait);
+the arithmetic is asserted in `hx-search` and the behaviour is exercised by the route test above.
+
+One more defect came out of driving a real daemon, and it was one layer down from the first timeout:
+**the ladder's own per-rung deadline cut the person off at 20s.** `with_pane` widened the fetcher's outer
+bound (above), but the ladder *inside* the pool still ended every rung at `hx-browser`'s
+`DEFAULT_RUNG_TIMEOUT` (20s) — so a person with a 90s budget was withdrawn at 20s and the report blamed
+the rung. Measured before/after on a live daemon: a challenge handed at 03:07:36 was withdrawn at
+03:07:56 (20s, the ladder's clock); after the fix, handed 03:08:39, withdrawn 03:10:09 (89.8s — the
+budget). `build_pool` now widens the ladder's deadline to clear the budget by the same grace, only when a
+person is attached; the machine rungs keep the machine deadline. Asserted as arithmetic in `hx-search`
+(`the_ladders_own_deadline_clears_a_persons_budget_but_not_the_machine_rungs`) — and the unit test
+`a_token_against_an_id_that_is_not_waiting_is_answered_not_hung_on` pins a **deadlock** an integration
+test found on the way: the token check must not hold the registry lock while calling into the registry,
+which is exactly what a request naming an id *with* a token reached.
+
+**Addressed to a person, and they are told** (`crates/hx-server/src/challenge_notice.rs`,
+`crates/hx-server/tests/challenge_api.rs`)
+
+A challenge is a question for one person, so it is now *delivered* rather than put on a noticeboard. The
+daemon names the operator (`screen.operator`, falling back to `api.admin_username`), pushes a
+notification to `approval.push_url` — the same webhook approvals and completions use, with its own
+`kind` (`challenge` / `challenge_resolved`) — and the listing carries who it is for and whether anyone
+was told. The notification carries a **one-time token** (a `NoticeToken`, redacted in logs exactly as
+the phone's respond token is): `POST /v1/challenges/{id}?token=…` answers that one challenge without the
+daemon's bearer token, and a wrong token is a `403` that leaves the question open.
+
+| What ran | Observed |
+|---|---|
+| A stub answering `403`, through a daemon with `api.token`, `screen.operator: yoav` and `approval.push_url` pointed at a loopback relay | The relay received `{"kind":"challenge","id":"chal-0",…,"operator":"yoav","page_url":"http://127.0.0.1:8901/#screen=chal-0","respond_url":"…/v1/challenges/chal-0?token=…"}` within a second of the wall being reached |
+| The listing | `"operator":"yoav","notified":true` — who it is for, and that a push really went out |
+| The answer, exactly as a relay would send it | `POST {respond_url} {"outcome":"solved"}` with **no** `Authorization` header → `200 {"answered":true}`; the relay then received `{"kind":"challenge_resolved",…,"outcome":"solved"}` |
+| No credential at all | The listing is a `401`, and so is an answer — the token is the way in, not an open door beside the bearer |
+| A token that is not this challenge's | `403` naming the mistake, and the challenge **still waiting** for the person who was asked |
+| The banner, in a real browser | `browser_f823… is blocked on http://127.0.0.1:8873/wall · 31s left · for yoav — told on their own channel`, with the reason and the action row |
+| The notification's `page_url` deep link | `#screen=chal-6` opened the screen pane, attached to the live challenge screen and drew the wall's frames; the banner showed over it |
+| The resolution, when nobody answers | The relay received `challenge_resolved … withdrawn` — a person told to hurry is told when they can stop, on every path including the `Drop` one |
+
+`an_addressed_challenge_is_announced_to_the_operator_and_its_token_answers_it` drives the whole loop in
+`challenge_api.rs` — real browser, real relay, token-only answer, wrong-token refusal, bearer-gated
+everything else. `scripts/check_web_client.py` gained checks for the `challenge-for` line and the deep
+link handler in the served page.
+
+**Several operators, each on their own channel** (`screen.operators`,
+`crates/hx-server/tests/challenge_api.rs`)
+
+One shared webhook is the noticeboard the addressing work was meant to end, and it is also unusable
+once a second person is responsible for a daemon: every question reaches every operator, and the name
+on it says nothing about whose run is blocked. `screen.operators` is a list of `{name, push_url}`, and
+the daemon **rotates** through it — each challenge goes to the next name in order, wrapping at the end
+— pushed to *only* that person's webhook, with the resolution taking the same route back.
+
+The interesting assertion is the one that is not made: what the **other** relay received. A test that
+stood up a single relay could not tell a routed push from a broadcast one, because both arrive. So this
+test stands up two, points the config at both, points `approval.push_url` at a third address that must
+never be used, and then checks that the second relay received nothing at all.
+
+| What ran | Observed |
+|---|---|
+| A daemon configured with `screen.operators: [yoav, dana]`, each on its own loopback relay, `approval.push_url` set to a third, unroutable address; a stub answering `403`; a live browser | yoav's relay received `{"kind":"challenge",…,"operator":"yoav",…}`; **dana's relay received nothing** — the push is routed, not broadcast, and the roster did not merge with the single-operator keys |
+| The listing | `"operator":"yoav","notified":true` — the same name the notification carried, and `notified` is about *that person* rather than about the daemon |
+| The answer, from the notification's own one-time URL | `POST {respond_url} {"outcome":"solved"}` with no `Authorization` → `200`; the fetch reports `screen-pane cleared the challenge` |
+| The resolution | Back to **yoav's** relay (`{"kind":"challenge_resolved",…,"operator":"yoav","outcome":"solved"}`) and to nobody else — the person told to hurry is the person who learns they can stop, and the other operator's phone is not woken about a run they were never asked about |
+| Both relays' total contents at the end | yoav `[challenge, challenge_resolved]`, dana `[]`. Exactly the two pushes about this run, and no third to the address `approval.push_url` names |
+
+The rotation itself is pinned as arithmetic in the pane, where it can be observed without a browser
+(`crates/hx-server/src/pane.rs`):
+
+| What ran | Observed |
+|---|---|
+| Three challenges against a roster of `[yoav, dana, sam]` | `yoav`, `dana`, `sam` — the config's order, one question each |
+| Five challenges against a roster of two | `yoav, dana, yoav, dana, yoav` — it wraps rather than running out of people to ask, which is the failure the rotation exists to prevent |
+| Two challenges against a default daemon | `admin`, `admin` — a daemon that names one operator gets no rotation it did not ask for, and the roster is still never empty |
+| A roster of `[yoav (with a webhook), dana (without one)]` | `notified: true` then `notified: false` from the same daemon and the same notifier. A daemon-level flag would have told dana her run was ringing somebody else |
+| A roster with a repeated name, a blank name, and a blank `push_url` | The repeated name keeps the first channel and the table holds two people; a blank name is dropped; nobody-with-a-channel reports as unreachable rather than as reachable |
+
+**Still not covered by any run:** the pane itself — *watching* a screen — stays first-come, so a
+second operator who opens the daemon's page can clear a wall addressed to the first; the routing is for
+the notification, not for the keystrokes. There is also no chat-connector path for the notice — the
+Telegram mirror answers *approvals*, not challenges — and nothing weights the rotation by who asked or
+which session the run came from, because the daemon has no fact to weight it by. And `allow_local` is exercised here against a loopback stub, not against the deployment it
+is written for: a private host or a metadata endpoint on a real network. The policy is the same code
+either way, but no run in this repository configures it against one.
+
+**A box that boots something** (`crates/hx-sandbox/tests/docker_live.rs`, `crates/hx-server/src/runtime.rs`)
+
+`sandbox_profiles.<name>.command` turns a box from a place to run commands into an environment with a
+process of its own. Against a real daemon (127.0.0.1:7721, `examples/dogfood.yaml`, `debian:latest`):
+
+| What ran | Observed |
+|---|---|
+| A profile with a command, through `POST /v1/sandboxes` | The engine's own view from the host: `/sbin/docker-init -- sh -c printf … ; exec sleep 3600` and `sleep 3600`, and from inside, `/proc/1/cmdline` is the profile's argv. A runtime that accepted the key and started `sleep infinity` anyway would look identical from every other angle |
+| The command really ran, before anything connected | The marker it wrote was in the **host** workspace (`target/hx-boot-ws/booted.txt`) — the box is not waiting for a probe to do something |
+| It is still a box | `id -u` is `1000`, `/workspace` is the only writable place, and an attached shell works *beside* the boot command rather than replacing it |
+| A command that exits at once | **Refused**, naming it: `sandbox profile 'one-shot' boots \`sh -c echo this box is already over\`, which exited within the 500ms it is given to prove it stays up … It has been removed.` `GET /v1/sandboxes` is empty afterwards and the slot is free |
+| The firecracker backend | Refuses a profile with `command` before any work: its guest boots its own init, so there is no place for the argv to go. Booting anyway would be a silent lie |
+| A NUL byte in a command | `command contains a NUL byte, which cannot be passed to a process; send the command without it` — before, it reached `execve` and the engine answered `exec /usr/bin/sh: invalid argument`, naming neither the request nor the byte |
+
+The first of those two defects is the one worth recording: a box whose command dies is reported by the
+engine exactly like a box that is quietly running a server (`create` succeeded, `start` succeeded, the
+container exists), and the only thing that could tell them apart is asking the engine about the
+container's own state. Hence `SandboxRuntime::alive`, whose default answers "cannot tell" — the
+CLI-speaking remote runtime and the microVM backend have no such call, and a backend that cannot
+observe its sandbox must not invent an answer. The grace period before the question is settled is
+`BOOT_GRACE` (500ms), paid only by a spec that boots something: a program that dies 50ms in is
+reported `running` by the first look, so one look is not a check.
+
+Also changed by this work: the remote runtime's command line now shell-quotes the default argv
+(`'sleep' 'infinity'`) exactly as it already quoted an operator's, because the far side is a shell and
+an argv element may contain a space — the two paths must not need different trust.
+
+Not covered by any run: a *long*-lived command that dies after the grace period (a server that crashes
+an hour in) is invisible to the check and the box stays tracked until its TTL; a remote sandbox with a
+`command` has no `alive` at all, so it keeps the old behaviour deliberately.
+
+Those runs are also why the suite's `Cleanup` guard was rewritten. It existed to remove a test's
+container when the test panics — its own doc comment says so, after a failing run left one up for 36
+minutes — but it did its work with `runtime.spawn` on the test's runtime, and `#[tokio::test]` drops
+that runtime the moment the body returns: the removal was scheduled and never polled, so **the guard
+worked only on the paths that never needed it**. Nine orphans from earlier runs were still up. It is
+a thread with its own current-thread runtime now, joined before the drop returns, and the claim is
+measured in both directions: a test that panics after a successful spawn leaves the container count
+unchanged (9 before, 9 after), and the full 15-of-18 run above now leaves **no** containers behind —
+where the same run left three.
+
+Running that suite on this host (Windows) gives **15 of 18 `docker_live` tests green, 3 red for
+reasons that have nothing to do with this work**: the two egress tests cannot bind-mount
+`hx-egress-proxy.exe` into a container (`mount denied … too many colons` — Docker Desktop will not
+accept a `\\?\C:\…` path), and the L2 settings test asserts `adopt_workspace_owner` produced a
+`uid:gid`, which is a documented no-op off Unix. `the_concurrency_cap_refuses_the_n_plus_first_container`
+is also red when the file's tests run in parallel — it counts **every** `hx-` container on the daemon,
+including ones other tests are creating — and passes with `--test-threads=1`.
 
 **The SSH transport, against a real sshd** (`crates/hx-remote/tests/ssh_live.rs`)
 
@@ -365,6 +680,24 @@ reported SearXNG's `connection refused` and DuckDuckGo's bot check as **failures
 returning an empty list.
 
 ### Tier B — unit-tested (in CI)
+
+**Read the `Tests` column with care: it has drifted, and this is the measurement rather than a
+correction.** The numbers below were carried forward by hand as crates grew, so several are far too
+low, and a table that looks precise while being stale is worse than one that admits it. Re-measured
+on this machine (Windows, `cargo test --locked --no-fail-fast`):
+
+| Crate | This table says | Measured now (passed / ignored) |
+|---|---|---|
+| `hx-core` | 108 | 218 / 0 |
+| `hx-search` | 45 | 193 / 6 |
+| `hx-sandbox` | 90 | 148 / 21 |
+| `hx-server` | 46 | 283 / 3 |
+
+`scripts/measure-test-counts.sh` is what produced the right-hand column — one `cargo test` per named
+member, summing every target's `test result:` line and keeping the raw output beside the number so
+the parse can be checked. Re-running it for the whole workspace is the way to refresh this table; the
+column is left as-is rather than half-corrected, because two current rows beside eight stale ones
+would read as "the others are current too".
 
 | Crate | Tests | LOC | What the tests actually prove |
 |---|---|---|---|

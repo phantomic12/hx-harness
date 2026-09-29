@@ -140,7 +140,10 @@ impl PushPayload {
 
 /// A wrapper whose `Debug` prints a URL with its query string stripped — the half of a URL that can carry a
 /// secret.
-struct SanitizedUrl<'a>(&'a str);
+///
+/// `pub(crate)` because the rule is not this module's private business: [`crate::challenge_notice`]
+/// puts a one-time token in a URL for the same reason and must redact it the same way.
+pub(crate) struct SanitizedUrl<'a>(pub(crate) &'a str);
 
 impl std::fmt::Debug for SanitizedUrl<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -202,6 +205,13 @@ impl PhoneApprover {
             waiting: Mutex::new(HashMap::new()),
             wait,
         })
+    }
+
+    /// The webhook completions are pushed to — the same relay approvals use, so an operator
+    /// configures one URL and both pings arrive. Exposed read-only because the completion push is
+    /// fire-and-forget and must not be able to reconfigure the approval path.
+    pub fn push_url(&self) -> &str {
+        &self.push_url
     }
 
     /// Test-only: seed a waiting approval and return its one-time token, so a route or module test can
@@ -361,9 +371,9 @@ impl Approver for PhoneApprover {
 /// reported with [`reqwest::Error::without_url`]: the transport error otherwise embeds the full
 /// request URL, and `push_url` is operator configuration that may itself carry a credential
 /// (basic-auth userinfo, a `?token=` query) which must never reach a log line via `%err`.
-pub(crate) async fn post_payload(
+pub(crate) async fn post_payload<T: Serialize>(
     url: &str,
-    payload: &PushPayload,
+    payload: &T,
 ) -> std::result::Result<(), String> {
     let response = phone_client()
         .post(url)
@@ -390,6 +400,47 @@ fn phone_client() -> &'static reqwest::Client {
             .build()
             .expect("the phone webhook client has no invalid configuration")
     })
+}
+
+/// The JSON body announcing a finished run. Lives beside [`PushPayload`] so the two wire shapes
+/// cannot drift: same webhook, same relay, two purposes an operator's relay must be able to tell
+/// apart by the `kind` field alone.
+#[derive(Clone, Serialize)]
+pub struct CompletionPayload {
+    /// Literal `"run_completed"`, so a relay can route or drop these independently of approvals.
+    pub kind: &'static str,
+    /// The session the run belongs to (the id every client addresses the conversation by).
+    pub session_id: String,
+    /// The session's title, when the store has one — the human-readable half of the ping.
+    pub title: String,
+    /// How the run ended: the same stop reason the API reply carries (`completed`, `cancelled`, …).
+    pub stop: String,
+    /// What the run cost. A push that says "done" but not "for how much" hides the one number a
+    /// phone cannot look up without opening the app.
+    pub cost_usd: f64,
+}
+
+/// Fire-and-forget push announcing a finished run to the same webhook approvals use.
+///
+/// **Fire-and-forget by design, and bounded by construction**: the run is already over, so a slow
+/// or down relay must not hold the *next* request (this is spawned), and a failed delivery is
+/// logged and dropped — a completion ping that never arrived costs a glance at the transcript,
+/// not a hung daemon. This is the asymmetry with the *approval* push, which is deliberately
+/// synchronous and inside the deadline: there, an undelivered question must deny the run rather
+/// than leave it waiting on a notification nobody saw.
+pub fn push_completion(push_url: String, payload: CompletionPayload) {
+    tokio::spawn(async move {
+        match post_payload(&push_url, &payload).await {
+            Ok(()) => {}
+            Err(err) => {
+                tracing::debug!(
+                    url = %SanitizedUrl(&push_url),
+                    error = %err,
+                    "completion push failed; the run is already over, so this is only a lost ping"
+                );
+            }
+        }
+    });
 }
 
 fn brief(action: &ActionRequest) -> String {

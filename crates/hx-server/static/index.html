@@ -101,6 +101,66 @@ button { cursor: pointer; }
 }
 .token-panel button:hover { border-color: var(--accent); }
 
+/* ---- markdown ---- */
+/* The agent's answers are markdown — code blocks and lists are how a model talks. This is a
+   small renderer rather than a library: the page ships from the daemon with no build step, and
+   a CDN script is a dependency on somebody else's uptime. */
+.md { line-height: 1.6; }
+.md p { margin: 6px 0 0; }
+.md p:first-child { margin: 0; }
+.md h1, .md h2, .md h3, .md h4 {
+  margin: 10px 0 4px; line-height: 1.3; font-size: 1.02em; font-weight: 650;
+}
+.md h1 { font-size: 1.15em; }
+.md h2 { font-size: 1.08em; }
+.md ul, .md ol { margin: 6px 0 0; padding-left: 20px; }
+.md li { margin: 2px 0; }
+.md blockquote {
+  margin: 6px 0 0; padding: 2px 12px; border-left: 2px solid var(--line); color: var(--dim);
+}
+.md code {
+  font-family: var(--mono); font-size: 12.5px; background: rgba(255,255,255,.06);
+  border-radius: 4px; padding: 1px 5px;
+}
+.md-pre { position: relative; margin: 8px 0 0; }
+.md-pre pre {
+  margin: 0; padding: 10px 12px; overflow: auto; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 8px;
+}
+.md-pre pre code { background: none; padding: 0; font-size: 12px; line-height: 1.55; }
+.md-copy {
+  position: absolute; top: 6px; right: 6px; font-size: 11px; padding: 2px 9px;
+  background: var(--panel-2); color: var(--dim); border: 1px solid var(--line); border-radius: 6px;
+}
+.md-copy:hover { color: var(--text); border-color: var(--accent); }
+.md hr { border: 0; border-top: 1px solid var(--line); margin: 10px 0; }
+.md a { color: var(--accent); text-decoration: none; }
+.md a:hover { text-decoration: underline; }
+
+/* ---- steering: the follow-up queue and the prompt cards' actions ---- */
+.queue { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 20px; width: min(820px, 100%); margin: 0 auto; }
+.queue:empty { display: none; }
+.queue .chip {
+  display: inline-flex; align-items: center; gap: 6px; max-width: 100%;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px;
+  padding: 3px 6px 3px 12px; font-size: 12px; color: var(--dim);
+}
+.queue .chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 320px; }
+.queue .chip button {
+  background: transparent; border: 0; color: var(--faint); font-size: 13px;
+  border-radius: 50%; width: 18px; height: 18px; line-height: 1;
+}
+.queue .chip button:hover { color: var(--bad); }
+.event .actions { display: flex; gap: 6px; margin-top: 6px; }
+.event .actions button {
+  background: transparent; color: var(--dim); border: 1px solid var(--line);
+  border-radius: 6px; padding: 2px 10px; font-size: 11px; opacity: .55; transition: opacity .12s;
+}
+.event:hover .actions button { opacity: 1; }
+.event .actions button:hover { color: var(--text); border-color: var(--accent); }
+.event .kind { cursor: pointer; }
+.event .note { color: var(--dim); font-size: 11.5px; font-family: var(--mono); }
+
 /* ---- app grid ---- */
 .app { flex: 1; display: flex; min-height: 0; }
 .side {
@@ -149,6 +209,14 @@ button { cursor: pointer; }
 .sess-actions button:hover { color: var(--text); border-color: var(--accent); }
 .sess-actions button.danger:hover { color: var(--bad); border-color: var(--bad); }
 .side-fold { border-top: 1px solid var(--line); flex: none; max-height: 42%; overflow-y: auto; }
+.spend-row { padding: 3px 14px; font-family: var(--mono); font-size: 11px; color: var(--dim); }
+.spend-row .line { display: flex; justify-content: space-between; gap: 8px; }
+.spend-row .line span:first-child { color: var(--text); overflow-wrap: anywhere; }
+.spend-row .line b { color: var(--text); font-weight: 600; white-space: nowrap; }
+.spend-row .counts { font-size: 10px; color: var(--faint); }
+.spend-row .unpriced, .unpriced { color: var(--faint); font-style: italic; }
+.spend-head { padding: 2px 14px; font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: var(--faint); margin-top: 6px; }
+#spend-ticker { font-family: var(--mono); font-size: 11px; color: var(--dim); cursor: default; }
 .card { border-bottom: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
 .card > h2 {
   font-size: 11px; text-transform: uppercase; letter-spacing: 1.1px; color: var(--faint);
@@ -278,6 +346,26 @@ button { cursor: pointer; }
 .sandbox { padding: 0 14px 8px; font-size: 12px; color: var(--dim); font-family: var(--mono); }
 .sandbox .live { color: var(--good); }
 .sandbox .off { color: var(--bad); }
+/* One live box per row, with the way in on the right. The box's id is the whole identity here,
+   which is why the button carries it rather than a row index that reorders under the pointer. */
+.sandbox .box {
+  margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--line);
+}
+.sandbox .box .line { display: flex; align-items: center; gap: 6px; }
+.sandbox .box .id { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A box that boots something says what, because that is the difference between it and the box
+   beside it: a column of ids tells nobody which one has the server in it. Its own line rather than
+   a second column, because the ids are already ellipsized at this width and a command would win the
+   space they need. Full argv in the tooltip; the line ellipsizes. */
+.sandbox .box .runs {
+  margin-top: 1px; color: var(--accent);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sandbox .box button {
+  font-size: 11px; background: transparent; color: var(--dim); border: 1px solid var(--line);
+  border-radius: 5px; padding: 1px 7px; font-family: var(--mono); flex: none;
+}
+.sandbox .box button:hover { color: var(--text); border-color: var(--accent); }
 .approval { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 8px 0; background: var(--panel-2); }
 .approval .risk {
   display: inline-block; font-size: 10px; text-transform: uppercase; letter-spacing: .6px;
@@ -324,7 +412,47 @@ button { cursor: pointer; }
   border-radius: 5px; padding: 2px 8px;
 }
 .dpane > h2 button:hover { color: var(--text); border-color: var(--accent); }
+/* Says which machine the terminal below is on. Not decoration: a shell in a sandbox and a shell on
+   the daemon's host look identical, and the difference decides what a typed command can touch. */
+#term-where { color: var(--faint); font-family: var(--mono); text-transform: none; letter-spacing: 0; }
+#term-where.inbox { color: var(--warn); }
 #terminal { flex: 1; min-height: 220px; padding: 6px 0 6px 8px; background: #0a0c0f; }
+/* The challenge banner: a site refused every automated rung, so the daemon is holding the fetch and
+   waiting for a person to clear the wall in the browser above this line. It sits at the top of the
+   screen pane rather than in a modal because the thing it asks for *is* the pane below it — the
+   person clears the wall in the browser, not in a dialog. */
+.challenge { margin: 0 14px 8px; padding: 8px 10px; border: 1px solid var(--line); border-left: 3px solid var(--warn); border-radius: 6px; background: var(--panel-2); font-size: 12px; line-height: 1.5; }
+.challenge-top { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+.challenge-top strong { color: var(--text); font-weight: 600; }
+.challenge-left { color: var(--warn); font-family: var(--mono); white-space: nowrap; }
+/* Who the question is for, and whether they were told. A person reading this banner has to know
+   whether they are the *addressee* or the only chance a run nobody was told about has. */
+.challenge-for { color: var(--dim); }
+.challenge-for b { color: var(--text); font-weight: 600; }
+.challenge-for .unheard { color: var(--warn); }
+.challenge-why { color: var(--dim); }
+.challenge-actions { display: flex; gap: 6px; margin-top: 6px; }
+.challenge-actions input { flex: 1; min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; color: var(--text); font-size: 12px; }
+.challenge-actions button { background: transparent; border: 1px solid var(--line); border-radius: 6px; color: var(--dim); font-size: 12px; padding: 4px 8px; cursor: pointer; white-space: nowrap; }
+.challenge-actions button:hover { color: var(--text); border-color: var(--accent); }
+#challenge-solved:hover { border-color: var(--ok); color: var(--ok); }
+/* A person on another view cannot see the banner, and the daemon is waiting: the tab that hides the
+   banner says so instead of leaving the fetch to sit until its budget runs out. */
+.top-views button.need, .tabs button.need { color: var(--warn); }
+
+/* The screen pane: a canvas the daemon's browser paints into, an address bar, and nothing else. The
+   canvas is sized from each frame (see `drawScreenFrame`), so its *displayed* size is whatever fits
+   and the input mapping goes through the element's rect rather than using coordinates raw. */
+.screen-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.screen-bar { display: flex; gap: 6px; padding: 4px 14px 8px; }
+.screen-bar input { flex: 1; min-width: 0; background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; font-family: var(--mono); font-size: 12px; }
+.screen-bar button { background: transparent; border: 1px solid var(--line); border-radius: 6px; color: var(--dim); font-size: 12px; padding: 4px 8px; cursor: pointer; }
+.screen-bar button:hover { color: var(--text); border-color: var(--accent); }
+.screen-stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; padding: 0 8px 10px; }
+#screen-canvas { max-width: 100%; max-height: 100%; background: #0a0c0f; outline: none; cursor: crosshair; }
+#screen-canvas:focus { box-shadow: 0 0 0 1px var(--accent); }
+.screen-note { color: var(--faint); font-size: 11px; padding: 0 14px 8px; line-height: 1.5; }
+#screen-where { color: var(--faint); font-family: var(--mono); text-transform: none; letter-spacing: 0; }
 .diff-pane, .fanout-pane, .prov-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .diff-input, .fanout-input { display: flex; gap: 6px; padding: 8px 14px; }
 .diff-input input, .fanout-row input, .modal-path input, .modal-cmd input {
@@ -487,12 +615,14 @@ button { cursor: pointer; }
 </head>
 <body>
 <header class="top">
-  <div class="brand"><b>hx</b><span>codex</span></div>
+  <div class="brand"><b>hx</b><span>harness</span></div>
   <div class="status"><span class="dot" id="dot"></span><span id="status-text">connecting…</span></div>
   <span id="instance-version" title="daemon instance / version"></span>
+  <span id="spend-ticker" title="spend over the last 30 days — see the spend panel for the breakdown"></span>
   <nav class="top-views" aria-label="panels">
     <button data-view="side" class="active" title="toggle the task list">tasks</button>
     <button data-view="terminal" class="active" title="terminal">terminal</button>
+    <button data-view="screen" title="a live browser the daemon runs">screen</button>
     <button data-view="diff" title="diff/review">diff</button>
     <button data-view="review" title="what this task changed">review</button>
     <button data-view="fanout" title="fan-out">fan-out</button>
@@ -530,6 +660,11 @@ button { cursor: pointer; }
         <div id="hosts"></div>
       </section>
       <section class="card">
+        <h2>spend<span id="spend-total"></span></h2>
+        <div id="spend-body"></div>
+        <div class="spend-row"><span class="unpriced">unpriced = tokens ran, no rate card covered them</span></div>
+      </section>
+      <section class="card">
         <h2>approvals<span id="approval-count"></span></h2>
         <div id="sandbox-status" class="sandbox"></div>
         <div id="approvals"></div>
@@ -552,22 +687,55 @@ button { cursor: pointer; }
         </div>
         <textarea id="prompt" rows="1" placeholder="Ask hx to do something…   Enter sends, Shift+Enter for a new line" autocomplete="off"></textarea>
         <button id="send">Send</button>
+        <button id="stop" class="stop" hidden title="stop the run in flight on this task">stop</button>
       </div>
-      <div class="hint">one task per conversation · events stream on the session socket · Enter sends</div>
+      <div class="queue" id="queue"></div>
+      <div class="hint">one task per conversation · prompts typed mid-run queue below · Enter sends</div>
       <div class="error" id="error"></div>
     </div>
   </main>
   <aside class="drawer" id="drawer">
     <div class="tabs" role="tablist">
       <button data-tab="terminal" class="active">terminal</button>
+      <button data-tab="screen">screen</button>
       <button data-tab="diff">diff</button>
       <button data-tab="review">review</button>
       <button data-tab="fanout">fan-out</button>
       <button data-tab="providers">providers</button>
     </div>
     <section class="dpane" id="dp-terminal">
-      <h2>terminal<span><button id="new-term">new</button></span></h2>
+      <h2>terminal<span><span id="term-where" title="which machine this terminal is on"></span><button id="new-term">new</button></span></h2>
       <div id="terminal"></div>
+    </section>
+    <section class="dpane" id="dp-screen" hidden>
+      <h2>screen<span><span id="screen-where" title="the page this browser is showing"></span><button id="screen-close">close</button></span></h2>
+      <div class="screen-pane">
+        <div class="challenge" id="challenge" hidden>
+          <div class="challenge-top">
+            <strong id="challenge-what">a site needs a person</strong>
+            <span class="challenge-left" id="challenge-left"></span>
+          </div>            <div class="challenge-for" id="challenge-for"></div>
+            <div class="challenge-why" id="challenge-why"></div>
+          <div class="challenge-actions">
+            <button id="challenge-watch" hidden>watch it</button>
+            <input id="challenge-note" placeholder="only to decline: why not" autocomplete="off" spellcheck="false">
+            <button id="challenge-solved" title="you cleared the wall in the browser — the task re-runs the ladder in this session">it is cleared</button>
+            <button id="challenge-give-up" title="decline, with a reason the report will quote">give up</button>
+          </div>
+        </div>
+        <div class="screen-bar">
+          <input id="screen-url" placeholder="https://example.com — Enter opens it" autocomplete="off" spellcheck="false">
+          <button id="screen-open">open</button>
+        </div>
+        <div class="screen-stage"><canvas id="screen-canvas" tabindex="0"></canvas></div>
+        <div class="screen-note" id="screen-note">
+          A browser the <b>daemon</b> runs and streams — click the picture to give it the keyboard,
+          then type; the page gets your clicks, wheel and keys. Nothing here is judged or filtered:
+          it can go anywhere the daemon's machine can reach. The browser keeps its own profile per
+          screen, so a login stays with the screen it was made in.
+        </div>
+        <div class="error" id="screen-error" style="width:auto;margin:0;padding:0 14px 8px"></div>
+      </div>
     </section>
     <section class="dpane" id="dp-diff" hidden>
       <h2>diff/review</h2>
@@ -741,14 +909,15 @@ const API = "";
 // Authentication
 //
 // The daemon may require a bearer token, and this page is one of the two clients that has to send
-// it. A browser cannot attach a header to a WebSocket handshake, so the token is presented two
-// ways: `Authorization: Bearer …` on every fetch, and `?token=` on a WebSocket URL — which the
-// daemon accepts *only* on an upgrade request, because that is the one request shape with no
-// alternative. See `crates/hx-server/src/auth.rs`.
+// it. A browser cannot attach a header to a WebSocket handshake, and the bearer token must never
+// ride in a URL (#24) — so before opening a socket the page trades the token for a *single-use
+// ticket*: `POST /v1/ws-ticket` (a normal header-authenticated call) answers with a value that is
+// good for one handshake and dies within seconds. What lands in any URL or log is then a dead
+// ticket, not the credential. See `crates/hx-server/src/ws_ticket.rs`.
 //
-// It is kept in localStorage so a reload does not lose it, and it is asked for once when the daemon
-// answers 401 rather than being something a person has to know to look for first. Nothing else is
-// stored here: this page owns no state the daemon does not.
+// The token itself is kept in localStorage so a reload does not lose it, and it is asked for once
+// when the daemon answers 401 rather than being something a person has to know to look for first.
+// Nothing else is stored here: this page owns no state the daemon does not.
 const TOKEN_KEY = "hx.api.token";
 const apiToken = () => localStorage.getItem(TOKEN_KEY) || "";
 const setToken = (value) => {
@@ -814,11 +983,20 @@ async function apiFetch(path, init = {}) {
   return res;
 }
 
-const wsURL = (path) => {
+const wsURL = async (path) => {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const bare = `${proto}//${location.host}${path}`;
   const token = apiToken();
-  const query = token ? `?token=${encodeURIComponent(token)}` : "";
-  return `${proto}//${location.host}${path}${query}`;
+  if (!token) return bare; // no token configured: the loopback deployment, nothing to trade
+  try {
+    const res = await apiFetch(`${API}/v1/ws-ticket`, { method: "POST" });
+    if (!res.ok) return bare; // refused here; the handshake 401s and the retry loop keeps at it
+    const body = await res.json();
+    if (!body.ticket) return bare;
+    return `${bare}?ticket=${encodeURIComponent(body.ticket)}`;
+  } catch (_) {
+    return bare;
+  }
 };
 
 const $ = (id) => document.getElementById(id);
@@ -890,30 +1068,78 @@ function b64decodeToBytes(b64) {
   return bytes;
 }
 
-async function ensureTerminal() {
-  // Reuse the terminal across reloads: `hx-term` is a fixed id, so a page refresh reattaches to the
-  // shell that is already running instead of starting a second one. A terminal that is gone (the
-  // shell exited) is recreated, which the POST below does on a 409.
-  terminalId = terminalId || "hx-term";
+/// Which machine the pane is showing, printed above it. See `#term-where`'s style for why.
+let termWhere = "";
+
+function paintTermWhere() {
+  const el = $("term-where");
+  if (!el) return;
+  el.textContent = termWhere;
+  el.classList.toggle("inbox", termWhere.startsWith("in "));
+}
+
+/// Create (or reattach to) a terminal under `id`, optionally inside a sandbox, and show it.
+///
+/// One function for all three ways in — the boot terminal, the `new` button, and clicking a box's
+/// `shell` button — because they differ only in the id and the extra field, and three copies of
+/// "POST, tolerate already-exists, attach" is three places for the tolerance to rot.
+async function ensureTerminalFor(id, extra, where) {
   const res = await apiFetch(`${API}/v1/terminals`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ id: terminalId, cols: term ? term.cols : 80, rows: term ? term.rows : 24 }),
+    body: JSON.stringify(Object.assign(
+      { id, cols: term ? term.cols : 80, rows: term ? term.rows : 24 },
+      extra || {}
+    )),
   });
   // 200 = created; anything else may mean it already exists, which is fine — attach and find out.
+  // A real refusal (no engine, a box that is gone, a backend that cannot attach a session) is a
+  // failure here, and its body is the daemon's sentence about why: shown verbatim.
   if (res.status !== 200) {
     const list = await apiFetch(`${API}/v1/terminals`).then((r) => r.json()).catch(() => ({}));
-    if (!(list.terminals || []).includes(terminalId)) {
+    if (!(list.terminals || []).includes(id)) {
       const body = await res.text();
       throw new Error(`could not create a terminal: ${body}`);
     }
   }
+  terminalId = id;
+  termWhere = where || "";
+  paintTermWhere();
+  // Cleared on purpose: the previous terminal's output belongs to a different shell, and appending
+  // one machine's scrollback above another's prompt is how a person runs a command in the wrong
+  // place.
+  if (term) term.reset();
   attachTerminal();
 }
 
-function attachTerminal() {
+/// The terminal this page starts with, or reattaches to after a reload.
+///
+/// Reuse across reloads is deliberate: `hx-term` is a fixed id, so a page refresh reattaches to the
+/// shell that is already running instead of starting a second one.
+async function ensureTerminal() {
+  terminalId = terminalId || "hx-term";
+  await ensureTerminalFor(terminalId, null, "on this machine");
+}
+
+/// Open a shell **inside** a sandbox, replacing whatever the pane was showing.
+///
+/// The id is derived from the box, so pressing `shell` twice reattaches to the same session rather
+/// than starting a second shell in the same container — the box has one of these per page, and a
+/// reload should not leave a shell running that nobody can reach again.
+async function openSandboxTerminal(sandboxId) {
+  // The drawer may be showing another pane; the tab's own click handler is what keeps panes,
+  // buttons and the xterm fit in step, so it is clicked rather than bypassed.
+  document.querySelector('.tabs button[data-tab="terminal"]')?.click();
+  await ensureTerminalFor(
+    `hx-sbx-${sandboxId}`,
+    { sandbox: sandboxId },
+    `in ${sandboxId}`
+  );
+}
+
+async function attachTerminal() {
   if (termSocket) { try { termSocket.close(); } catch (_) {} }
-  termSocket = new WebSocket(wsURL(`/v1/terminals/${terminalId}/ws`));
+  termSocket = new WebSocket(await wsURL(`/v1/terminals/${terminalId}/ws`));
 
   termSocket.onopen = () => {
     termReconnectDelay = 250;
@@ -957,12 +1183,622 @@ function attachTerminal() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Screen — a browser the daemon runs, streamed as frames with the input going back
+//
+// A separate pane from the terminal rather than a mode of it: a screen is not bytes on a pty. Its
+// frames are JPEGs, its input is mouse and keyboard events *in the frame's own coordinates*, and the
+// two have nothing in common but the ownership model — the browser lives in the daemon, so closing
+// this tab does not close the screen and reattaching shows the picture as it is now.
+//
+// What it deliberately does not do is claim the browser is *in* a sandbox. It is on the daemon's
+// machine; the pane says so. A box's own pixels need a browser inside the box, which needs an image
+// that carries one and a way for the daemon to reach its port — neither of which exists here yet.
+
+let screenId = null, screenSocket = null, screenReconnectDelay = 250, screenEnded = false;
+// The page the browser is showing, for the address bar and for `reload`.
+let screenURL = "";
+// Frame coalescing: a draw is asynchronous (`createImageBitmap`), and frames can arrive faster than
+// one paints. The newest one wins — an older frame drawn after a newer one would show the past.
+let screenDrawing = false, screenPending = null;
+
+/// Where a pointer event lands, in the *frame's* coordinates.
+///
+/// The canvas is displayed scaled to fit the pane, so the raw `clientX`/`clientY` are not frame
+/// pixels. Mapping through the element's rect is what makes a click land where the person clicked
+/// rather than where the browser would have drawn it at full size.
+function screenPoint(ev) {
+  const canvas = $("screen-canvas");
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = rect.width ? canvas.width / rect.width : 1;
+  const scaleY = rect.height ? canvas.height / rect.height : 1;
+  return { x: (ev.clientX - rect.left) * scaleX, y: (ev.clientY - rect.top) * scaleY };
+}
+
+function screenButton(ev) {
+  return ev.button === 1 ? "middle" : ev.button === 2 ? "right" : "left";
+}
+
+/// Which of Alt(1)/Ctrl(2)/Meta(4)/Shift(8) are held, as CDP's own mask.
+///
+/// Sent with every key because a shortcut *is* the mask: the same "a" with Ctrl held has to arrive
+/// as one, or the page types a letter where the person asked it to select.
+function screenModifiers(ev) {
+  return (ev.altKey ? 1 : 0) | (ev.ctrlKey ? 2 : 0) | (ev.metaKey ? 4 : 0) | (ev.shiftKey ? 8 : 0);
+}
+
+function screenSend(frame) {
+  if (screenSocket && screenSocket.readyState === WebSocket.OPEN) {
+    screenSocket.send(JSON.stringify(frame));
+    return true;
+  }
+  return false;
+}
+
+function initScreen() {
+  const canvas = $("screen-canvas");
+  if (!canvas) return false;
+  canvas.width = 1280;
+  canvas.height = 800;
+
+  // A canvas takes no focus on its own, so a click focuses it *and* is sent: the first click into a
+  // pane that was not focused must still reach the page, or every first click is swallowed.
+  canvas.addEventListener("mousedown", (ev) => {
+    ev.preventDefault();
+    canvas.focus();
+    const p = screenPoint(ev);
+    screenSend({ type: "mouse_move", x: p.x, y: p.y });
+    screenSend({
+      type: "mouse_button",
+      x: p.x,
+      y: p.y,
+      button: screenButton(ev),
+      down: true,
+      clicks: Math.max(1, ev.detail | 0),
+    });
+  });
+  canvas.addEventListener("mouseup", (ev) => {
+    const p = screenPoint(ev);
+    screenSend({
+      type: "mouse_button",
+      x: p.x,
+      y: p.y,
+      button: screenButton(ev),
+      down: false,
+      clicks: Math.max(1, ev.detail | 0),
+    });
+  });
+  canvas.addEventListener("mousemove", (ev) => {
+    const p = screenPoint(ev);
+    screenSend({ type: "mouse_move", x: p.x, y: p.y });
+  });
+  // Right-click reaches the page rather than this page's menu: the context menu belongs to whatever
+  // the screen is showing, and a pane that opened its own would make a web app's menu unreachable.
+  canvas.addEventListener("contextmenu", (ev) => ev.preventDefault());
+  canvas.addEventListener(
+    "wheel",
+    (ev) => {
+      ev.preventDefault();
+      const p = screenPoint(ev);
+      // `deltaMode` is the unit the browser chose: 0 pixels, 1 lines, 2 pages. A line is not a pixel
+      // and a screen that scrolled a whole line's worth for one notch would feel broken.
+      const unit = ev.deltaMode === 1 ? 16 : ev.deltaMode === 2 ? canvas.height : 1;
+      screenSend({
+        type: "wheel",
+        x: p.x,
+        y: p.y,
+        delta_x: ev.deltaX * unit,
+        delta_y: ev.deltaY * unit,
+      });
+    },
+    { passive: false }
+  );
+
+  const onKey = (ev) => {
+    const mods = screenModifiers(ev);
+    if (ev.type === "keydown") {
+      // A character key inserts only with *no* Ctrl/Meta/Alt: with them it is a shortcut, and sending
+      // text as well would have the page do both — select-all *and* type an "a".
+      const inserts = ev.key.length === 1 && !ev.ctrlKey && !ev.metaKey && !ev.altKey;
+      screenSend({
+        type: "key_down",
+        key: ev.key,
+        code: ev.code,
+        key_code: ev.keyCode || 0,
+        modifiers: mods,
+        text: inserts ? ev.key : null,
+      });
+    } else {
+      screenSend({ type: "key_up", key: ev.key, code: ev.code, key_code: ev.keyCode || 0, modifiers: mods });
+    }
+    // The pane keeps the keys the *page* should have: Tab to move focus, Space and the arrows to
+    // scroll, Backspace to go back. Without this they act on this page instead, and the screen looks
+    // like it is ignoring input. The browser's own keys (F5, F12, Ctrl+W) are left alone.
+    if (ev.key !== "F5" && ev.key !== "F12") ev.preventDefault();
+  };
+  canvas.addEventListener("keydown", onKey);
+  canvas.addEventListener("keyup", onKey);
+
+  $("screen-open").addEventListener("click", () => openScreenFromBar());
+  $("screen-url").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); openScreenFromBar(); }
+  });
+  $("screen-close").addEventListener("click", async () => {
+    if (!screenId) return;
+    const id = screenId;
+    // Cleared first: the socket's close handler would otherwise reconnect to a screen this request
+    // is about to delete, and the reconnect would win the race often enough to matter.
+    screenEnded = true;
+    try { if (screenSocket) screenSocket.close(); } catch (_) {}
+    screenSocket = null;
+    screenId = null;
+    try {
+      const res = await apiFetch(`${API}/v1/screens/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+      paintScreenWhere(`closed ${id}`);
+    } catch (e) {
+      $("screen-error").textContent = `could not close ${id}: ${e.message || e}`;
+    }
+    // Closing a screen that was presenting a challenge ends the challenge — the person walked away
+    // from the question — so the banner is re-read rather than left showing a fetch nobody is
+    // waiting for any more.
+    pollChallenges();
+  });
+
+  $("challenge-watch").addEventListener("click", watchChallenge);
+  $("challenge-solved").addEventListener("click", () => answerChallenge("solved"));
+  $("challenge-give-up").addEventListener("click", () =>
+    answerChallenge("abandoned", $("challenge-note").value.trim())
+  );
+  $("challenge-note").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") answerChallenge("abandoned", $("challenge-note").value.trim());
+  });
+  document.addEventListener("visibilitychange", () => paintChallengeTitle(!!pendingChallenge));
+  return true;
+}
+
+function paintScreenWhere(text) {
+  const el = $("screen-where");
+  if (el) el.textContent = text || "";
+}
+
+/// Open the address bar's URL: navigate the live screen if there is one, else launch it at that page.
+async function openScreenFromBar() {
+  const typed = $("screen-url").value.trim();
+  $("screen-error").textContent = "";
+  if (screenId && screenSocket && screenSocket.readyState === WebSocket.OPEN) {
+    // An empty bar means *the page it is already on*, not `about:blank`: the bar is filled from the
+    // `navigated` frames, so a person who clears it and presses open means "show me this again".
+    const url = typed || screenURL;
+    if (!url) return;
+    screenURL = url;
+    screenSend({ type: "navigate", url });
+    return;
+  }
+  try {
+    // A reload after the screen is gone reattaches to the same id, so the browser is reused rather
+    // than a second one launched under a new name every time the pane is opened. An empty bar on a
+    // *first* open means the daemon's configured `screen.url`, which is why nothing is invented here.
+    await ensureScreen(screenId || "hx-screen", typed);
+  } catch (e) {
+    $("screen-error").textContent = String(e.message || e);
+  }
+}
+
+/// Launch a screen under `id` and attach to it.
+async function ensureScreen(id, url) {
+  const res = await apiFetch(`${API}/v1/screens`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ id, url: url || undefined }),
+  });
+  if (!res.ok) {
+    // The daemon's own sentence, verbatim: a missing browser names every path it searched, and a
+    // rewritten version of that would be a paraphrase of the one useful fact.
+    throw new Error(await res.text());
+  }
+  const body = await res.json();
+  screenId = id;
+  screenURL = (body.screen && body.screen.url) || url || "";
+  if (body.screen && body.screen.width && body.screen.height) {
+    const canvas = $("screen-canvas");
+    canvas.width = body.screen.width;
+    canvas.height = body.screen.height;
+  }
+  attachScreen();
+}
+
+async function attachScreen() {
+  screenEnded = false;
+  if (screenSocket) { try { screenSocket.close(); } catch (_) {} }
+  screenSocket = new WebSocket(await wsURL(`/v1/screens/${screenId}/ws`));
+
+  screenSocket.onopen = () => {
+    screenReconnectDelay = 250;
+    paintScreenWhere(screenURL || screenId);
+  };
+  screenSocket.onmessage = (ev) => {
+    let frame;
+    try { frame = JSON.parse(ev.data); } catch (_) { return; }
+    switch (frame.type) {
+      case "frame":
+        drawScreenFrame(frame);
+        break;
+      case "navigated":
+        screenURL = frame.url;
+        $("screen-url").value = frame.url;
+        paintScreenWhere(frame.url);
+        break;
+      case "lagged":
+        // Frames were dropped *for this client*. Said out loud, because a screen missing frames shows
+        // a state that never existed, and "my picture is stale" is otherwise indistinguishable from
+        // "the page is not changing".
+        paintScreenWhere(`${screenURL} — ${frame.missed} frames dropped`);
+        break;
+      case "ended":
+        screenEnded = true;
+        paintScreenWhere(`screen ended: ${frame.reason}`);
+        break;
+      case "error":
+        $("screen-error").textContent = frame.message;
+        break;
+    }
+  };
+  screenSocket.onclose = async () => {
+    // Reconnect with a backoff, unless the daemon said the screen is over: the browser lives in the
+    // daemon, so a dropped socket is a failed *attachment* and reattaching is the whole recovery.
+    if (screenEnded || !screenId) return;
+    // A screen the daemon no longer has is not a failed attachment. It was closed — by another tab,
+    // by the challenge it was presenting ending, by the daemon — and a socket to a name nothing
+    // answers to is a 404 the browser's WebSocket API does not expose apart from any other failure,
+    // so the retry would be forever. Asked about rather than guessed: a *failed* listing is a daemon
+    // that is down, which is exactly the case reconnecting is for.
+    const gone = await screenGone(screenId);
+    if (gone) {
+      screenEnded = true;
+      screenId = null;
+      paintScreenWhere(`screen closed: ${gone}`);
+      return;
+    }
+    // Said out loud, because the caption would otherwise keep the last thing that happened — a
+    // screen closed a moment ago, or a page that never loaded — while the pane is quietly doing
+    // something else.
+    paintScreenWhere(`reconnecting to ${screenId}…`);
+    setTimeout(() => { if (screenId && !screenEnded) attachScreen(); }, screenReconnectDelay);
+    screenReconnectDelay = Math.min(screenReconnectDelay * 2, 8000);
+  };
+}
+
+/// Why the screen `id` is not there any more, or `null` when it is (or when the daemon could not be
+/// asked, which is a different situation and not this function's to report).
+async function screenGone(id) {
+  try {
+    const res = await apiFetch(`${API}/v1/screens`);
+    if (!res.ok) return null;
+    const body = await res.json();
+    const screens = body.screens || [];
+    const found = screens.find((s) => s.id === id);
+    if (!found) return "the daemon no longer has it";
+    // A screen that is over is still listed, with its reason: attaching to it would succeed and then
+    // end immediately, so the honest thing is to show why instead of bouncing.
+    return found.ended ? `it ended: ${found.ended}` : null;
+  } catch (_) {
+    return null;
+  }
+  screenSocket.onerror = () => { /* onclose handles it */ };
+}
+
+// ---------------------------------------------------------------------------------------------
+// The human in the loop.
+//
+// A site refused the plain fetch and a real browser, so the daemon handed the wall to a *person*: it
+// launched the browser this pane draws and is holding the fetch until somebody answers. That makes
+// this the one surface in the page where doing nothing has a cost — the fetch waits for its budget
+// and then gives up — so the banner is loud, it is polled rather than pushed (there is no event,
+// the fetch is not this tab's), and the tab that hides it says something when the page is not
+// looking.
+//
+// Answering is the person's word and nothing else: "cleared it" is not a check that the wall is gone,
+// and the pane says so where a person will read it, because the fetch it unblocks is about to report
+// exactly that to whoever asked for the page.
+// ---------------------------------------------------------------------------------------------
+
+let pendingChallenge = null;
+
+async function pollChallenges() {
+  let challenges = [];
+  try {
+    const res = await apiFetch(`${API}/v1/challenges`);
+    if (res.ok) challenges = (await res.json()).challenges || [];
+    else { paintChallengeStale(); return; }
+  } catch (_) {
+    // Unreachable daemon: the banner stays (hiding it would throw away the person's chance to answer
+    // a challenge that is probably still live) and stops counting down, because a countdown that
+    // keeps ticking through a failed poll is a number nobody measured.
+    paintChallengeStale();
+    return;
+  }
+  paintChallenge(challenges[0] || null);
+}
+
+/// Show the challenge the daemon is waiting on, or hide the banner when there is none.
+function paintChallenge(challenge) {
+  const host = $("challenge");
+  if (!host) return;
+  const watcher = screenId === (challenge && challenge.screen) &&
+    screenSocket && screenSocket.readyState === WebSocket.OPEN;
+  pendingChallenge = challenge;
+  host.hidden = !challenge;
+  markChallengeTabs(!!challenge);
+  paintChallengeTitle(!!challenge);
+  if (!challenge) return;
+
+  $("challenge-what").textContent = `${challenge.session} is blocked on ${challenge.url}`;
+  $("challenge-left").textContent = challenge.seconds_left > 0
+    ? `${challenge.seconds_left}s left`
+    : "the budget is up";
+  // Addressed to one operator, and the daemon says whether it managed to tell *that* operator. A
+  // roster can hold people with a channel of their own and people without, so "was anybody told" is
+  // the wrong question — the honest one is about the name on the challenge. "Someone has this" and
+  // "you are the only chance this run has" are different instructions to the person reading them, and
+  // on a daemon with several operators the banner is also what tells the *wrong* person to stay put.
+  const who = $("challenge-for");
+  if (who) {
+    const name = challenge.operator || "the operator";
+    who.textContent = "";
+    const line = document.createElement("span");
+    const bold = document.createElement("b");
+    bold.textContent = name;
+    line.append("for ", bold);
+    if (challenge.notified) {
+      line.append(" — told on their own channel");
+    } else {
+      const unheard = document.createElement("span");
+      unheard.className = "unheard";
+      unheard.textContent =
+        " — nobody was told (no push_url for that operator), so this page is the only place to answer";
+      line.append(unheard);
+    }
+    who.append(line);
+  }
+  $("challenge-why").textContent = challenge.reason;
+  // The person has to be looking at *this* screen to clear the wall in it. When they are watching a
+  // different one, the banner offers the switch rather than taking it: moving the pane under someone
+  // who is mid-click is worse than asking.
+  const watch = $("challenge-watch");
+  watch.hidden = !!watcher;
+  watch.textContent = `watch ${challenge.screen}`;
+}
+
+function paintChallengeStale() {
+  const left = $("challenge-left");
+  if (left && !$("challenge").hidden) left.textContent = "checking…";
+}
+
+/// Say so on the tab that is hiding the banner.
+function markChallengeTabs(needed) {
+  document.querySelectorAll('[data-view="screen"], [data-tab="screen"]').forEach((el) => {
+    el.classList.toggle("need", needed);
+  });
+}
+
+/// The title bar joins in only when nobody is looking, the way the approval alarm does.
+function paintChallengeTitle(needed) {
+  if (!needed) {
+    if (document.title.startsWith("● a site needs you")) document.title = titleBase;
+    return;
+  }
+  if (document.hidden && !document.title.startsWith("●")) {
+    document.title = `● a site needs you — ${titleBase}`;
+  }
+}
+
+/// Answer the challenge the banner is showing.
+async function answerChallenge(outcome, note) {
+  const challenge = pendingChallenge;
+  if (!challenge) return;
+  $("screen-error").textContent = "";
+  const body = note ? { outcome, note } : { outcome };
+  try {
+    const res = await apiFetch(`${API}/v1/challenges/${encodeURIComponent(challenge.id)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      // The daemon's own sentence: a decline with no note is refused by name, and a challenge that
+      // ended while the person was typing says so rather than pretending the click landed.
+      $("screen-error").textContent = `could not answer ${challenge.id}: ${await res.text()}`;
+      await pollChallenges();
+      return;
+    }
+    $("challenge-note").value = "";
+    paintChallenge(null);
+    paintScreenWhere(`${outcome === "solved" ? "cleared" : "declined"} ${challenge.id}`);
+  } catch (e) {
+    $("screen-error").textContent = `could not answer ${challenge.id}: ${e.message || e}`;
+  }
+}
+
+/// Attach this pane to the screen a pending challenge is presented on.
+/// Follow the daemon's own deep link: `#screen=<id>`, which is what a challenge notification carries.
+///
+/// The pane is revealed before the socket is attached: a URL that opened a browser nobody can see
+/// would be a link that does nothing, and the whole point of the notification is that it takes a
+/// person to the screen they have to clear the wall in.
+///
+async function followScreenLink() {
+  const raw = (location.hash || "").replace(/^#/, "");
+  if (!raw.startsWith("screen=")) return false;
+  const id = decodeURIComponent(raw.slice("screen=".length)).trim();
+  if (!id) return false;
+  const drawer = $("drawer");
+  const pane = $("dp-screen");
+  if (drawer && (drawer.hidden || (pane && pane.hidden))) {
+    const button = document.querySelector('.top-views button[data-view="screen"]');
+    if (button) button.click();
+  }
+  screenEnded = false;
+  screenId = id;
+  try {
+    await attachScreen();
+    return true;
+  } catch (e) {
+    $("screen-error").textContent = `could not open ${id}: ${e.message || e}`;
+    return false;
+  }
+}
+
+async function watchChallenge() {
+  const challenge = pendingChallenge;
+  if (!challenge) return;
+  screenEnded = false;
+  screenId = challenge.screen;
+  screenURL = challenge.url;
+  $("screen-url").value = challenge.url;
+  $("screen-error").textContent = "";
+  try {
+    attachScreen();
+    paintChallenge(challenge);
+  } catch (e) {
+    $("screen-error").textContent = String(e.message || e);
+  }
+}
+
+/// Paint one frame, coalescing: a draw is asynchronous, so only the newest waiting frame is kept.
+function drawScreenFrame(frame) {
+  if (screenDrawing) { screenPending = frame; return; }
+  screenDrawing = true;
+  let bytes;
+  try { bytes = b64decodeToBytes(frame.data); } catch (_) { screenDrawing = false; return; }
+  const blob = new Blob([bytes], { type: "image/jpeg" });
+  createImageBitmap(blob)
+    .then((bitmap) => {
+      const canvas = $("screen-canvas");
+      // The canvas takes the *frame's* size, so what is drawn is what was rendered: a canvas sized to
+      // the request instead would letterbox a page that came back a different shape.
+      if (canvas.width !== frame.width || canvas.height !== frame.height) {
+        canvas.width = frame.width;
+        canvas.height = frame.height;
+      }
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(bitmap, 0, 0, frame.width, frame.height);
+      bitmap.close();
+      screenDrawing = false;
+      const pending = screenPending;
+      screenPending = null;
+      if (pending) drawScreenFrame(pending);
+    })
+    .catch(() => {
+      // A frame that will not decode is one frame; the next one usually will. Reported once, not
+      // per frame, because a broken stream would otherwise fill the error line.
+      screenDrawing = false;
+      screenPending = null;
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
+// ---- markdown ---------------------------------------------------------------------------------
+
+// Escape before any markup is interpreted. Every renderer here runs on the escaped text, so
+// model output can never become page markup — the one security property a chat pane must hold.
+function esc(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+// Inline rules: `code`, **bold**, *italic*, [text](https://…). Inline code is lifted out first so
+// the other rules cannot touch its contents. Links only match http(s) — a `javascript:` URL can
+// only ever be text here.
+function mdInline(s) {
+  const slots = [];
+  let out = s.replace(/`([^`]+)`/g, (_, code) => {
+    slots.push(`<code>${code}</code>`);
+    return `\u0000${slots.length - 1}\u0000`;
+  });
+  out = out
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[\s(])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>")
+    .replace(
+      /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
+      (_, t, u) => `<a href="${u}" target="_blank" rel="noreferrer">${t}</a>`
+    );
+  return out.replace(/\u0000(\d+)\u0000/g, (_, i) => slots[+i]);
+}
+
+// Block rules over **already-escaped** text: fenced code (with a copy button), headings, quotes,
+// lists, rules, paragraphs. Whatever this does not recognise is a paragraph line — a markdown
+// dialect that drops text would be worse than plain text.
+function mdToHtml(text) {
+  const lines = String(text).split("\n");
+  const out = [];
+  let para = [];
+  let list = null;
+  let quote = [];
+  const flushPara = () => {
+    if (para.length) { out.push(`<p>${para.map(mdInline).join("<br>")}</p>`); para = []; }
+  };
+  const flushList = () => {
+    if (list) { out.push(`</${list}>`); list = null; }
+  };
+  const flushQuote = () => {
+    if (quote.length) {
+      out.push(`<blockquote>${quote.map(mdInline).join("<br>")}</blockquote>`);
+      quote = [];
+    }
+  };
+  const flushAll = () => { flushPara(); flushList(); flushQuote(); };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^\s*```/.test(line)) {
+      flushAll();
+      const body = [];
+      i++;
+      while (i < lines.length && !/^\s*```/.test(lines[i])) { body.push(lines[i]); i++; }
+      const code = body.join("\n");
+      out.push(
+        `<div class="md-pre"><button class="md-copy" type="button">copy</button>` +
+          `<pre><code>${code}</code></pre></div>`
+      );
+      continue;
+    }
+    const heading = line.match(/^(#{1,4})\s+(.*)$/);
+    if (heading) {
+      flushAll();
+      out.push(`<h${heading[1].length}>${mdInline(heading[2])}</h${heading[1].length}>`);
+      continue;
+    }
+    if (/^\s*(-{3,}|\*{3,})\s*$/.test(line)) { flushAll(); out.push("<hr>"); continue; }
+    const bullet = line.match(/^\s*[-*+]\s+(.*)$/);
+    const numbered = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (bullet || numbered) {
+      flushPara(); flushQuote();
+      const want = bullet ? "ul" : "ol";
+      if (list && list !== want) flushList();
+      if (!list) { out.push(`<${want}>`); list = want; }
+      out.push(`<li>${mdInline((bullet || numbered)[1])}</li>`);
+      continue;
+    }
+    const quoted = line.match(/^\s*&gt;\s?(.*)$/);
+    if (quoted) { flushPara(); flushList(); quote.push(quoted[1]); continue; }
+    if (/^\s*$/.test(line)) { flushAll(); continue; }
+    flushList(); flushQuote();
+    para.push(line);
+  }
+  flushAll();
+  return out.join("\n");
+}
+
 // Session events
 
 let sessionId = null, eventSocket = null, lastSeq = 0, eventReconnectDelay = 250;
 // The text card currently being appended to. Reset whenever a non-delta arrives, so two replies
 // never merge into one bubble.
 let streaming = null;
+// The raw text behind the streaming card, kept apart from its rendered form.
+let streamingText = "";
 
 function kindOf(event) {
   // The daemon tags events with `event` (`#[serde(tag = "event", rename_all = "snake_case")]`).
@@ -986,11 +1822,16 @@ function noteActivity(id, event) {
     let tools = runningTools.get(id);
     if (!tools) { tools = new Set(); runningTools.set(id, tools); }
     tools.add(event.name || "tool");
+    activeRuns.add(id);
   } else if (kind === "tool_call_finished") {
     const tools = runningTools.get(id);
     if (tools) { tools.delete(event.name || "tool"); if (!tools.size) runningTools.delete(id); }
+    activeRuns.add(id);
+  } else if (kind === "turn_started") {
+    activeRuns.add(id);
   } else if (kind === "turn_finished" || kind === "error") {
     runningTools.delete(id);
+    activeRuns.delete(id);
   } else {
     return;
   }
@@ -999,6 +1840,7 @@ function noteActivity(id, event) {
 }
 
 function paintActivity() {
+  paintStop();
   const host = $("activity");
   if (!host) return;
   const tools = sessionId ? runningTools.get(sessionId) : null;
@@ -1026,6 +1868,13 @@ function paintActivity() {
   host.textContent = "";
 }
 
+// The stop button rides the same liveness as the chip: it exists while a run does, so a person
+// always has a brake within reach — and never sees a brake for a run that already ended.
+function paintStop() {
+  const stop = $("stop");
+  if (stop) stop.hidden = !sessionId || !activeRuns.has(sessionId);
+}
+
 function appendDelta(seq, text) {
   const host = $("events");
   if (!streaming || !streaming.isConnected) {
@@ -1042,13 +1891,17 @@ function appendDelta(seq, text) {
     meta.appendChild(s);
     meta.appendChild(k);
     const body = document.createElement("div");
-    body.className = "body";
+    body.className = "body md";
     el.appendChild(meta);
     el.appendChild(body);
     host.appendChild(el);
     streaming = body;
+    streamingText = "";
   }
-  streaming.textContent += text;
+  // Re-rendered whole on every delta, from the raw text: a delta can split a code fence or a
+  // word, so the accumulated source has to survive each render.
+  streamingText += text;
+  streaming.innerHTML = mdToHtml(esc(streamingText));
 }
 
 function renderEvent(frame) {
@@ -1057,9 +1910,9 @@ function renderEvent(frame) {
   const kind = kindOf(event);
   const k = kind.toLowerCase();
   let role = "agent";
-  if (/(user|prompt|human|input)/.test(k)) role = "user";
+  if (k === "message_received" || /(user|prompt|human|input)/.test(k)) role = "user";
   else if (/(tool|exec|command|call|result|output)/.test(k)) role = "tool";
-  else if (/(system|status|notice|error)/.test(k)) role = "system";
+  else if (/(system|status|notice|error|approval)/.test(k)) role = "system";
   el.className = `event role-${role}`;
   const meta = document.createElement("div");
   meta.className = "meta";
@@ -1069,35 +1922,98 @@ function renderEvent(frame) {
   const kk = document.createElement("span");
   kk.className = "kind";
   kk.textContent = kind;
+  // The kind label is the raw event's door: one click shows the whole JSON, one hides it. The
+  // transcript reads as prose first, and nothing is hidden behind a re-renderer.
+  kk.title = "click for the raw event";
+  kk.addEventListener("click", () => {
+    const open = el.querySelector("pre.raw");
+    if (open) { open.remove(); return; }
+    const raw = document.createElement("pre");
+    raw.className = "raw";
+    raw.textContent = JSON.stringify(event, null, 2);
+    el.appendChild(raw);
+  });
   meta.appendChild(seq);
   meta.appendChild(kk);
+  const note = oneLine(event);
+  if (note) {
+    const n = document.createElement("span");
+    n.className = "note";
+    n.textContent = note;
+    meta.appendChild(n);
+  }
   el.appendChild(meta);
   const text =
     event.text || event.content || event.message || event.output ||
-    event.summary || event.value || "";
+    event.summary || event.reason || event.value || "";
   if (typeof text === "string" && text) {
     const b = document.createElement("div");
-    b.className = "body";
-    b.textContent = text;
+    // The agent's own words are markdown — its answers are full of code and lists — while a user
+    // prompt or a tool summary is shown exactly as typed: rendering somebody's pasted text as
+    // markup is how a transcript starts lying about what was said.
+    if (role === "agent") {
+      b.className = "body md";
+      b.innerHTML = mdToHtml(esc(text));
+    } else {
+      b.className = "body";
+      b.textContent = text;
+    }
     el.appendChild(b);
-  }
-  const summary = summarize(event);
-  if (summary && (typeof text !== "string" || !text || summary !== JSON.stringify(text))) {
-    const pre = document.createElement("pre");
-    pre.textContent = summary;
-    el.appendChild(pre);
+    // A prompt can be steered: loaded back into the composer to change, or sent again as it was.
+    // Both append to the trail rather than rewriting it — the store is the audit, and an edited
+    // prompt leaves the original standing beside the new one.
+    if (role === "user") {
+      const actions = document.createElement("div");
+      actions.className = "actions";
+      const edit = document.createElement("button");
+      edit.textContent = "edit";
+      edit.title = "load this prompt back into the composer, to change and resend";
+      edit.addEventListener("click", () => {
+        const input = $("prompt");
+        input.value = text;
+        input.focus();
+      });
+      const again = document.createElement("button");
+      again.textContent = "ask again";
+      again.title = "send this prompt again — the trail keeps both";
+      again.addEventListener("click", () => submitPrompt(text));
+      actions.appendChild(edit);
+      actions.appendChild(again);
+      el.appendChild(actions);
+    }
   }
   return el;
 }
 
-// A compact one-line-ish rendering: the raw event, minus the fields that are the same on every
-// event of a kind. The full JSON is a click away, so nothing is hidden.
-function summarize(event) {
-  const clone = JSON.parse(JSON.stringify(event));
-  delete clone.type;
-  const keys = Object.keys(clone);
-  if (keys.length === 0) return "";
-  return JSON.stringify(clone);
+// One compact human line per structural event — what the raw JSON used to dump under every
+// card. ""` means the card's body already says it. The full event is one click on the kind label
+// away, so nothing is hidden by being tidy.
+function oneLine(event) {
+  switch (kindOf(event)) {
+    case "turn_started":
+      return `turn ${event.turn ?? "?"}`;
+    case "turn_finished":
+      return `stop ${event.stop || "?"}`;
+    case "usage":
+      return `${event.input_tokens ?? 0} in / ${event.output_tokens ?? 0} out · ${event.model || event.provider || "?"}`;
+    case "tool_call_started":
+      return `${event.name || "tool"} ${shortJson(event.arguments)}`;
+    case "approval_resolved":
+      return `${event.approved ? "allowed" : "denied"} by ${event.by || "?"}`;
+    case "message_received":
+    case "tool_call_finished":
+    case "approval_requested":
+    case "error":
+    case "text_delta":
+      return "";
+    default:
+      return shortJson(event);
+  }
+}
+
+function shortJson(value) {
+  const s = JSON.stringify(value ?? {});
+  return s.length > 120 ? s.slice(0, 117) + "…" : s;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1115,6 +2031,8 @@ let sessions = [];
 // tasks with an approval nobody has answered. Both feed the row marker and the composer chip.
 const runningTools = new Map();
 let waitingSessions = new Set();
+// Tasks with a run in flight (turn started, no turn finished yet) — what the stop button is for.
+const activeRuns = new Set();
 
 const sidOf = (s) => (typeof s === "string" ? s : (s && (s.id || s.session))) || "";
 const titleOf = (s) => {
@@ -1284,6 +2202,7 @@ async function deleteSession() {
     lastSeq = 0;
     streaming = null;
     runningTools.delete(gone);
+    activeRuns.delete(gone);
     try { localStorage.removeItem(SESSION_KEY); } catch (_) {}
     $("events").innerHTML = "";
     if (eventSocket) { try { eventSocket.close(); } catch (_) {} eventSocket = null; }
@@ -1308,9 +2227,9 @@ async function ensureSession() {
   await createSession();
 }
 
-function attachSession() {
+async function attachSession() {
   if (eventSocket) { try { eventSocket.close(); } catch (_) {} }
-  eventSocket = new WebSocket(wsURL(`/v1/sessions/${sessionId}/ws`));
+  eventSocket = new WebSocket(await wsURL(`/v1/sessions/${sessionId}/ws`));
 
   eventSocket.onopen = () => {
     eventReconnectDelay = 250;
@@ -1336,6 +2255,7 @@ function attachSession() {
       $("events").appendChild(renderEvent(frame));
     }
     noteActivity(sessionId, arrived);
+    noteAttention(arrived);
     $("events").scrollTop = $("events").scrollHeight;
   };
   eventSocket.onclose = () => {
@@ -1347,12 +2267,24 @@ function attachSession() {
 // ---------------------------------------------------------------------------------------------
 // Prompting
 
-async function sendPrompt() {
-  const input = $("prompt");
-  const prompt = input.value.trim();
-  if (!prompt || !sessionId) return;
-  input.value = "";
-  $("send").disabled = true;
+// A run in flight on this page. The daemon serialises runs per session, so a prompt sent mid-run
+// would sit unanswered on the session lock; queueing it here is what makes a follow-up *visible*
+// instead of a request that silently waits.
+let running = false;
+let promptQueue = [];
+
+// One path for every prompt this page sends: the composer, a queued follow-up, "ask again" on an
+// old card. Mid-run prompts queue visibly and go out on their own when the run ends.
+async function submitPrompt(prompt) {
+  if (!sessionId || !prompt) return;
+  if (running) {
+    promptQueue.push(prompt);
+    paintQueue();
+    return;
+  }
+  running = true;
+  activeRuns.add(sessionId);
+  paintActivity();
   showError("");
   try {
     const res = await apiFetch(`${API}/v1/chat`, {
@@ -1375,17 +2307,80 @@ async function sendPrompt() {
   } catch (e) {
     showError(String(e.message || e));
   } finally {
-    $("send").disabled = false;
+    running = false;
+    activeRuns.delete(sessionId);
+    paintActivity();
+    paintQueue();
     $("prompt").focus();
+    // The next queued follow-up goes out on its own — that is what queueing one means.
+    if (promptQueue.length) submitPrompt(promptQueue.shift());
+  }
+}
+
+function sendPrompt() {
+  const input = $("prompt");
+  const prompt = input.value.trim();
+  if (!prompt) return;
+  input.value = "";
+  submitPrompt(prompt);
+}
+
+// The queue is visible because it is not free: a follow-up typed while a run is going is intent
+// with money attached, and it must not live somewhere the person who typed it cannot see it.
+function paintQueue() {
+  const host = $("queue");
+  if (!host) return;
+  host.innerHTML = "";
+  promptQueue.forEach((text, index) => {
+    const chip = document.createElement("span");
+    chip.className = "chip";
+    const label = document.createElement("span");
+    label.textContent = text.length > 60 ? text.slice(0, 60) + "…" : text;
+    const drop = document.createElement("button");
+    drop.textContent = "×";
+    drop.title = "drop this queued prompt";
+    drop.addEventListener("click", () => {
+      promptQueue.splice(index, 1);
+      paintQueue();
+    });
+    chip.appendChild(label);
+    chip.appendChild(drop);
+    host.appendChild(chip);
+  });
+}
+
+// The brake. The daemon's `POST /v1/sessions/{id}/cancel` is cooperative — the run stops at its
+// next safe boundary and answers with `stop: "cancelled"` — and it answers a question the run is
+// parked on as denied, so "stop" works even while the run waits for an approval nobody wants to
+// give.
+async function stopRun() {
+  if (!sessionId) return;
+  const btn = $("stop");
+  if (btn) btn.disabled = true;
+  try {
+    const res = await apiFetch(`${API}/v1/sessions/${sessionId}/cancel`, { method: "POST" });
+    if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+    const body = await res.json();
+    if (!body.cancelled) {
+      // Said rather than silently done: the button was stale, and a stop that stopped nothing
+      // must not read as one that did.
+      activeRuns.delete(sessionId);
+      paintActivity();
+    }
+  } catch (e) {
+    showError(String(e.message || e));
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 
 // ---------------------------------------------------------------------------------------------
 // Approvals
 
-// Polled rather than pushed. An approval is rare and a second of latency costs nothing, while a
-// push channel would be a second socket to keep alive and reconnect for something that mostly has
-// nothing to say. If this ever polls a busy daemon, that trade should be revisited — not before.
+// Pushed for the open task: an approval is an ordinary event on the session socket, so
+// `noteAttention` re-reads the queue the moment a question is asked or answered. The timer is now
+// only the cross-task fallback (a question on a task this page is not open on) — and the thing
+// that keeps the sandbox/host panes fresh, which is why it stays quick.
 const APPROVAL_POLL_MS = 2000;
 let approvalTimer = null;
 
@@ -1421,6 +2416,188 @@ async function pollSandboxes() {
     host.appendChild(span);
   } catch (e) {
     host.textContent = `sandbox state unknown: ${e.message || e}`;
+    return;
+  }
+  // The boxes themselves, each with the way in. `/v1/status` gives the summary and not the ids, so
+  // this second read is the one that knows what there is to enter — a daemon with a working engine
+  // and no live boxes renders nothing here, which is the honest picture.
+  try {
+    const res = await apiFetch(`${API}/v1/sandboxes`);
+    if (!res.ok) return;
+    const boxes = await res.json();
+    for (const box of boxes) {
+      const row = document.createElement("div");
+      row.className = "box";
+      const line = document.createElement("div");
+      line.className = "line";
+      const id = document.createElement("span");
+      id.className = "id";
+      // The profile and remaining life, not just the id: which box is which is unreadable from an
+      // opaque id alone, and "expires in 40m" is what decides whether to bother.
+      const left = Math.max(0, Math.round((new Date(box.expires_at) - Date.now()) / 60000));
+      id.textContent = `${box.profile} · ${box.id} · ${left}m left`;
+      id.title = `${box.id} (${box.isolation})`;
+      // What it runs, when it runs anything: an idle box has no command and adds nothing here.
+      let runs = null;
+      if (Array.isArray(box.command) && box.command.length) {
+        runs = document.createElement("span");
+        runs.className = "runs";
+        runs.textContent = `runs ${box.command.join(" ")}`;
+        runs.title = box.command.join(" ");
+      }
+      const shell = document.createElement("button");
+      shell.type = "button";
+      shell.textContent = "shell";
+      shell.title = `open a terminal inside ${box.id}`;
+      shell.addEventListener("click", async () => {
+        try {
+          await openSandboxTerminal(box.id);
+        } catch (e) {
+          // The daemon's own sentence, verbatim: for a refused session it already says what is
+          // wrong (a backend with no way to open one, a box that just stopped) and inventing a
+          // friendlier message would replace the answer with a paraphrase.
+          showError(String(e.message || e));
+        }
+      });
+      line.appendChild(id);
+      line.appendChild(shell);
+      row.appendChild(line);
+      // Below the identity, not beside it: what a box runs is worth a line of its own and would
+      // otherwise take the width the id needs to be readable at all.
+      if (runs) row.appendChild(runs);
+      host.appendChild(row);
+    }
+  } catch (e) {
+    // The summary above is already rendered and useful; a failed list read is not worth replacing
+    // it with an error line, so this stays quiet.
+  }
+}
+
+// A question arriving on the open task's socket is the push half of the approval surface: it
+// only re-reads the queue (one request, every session) — the notification itself is driven from
+// what that read returns, so a question can never alarm twice or alarm on replayed history.
+function noteAttention(event) {
+  const kind = kindOf(event);
+  if (kind === "approval_requested" || kind === "approval_resolved") pollApprovals();
+  // A priced call just happened: money moved, so the spend panel re-reads. Cheap and idempotent.
+  if (kind === "usage") refreshSpend();
+  // A turn finished: if this page is in the background, tell the person their answer is ready —
+  // the run-completion half of "answer from anywhere". A foreground page says nothing (the
+  // stream is the answer); a page that cannot notify just keeps its title.
+  if (kind === "turn_finished" && document.hidden) notifyRunDone(event);
+}
+
+// One notification per finished run: `tag` collapses repeats, and a notification that fires while
+// the page regains focus is worse than none. Degrades silently like the approval notification.
+function notifyRunDone(event) {
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  try {
+    new Notification("hx: run finished", {
+      body: `${titleBase} — the run ended, the answer is on the transcript`,
+      tag: `hx-done-${sessionId || "global"}`,
+    });
+  } catch (_) {}
+}
+
+// Money made visible. The store always carried every usage row; this is the panel that finally
+// asks it where the money went — by day, by model, by session — so a budget stops being
+// decorative. A row priced at zero with tokens stands as `unpriced`, never as free.
+function spendCost(row) {
+  const cost = typeof row.cost_usd === "number" ? row.cost_usd : 0;
+  const tokens = (row.input_tokens || 0) + (row.output_tokens || 0);
+  if (cost > 0) return `$${cost.toFixed(4)}`;
+  return tokens > 0 ? "unpriced" : "—";
+}
+
+function spendRow(key, row) {
+  // Two lines, never one wrapping mess: the name and the money on top (the two things a person
+  // scans for), the token counts beneath in a smaller voice.
+  const div = document.createElement("div");
+  div.className = "spend-row";
+  const top = document.createElement("div");
+  top.className = "line";
+  const label = document.createElement("span");
+  label.textContent = key;
+  const money = document.createElement("span");
+  const cost = typeof row.cost_usd === "number" ? row.cost_usd : 0;
+  const tokens = (row.input_tokens || 0) + (row.output_tokens || 0);
+  if (cost > 0 || tokens === 0) {
+    const b = document.createElement("b");
+    b.textContent = spendCost(row);
+    money.append(b);
+  } else {
+    money.className = "unpriced";
+    money.textContent = "unpriced";
+  }
+  top.append(label, money);
+  const counts = document.createElement("div");
+  counts.className = "counts";
+  counts.textContent = `${row.calls || 0} call(s) · ${row.input_tokens || 0} in / ${row.output_tokens || 0} out`;
+  div.append(top, counts);
+  return div;
+}
+
+async function refreshSpend() {
+  const host = $("spend-body");
+  if (!host) return;
+  try {
+    const res = await apiFetch(`${API}/v1/usage`);
+    if (!res.ok) return;
+    const report = await res.json();
+    const total = report.total || {};
+    const ticker = $("spend-ticker");
+    if (ticker) ticker.textContent = `spend ${spendCost(total)} / 30d`;
+    const head = $("spend-total");
+    if (head) {
+      head.textContent = `${spendCost(total)} · ${total.calls || 0} call(s)`;
+    }
+    host.replaceChildren();
+    const section = (title, rows, keyOf) => {
+      if (!Array.isArray(rows) || rows.length === 0) return;
+      const h = document.createElement("div");
+      h.className = "spend-head";
+      h.textContent = title;
+      host.append(h);
+      for (const row of rows) host.append(spendRow(keyOf(row), row));
+    };
+    section("by model", report.by_model, (r) => r.key || "?");
+    section("by day", report.by_day, (r) => r.key || "?");
+    section("by session", report.by_session, (r) => r.title || r.key || "?");
+    if (!host.childElementCount) {
+      const empty = document.createElement("div");
+      empty.className = "spend-row";
+      empty.textContent = "no provider calls in the last 30 days";
+      host.append(empty);
+    }
+  } catch (_) { /* a panel that cannot read is not worth an error banner */ }
+}
+
+// The title bar joins the alarm: a tab left open in the background is where a run's question
+// actually waits. Restored on focus and when the queue empties.
+const titleBase = document.title;
+function flashTitle() {
+  if (!document.title.startsWith("●")) document.title = `● approval — ${titleBase}`;
+}
+window.addEventListener("focus", () => { document.title = titleBase; });
+
+// Desktop notification for a question that needs a person. Degrades silently: a browser that has
+// not granted (or does not support) notifications still has the pane, the chip and the title.
+function notifyApprovals(reqs) {
+  if (!("Notification" in window)) return;
+  const fire = () => {
+    for (const req of reqs.slice(0, 3)) {
+      try {
+        new Notification("hx: approval needed", {
+          body: `${req.tool || "tool"} — ${req.summary || req.reason || ""}`,
+          tag: `hx-approval-${req.id}`,
+        });
+      } catch (_) {}
+    }
+  };
+  if (Notification.permission === "granted") fire();
+  else if (Notification.permission === "default") {
+    const asked = Notification.requestPermission();
+    if (asked && asked.then) asked.then((p) => { if (p === "granted") fire(); }, () => {});
   }
 }
 
@@ -1436,7 +2613,13 @@ async function pollApprovals() {
   }
 }
 
+// Ids already seen. `null` means "not primed yet": the first read only records, so opening the
+// page beside an old question does not raise an alarm for it.
+let knownApprovals = null;
 function renderApprovals(items) {
+  const ids = new Set(items.map((r) => r && r.id).filter(Boolean));
+  const fresh = knownApprovals ? new Set([...ids].filter((id) => !knownApprovals.has(id))) : new Set();
+  knownApprovals = ids;
   const host = $("approvals");
   $("approval-count").textContent = items.length ? `${items.length}` : "";
   // Which tasks are blocked on a person. The session rides on the request itself (the queue stamps
@@ -1461,6 +2644,8 @@ function renderApprovals(items) {
     for (const req of items) host.appendChild(renderApproval(req));
   }
   if (changed) { renderSessions(); paintActivity(); }
+  if (items.length === 0) document.title = titleBase;
+  if (fresh.size) { flashTitle(); notifyApprovals(items.filter((r) => fresh.has(r.id))); }
 }
 
 function renderApproval(req) {
@@ -2409,7 +3594,7 @@ async function deleteProvider(name) {
 // ---- Codex chrome: drawer tabs, panel toggles, version, onboarding (no API contract changes) ----
 (function codexChrome() {
   const tabBtns = Array.from(document.querySelectorAll(".tabs button[data-tab]"));
-  const panes = { terminal: $("dp-terminal"), diff: $("dp-diff"), fanout: $("dp-fanout"), providers: $("dp-providers") };
+  const panes = { terminal: $("dp-terminal"), screen: $("dp-screen"), diff: $("dp-diff"), fanout: $("dp-fanout"), providers: $("dp-providers") };
   function showTab(name) {
     for (const [key, pane] of Object.entries(panes)) {
       if (pane) pane.hidden = key !== name;
@@ -2640,22 +3825,55 @@ refreshAuthUI();
   if (initTerm()) {
     try { await ensureTerminal(); } catch (e) { showError(String(e.message || e)); }
   }
+  // Wired, not started: no browser is launched until someone opens the pane and asks for a page.
+  // A page load that started a browser would spend the daemon's memory on every refresh of every
+  // window, which is not what opening a UI means.
+  initScreen();
+  // A notification's deep link, before the first poll: the person who followed it is owed the screen
+  // it names, whether or not they arrived in time to see the banner.
+  try { await followScreenLink(); } catch (_) {}
+  // Polled like the approval queue, and for its reason: a challenge can arrive with no other activity
+  // on this page — it belongs to a fetch the daemon is running, not to anything this tab did — and the
+  // daemon is holding that fetch until somebody answers.
+  try { await pollChallenges(); } catch (_) {}
   try { await ensureSession(); } catch (e) { showError(String(e.message || e)); }
   // Polled for the page's lifetime: an approval can arrive with no other activity, so there is no
   // event to hang the refresh off.
-  await Promise.all([pollApprovals(), pollSandboxes(), pollHosts(), pollProviders()]);
+  await Promise.all([pollApprovals(), pollSandboxes(), pollHosts(), pollProviders(), refreshSpend()]);
   try { if (window.__maybeOnboard) await window.__maybeOnboard(); } catch (_) {}
   approvalTimer = setInterval(() => {
     pollApprovals();
+    pollChallenges();
     pollSandboxes();
     pollHosts();
     refreshSessions();
   }, APPROVAL_POLL_MS);
+  // Spend moves only when a run spends: re-read on the `usage` push (noteAttention) and here on a
+  // slow tick as the cross-task fallback — the 2s cadence would be noise for a number this stable.
+  setInterval(refreshSpend, 60_000);
   window.addEventListener("beforeunload", () => clearInterval(approvalTimer));
 })();
 
 $("prompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) sendPrompt(); });
 $("send").addEventListener("click", sendPrompt);
+$("stop").addEventListener("click", stopRun);
+// Copy buttons are delegated: the markdown renderer builds HTML strings, so no handler can ride
+// along on the elements it makes.
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest && e.target.closest(".md-copy");
+  if (!btn) return;
+  const code = btn.parentNode && btn.parentNode.querySelector("code");
+  if (!code) return;
+  const done = () => {
+    btn.textContent = "copied";
+    setTimeout(() => { btn.textContent = "copy"; }, 1200);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(code.innerText).then(done, () => {});
+  } else {
+    done();
+  }
+});
 $("new-session").addEventListener("click", createSession);
 $("session-delete").addEventListener("click", deleteSession);
 $("session-rename").addEventListener("click", () => { const el = $("session-label"); el.focus(); el.select(); });
@@ -2669,14 +3887,7 @@ $("new-term").addEventListener("click", async () => {
   // shell, and reusing the id would just reattach to the first.
   const id = `hx-term-${Date.now().toString(36)}`;
   try {
-    await apiFetch(`${API}/v1/terminals`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ id, cols: term.cols, rows: term.rows }),
-    });
-    terminalId = id;
-    term.reset();
-    attachTerminal();
+    await ensureTerminalFor(id, null, "on this machine");
   } catch (e) {
     showError(String(e.message || e));
   }

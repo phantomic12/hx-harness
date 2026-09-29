@@ -120,6 +120,13 @@ hosts:
     port: 22
     user: deploy
     auth: { kind: key, secret_ref: "vault:ssh/buildbox" }
+    # Host key checking: `strict` (the default — an unknown host is refused), `tofu` (trust on
+    # first use: the first connection records the key and a later *change* is refused), or
+    # `insecure` (accept anything, warn loudly). Omit the key and you get strict. Use `tofu` for
+    # machines too new to have a known_hosts entry — it is per host and spelled by name, so a
+    # lax policy is a line here rather than a default. A changed key is refused under strict and
+    # tofu alike; the choice is only about what happens on a *first* contact.
+    # host_key: tofu
     # A sandbox profile with `host: buildbox` and an `egress:` allowlist needs the compiled
     # `hx-egress-proxy` binary to exist **on buildbox** — the proxy sidecar runs there, and it
     # bind-mounts the binary from that machine's filesystem. The daemon cannot guess where a
@@ -164,6 +171,117 @@ sandbox_profiles:
     pids_max: 1024
     ttl_secs: 3600
     # Defaults are the safe ones: no network, read-only root, non-root user.
+
+  # A profile with a `command` is a box that boots *something* instead of idling: `command` is the
+  # sandbox's own process (an argv, not a shell line — write `["sh", "-c", "…"]` when you want one),
+  # and leaving it out means `sleep infinity`, a box you only exec into. The confinement is identical
+  # either way: the cgroup limits, the network policy, the egress allowlist and the TTL above all
+  # still apply, so a long-lived server is not a weaker sandbox. The docker and remote backends
+  # honour it; the firecracker backend boots the guest image's own init and refuses a profile with
+  # the key rather than running something the operator did not ask for.
+  #
+  #   server:
+  #     isolation: l2
+  #     image: python:3.12-slim
+  #     ttl_secs: 3600
+  #     network: true          # a server that nobody can reach is a test with no assertions
+  #     readonly_rootfs: false # and the port it binds may want a scratch dir to write
+  #     command: ["python3", "-m", "http.server", "8000"]
+
+# ---------------------------------------------------------------------------
+# The terminal and the screen: what a client's `POST /v1/terminals` runs, and the browser
+# `POST /v1/screens` launches.
+#
+# `terminal.shell` defaults to `$SHELL`, else `/bin/sh`. It names a shell on the *daemon's* machine;
+# a terminal in a sandbox or on a remote host ignores it, because `/bin/zsh` in a config is a path on
+# the machine the config was written for and would be a guess about any other.
+#
+# A **screen** is a browser the daemon runs and streams to the web client's `screen` pane: JPEG frames
+# down a WebSocket, the watcher's clicks, wheel and keys back up. It owns a browser profile per screen
+# under `profile_root` (a cookie jar is an identity, so two screens never share one) and it is
+# deliberately not confined by a sandbox: the browser runs where the daemon does, and can reach
+# whatever that machine can. The same client can already open a shell there, which is strictly more.
+#
+#   terminal:
+#     shell: /bin/bash
+#
+#   screen:
+#     # Omitted means "search the platform's usual places" — Chrome, then Edge, then the Linux paths —
+#     # which is the *same* search the browser rung uses, so a fetch and a screen on one host agree on
+#     # which browser is meant. A host with none answers 503 naming every path it looked at.
+#     browser: /usr/bin/google-chrome
+#     # The page a screen opens when a request names none. Omitted means `about:blank`: a daemon that
+#     # opened a page of its own choosing would be reaching the network on a watcher's behalf.
+#     url: http://127.0.0.1:7717/
+#     width: 1280
+#     height: 800
+#     quality: 70
+#     # One directory per screen. Must be an absolute path or one relative to the daemon's working
+#     # directory (it is resolved before the browser sees it — Chrome refuses a relative
+#     # `--user-data-dir` outright). Defaults to a directory under the system temporary directory.
+#     profile_root: /var/lib/hx/screens
+#     # How long a person is given to clear a wall that refused every automated rung, in seconds. A
+#     # site that refuses the plain fetch *and* a real browser gets handed to a person: the daemon opens
+#     # a screen and waits this long for an answer from the web client (see the screen pane's banner,
+#     # `POST /v1/challenges`). **0 never asks** — the interactive rung keeps its fail-closed default
+#     # and a refused page ends at the browser's refusal. Worth knowing before leaving it at 300: a
+#     # background research run that hits a bot wall will open a browser on **this** machine and hold
+#     # that fetch while it waits.
+#     challenge_budget_secs: 300
+#     # Who a challenge is addressed to — the person the daemon tells when a run is stuck on a wall.
+#     # Omitted means the account the daemon already has: `api.admin_username`, itself `admin`. The
+#     # name reaches the web client's banner ("for yoav") and the notification pushed below, and the
+#     # banner also says whether *that* person was told — an operator with no `push_url` shows that
+#     # this page is the only place their question exists.
+#     operator: yoav
+#
+#     # ...or name every operator who may be asked, each with the channel that reaches *them*. A
+#     # challenge is a question for one person, so with several people responsible for a daemon the
+#     # daemon picks one: challenges **rotate** through this list in order, wrapping at the end, so
+#     # two runs in a row never land on the same phone and no run is left unaddressed. Each challenge
+#     # is pushed only to its own addressee's `push_url` — never broadcast, and never to the shared
+#     # `approval.push_url` below, which a roster entry deliberately does not inherit.
+#     #
+#     # An entry with no `push_url` is a person the daemon can address but not ring: their questions
+#     # wait on the page, and the daemon says so once at startup rather than leaving you to find out.
+#     # A repeated name keeps the first `push_url`, so one person is never rung twice for one question.
+#     # Writing this list makes `operator` and `approval.push_url` irrelevant to challenges — the list
+#     # is the whole truth.
+#     operators:
+#       - { name: yoav, push_url: "https://relay.example/hx/yoav" }
+#       - { name: dana, push_url: "https://relay.example/hx/dana" }
+#       # Reachable, but only on the daemon's own page:
+#       - { name: sam }
+
+# ---------------------------------------------------------------------------
+# The operator's notification webhook. Off unless it is configured.
+# ---------------------------------------------------------------------------
+# `approval.push_url` is where the daemon pings a *person*, over a generic webhook — a relay you run,
+# a `notify` endpoint, or a script that turns the JSON into a lock-screen notification. No APNs/FCM
+# provider is required and none is bundled. Three kinds of ping arrive here, each with its own `kind`
+# so one relay can route them apart:
+#
+#   challenge            a page refused every automated rung and someone has to clear the wall. Sent
+#                        only to the `push_url` of the operator it is addressed to. The payload names
+#                        the site, the session, that operator, the time left and the
+#                        screen to look at (`page_url`), and carries a **one-time** `respond_url`:
+#                        `POST` it `{"outcome":"solved"}` and the challenge is answered *without* the
+#                        daemon's bearer token. The note the token lives in is redacted from every log
+#                        line. Clearing the wall itself happens on the screen — the token only reports
+#                        that a person did.
+#   challenge_resolved   that challenge ended, and how (`solved`, `abandoned`, `withdrawn`). It goes
+#                        back down the same route it came up: the person who was told to hurry is the
+#                        person who learns they can stop, and nobody else's phone is woken.
+#   run_completed        a run finished, with its stop reason and cost.
+#
+# Nothing is posted when this key is omitted: those pings are simply not sent, which the challenge
+# banner says on the page rather than implying somebody was reached. This is also the *only* operator
+# channel `screen.operators` does not replace: each entry there carries its own `push_url`, so a
+# question addressed to one person is never delivered on another's webhook. With no `operators` list
+# this key is the single operator's channel, exactly as it has always been.
+#
+#   approval:
+#     push_url: https://relay.example/hx
 
 # ---------------------------------------------------------------------------
 # Approval: what runs by itself, and what has to be asked about.
@@ -264,13 +382,44 @@ search:
   # google_cse_cx: "0123456789abcdef0"   # the engine id, not a secret
 
 # ---------------------------------------------------------------------------
+# How a research run fetches the pages it cites: which browser, and who the target may be.
+#
+# `screen` is a browser a person *watches*; this is a **rung of the fetch ladder** — the layer a page
+# whose plain `GET` was refused gets handed to. The two share exactly one thing, the search that finds
+# a browser when no path is named, so on a host with one browser installed a fetch and a screen agree
+# on which browser is meant. Everything else is separate, so the two keys below can name different
+# binaries without either being wrong.
+#
+#   fetch:
+#     # Omitted means the platform's usual places. A named path is launched exactly as given, which is
+#     # how a host whose browser is somewhere unexpected gets a browser rung at all; a wrong path fails
+#     # loudly with the path in the message rather than silently searching somewhere else.
+#     browser: /usr/bin/google-chrome
+#     # Who a fetched target may be: `public_internet` (the default) or `allow_local`.
+#     #
+#     # `allow_local` admits loopback and private addresses, so a fetched page's own script can reach
+#     # every service on the daemon's loopback — a dev server with no auth, a metrics endpoint, the
+#     # cloud metadata service at 169.254.169.254. Set it when the backend set is trusted and the point
+#     # is a service on this machine (a local SearXNG, a wiki on a private host); otherwise leave it.
+#     admission: public_internet
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Chat connectors (M5 in the roadmap).
 # ---------------------------------------------------------------------------
+# Chat connectors. A `kind: telegram` connector is an **approval mirror**: questions a run asks
+# are posted to the chat with allow/deny buttons, and a tap answers the run — the web/CLI client
+# watching the same session sees the question resolved the moment the phone decides it. The ceiling
+# is a phone ceiling: a tap may authorise reads and workspace mutations, never egress, destructive
+# or privileged actions (see `crates/hx-server/src/telegram_mirror.rs`). The first entry of
+# `allow_from` must be the **numeric chat id** questions are mirrored to (a `@handle` cannot be
+# addressed by the Bot API's approval cards); further entries are chats whose taps are accepted.
 connectors:
   telegram:
     kind: telegram
     token: "vault:telegram/bot"
-    allow_from: ["@yourhandle"]
+    allow_from: ["123456789", "@yourhandle"]
+    # api_root: "https://api.telegram.org"   # or a self-hosted Bot API server / testing stub
 
 # ---------------------------------------------------------------------------
 # MCP servers (M6 in the roadmap): other people's tool servers, consumed by

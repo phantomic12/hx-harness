@@ -86,10 +86,29 @@ pub struct AppState {
     /// One lock per session, held for the duration of a run: two requests on one session would
     /// otherwise interleave into a transcript neither of them wrote.
     pub chats: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    /// The runs currently in flight, by session id, each with its brake. This is what `POST
+    /// /v1/sessions/{id}/cancel` pulls; an entry exists exactly while a run does, so
+    /// `"cancelled": false` means "nothing was running", not "the id was wrong".
+    pub runs: Mutex<HashMap<String, hx_agent::CancelSignal>>,
     /// The server-side terminals. Owned by the daemon, not by a connection: a shell outlives the
     /// client that opened it, which is what lets two clients attach to one terminal and see the
     /// same bytes.
     pub terminals: Arc<crate::terminal::Terminals>,
+    /// The live screens: browsers the daemon runs and streams, one directory of profile each.
+    ///
+    /// Owned here for the terminal's reason — a screen outlives the tab watching it — and kept
+    /// beside the terminals because the two are the same shape: a thing the daemon owns that a
+    /// client attaches to, with frames or bytes going both ways. See [`crate::screen`].
+    pub screens: Arc<crate::screen::Screens>,
+    /// The challenges a person has been handed and has not answered.
+    ///
+    /// Kept beside the screens because a challenge is presented *as* one: the listing a client
+    /// polls and the answer it posts both name a screen, and the pane is what holds the two
+    /// together. See [`crate::pane`].
+    pub challenges: Arc<crate::pane::Challenges>,
+    /// The human in the loop: what `hx-browser`'s interactive rung asks when a site refuses the
+    /// automated rungs, and what a person answers from the web client.
+    pub pane: Arc<crate::pane::ScreenPane>,
     /// Live events, broadcast to SSE subscribers as a run produces them.
     ///
     /// Events are also persisted, so this is the *live* half of the same stream a late reader gets
@@ -142,6 +161,14 @@ pub struct AppState {
     pub webhook_sessions: Mutex<HashMap<String, SessionId>>,
     /// The on-disk config file, so a runtime provider edit can be persisted. See [`Self::provider_configs`].
     pub config_path: Option<PathBuf>,
+    /// Single-use tickets a browser trades its bearer token for, so a WebSocket handshake — which
+    /// cannot carry an `Authorization` header — has a credential that is safe in a URL. Outstanding
+    /// tickets only; in-memory, so a restart invalidates them. See [`crate::ws_ticket`].
+    pub ws_tickets: crate::ws_ticket::WsTicketBook,
+    /// The Telegram approval mirrors, one per buildable `kind: telegram` connector. `None` when
+    /// none exist — the shape every test harness has, since mirrors are built from the config in
+    /// `from_parts` and need a resolvable bot token. See [`crate::telegram_mirror`].
+    pub telegram_mirrors: Option<Vec<Arc<crate::telegram_mirror::TelegramMirror>>>,
 }
 
 /// Everything [`AppState::build`] assembles, so a test can assemble it differently.
@@ -365,7 +392,41 @@ impl AppState {
     /// retained webhook driver nobody reads is a queue that fills and then `429`s forever (#73),
     /// and that is true no matter which constructor retained it.
     pub fn from_parts(parts: AppStateParts) -> Arc<Self> {
-        let state = Arc::new(Self {
+        // Built before the state, and from the parts' config, for the same reason the Telegram mirrors
+        // below are: the pane's launch options are the `screen` section, and a test's parts should not
+        // have to name them to get a daemon with a working screen surface.
+        let screens = Arc::new(crate::screen::Screens::new());
+        let challenges = Arc::new(crate::pane::Challenges::new());
+        // Who a challenge may be addressed to, resolved once here so the pane and the notifier cannot
+        // disagree about it: the pane rotates through this roster to pick the addressee, and the
+        // notifier routes by the name the pane stamped on the question. `approval.push_url` is the
+        // single-operator form of it and is folded in by `challenge_operators`.
+        let operators = parts.config.challenge_operators();
+        // Said once, at startup, rather than discovered by an operator whose run is already blocked:
+        // an entry with no `push_url` is a person the daemon can address but not ring, and the only
+        // place that becomes visible is a banner that says "nobody was told". The whole roster being
+        // mute is the same problem one level up, and is a louder warning.
+        for operator in &operators {
+            if operator.push_url.is_none() {
+                tracing::warn!(
+                    operator = %operator.name,
+                    "this operator has no push_url, so a challenge addressed to them is only on the                      daemon's page; the other operators on the roster are unaffected"
+                );
+            }
+        }
+        // `respond_base` is the daemon's own origin, so the answer URL in a notification is one a
+        // person can actually open.
+        let notices = crate::challenge_notice::WebhookNotices::new(
+            &operators,
+            crate::phone::origin_of(&parts.config.daemon.http_addr),
+        );
+        let pane = Arc::new(crate::pane::ScreenPane::new(
+            Arc::clone(&screens) as Arc<dyn crate::pane::ScreenHost>,
+            Arc::clone(&challenges),
+            notices as Arc<dyn crate::challenge_notice::ChallengeNotices>,
+            crate::pane::PaneOptions::from_config(&parts.config),
+        ));
+        let mut state = Arc::new(Self {
             config: parts.config,
             router: parts.router,
             providers: parts.providers,
@@ -378,7 +439,11 @@ impl AppState {
             phone: parts.phone,
             search: parts.search,
             chats: Mutex::new(HashMap::new()),
+            runs: Mutex::new(HashMap::new()),
             terminals: Arc::new(crate::terminal::Terminals::new()),
+            screens: screens.clone(),
+            challenges: challenges.clone(),
+            pane,
             // Capacity generous enough that a burst of token deltas does not drop a subscriber;
             // a slow reader is *supposed* to lag (reconnecting redraws from the store), but a
             // normal live client must not lose events it was awake for.
@@ -394,8 +459,29 @@ impl AppState {
             webhooks: parts.webhooks,
             webhook_sessions: Mutex::new(HashMap::new()),
             config_path: parts.config_path,
+            ws_tickets: crate::ws_ticket::WsTicketBook::new(),
+            // Filled in below, before the `Arc` is returned: mirrors cannot be part of a test's
+            // parts (they demand a resolvable bot token), so they are built here from the parts'
+            // config rather than accepted from the caller. See [`crate::telegram_mirror`].
+            telegram_mirrors: None,
         });
         crate::webhook_bridge::spawn_webhook_bridges(&state);
+        // The Telegram mirrors, built from the config the parts carry. A mirror that cannot start
+        // (unresolvable token, no chat id) is logged and skipped rather than failing the daemon —
+        // the same degrade-not-die rule the search backends follow. Building here (not in `build`)
+        // is what keeps assembly one place: a retained driver nobody polls was exactly how #73's
+        // silent `429`s happened, and the mirrors' receive loops are the same shape of thing.
+        //
+        // The `Arc::get_mut` is sound: the state was just constructed and no reference has
+        // escaped yet (`spawn_webhook_bridges` takes `&state` and returns).
+        let mirrors = crate::telegram_mirror::build_telegram_mirrors(&state);
+        if let Some(state_mut) = Arc::get_mut(&mut state) {
+            state_mut.telegram_mirrors = if mirrors.is_empty() {
+                None
+            } else {
+                Some(mirrors)
+            };
+        }
         state
     }
 
@@ -568,6 +654,19 @@ impl AppState {
                 Ok(ids) => {
                     for id in ids {
                         tracing::info!(sandbox = %id, "reaped expired sandbox");
+                        // The reaper is the *other* way a box goes away, and it carries the same
+                        // obligation as an explicit destroy: a shell somebody is watching inside it
+                        // has to be told the box expired, not left parked on an exec stream the
+                        // engine will never end. Both paths, or the leak just moves to whoever
+                        // forgets — see `Terminals::close_sandbox`.
+                        let closed = self.terminals.close_sandbox(id.as_str()).await;
+                        if !closed.is_empty() {
+                            tracing::info!(
+                                sandbox = %id,
+                                terminals = ?closed,
+                                "closed the expired sandbox's terminals"
+                            );
+                        }
                         reaped.push(id);
                     }
                 }

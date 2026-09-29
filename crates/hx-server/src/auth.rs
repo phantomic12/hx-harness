@@ -49,13 +49,20 @@
 //! ## The WebSocket exception to "the header, or nothing"
 //!
 //! A browser cannot set headers on a WebSocket handshake, so a page that must attach to
-//! `/v1/sessions/{id}/ws` has no way to present a bearer header. The WebSocket routes therefore
-//! accept the token from `?token=` **only on a WebSocket upgrade request** — a plain `GET` with a
-//! query parameter is refused like any other unauthenticated request, and upgrade headers on a
-//! non-WebSocket route are ignored. The honest cost, written down rather than hidden: a value in a
-//! query string can reach an access log or a `Referer`, which is why the header remains the form
-//! the CLI and every non-browser client use, and why the parameter is narrowed to the one request
-//! shape that has no alternative. The alternative considered and rejected was exempting the
+//! `/v1/sessions/{id}/ws` has no way to present a bearer header. An earlier design accepted the
+//! bearer token from `?token=` on upgrade requests; that put the long-lived credential where logs,
+//! `Referer` headers and browser history can see it, and it is gone (#24). In its place the daemon
+//! mints **single-use tickets** ([`crate::ws_ticket`]): `POST /v1/ws-ticket`, authenticated by the
+//! bearer like everything else, returns a random value good for one handshake and thirty seconds.
+//! The upgrade then presents `?ticket=`, and the handshake spends it.
+//!
+//! The honest cost, written down rather than hidden: the ticket still travels in a URL, so it can
+//! still reach an access log — but what the log holds is a value that is dead within thirty seconds
+//! and dead *immediately* if the handshake that owned it has already run. That is a strictly weaker
+//! leak than the bearer token it replaced, which is replayable for as long as it stands. The
+//! parameter is accepted only on a WebSocket upgrade to a WebSocket route: a plain `GET` with
+//! `?ticket=` is refused like any other unauthenticated request, and the ticket is not a
+//! credential for any HTTP route. The alternative considered and rejected was exempting the
 //! WebSocket routes, which would have left the live event stream and the terminal — the two routes
 //! that hand over a shell — unauthenticated.
 
@@ -92,6 +99,46 @@ fn is_phone_respond_route(path: &str) -> bool {
     )
 }
 
+/// The challenge answer route, which is the one route that also takes a credential from its query
+/// string.
+///
+/// Not *exempt* like the phone respond route: an answer is accepted with the daemon's bearer token as
+/// well, because the web client holds one, so the middleware still authenticates it normally. What is
+/// special here is only that a request with **no** bearer header and a `?token=` is let through to the
+/// handler, which verifies the token against the challenge's own record and refuses a mismatch with a
+/// `403` ([`crate::routes`]).
+///
+/// The token is minted per challenge, delivered only to the operator's notification channel, and spent
+/// by the answer that uses it, so what a relay or a lock screen holds is a five-minute, one-question
+/// credential rather than the master one. See [`crate::challenge_notice`].
+fn is_challenge_answer_route(path: &str) -> bool {
+    let mut segments = path.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (Some(""), Some("v1"), Some("challenges"), Some(id), None) if !id.is_empty()
+    )
+}
+
+/// The one-time token a challenge answer presents in its query string, if any.
+///
+/// Read raw, like [`presented_ticket`]: the value is hex, so a percent-encoded one simply fails to
+/// match the book it is checked against, and decoding here would only widen the shape a guess can
+/// take. Whether it is *this challenge's* token is the registry's answer
+/// ([`crate::pane::Challenges::answer_with_token`]), not this function's.
+fn presented_challenge_token(request: &Request) -> Option<String> {
+    let query = request.uri().query()?;
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == "token" && !value.is_empty()).then(|| value.to_string())
+    })
+}
+
 /// Routes that are WebSocket upgrades.
 ///
 /// A browser cannot set an `Authorization` header on a WebSocket handshake, so these routes accept
@@ -99,7 +146,7 @@ fn is_phone_respond_route(path: &str) -> bool {
 pub fn is_websocket_route(path: &str) -> bool {
     let mut segments = path.split('/');
     // Path must start with '/' (first item "") and have exactly 5 segments:
-    // ["", "v1", "sessions" | "terminals", <id>, "ws"]
+    // ["", "v1", "sessions" | "terminals" | "screens", <id>, "ws"]
     matches!(
         (
             segments.next(),
@@ -112,7 +159,7 @@ pub fn is_websocket_route(path: &str) -> bool {
         (
             Some(""),
             Some("v1"),
-            Some("sessions" | "terminals"),
+            Some("sessions" | "terminals" | "screens"),
             Some(id),
             Some("ws"),
             None,
@@ -149,11 +196,29 @@ pub async fn require_bearer(
         return next.run(request).await;
     }
 
-    match presented_token(&request) {
-        Some(presented) if expected.matches(&presented) => {}
+    let authenticated = match presented_token(&request) {
+        Some(presented) if expected.matches(&presented) => true,
         // A missing token and a wrong one produce byte-identical responses: the body must not be a
         // way to learn whether a guess was close, or whether a token is configured at all.
-        _ => return unauthorized(),
+        Some(_) => false,
+        // Nothing in the header: two other credentials exist, and neither is the bearer token in a
+        // URL. A single-use `?ticket=` is accepted for a WebSocket upgrade and nowhere else — one
+        // handshake spends it, so what a URL leaks is already dead. And a challenge answer may present
+        // the one-time `?token=` from the operator's own notification, which the *handler* checks
+        // against the challenge it names; `?token=` (the bearer itself) is still deliberately *not*
+        // read anywhere: see the module doc and
+        // `the_query_string_is_not_a_credential_channel_anymore`.
+        None => {
+            (is_websocket_route(&path)
+                && is_websocket_upgrade(request.headers())
+                && presented_ticket(&request)
+                    .is_some_and(|ticket| state.ws_tickets.consume(&ticket)))
+                || (is_challenge_answer_route(&path)
+                    && presented_challenge_token(&request).is_some())
+        }
+    };
+    if !authenticated {
+        return unauthorized();
     }
 
     // Bearer auth passed, but a browser page from another site presenting a stolen token must
@@ -196,13 +261,28 @@ pub fn is_webhook_route(path: &str) -> bool {
 
 /// The token a request presents, if any.
 ///
-/// The header is checked first and is the only channel for a non-browser client. The query parameter
-/// is consulted only for a WebSocket upgrade on a WebSocket route — see the module doc.
+/// The header is the only channel, for every client. A browser handshake that has no header
+/// channel presents a [`crate::ws_ticket`] instead — read separately by [`presented_ticket`], so
+/// the bearer token itself never appears in a URL. See the module doc.
 fn presented_token(request: &Request) -> Option<String> {
     if let Some(token) = bearer_from_headers(request.headers()) {
         return Some(token.to_string());
     }
     None
+}
+
+/// The single-use ticket a WebSocket handshake presents in its query string, if any.
+///
+/// Read raw: a ticket is hex, so a percent-encoded value simply fails to match the book and is
+/// refused — decoding here would only widen the shape a guess can take. Whether the value is a
+/// *live* ticket is the book's answer ([`crate::ws_ticket::WsTicketBook::consume`]), not this
+/// function's.
+fn presented_ticket(request: &Request) -> Option<String> {
+    let query = request.uri().query()?;
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == "ticket" && !value.is_empty()).then(|| value.to_string())
+    })
 }
 
 /// `Authorization: Bearer <token>`, and nothing else.
@@ -465,6 +545,7 @@ mod tests {
             "/v1/chat",
             "/v1/sessions/ses_1/ws",
             "/v1/terminals/t/ws",
+            "/v1/screens/s/ws",
             // Not a prefix match: a path that merely starts with an exempt one is not exempt.
             "/healthz/../v1/status",
             "/index.html",
@@ -477,6 +558,7 @@ mod tests {
     fn only_websocket_routes_accept_query_credentials() {
         assert!(is_websocket_route("/v1/sessions/ses_1/ws"));
         assert!(is_websocket_route("/v1/terminals/term_1/ws"));
+        assert!(is_websocket_route("/v1/screens/scr_1/ws"));
         for path in [
             "/v1/status",
             "/v1/chat",
@@ -486,6 +568,9 @@ mod tests {
             "/v1/terminals",
             "/v1/terminals/term_1",
             "/v1/terminals/term_1/ws/more",
+            "/v1/screens",
+            "/v1/screens/scr_1",
+            "/v1/screens//ws",
             "/v2/sessions/ses_1/ws",
             "/healthz",
             "/",
@@ -495,6 +580,53 @@ mod tests {
                 "{path:?} is not a WebSocket upgrade route"
             );
         }
+    }
+
+    #[test]
+    fn one_route_takes_a_readable_token_and_nothing_else_does() {
+        // The challenge answer is the only route whose query string can carry a credential, and it is
+        // a different kind of credential: minted per challenge, sent only to the operator's
+        // notification channel, and spent by the answer. Everything else keeps the rule that a URL is
+        // not a way in.
+        assert!(is_challenge_answer_route("/v1/challenges/chal-1"));
+        for path in [
+            "/v1/challenges",
+            "/v1/challenges/",
+            "/v1/challenges/chal-1/more",
+            "/v1/approvals/apr-1",
+            "/v1/sessions/ses_1/ws",
+            "/v1/status",
+            "/v2/challenges/chal-1",
+        ] {
+            assert!(
+                !is_challenge_answer_route(path),
+                "{path:?} does not take an answer token"
+            );
+        }
+
+        use axum::http::Request;
+        let read = |uri: &str| {
+            let req = Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            presented_challenge_token(&req)
+        };
+        assert_eq!(
+            read("/v1/challenges/chal-1?token=abc").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            read("/v1/challenges/chal-1?token="),
+            None,
+            "an empty token is an absent one, not a credential"
+        );
+        assert_eq!(read("/v1/challenges/chal-1"), None);
+        assert_eq!(
+            read("/v1/challenges/chal-1?ticket=abc"),
+            None,
+            "a ticket is not a challenge token, and this path has no ticket book"
+        );
     }
 
     #[test]

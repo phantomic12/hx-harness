@@ -48,9 +48,13 @@ pub struct Config {
     #[serde(default)]
     pub search: SearchConfig,
     #[serde(default)]
+    pub fetch: FetchConfig,
+    #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
     pub terminal: TerminalConfig,
+    #[serde(default)]
+    pub screen: ScreenConfig,
     #[serde(default)]
     pub update: crate::update::UpdateConfig,
     #[serde(default)]
@@ -201,6 +205,275 @@ fn default_terminal_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
 }
 
+/// How a research run fetches the pages it cites: which browser, and who the target may be.
+///
+/// Deliberately not the same section as `screen`, because the two are different things wearing a
+/// similar name. A screen is a browser a *person watches* (`POST /v1/screens`, the web client's pane) and
+/// nothing about it reads a document; this is a *rung of the fetch ladder*, the layer hx-search hands a
+/// page whose plain `GET` was refused. They share one thing — the search that finds a browser when no
+/// path is named — and that sharing is deliberate: on a host with one browser installed there is one
+/// answer to *"which browser"* whichever of the two is asking. Everything else about them is separate,
+/// so
+/// `fetch.browser` and `screen.browser` can point at different binaries without either being wrong.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FetchConfig {
+    /// The browser binary the interactive rung drives, or `None` to search the platform's usual
+    /// places (see `screen.browser` for what that search is and how it reports finding nothing).
+    ///
+    /// A named path is launched exactly as given, which is the point of naming one: a host whose
+    /// browser is not where the search looks gets a rung that runs, and a *wrong* named path fails
+    /// loudly with the path in the message instead of silently searching somewhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser: Option<String>,
+
+    /// Who a fetched target may be.
+    ///
+    /// Defaults to [`FetchAdmission::PublicInternet`], and the default is the safe answer rather
+    /// than the convenient one — see [`FetchAdmission::AllowLocal`] for what loosening it opens.
+    #[serde(default)]
+    pub admission: FetchAdmission,
+}
+
+impl FetchConfig {
+    /// The browser to drive, or `None` to search the platform's usual places.
+    ///
+    /// A blank value means *search* rather than the empty path, the same rule `screen.browser`
+    /// follows: `browser: ""` is a key somebody cleared, not a binary called nothing.
+    pub fn browser_binary(&self) -> Option<&std::path::Path> {
+        self.browser
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(std::path::Path::new)
+    }
+}
+
+/// Who a research fetch's target may be.
+///
+/// A deliberately small vocabulary, and one that mirrors `hx-browser`'s own
+/// [`Admission`](hx_browser::Admission) by name rather than by sharing a type: the config model
+/// cannot depend on the fetcher crate (the fetcher crate depends on *it*), so the mapping between the
+/// two lives where both are in scope — `hx_search::FetchPolicy::from_config` — in one place with one
+/// test. Every variant is named for a *decision*, not for an address range: the point of the setting
+/// is that loosening it is something an operator wrote down.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FetchAdmission {
+    /// The public internet only. Loopback, private, link-local, CGNAT and cloud-metadata addresses
+    /// are refused before any connection.
+    #[default]
+    PublicInternet,
+
+    /// The address rule is lifted: loopback and private addresses are admitted. `file://` is still
+    /// refused — the scheme rule is not part of this.
+    ///
+    /// **This gives every fetched page the daemon's own network position.** A hostile page's
+    /// `fetch('http://127.0.0.1:…')`, a redirect to a private address, and the cloud metadata service
+    /// at `169.254.169.254` all become reachable from a research run — which is the SSRF hole
+    /// `PublicInternet` exists to close, and the reason the default is not this. Set it when the
+    /// backend set is trusted and the point is a service on this machine (a local SearXNG, a wiki on
+    /// a private host), and know that "the backend set is trusted" is now load-bearing.
+    AllowLocal,
+}
+
+/// The live screen: what a client's `POST /v1/screens` launches when the request does not say.
+///
+/// A screen is a browser the *daemon* runs and streams — pixels out, clicks and keystrokes in. It is
+/// not a fetch: nothing here judges a target or reads a document (see `crates/hx-browser`'s `screen`
+/// module for what that deliberately leaves open, and why a client that can ask for a screen can
+/// already ask for a shell). What this section configures is *which* browser and *how big* a screen.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScreenConfig {
+    /// The browser binary to drive, or `None` to search the platform's usual places.
+    ///
+    /// Empty means search, and the search's refusal names every path it looked at — so an operator
+    /// whose daemon runs under a service manager with an unpredictable `PATH` learns what was
+    /// wanted instead of watching a screen refuse to start with no explanation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser: Option<String>,
+
+    /// The page a new screen opens when the request names none. `None` means `about:blank`.
+    ///
+    /// Deliberately not a default *home page*: a daemon that opened a page of its own choosing on
+    /// every screen would be reaching the network on a watcher's behalf without being asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+
+    /// The viewport's width, in CSS pixels.
+    #[serde(default = "default_screen_width")]
+    pub width: u32,
+
+    /// The viewport's height, in CSS pixels.
+    #[serde(default = "default_screen_height")]
+    pub height: u32,
+
+    /// JPEG quality, 0-100. A screen is for a person to look at; lossless frames over a socket are
+    /// bandwidth nobody asked for.
+    #[serde(default = "default_screen_quality")]
+    pub quality: u8,
+
+    /// Where browser profiles live, one directory per screen under it.
+    ///
+    /// A browser profile is a cookie jar and a cookie jar is a session's identity, so two screens
+    /// must never share one — the same boundary `crates/hx-browser`'s pool draws for fetches. The
+    /// default is under the system temporary directory rather than the data directory: each screen
+    /// gets its own directory by construction, and an operator who wants a profile to survive a
+    /// daemon restart is asking for something storage-backed, which this key is where to say.
+    #[serde(default = "default_screen_profile_root")]
+    pub profile_root: String,
+
+    /// How long a person is given to clear a wall that refused every automated rung, in seconds.
+    ///
+    /// **`0` never asks a person**, and that is the one value with a meaning of its own rather than a
+    /// duration: the interactive rung keeps its fail-closed default, and a refused page ends at the
+    /// browser's refusal. Non-zero means a site that refuses the plain rung *and* a real browser opens
+    /// a screen on **this machine** and waits that long for an answer from the web client — a visible
+    /// thing to happen on a daemon, and one that holds the fetch while it happens, which is why it is
+    /// a knob rather than a constant. See `crates/hx-browser/src/interactive.rs` for the contract and
+    /// `crates/hx-server/src/pane.rs` for what the person is shown.
+    #[serde(default = "default_challenge_budget_secs")]
+    pub challenge_budget_secs: u64,
+
+    /// Who a wall-clearing challenge is addressed to. Blank means the daemon's own operator:
+    /// [`Config::challenge_operator`] falls back to `api.admin_username`.
+    ///
+    /// A challenge is a *question for one person*, not a banner for whoever happens to be looking at
+    /// the daemon's page. This names them: the name reaches the listing the web client draws and the
+    /// notification the daemon pushes to `approval.push_url`, so an operator on a phone can tell
+    /// whose run is blocked before opening anything. It is an identifier and never a secret, which is
+    /// why it is written here rather than as a `store:name` reference.
+    ///
+    /// This is the *one-operator* form, and it is kept working. A daemon with several people responsible
+    /// for it writes [`ScreenConfig::operators`] instead, each with its own webhook; this key is then
+    /// ignored. See [`Config::challenge_operators`] for how the two are reconciled into one roster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<String>,
+
+    /// Every operator who may be handed a challenge, each with the channel that reaches *them*.
+    ///
+    /// A challenge is a question for one person, so naming one is the point; naming several asks a
+    /// different question — *which* of you is it this time — and the answer is a policy a config
+    /// cannot know. So the roster is ordered and the daemon rotates through it ([^rotate]), handing
+    /// each challenge to exactly one person and pushing it only to that person's `push_url`. The
+    /// resolution goes the same way: the person told to hurry is the person who learns they can stop,
+    /// and nobody else's phone buzzes about a run they were never asked about.
+    ///
+    /// Ignored — with the single-operator shape used instead — when this is empty, so an existing
+    /// config keeps meaning exactly what it meant.
+    ///
+    /// [^rotate]: `ScreenPane` owns the cursor; see `hx-server/src/pane.rs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operators: Vec<ChallengeOperator>,
+}
+
+/// One person a challenge may be addressed to, and the channel that reaches them.
+///
+/// A pair rather than two config keys because they are one fact: a name without a webhook is a person
+/// who can only be told by looking at the daemon's page, and a webhook without a name is a channel
+/// with nobody to address. Keeping them in one entry means a roster cannot grow a row that is half
+/// written.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChallengeOperator {
+    /// The person's name, as it appears in the listing, the notification, and the page's banner.
+    ///
+    /// Required, and an entry without one is dropped rather than defaulted: a challenge addressed to
+    /// `""` is addressed to nobody, and a name the operator did not write is a name they will not
+    /// recognise on their own lock screen. Identifiers, never secrets — no `store:name` reference.
+    pub name: String,
+
+    /// The webhook that pings *this* person, or `None` for a person who is only reachable on the page.
+    ///
+    /// Deliberately not inherited from `approval.push_url` the way the single-operator form is: that
+    /// fallback exists because there is exactly one operator, where "their webhook" is unambiguous.
+    /// With several, silently sending a question addressed to one person to another's channel is the
+    /// precise bug a roster is meant to remove. A `None` is honest instead — the banner says nobody
+    /// was told, and the page is where this question has to be answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_url: Option<String>,
+}
+
+fn default_screen_width() -> u32 {
+    1280
+}
+
+fn default_screen_height() -> u32 {
+    800
+}
+
+fn default_screen_quality() -> u8 {
+    70
+}
+
+fn default_challenge_budget_secs() -> u64 {
+    // The contract's own default, restated here rather than loosened or tightened by the config
+    // layer: five minutes is long enough to log in somewhere and short enough that a forgotten
+    // challenge does not hold a session open for an afternoon.
+    300
+}
+
+fn default_screen_profile_root() -> String {
+    std::env::temp_dir()
+        .join("hx-screens")
+        .to_string_lossy()
+        .into_owned()
+}
+
+impl Default for ScreenConfig {
+    fn default() -> Self {
+        Self {
+            browser: None,
+            url: None,
+            width: default_screen_width(),
+            height: default_screen_height(),
+            quality: default_screen_quality(),
+            profile_root: default_screen_profile_root(),
+            challenge_budget_secs: default_challenge_budget_secs(),
+            operator: None,
+            operators: Vec::new(),
+        }
+    }
+}
+
+impl ScreenConfig {
+    /// The page a screen opens when the request names none.
+    pub fn url_or_default(&self) -> &str {
+        self.url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .unwrap_or("about:blank")
+    }
+
+    /// Where browser profiles go, falling back to the default when the key is blank.
+    ///
+    /// Blank means default rather than "the working directory": a profile directory is a cookie jar,
+    /// and one that landed next to whatever the daemon was started from would be a jar nobody meant
+    /// to keep (and a `rm -rf` nobody meant to run).
+    /// How long a person gets, or `None` when no person is to be asked at all.
+    ///
+    /// One place turns the "`0` means never" convention into a type, so no caller has to remember
+    /// which of `Some(Duration::ZERO)` and `None` means what: a zero budget reaching the rung would
+    /// be a person asked with no time to answer, which looks exactly like a broken feature.
+    pub fn challenge_budget(&self) -> Option<std::time::Duration> {
+        match self.challenge_budget_secs {
+            0 => None,
+            secs => Some(std::time::Duration::from_secs(secs)),
+        }
+    }
+
+    pub fn profile_root_or_default(&self) -> std::path::PathBuf {
+        let trimmed = self.profile_root.trim();
+        if trimmed.is_empty() {
+            std::path::PathBuf::from(default_screen_profile_root())
+        } else {
+            std::path::PathBuf::from(trimmed)
+        }
+    }
+}
+
 impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
@@ -227,6 +500,95 @@ impl Config {
         let yaml = serde_yaml::to_string(self)
             .map_err(|e| HxError::Config(format!("could not serialize config to yaml: {e}")))?;
         Ok(yaml)
+    }
+
+    /// Every operator a challenge may be addressed to, in the order they are asked.
+    ///
+    /// This is the one place the two config shapes become one roster, and the rule is deliberately
+    /// one-sided:
+    ///
+    /// - `screen.operators` names them. Order is meaningful and is kept, because the daemon rotates
+    ///   through it and the first entry is the one a daemon with a single challenge outstanding is
+    ///   asking. Each entry keeps its own `push_url`; see [`ChallengeOperator`].
+    /// - Otherwise there is exactly one operator, the one `screen.operator` names (falling back to
+    ///   `api.admin_username`), paged on `approval.push_url` — the webhook that key has always meant.
+    ///   This is the whole of the old behaviour, so a config written before a roster existed keeps
+    ///   meaning exactly what it meant.
+    ///
+    /// **Never empty.** A daemon with nobody configured still has the account it authenticates, and a
+    /// challenge with no addressee is a question asked into an empty room — the one failure this
+    /// whole path exists to prevent. Every caller can therefore index the roster without
+    /// a `None` case, and the pane's rotation has a non-zero length to rotate over.
+    ///
+    /// Names are the identity: an entry with a blank name is dropped, and a repeated name keeps the
+    /// first webhook rather than becoming a second row that pings the same person under a name the
+    /// listing cannot disambiguate. Entries are otherwise passed through untouched — a person with no
+    /// `push_url` stays in the roster, because being reachable on the page is a real answer even
+    /// though it is not a fast one.
+    pub fn challenge_operators(&self) -> Vec<ChallengeOperator> {
+        let configured: Vec<ChallengeOperator> = self
+            .screen
+            .operators
+            .iter()
+            .filter_map(|operator| {
+                let name = operator.name.trim();
+                (!name.is_empty()).then(|| ChallengeOperator {
+                    name: name.to_string(),
+                    push_url: operator
+                        .push_url
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|url| !url.is_empty())
+                        .map(str::to_string),
+                })
+            })
+            .collect();
+
+        let mut roster: Vec<ChallengeOperator> = Vec::with_capacity(configured.len().max(1));
+        for operator in configured {
+            if roster.iter().any(|kept| kept.name == operator.name) {
+                continue;
+            }
+            roster.push(operator);
+        }
+        if !roster.is_empty() {
+            return roster;
+        }
+
+        // The single-operator form, and the only path that reads `approval.push_url`: with one person
+        // there is nothing for that key to be ambiguous about. A roster entry never inherits it —
+        // see `ChallengeOperator::push_url`.
+        vec![ChallengeOperator {
+            name: self.challenge_operator().to_string(),
+            push_url: self
+                .approval
+                .push_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .map(str::to_string),
+        }]
+    }
+
+    /// The operator a daemon with one challenge outstanding is asking: the first of
+    /// [`Config::challenge_operators`].
+    ///
+    /// Kept as its own name because the *fallback chain* is the part other code reads — `screen.operator`
+    /// when it names someone, and otherwise the operator the daemon already knows: the account
+    /// `POST /v1/login` checks (`api.admin_username`, itself `"admin"` by default). One rule, in one
+    /// place, so the name on the listing and the name in the notification cannot come from two
+    /// different readings of the config — a challenge addressed to a person the daemon does not
+    /// otherwise have a name for is the bug this picks a side to avoid.
+    ///
+    /// On a roster this is the first entry, and it is *not* who every challenge is for: that is
+    /// decided per challenge as the pane rotates. Prefer [`Config::challenge_operators`].
+    pub fn challenge_operator(&self) -> &str {
+        self.screen
+            .operator
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| self.api.admin_username_or_default())
     }
 
     /// Resolve the pool a role should use, following `inherits` chains.
@@ -353,7 +715,10 @@ fn default_socket() -> String {
     "unix://$XDG_RUNTIME_DIR/hx/hxd.sock".into()
 }
 fn default_http_addr() -> String {
-    "127.0.0.1:8787".into()
+    // The one address in the whole system: `hxd` binds it and every client looks for it here
+    // (a flag or `HX_BIND` overrides it for one process). Two defaults that disagree are a
+    // default deployment that cannot find itself — which is exactly what this used to be.
+    "127.0.0.1:7717".into()
 }
 fn default_data_dir() -> String {
     "~/.hx".into()
@@ -586,6 +951,28 @@ pub enum AuthMethod {
     Platform,
 }
 
+/// How the SSH transport treats the far host's key. The config form of
+/// `hx_remote::HostKeyPolicy` — spelled here because the config crate is below the transport.
+///
+/// `strict` is the default and refuses an unknown host; `tofu` records the key of a new host on
+/// first contact and refuses it ever changing; `insecure` accepts anything and says so loudly.
+/// See `hx_remote::ssh::HostKeyPolicy` for what each one costs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HostKeyCheck {
+    #[default]
+    Strict,
+    Tofu,
+    Insecure,
+}
+
+impl HostKeyCheck {
+    /// For `skip_serializing_if`: the default spelled out in YAML is noise for the common case.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostConfig {
@@ -601,6 +988,13 @@ pub struct HostConfig {
     /// Reach this host through another registered host (bastion / jump box).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jump: Option<HostId>,
+    /// Host key checking for an `ssh` host: `strict` (default), `tofu`, or `insecure`.
+    ///
+    /// `#[serde(default)]` so every existing config parses unchanged and stays strict — the
+    /// default is the safe one, and a deployment that wants trust-on-first-use asks for it by
+    /// name. Read by `hx-server`'s `hosts::connect_ssh`; meaningless for `local` and `winrm`.
+    #[serde(default, skip_serializing_if = "HostKeyCheck::is_default")]
+    pub host_key: HostKeyCheck,
     #[serde(default)]
     pub tags: Vec<String>,
     /// Path of the compiled `hx-egress-proxy` binary **on this host**, for a remote sandbox
@@ -702,6 +1096,17 @@ pub struct SandboxProfile {
     /// keeps every existing profile (which never had the key) parsing unchanged.
     #[serde(default)]
     pub host: Option<String>,
+    /// What the sandbox runs. Absent means an idle box (`sleep infinity`): the caller opens
+    /// terminals and runs commands in it. Present means the box boots *something* — a dev server, a
+    /// test suite, a REPL — and the process is the command's, not the harness's.
+    ///
+    /// WHY an argv and not a shell string: this is the OCI `Cmd`, a program plus its arguments,
+    /// with no shell to interpolate anything. An operator who wants shell syntax writes `["sh",
+    /// "-c", "..."]` explicitly, which makes the quoting their decision rather than a default
+    /// nobody can see. The confinement is identical either way — cgroup limits, network policy,
+    /// egress allowlist and TTL all still apply — so a longer-lived command is not a weaker box.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
 }
 
 impl Default for SandboxProfile {
@@ -718,6 +1123,7 @@ impl Default for SandboxProfile {
             network: false,
             readonly_rootfs: true,
             host: None,
+            command: None,
         }
     }
 }
@@ -788,6 +1194,14 @@ pub struct ConnectorConfig {
     /// to 1 rather than failing the whole daemon over a typo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_capacity: Option<usize>,
+    /// Override the platform's API root, for a connector whose kind supports one.
+    ///
+    /// Telegram's use is the canonical one: a self-hosted Bot API server (or a testing stub) lives
+    /// on a different host than `https://api.telegram.org`, and an operator running one must be
+    /// able to say so. Absent means the platform default. Only read by connector kinds that have
+    /// an API root at all; the rest ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_root: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1391,7 +1805,7 @@ roles:
         );
         assert_eq!(c.sandbox_profiles.len(), 0);
         assert!(!c.search.backends.is_empty());
-        assert_eq!(c.daemon.http_addr, "127.0.0.1:8787");
+        assert_eq!(c.daemon.http_addr, "127.0.0.1:7717");
     }
 
     #[test]
@@ -1560,6 +1974,263 @@ sandbox_profiles:
     }
 
     #[test]
+    fn a_sandbox_profile_can_boot_something_or_omit_the_key_entirely() {
+        // `command` is what turns a box into an environment: a profile that names one boots that
+        // program as the sandbox's own process. Like `host`, it is additive — the test that matters
+        // most is the first half, that every profile written before the field existed still parses
+        // and means an idle box (`None`), never an empty argv.
+        let yaml = r#"
+            sandbox_profiles:
+              idle:
+                isolation: l2
+              server:
+                isolation: l2
+                command: ["python3", "-m", "http.server", "8000"]
+            "#;
+        let c = Config::from_yaml(yaml).unwrap();
+        assert_eq!(
+            c.sandbox_profiles["idle"].command, None,
+            "a profile without `command` is an idle box"
+        );
+        assert_eq!(
+            c.sandbox_profiles["server"].command.as_deref(),
+            Some(
+                ["python3", "-m", "http.server", "8000"]
+                    .map(String::from)
+                    .as_slice()
+            ),
+            "a profile with `command` boots that argv"
+        );
+    }
+
+    #[test]
+    fn a_challenge_is_addressed_to_the_configured_operator_or_the_daemons_own_account() {
+        // One rule, one place. A challenge is a question for a person, and the person's name has to
+        // come from *somewhere*: `screen.operator` when an operator names themselves, and otherwise
+        // the account the daemon already authenticates (`api.admin_username`, itself `admin`).
+        let unnamed = Config::from_yaml("screen:\n  width: 800\n").unwrap();
+        assert_eq!(
+            unnamed.challenge_operator(),
+            "admin",
+            "a daemon that names nobody still has an operator, and it is the account it already has"
+        );
+
+        let login_named = Config::from_yaml("api:\n  admin_username: yoav\n").unwrap();
+        assert_eq!(
+            login_named.challenge_operator(),
+            "yoav",
+            "the account the daemon authenticates is the fallback, not a second invented name"
+        );
+
+        let named = Config::from_yaml("screen:\n  operator: \"  Yoav  \"\n").unwrap();
+        assert_eq!(
+            named.challenge_operator(),
+            "Yoav",
+            "an explicit name wins, trimmed — a challenge says who it is for, not \"  "
+        );
+
+        // Blank is absent, not a person called "". A key an operator wrote with an empty value is an
+        // operator who has not decided a name yet, which is exactly the fallback's case.
+        let blank = Config::from_yaml("screen:\n  operator: \"   \"\n").unwrap();
+        assert_eq!(blank.challenge_operator(), "admin");
+        assert!(blank.screen.operator.is_some(), "and the key itself is kept");
+    }
+
+    #[test]
+    fn a_roster_of_operators_gives_each_person_their_own_channel() {
+        // The claim this whole shape exists for: several people responsible for a daemon, and a
+        // challenge going to *one* of them at *their* address rather than to a URL everybody shares.
+        let config = Config::from_yaml(
+            r#"
+screen:
+  operators:
+    - { name: yoav, push_url: "https://relay.test/yoav" }
+    - { name: dana, push_url: "https://relay.test/dana" }
+"#,
+        )
+        .unwrap();
+
+        let roster = config.challenge_operators();
+        let names: Vec<&str> = roster.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, vec!["yoav", "dana"], "order is kept: it is the rotation order");
+        assert_eq!(
+            roster[1].push_url.as_deref(),
+            Some("https://relay.test/dana"),
+            "and the second person has their own webhook, not the first's"
+        );
+
+        // The single-operator keys are *ignored* rather than merged: a roster entry never silently
+        // inherits `approval.push_url`, because a question addressed to dana that arrives on yoav's
+        // phone is the exact confusion this shape removes.
+        let mixed = Config::from_yaml(
+            r#"
+api:
+  admin_username: admin
+approval:
+  push_url: https://relay.test/shared
+screen:
+  operator: someone-else
+  operators:
+    - { name: yoav }
+"#,
+        )
+        .unwrap();
+        let roster = mixed.challenge_operators();
+        assert_eq!(roster.len(), 1, "the roster is the whole truth once it is written");
+        assert_eq!(roster[0].name, "yoav");
+        assert_eq!(
+            roster[0].push_url, None,
+            "an operator with no channel of their own is told on the page, not on somebody else's              webhook"
+        );
+    }
+
+    #[test]
+    fn a_roster_is_never_empty_and_never_names_one_person_twice() {
+        // Never empty: a challenge with no addressee is a question asked into an empty room, and the
+        // pane's rotation divides by this length. So a config that names nobody still resolves.
+        let nobody = Config::from_yaml("screen: {}").unwrap();
+        let roster = nobody.challenge_operators();
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].name, "admin", "and it is the account the daemon authenticates");
+
+        // Blank and repeated names are dropped here rather than in the pane, so a name on a listing
+        // always resolves to exactly one channel.
+        let messy = Config::from_yaml(
+            r#"
+screen:
+  operators:
+    - { name: "  " }
+    - { name: yoav, push_url: "https://relay.test/first" }
+    - { name: " yoav ", push_url: "https://relay.test/second" }
+    - { name: dana }
+"#,
+        )
+        .unwrap();
+        let roster = messy.challenge_operators();
+        let names: Vec<&str> = roster.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, vec!["yoav", "dana"], "blank is nobody; a repeat is the same person");
+        assert_eq!(
+            roster[0].push_url.as_deref(),
+            Some("https://relay.test/first"),
+            "and the first webhook written for a name is the one kept"
+        );
+    }
+
+    #[test]
+    fn a_roster_of_only_blank_names_falls_back_to_the_daemons_own_account() {
+        // A list is written, and every row in it is unusable. That is not "no operators" — it is an
+        // operator who meant to write one and did not — so the fallback still applies rather than
+        // leaving the daemon with nobody to ask.
+        let config = Config::from_yaml("screen:
+  operators:
+    - { name: \"   \" }
+").unwrap();
+        let roster = config.challenge_operators();
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].name, "admin");
+
+        // And the old shape, unchanged, still resolves to exactly what it always did.
+        let single = Config::from_yaml(
+            "screen:
+  operator: yoav
+approval:
+  push_url: https://relay.test/yoav
+",
+        )
+        .unwrap();
+        let roster = single.challenge_operators();
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].name, "yoav");
+        assert_eq!(roster[0].push_url.as_deref(), Some("https://relay.test/yoav"));
+    }
+
+    #[test]
+    fn the_challenge_budget_defaults_to_a_person_being_asked_and_zero_turns_it_off() {
+        // `0` is the one value with a meaning of its own rather than a duration, so it is the one that
+        // has to be pinned: a zero budget reaching the rung would be a person asked with no time to
+        // answer, which looks exactly like a broken feature. `challenge_budget()` is the single place
+        // the convention becomes a type.
+        let omitted = Config::from_yaml("screen:\n  width: 800\n").unwrap();
+        assert_eq!(
+            omitted.screen.challenge_budget(),
+            Some(std::time::Duration::from_secs(300)),
+            "the contract's own default, restated by the config layer rather than invented here"
+        );
+
+        let off = Config::from_yaml("screen:\n  challenge_budget_secs: 0\n").unwrap();
+        assert_eq!(
+            off.screen.challenge_budget(),
+            None,
+            "zero means nobody is asked, not a person asked with no time"
+        );
+        assert_eq!(off.screen.challenge_budget_secs, 0, "and the raw value is kept");
+
+        let short = Config::from_yaml("screen:\n  challenge_budget_secs: 45\n").unwrap();
+        assert_eq!(
+            short.screen.challenge_budget(),
+            Some(std::time::Duration::from_secs(45))
+        );
+    }
+
+    #[test]
+    fn the_fetch_section_defaults_to_the_public_internet_and_the_hosts_own_browser() {
+        // The default is the safe answer, and it is the answer a config that says nothing about
+        // fetching gets: a daemon that widened its own target rule would be a daemon whose author
+        // never wrote the decision down.
+        let omitted = Config::from_yaml("screen:\n  width: 800\n").unwrap();
+        assert_eq!(omitted.fetch.admission, FetchAdmission::PublicInternet);
+        assert_eq!(omitted.fetch.browser, None, "no binary named means: search");
+        assert_eq!(omitted.fetch.browser_binary(), None);
+
+        let named = Config::from_yaml(
+            "fetch:\n  browser: /opt/chrome/chrome\n  admission: allow_local\n",
+        )
+        .unwrap();
+        assert_eq!(named.fetch.admission, FetchAdmission::AllowLocal);
+        assert_eq!(
+            named.fetch.browser_binary(),
+            Some(std::path::Path::new("/opt/chrome/chrome"))
+        );
+
+        // A blank path is a key somebody cleared, not a binary called "": the same rule
+        // `screen.browser` follows, so `browser:` and `browser: ""` cannot mean two things.
+        let blank = Config::from_yaml("fetch:\n  browser: '  '\n").unwrap();
+        assert_eq!(blank.fetch.browser_binary(), None);
+    }
+
+    #[test]
+    fn the_fetch_section_refuses_a_typo_in_a_key_or_an_admission_nobody_defined() {
+        // Both halves of the file's promise: an unknown key is a hard error (a setting the operator
+        // believes is in force must not be silently ignored), and an admission policy is a named
+        // decision rather than a boolean — `allow_local: true` is not a spelling this accepts, which
+        // is what stops a guess from being a widening.
+        let typo = Config::from_yaml("fetch:\n  allow_local: true\n");
+        assert!(typo.is_err(), "a key nobody reads must fail loudly: {typo:?}");
+
+        let unknown = Config::from_yaml("fetch:\n  admission: anything_goes\n");
+        assert!(
+            unknown.is_err(),
+            "an admission policy is a named decision, not free text: {unknown:?}"
+        );
+
+        // And the spellings that *are* accepted, to pin the wire form a config file has to write.
+        for (yaml, expected) in [
+            ("public_internet", FetchAdmission::PublicInternet),
+            ("allow_local", FetchAdmission::AllowLocal),
+        ] {
+            let parsed =
+                Config::from_yaml(&format!("fetch:\n  admission: {yaml}\n")).expect("a named policy");
+            assert_eq!(parsed.fetch.admission, expected, "{yaml}");
+        }
+
+        assert_eq!(
+            Config::default().fetch.admission,
+            FetchAdmission::PublicInternet,
+            "an in-code default and an unsaid config key are the same policy"
+        );
+    }
+
+    #[test]
     fn a_host_config_without_an_egress_proxy_bin_still_parses_and_one_with_it_round_trips() {
         // The key is additive, so the test that matters most is the first half: every config written
         // before it existed must keep parsing, and a host that never runs a remote egress sandbox
@@ -1595,6 +2266,59 @@ hosts:
         assert!(json.contains("/opt/hx/hx-egress-proxy"), "{json}");
         let back: HostConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back, c.hosts["egressbox"]);
+    }
+
+    #[test]
+    fn a_host_without_a_host_key_check_stays_strict_and_one_with_it_gets_what_it_asked_for() {
+        // The policy knob is the config promise `HostKeyPolicy::Tofu` was written for: strict must
+        // remain what an unmodified config *means* (a default is a security posture), while a
+        // deployment that wants trust-on-first-use gets it by naming it. And a typo must fail at
+        // parse time, not silently degrade to the permissive end.
+        let yaml = r#"
+hosts:
+  freshbox:
+    kind: ssh
+    address: "10.0.0.7"
+    user: "yoav"
+    auth: { kind: agent }
+  tofubox:
+    kind: ssh
+    address: "10.0.0.8"
+    user: "yoav"
+    auth: { kind: agent }
+    host_key: tofu
+  openbox:
+    kind: ssh
+    address: "10.0.0.9"
+    user: "yoav"
+    auth: { kind: agent }
+    host_key: insecure
+"#;
+        let c = Config::from_yaml(yaml).expect("all three must parse");
+        assert_eq!(
+            c.hosts["freshbox"].host_key,
+            HostKeyCheck::Strict,
+            "a config that never heard of `host_key` stays strict"
+        );
+        assert_eq!(c.hosts["tofubox"].host_key, HostKeyCheck::Tofu);
+        assert_eq!(c.hosts["openbox"].host_key, HostKeyCheck::Insecure);
+
+        // A misspelling is refused at parse time. A policy that silently means "strict" on a typo
+        // is one thing; a policy that silently means `insecure` is a hole with a config file's
+        // name on it.
+        let typo = r#"
+hosts:
+  tofubox:
+    kind: ssh
+    address: "10.0.0.8"
+    user: "yoav"
+    auth: { kind: agent }
+    host_key: trust-on-first-use
+"#;
+        assert!(
+            Config::from_yaml(typo).is_err(),
+            "an unknown host_key value is refused, not guessed"
+        );
     }
 
     #[test]

@@ -120,6 +120,34 @@ fn error_body(bytes: &[u8]) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn the_cancel_route_is_mounted() {
+    let state = harness().await;
+
+    // Nothing runs under this id, so the handler answers `{"cancelled": false}` — an honest stop
+    // that stopped nothing, never a 404 with an empty body. Idempotence is the point: a client's
+    // second stop must not read as an error.
+    let (status, bytes) = request(
+        Arc::clone(&state),
+        "POST",
+        "/v1/sessions/ses_no_such_run/cancel",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("a handler answers JSON, not an empty 404 body");
+    assert_eq!(
+        json["cancelled"], serde_json::json!(false),
+        "nothing was running: {json}"
+    );
+    assert_eq!(
+        json["session"],
+        serde_json::json!("ses_no_such_run"),
+        "and the answer names what it looked at: {json}"
+    );
+}
+
+#[tokio::test]
 async fn the_research_route_is_mounted() {
     let state = harness().await;
 
@@ -214,6 +242,35 @@ async fn the_phone_respond_route_is_mounted() {
 }
 
 #[tokio::test]
+async fn the_usage_route_is_mounted() {
+    let state = harness().await;
+
+    // An empty report is still a report — the handler's five keys — never an empty-body 404.
+    let (status, bytes) = request(Arc::clone(&state), "GET", "/v1/usage", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("a handler answers JSON, not an empty 404 body");
+    for key in ["since", "total", "by_day", "by_model", "by_session"] {
+        assert!(json.get(key).is_some(), "the report carries `{key}`: {json}");
+    }
+
+    // A malformed window is the handler's 400 naming the field — never the 404 fallback.
+    let (status, bytes) = request(
+        Arc::clone(&state),
+        "GET",
+        "/v1/usage?since=yesterday",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "`since` must be RFC3339");
+    let body = error_body(&bytes);
+    assert!(
+        body["error"].as_str().unwrap_or("").contains("since"),
+        "the 400 names the field: {body}"
+    );
+}
+
+#[tokio::test]
 async fn every_other_public_endpoint_is_mounted() {
     let state = harness().await;
 
@@ -224,10 +281,31 @@ async fn every_other_public_endpoint_is_mounted() {
         ("GET", "/", None, StatusCode::OK),
         ("GET", "/v1/status", None, StatusCode::OK),
         ("GET", "/v1/pools", None, StatusCode::OK),
+        ("GET", "/v1/usage", None, StatusCode::OK),
+        ("POST", "/v1/ws-ticket", None, StatusCode::OK),
         ("GET", "/v1/hosts", None, StatusCode::OK),
         ("GET", "/v1/sessions", None, StatusCode::OK),
         ("GET", "/v1/approvals", None, StatusCode::OK),
         ("GET", "/v1/terminals", None, StatusCode::OK),
+        ("GET", "/v1/screens", None, StatusCode::OK),
+        // The human in the loop: a listing is a listing, and an id nobody minted is a 404 rather than
+        // a challenge that is over (which is a 409 — see `challenge_api.rs`).
+        ("GET", "/v1/challenges", None, StatusCode::OK),
+        (
+            "POST",
+            "/v1/challenges/no-such-challenge",
+            Some(r#"{"outcome":"solved"}"#),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            // The notification's one-time token is the route's *other* credential, so a request that
+            // arrives with one and names an id nobody minted is the same 404 rather than a 401: the
+            // token was read, and what it was asked about does not exist. See `crate::auth`.
+            "POST",
+            "/v1/challenges/no-such-challenge?token=abc",
+            Some(r#"{"outcome":"solved"}"#),
+            StatusCode::NOT_FOUND,
+        ),
         (
             "POST",
             "/v1/search",
@@ -268,6 +346,8 @@ async fn every_other_public_endpoint_is_mounted() {
         ("POST", "/v1/sandboxes"),
         ("POST", "/v1/sessions"),
         ("POST", "/v1/terminals"),
+        ("POST", "/v1/screens"),
+        ("POST", "/v1/challenges/no-such-challenge"),
     ] {
         let (status, _) = request(Arc::clone(&state), method, uri, Some("{}")).await;
         assert_ne!(status, StatusCode::NOT_FOUND, "{method} {uri} is mounted");

@@ -11,31 +11,42 @@
 //! stream (`GET /v1/sessions/{id}/ws` — any client attaches to one session and receives its events
 //! live, with store-seq reconnection; see [`stream_ws`]). The SSE surface stays for a client that
 //! wants one request one run; the WebSocket room is the multiplex two front ends on one session use.
-//! Not yet exposed: a PTY/terminal attach over that WebSocket (M2's second half), MCP, and an
+//! A live *screen* has the same shape as a terminal and its own socket for the same reasons:
+//! `POST /v1/screens` launches a browser the daemon owns, `GET /v1/screens/{id}/ws` streams its
+//! frames down and a watcher's clicks and keystrokes back up. See [`screen`] and [`screen_ws`].
+//!
+//! Not yet exposed: MCP, and an
 //! approval push channel — which is why the daemon's approver refuses every prompt with the reason
 //! instead of waiting for an answer that cannot arrive. See `ROADMAP.md` — M1 and M2.
 
 pub mod auth;
+pub mod challenge_notice;
 pub mod chat;
 pub mod diff;
 pub mod fanout;
 pub mod hosts;
+pub mod pane;
 pub mod phone;
 pub mod remote_sandbox;
 pub mod review;
 pub mod routes;
 pub mod sandbox;
+pub mod screen;
+pub mod screen_ws;
+pub mod sandbox_terminal;
 pub mod spawn;
 pub mod state;
 pub mod stream;
 pub mod stream_ws;
+pub mod telegram_mirror;
 pub mod terminal;
-#[cfg(unix)]
 pub mod terminal_ws;
 pub mod webhook;
 pub mod webhook_bridge;
+pub mod ws_ticket;
 
 pub use chat::{ChatReply, ChatRequest, ModelFactory, RouterModels};
 pub use routes::{app, status_for, ApiError};
 pub use sandbox::{SandboxCache, SandboxFor};
+pub use screen::{Screen, ScreenInput, ScreenOutput, ScreenSummary, Screens};
 pub use state::{AppState, AppStateParts, HostSummary, LiveEvent, SandboxSummary, StatusReport};

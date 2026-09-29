@@ -28,7 +28,9 @@ use hx_core::error::HxError;
 use hx_core::ids::SessionId;
 use hx_sandbox::SandboxSpec;
 use hx_search::{
-    default_pool_root, select_fetcher, FetchMode, FetchRouteError, Recency, ResearchRequest,
+    default_pool_root, select_fetcher_with_policy, FetchMode, FetchPolicy, FetchRouteError,
+    HumanRequest,
+    Recency, ResearchRequest,
     ResearchTask, SearchQuery,
 };
 use hx_secrets::Redactor;
@@ -71,6 +73,8 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/", get(web_client))
         .route("/v1/status", get(status))
         .route("/v1/pools", get(pools))
+        .route("/v1/usage", get(usage))
+        .route("/v1/ws-ticket", post(ws_ticket))
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/{name}", put(upsert_provider).delete(remove_provider))
         .route("/v1/login", post(login))
@@ -93,6 +97,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/sessions", get(list_sessions).post(create_session))
         .route("/v1/sessions/{id}", get(get_session).delete(delete_session))
         .route("/v1/sessions/{id}/rename", post(rename_session))
+        .route("/v1/sessions/{id}/cancel", post(cancel_session))
         .route("/v1/sessions/{id}/export", get(export_session))
         .route("/v1/sessions/{id}/events", get(session_events))
         .route("/v1/sessions/{id}/audit", get(session_audit))
@@ -106,6 +111,22 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/terminals/{id}/ws", get(terminal_ws_handler))
         .route("/v1/terminals", get(list_terminals).post(create_terminal))
         .route("/v1/terminals/{id}", delete(kill_terminal))
+        // The screen is the terminal's sibling and not a frame on any existing stream: a browser's
+        // frames are large, unordered against the events, and bidirectional (a watcher's clicks come
+        // back up). `POST /v1/screens` launches the browser, the socket attaches to it. See
+        // `crate::screen` for why the daemon owns it and `crate::screen_ws` for the socket's shape.
+        .route("/v1/screens/{id}/ws", get(screen_ws_handler))
+        .route("/v1/screens", get(list_screens).post(create_screen))
+        .route("/v1/screens/{id}", delete(kill_screen))
+        // The human in the loop, on the same wire as everything else the web client does. A browser
+        // climb that a site refused hand the wall to a person: the challenge is *presented* on a
+        // screen (`/v1/screens/{id}/ws` is how a person looks at it), and the answer — solved, or
+        // declined with the person's own words — comes back here. Two routes rather than a frame on
+        // the screen socket, because a window onto a page and a decision about a fetch are different
+        // things: a challenge outlives any particular watcher, and an answer must be recordable from
+        // a client that is not watching (a phone, a second tab). See `crate::pane`.
+        .route("/v1/challenges", get(list_challenges))
+        .route("/v1/challenges/{id}", post(answer_challenge))
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{id}", post(answer_approval))
         // The phone's tap comes back here — see `crate::phone`. Exempt from the bearer token (the
@@ -188,8 +209,10 @@ pub fn status_for(err: &HxError) -> StatusCode {
         HxError::NoRoute(_) => StatusCode::SERVICE_UNAVAILABLE,
         // Bad configuration is the operator's problem and needs surfacing loudly.
         HxError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        // Provider and sandbox failures are upstream, not the client's fault.
-        HxError::Provider(_) | HxError::Sandbox(_) | HxError::Remote(_) => StatusCode::BAD_GATEWAY,
+        // Provider, sandbox and screen failures are upstream, not the client's fault.
+        HxError::Provider(_) | HxError::Sandbox(_) | HxError::Screen(_) | HxError::Remote(_) => {
+            StatusCode::BAD_GATEWAY
+        }
         HxError::Secret(_) => StatusCode::FORBIDDEN,
         // A rejected credential is not the client's fault either, but it is a 401: the fix is on the
         // operator's side (rotate the key), and the credential is benched meanwhile.
@@ -229,6 +252,50 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<crate::state::Status
 
 async fn pools(State(state): State<Arc<AppState>>) -> Json<Vec<hx_provider::PoolStatus>> {
     Json(state.router().status().pools)
+}
+
+/// Trade the bearer token for one WebSocket handshake's worth of credential.
+///
+/// A browser cannot put an `Authorization` header on a WebSocket handshake, and the bearer token
+/// must never be in a URL (#24). This is the exchange that satisfies both: the token comes here in
+/// a header, a single-use ticket goes back, and the upgrade presents `?ticket=` — a value that is
+/// dead after one handshake and after [`crate::ws_ticket::WS_TICKET_TTL`] at the latest. This
+/// route is behind the same bearer middleware as everything else, so a ticket is only ever minted
+/// *with* the credential it stands in for.
+async fn ws_ticket(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let ticket = state.ws_tickets.mint();
+    Json(serde_json::json!({
+        "ticket": ticket,
+        "expires_in_secs": crate::ws_ticket::WS_TICKET_TTL.as_secs(),
+    }))
+}
+
+/// What a client asks when money must be visible: `?since=<RFC3339>` (default: 30 days back).
+///
+/// The store carried every usage row and nothing aggregated them, so spend was a fact only an
+/// archaeologist with SQL could find — the exact invisibility that makes a budget decorative.
+#[derive(Debug, Default, Deserialize)]
+struct UsageQuery {
+    #[serde(default)]
+    since: Option<String>,
+}
+
+async fn usage(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<UsageQuery>,
+) -> Result<Json<hx_store::UsageReport>, ApiError> {
+    let since = match params.since.as_deref() {
+        Some(raw) => chrono::DateTime::parse_from_rfc3339(raw)
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("`since` must be an RFC3339 timestamp, not {raw:?}"),
+                )
+            })?
+            .with_timezone(&chrono::Utc),
+        None => chrono::Utc::now() - chrono::Duration::days(30),
+    };
+    Ok(Json(state.store.usage_report(since)?))
 }
 
 /// List the providers the daemon is running with. Never includes a secret.
@@ -444,6 +511,13 @@ async fn destroy_sandbox(
         )
     })?;
     manager.destroy(&id).await.map_err(ApiError::from)?;
+    // The shells people opened inside it go with it. The engine does not end the exec stream when
+    // the container is removed, so without this an attached client keeps a prompt that accepts
+    // typing and will never answer. `exited` is sent to each one; see `Terminals::close_sandbox`.
+    let closed = state.terminals.close_sandbox(&id).await;
+    if !closed.is_empty() {
+        tracing::info!(sandbox = %id, terminals = ?closed, "closed the sandbox's terminals with it");
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -538,9 +612,24 @@ async fn chat(
         ));
     }
 
-    Ok(Json(
-        crate::chat::run_chat(&state, request, chrono::Utc::now()).await?,
-    ))
+    // The run is the daemon's, not the request's. It is spawned and this handler only *waits* for
+    // its answer, so a client that goes away mid-run (a closed laptop, a killed `hx chat`) leaves
+    // the run to finish and file every message — the alternative is a run torn out the moment its
+    // observer disconnects, mid tool-call, leaving a call with no result. (`POST /v1/chat/stream`
+    // has always run this way.) The reply is lost with its request; the session keeps the run.
+    let run = tokio::spawn(crate::chat::run_chat(
+        state,
+        request,
+        chrono::Utc::now(),
+    ));
+    match run.await {
+        Ok(reply) => Ok(Json(reply?)),
+        // The run task itself died — a panic in the loop, not a client's doing.
+        Err(join) => Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("the run ended without reporting an outcome: {join}"),
+        )),
+    }
 }
 
 /// Query parameters for the session routes.
@@ -653,6 +742,38 @@ async fn delete_session(
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
+/// Stop the run a session has in flight, if there is one.
+///
+/// Idempotent, and honest about what happened: `"cancelled": false` means nothing was running —
+/// the stop was still the right request, so that is a 200 and not a 404. What the brake does is
+/// cooperative (see [`hx_agent::CancelSignal`]): the run stops at its next safe boundary and ends
+/// with `StopReason::Cancelled`, so the transcript keeps every call that ran and never starts one
+/// more. A run parked on an approval question is woken here too — the question is answered `deny`
+/// by `"cancel"`, which is the truth (the call did not run because the run was stopped), and which
+/// means "stop" answers in seconds instead of waiting out the question's silence timeout.
+async fn cancel_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let signal = state.runs.lock().expect("runs lock").get(&id).cloned();
+    let cancelled = match signal {
+        Some(signal) => {
+            signal.cancel();
+            for request in state.approvals.outstanding(Some(&id)) {
+                state.approvals.answer(
+                    request.id.as_str(),
+                    hx_core::approval::ApprovalOption::Deny,
+                    "cancel",
+                    hx_core::approval::RiskClass::Privileged,
+                );
+            }
+            true
+        }
+        None => false,
+    };
+    Json(serde_json::json!({ "session": id, "cancelled": cancelled }))
+}
+
 /// What a client asks for when it wants a new terminal.
 #[derive(Debug, Deserialize)]
 struct CreateTerminalBody {
@@ -665,6 +786,14 @@ struct CreateTerminalBody {
     /// A host id, never a transport: which of SSH or something else carries it is configuration.
     #[serde(default)]
     host: Option<String>,
+    /// The sandbox to open the shell *inside*, from `GET /v1/sandboxes`.
+    ///
+    /// An id from the daemon's own sandbox manager, so unlike `host` there is no transport to
+    /// resolve and no capability to check: the caller is naming a box the daemon is already running,
+    /// and a shell in it is the same confinement `exec` on the same box already has. Mutually
+    /// exclusive with `host` — see the handler, which refuses both rather than picking one.
+    #[serde(default)]
+    sandbox: Option<String>,
     /// The shell, if the caller wants something other than the configured default.
     #[serde(default)]
     shell: Option<String>,
@@ -690,19 +819,14 @@ fn default_rows() -> u16 {
 /// `terminal_ws` operates on a running terminal, and terminals do not exist on a host without a PTY,
 /// so that module is Unix-only and this picks the behaviour at compile time. The route exists either
 /// way: answering "not on this platform" is clearer to a client than a 404 that reads like a typo.
-#[cfg(unix)]
+// Not platform-gated, and that is a change worth recording. It used to be: a host with no pty
+// answered `501` here, on the reasoning that "terminals do not exist on a host without a PTY". That
+// conflated the terminal with the *local* shell that was once the only way to get one. A terminal
+// is the daemon's scrollback, its broadcast and its WebSocket — all portable — around a session,
+// and a session may live in a sandbox or on another machine, neither of which needs a pty *here*.
+// So the socket is served everywhere, and the platform limit stays where it belongs: in
+// `Terminals::create`, which still refuses to start a shell on a machine with no pty, and says why.
 use crate::terminal_ws::terminal_ws as terminal_ws_handler;
-
-#[cfg(not(unix))]
-async fn terminal_ws_handler(Path(id): Path<String>) -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "error": "terminals need a PTY, which this platform does not have",
-            "terminal": id,
-        })),
-    )
-}
 
 /// `POST /v1/terminals` — start a terminal. A client attaches to it with `GET /v1/terminals/{id}/ws`.
 async fn create_terminal(
@@ -713,6 +837,21 @@ async fn create_terminal(
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "a terminal id cannot be empty",
+        ));
+    }
+    // A terminal is either on a machine or in a box, and the two are different enough that picking
+    // one for the caller would be a guess about what they meant: `host` resolves a transport and is
+    // capability-gated, while `sandbox` names a container the daemon already runs and ignores
+    // `shell`/`args` entirely, because a path like `/bin/zsh` in the config is a path on *this* host.
+    //
+    // Checked before the capability gate below on purpose: the host gate answers a *policy* question
+    // ("may this daemon open a shell there"), and answering it for a request that names two targets
+    // at once would be refusing one of them on behalf of a caller who has not said which they meant.
+    if body.sandbox.is_some() && body.host.is_some() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "give `host` or `sandbox`, not both: one terminal is on one machine, and a sandbox is a \
+             container the daemon already runs rather than a machine to reach over a transport",
         ));
     }
     // An interactive shell is the strongest thing this daemon offers a machine: unlike `exec` there
@@ -744,6 +883,37 @@ async fn create_terminal(
         })));
     }
 
+    if let Some(sandbox_id) = body.sandbox.as_deref() {
+        let manager = state.sandboxes.as_ref().ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                sandbox_unavailable_message(&state),
+            )
+        })?;
+        // Gated on the sandbox existing and running, which `attach` does; a 404 for an unknown id is
+        // the honest answer, and it is the same answer `POST /v1/sandboxes/{id}/exec` gives.
+        let session = crate::sandbox_terminal::open(manager, sandbox_id, body.cols, body.rows)
+            .await
+            .map_err(|err| {
+                let status = if err.to_string().contains("no sandbox with id") {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::CONFLICT
+                };
+                ApiError::new(status, err.to_string())
+            })?;
+        // Bound to the box, so a destroy or a TTL reap ends this terminal with it rather than
+        // leaving a pane that accepts typing over a container that no longer exists.
+        state
+            .terminals
+            .create_in_sandbox(&body.id, session, sandbox_id)?;
+        return Ok(Json(serde_json::json!({
+            "id": body.id,
+            "sandbox": sandbox_id,
+            "created": true,
+        })));
+    }
+
     // The shell comes from config, never from the request, unless the caller names one explicitly.
     // Defaulting to the configured shell keeps the terminal consistent with what the daemon is set
     // up to run rather than to whatever `/bin/sh` happens to be.
@@ -759,6 +929,172 @@ async fn create_terminal(
 /// `GET /v1/terminals` — the live terminals.
 async fn list_terminals(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "terminals": state.terminals.ids() }))
+}
+
+/// The body of `POST /v1/screens`.
+#[derive(Debug, Deserialize)]
+struct CreateScreenBody {
+    id: String,
+    /// The page to open. Absent means `screen.url` from the config, or `about:blank`.
+    #[serde(default)]
+    url: Option<String>,
+    /// The viewport, when the caller wants a different one than the config's.
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
+}
+
+use crate::screen_ws::screen_ws as screen_ws_handler;
+
+/// `POST /v1/screens` — launch a browser the daemon owns and streams.
+///
+/// The browser runs on **this** machine and its profile directory is derived from the screen's id
+/// under `screen.profile_root`, so two screens never share a cookie jar. The refusal when no browser
+/// is installed is a `503` naming every path that was searched: "there is no browser here" is a fact
+/// about the host, not a failure of the request, and an operator cannot fix a search they cannot see.
+///
+/// No capability gate, and that is a considered answer rather than an oversight: `POST /v1/terminals`
+/// (which the same client can call) opens a shell on this machine, and a browser is strictly less
+/// than a shell. What the screen deliberately does *not* do is judge where it navigates — see
+/// `crates/hx-browser/src/screen.rs`, which states that gap in full rather than leaving it implied.
+async fn create_screen(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateScreenBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id = body.id.trim().to_string();
+    if id.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "a screen id cannot be empty"));
+    }
+    let config = &state.config.screen;
+    let user_data_dir = crate::screen::profile_dir_for(&config.profile_root_or_default(), &id)
+        .map_err(ApiError::from)?;
+    let url = body
+        .url
+        .or_else(|| config.url.clone())
+        .unwrap_or_else(|| config.url_or_default().to_string());
+    let options = hx_browser::screen::ScreenOptions {
+        browser: config
+            .browser
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from),
+        url,
+        user_data_dir,
+        // A zero-sized viewport is not a screen: the engine rejects a zero dimension and a frame of
+        // nothing is not worth a socket. Floored rather than refused because the *caller* asked for
+        // a size and the request is otherwise well formed.
+        width: body.width.unwrap_or(config.width).max(1),
+        height: body.height.unwrap_or(config.height).max(1),
+        quality: config.quality,
+        startup_timeout: hx_browser::screen::BROWSER_SCREEN_STARTUP_TIMEOUT,
+    };
+    let screen = state.screens.create(&id, options).await.map_err(ApiError::from)?;
+    Ok(Json(serde_json::json!({
+        "created": true,
+        "screen": screen.summary(),
+    })))
+}
+
+/// `GET /v1/screens` — what the daemon is streaming, and whether each is still live.
+async fn list_screens(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "screens": state.screens.summaries() }))
+}
+
+/// `DELETE /v1/screens/{id}` — close a screen, taking its browser with it.
+///
+/// Awaited, not spawned: the caller asked for the browser to be gone, and a daemon that answered
+/// "closed" while a renderer was still exiting would be reporting a state it had not reached.
+async fn kill_screen(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !state.screens.remove(&id).await {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "no such screen"));
+    }
+    // A screen that was presenting a challenge takes the question with it: a person who closed the
+    // window has walked away from it, and the waiting pane is told so (and takes its browser back)
+    // rather than asking for five minutes about a page that is no longer on screen.
+    if state.challenges.screen_closed(&id) {
+        tracing::info!(screen = %id, "closed a screen that was presenting a challenge");
+    }
+    Ok(Json(serde_json::json!({ "deleted": true })))
+}
+
+/// `GET /v1/challenges` — what the daemon is waiting for a person to clear, right now.
+///
+/// The pane's own listing, beside the screens': a challenge names the screen a person watches, so a
+/// client that wants to show "this task needs you" polls this and then attaches to that screen's
+/// socket. Challenges whose pane is gone are dropped rather than listed — see
+/// [`crate::pane::Challenges::pending`].
+async fn list_challenges(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "challenges": state.challenges.pending() }))
+}
+
+/// `POST /v1/challenges/{id}[?token=…]` — the person's answer.
+///
+/// Two credentials, and they are the same person seen twice. A client holding the daemon's bearer
+/// token answers as the daemon's own operator (which is what the web client and the CLI do). The
+/// operator's *notification* carries a per-challenge one-time token instead, because a lock screen or
+/// a chat relay must never hold the master credential: `?token=…` is accepted as the credential for
+/// this one question, checked against the record the challenge itself published, and spent by the
+/// answer. See [`crate::challenge_notice`] and [`crate::auth`].
+///
+/// Four outcomes, and none of them is a bare `200`:
+///
+/// - `200` with `{"answered":true}` when the pane was still waiting and has been told.
+/// - `409` when nobody is waiting any more — the rung's budget expired between the listing and the
+///   click, the fetch was dropped, or the screen was closed. A person told their click cleared a wall
+///   nothing is looking at any more has been told a lie about the one thing this endpoint reports.
+/// - `404` when there is no such challenge, which is a different fact from "it is over".
+/// - `403` when the token is not the one this challenge published. A request that misnamed its
+///   question is not an answer to it, so the challenge is left waiting rather than ended.
+///
+/// The `400` for an abandoned challenge with no note is [`AnswerBody::check`]'s rule: a decision with
+/// no reason is the mystery the `abandoned` variant exists to prevent.
+async fn answer_challenge(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<AnswerParams>,
+    Json(body): Json<crate::pane::AnswerBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    body.check()
+        .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?;
+
+    let outcome = match params.token.as_deref() {
+        Some(token) => state.challenges.answer_with_token(&id, token, body.outcome()),
+        None => state.challenges.answer(&id, body.outcome()),
+    };
+    let answered = match outcome {
+        crate::pane::AnswerOutcome::Delivered => true,
+        crate::pane::AnswerOutcome::NobodyWaiting => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "the challenge is over: nobody is waiting for this answer any more (the budget \
+                 expired, or the screen was closed)",
+            ))
+        }
+        crate::pane::AnswerOutcome::Unknown => {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "no such challenge"))
+        }
+        crate::pane::AnswerOutcome::WrongToken => {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "that token is not the one this challenge published: it answers the challenge it \
+                 was minted for, and this one is still waiting",
+            ))
+        }
+    };
+    Ok(Json(serde_json::json!({ "answered": answered })))
+}
+
+/// The query string the answer route reads. Only `token`, and only here: every other route takes its
+/// credential in a header, so a URL in a log line is never a way in. See [`crate::auth`].
+#[derive(Debug, serde::Deserialize)]
+struct AnswerParams {
+    #[serde(default)]
+    token: Option<String>,
 }
 
 /// `DELETE /v1/terminals/{id}` — drop a terminal.
@@ -1358,8 +1694,17 @@ async fn research_inner(
 
     let (request, mode) = body.into_request_and_mode();
     let client = state.search.client().clone();
+    // The operator's own `fetch:` section — who a target may be, and which browser to drive — turned
+    // into the policy every rung of this selection is built on.
+    let policy = FetchPolicy::from_config(&state.config.fetch);
+    // The last rung is a person, and this is where the daemon hands the ladder one. `screen.
+    // challenge_budget_secs: 0` is the off switch: no pane is offered, the interactive rung keeps its
+    // fail-closed default, and a refused page ends at the browser's refusal. Anything else means a
+    // site that refuses every automated rung opens a screen on this machine and waits — a visible
+    // thing to happen, which is why the budget is configured rather than assumed.
     let selection =
-        select_fetcher(&client, mode, default_pool_root()).map_err(research_route_error)?;
+        select_fetcher_with_policy(&client, mode, default_pool_root(), &policy, human_request(&state))
+            .map_err(research_route_error)?;
     let task = ResearchTask::new(state.search.all(), client, selection.fetcher());
     let report = task.run(&request).await;
 
@@ -1375,6 +1720,20 @@ async fn research_inner(
         sources: report.sources,
         paid_calls: report.paid_calls,
     }))
+}
+
+/// The person a refused page may summon, or `None` when the config says nobody is to be asked.
+///
+/// One place turns the daemon's screen pane into the thing `hx-search`'s ladder takes, so the
+/// decision "may a background research run open a browser and wait for a human?" is made once and
+/// visibly. `screen.challenge_budget_secs: 0` is the off switch — see
+/// [`hx_core::config::ScreenConfig::challenge_budget`].
+fn human_request(state: &Arc<AppState>) -> Option<HumanRequest> {
+    let budget = state.config.screen.challenge_budget()?;
+    Some(HumanRequest {
+        pane: Arc::clone(&state.pane) as Arc<dyn hx_browser::HumanPane>,
+        budget,
+    })
 }
 
 /// Every event of a session, in order: what a client that just attached renders.

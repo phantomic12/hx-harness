@@ -4,10 +4,13 @@
 A browser check is better, but the browser stack is down, and "the UI compiles" is not evidence the
 UI works. This speaks the same frames the page's JavaScript does — the same `POST /v1/terminals`,
 the same `GET /v1/terminals/{id}/ws` with base64 `input`, and the same session socket — using only
-the standard library, so nothing about the transport is being stubbed out or assumed.
+the standard library, so nothing about the transport is being stubbed out or assumed. The `screen`
+pane is driven the same way: `POST /v1/screens`, `GET /v1/screens/{id}/ws`, a real JPEG frame off it,
+and the same mouse and key frames the pane sends.
 
 What it proves: the endpoints the page calls exist, the frames it parses are the frames the daemon
-sends, and two independent clients on one terminal genuinely receive the same bytes.
+sends, two independent clients on one terminal genuinely receive the same bytes, and a screen streams
+a frame a client can draw and accepts the input a person would send it.
 """
 
 import base64
@@ -20,8 +23,18 @@ import time
 import urllib.error
 import urllib.request
 
-HOST = "127.0.0.1"
-PORT = 8899
+# The address to drive. Overridable because the fixed one is a *convention*, not a fact: a machine
+# where 8899 is already taken (a real service, a colleague's daemon, another walk of this harness on
+# 7721) made this script unrunnable, and a check that cannot be pointed at a running daemon is a
+# check nobody runs.
+HOST = os.environ.get("HX_WEB_CHECK_HOST", "127.0.0.1")
+PORT = int(os.environ.get("HX_WEB_CHECK_PORT", "8899"))
+# The sandbox to open the terminal in. On Windows the daemon has no pty of its own, so a *local*
+# terminal is refused and the only shell this walk can drive is one inside a box the daemon runs;
+# naming one here makes the script runnable on such a host instead of failing its first terminal
+# check for a reason unrelated to the web client. Unset means the daemon's own host, which is what
+# every Unix host (and every earlier run) means.
+SANDBOX = os.environ.get("HX_WEB_CHECK_SANDBOX")
 
 
 def http(method, path, body=None):
@@ -147,7 +160,10 @@ def main():
     check("GET / serves the client", status == 200 and "<title>hx</title>" in body, f"{status}")
 
     # 2. The terminal the page creates on load.
-    status, body = http("POST", "/v1/terminals", {"id": "ui-term", "cols": 80, "rows": 24})
+    terminal_body = {"id": "ui-term", "cols": 80, "rows": 24}
+    if SANDBOX:
+        terminal_body["sandbox"] = SANDBOX
+    status, body = http("POST", "/v1/terminals", terminal_body)
     check("POST /v1/terminals", status == 200, f"{status} {body[:120]}")
 
     # 3. Two clients attaching to that one terminal — the M2 criterion, over the page's own protocol.
@@ -281,7 +297,14 @@ def main():
     for marker in ("/v1/hosts", "id=\"hosts\"", "No hosts are configured."):
         check(f"the page renders the hosts pane ({marker})", marker in page, "missing from the served page")
 
-    # 12. Deleting the terminal, as the page does not do but a cleanup must.
+    # 12. The `screen` pane's contract. See `check_screen` for what it proves and what it skips.
+    check_screen(check)
+
+    # 13. The `challenge` routes the pane's banner posts to. See `check_challenges` for what that
+    # proves and what it deliberately does not.
+    check_challenges(check)
+
+    # 14. Deleting the terminal, as the page does not do but a cleanup must.
     status, _ = http("DELETE", "/v1/terminals/ui-term")
     check("DELETE /v1/terminals/{id}", status == 200, str(status))
 
@@ -291,6 +314,108 @@ def main():
         return 1
     print("all checks passed")
     return 0
+
+
+def check_challenges(check):
+    """The `challenge` routes the pane's banner posts to — the refusals, and the banner's markup.
+
+    Only the refusals are checked, and they are checked on **every** host: a live challenge needs a
+    site that refuses every automated rung, which is a thing to arrange rather than a thing to assume.
+    The end to end of the loop is `crates/hx-server/tests/challenge_api.rs`, which drives it against a
+    stub that refuses and a real browser; what a client can be told *wrongly* on any daemon is here: a
+    listing that is not a listing, an id that was never one reporting as over, and a decline whose
+    reason was dropped on the floor.
+    """
+    status, body = http("GET", "/v1/challenges")
+    ok = status == 200 and isinstance(json.loads(body or "{}").get("challenges"), list)
+    check("GET /v1/challenges returns a listing", ok, f"{status} {body[:120]}")
+    status, body = http("POST", "/v1/challenges/chal_never_existed", {"outcome": "solved"})
+    check(
+        "answering a challenge that never existed is a 404",
+        status == 404,
+        f"{status} {body[:120]}",
+    )
+    status, body = http(
+        "POST", "/v1/challenges/chal_never_existed", {"outcome": "abandoned", "note": "  "}
+    )
+    check(
+        "a decline with no reason is refused as the caller's mistake (400, not 404)",
+        status == 400 and "note" in body,
+        f"{status} {body[:160]}",
+    )
+    _, page = http("GET", "/")
+    for marker in (
+        'id="challenge"',
+        "challenge-solved",
+        "/v1/challenges",
+        # Who the question is for, and the deep link a notification carries: a banner that did not say
+        # whose run is blocked would be the noticeboard the addressing work replaced, and a
+        # notification URL that opened no screen would be a link that does nothing.
+        'id="challenge-for"',
+        "followScreenLink",
+        # On a daemon with several operators, "nobody was told" is about the *named* person and no
+        # longer about the whole daemon, and the page is the only place a name is spelled out for a
+        # human. A banner still blaming `approval.push_url` would send an operator to the wrong key.
+        "no push_url for that operator",
+    ):
+        check(f"the page renders the challenge banner ({marker})", marker in page, "missing from the served page")
+
+
+def check_screen(check):
+    """Drive the `screen` pane's frames: launch a browser, read a real frame, send a person's input.
+
+    Skipped rather than failed when the daemon's host has no browser — the pane tells a person the same
+    thing, with every path it looked at, and a script that failed here would be testing the machine
+    rather than the protocol.
+
+    The input is *not* followed by a wait for a frame, and that is deliberate: a page that does not
+    repaint sends none, so a check that blocked on one would be a check that hangs instead of
+    reporting. What is asserted is that the daemon accepts the frames a pane sends and the screen
+    stays live — a refused input comes back as `error`, and a broken driver as `ended`.
+    """
+    status, body = http("POST", "/v1/screens", {"id": "ui-screen", "width": 800, "height": 600})
+    if status == 503:
+        print(f"SKIP  the screen (no browser on this host: {json.loads(body)['error'][:90]}…)")
+    else:
+        check("POST /v1/screens", status == 200, f"{status} {body[:160]}")
+        listed = json.loads(http("GET", "/v1/screens")[1]).get("screens", [])
+        check(
+            "GET /v1/screens lists the live screen",
+            any(s.get("id") == "ui-screen" and s.get("ended") is None for s in listed),
+            f"{listed}"[:160],
+        )
+
+        s = WS("/v1/screens/ui-screen/ws")
+        frames = read_until(s, "frame")
+        frame = [f for f in frames if f.get("type") == "frame"][-1]
+        jpeg = base64.b64decode(frame["data"])
+        check("a frame is a JPEG, passed through untouched", jpeg[:3] == b"\xff\xd8\xff", repr(jpeg[:8]))
+        check(
+            "the frame carries the viewport that was asked for",
+            (frame.get("width"), frame.get("height")) == (800, 600),
+            f"{frame.get('width')}x{frame.get('height')}",
+        )
+
+        s.send({"type": "mouse_button", "x": 10.0, "y": 10.0, "button": "left", "down": True, "clicks": 1})
+        s.send({"type": "mouse_button", "x": 10.0, "y": 10.0, "button": "left", "down": False, "clicks": 1})
+        s.send({"type": "key_down", "key": "a", "code": "KeyA", "key_code": 65, "modifiers": 0, "text": "a"})
+        s.send({"type": "key_up", "key": "a", "code": "KeyA", "key_code": 65, "modifiers": 0})
+        time.sleep(1)
+        still = json.loads(http("GET", "/v1/screens")[1]).get("screens", [])
+        check(
+            "the click and the key left the screen live",
+            any(x.get("id") == "ui-screen" and x.get("ended") is None for x in still),
+            f"{still}"[:160],
+        )
+        s.close()
+
+        status, _ = http("DELETE", "/v1/screens/ui-screen")
+        check("DELETE /v1/screens/{id}", status == 200, str(status))
+        check(
+            "the screen is gone from the listing",
+            json.loads(http("GET", "/v1/screens")[1]).get("screens") == [],
+            "",
+        )
 
 
 if __name__ == "__main__":
