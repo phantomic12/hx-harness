@@ -141,7 +141,13 @@ impl FetchReport {
         )
     }
 
-    /// `"http (…), stealth (…)"` — the rungs that failed on the way to a success.
+    /// `"http (…), chromium (…), interactive-cdp (…)"` — the rungs that failed on the way to a
+    /// success, each by its own **name**.
+    ///
+    /// By name rather than by kind because a real ladder now holds two rungs of one kind: the browser
+    /// and the person asked when the browser is refused are both [`RungKind::Interactive`], and a
+    /// trail reading `interactive (…), interactive (…)` would hide the only thing it is read for —
+    /// whether a person was asked. [`Attempt::rung_name`](Attempt) exists for this.
     fn escalation_trail(&self) -> String {
         let failed: Vec<String> = self
             .attempts
@@ -150,7 +156,7 @@ impl FetchReport {
                 attempt
                     .failure
                     .as_ref()
-                    .map(|failure| format!("{} ({failure})", attempt.rung))
+                    .map(|failure| format!("{} ({failure})", attempt.rung_name))
             })
             .collect();
         failed.join(", ")
@@ -184,6 +190,12 @@ impl Ladder {
         self
     }
 
+    /// The per-attempt deadline in force. Read-only, so a caller that *builds* a ladder elsewhere can
+    /// still assert on the bound it will enforce — the arithmetic a person's budget depends on.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// A ceiling on how many rungs one fetch may climb, whatever the list holds.
     pub fn with_max_attempts(mut self, max: usize) -> Self {
         self.max_attempts = max;
@@ -192,6 +204,16 @@ impl Ladder {
 
     pub fn rungs(&self) -> Vec<RungKind> {
         self.rungs.iter().map(|rung| rung.kind()).collect()
+    }
+
+    /// The rungs' own names, in order.
+    ///
+    /// Beside [`rungs`](Ladder::rungs) because a kind is no longer enough to say what a ladder will
+    /// do: the browser and the person asked when the browser is refused are both
+    /// [`RungKind::Interactive`], so a caller inspecting a ladder — or a test pinning its shape — has
+    /// to read the names to tell them apart.
+    pub fn rung_names(&self) -> Vec<&str> {
+        self.rungs.iter().map(|rung| rung.name()).collect()
     }
 
     pub fn is_empty(&self) -> bool {

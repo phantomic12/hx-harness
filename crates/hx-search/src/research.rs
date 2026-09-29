@@ -30,9 +30,11 @@
 //! makes that a running decision rather than a manual construction: it chooses `BrowserFetcher` for the
 //! `Auto` or `Browser` modes and `HttpFetcher` otherwise, honours browser availability with a fallback that
 //! cannot lie (see [`select_fetcher`]), and records the choice for tests and honest reporting.
-//! The chromium tests that drive real Chromium run **locally** — the browser is installed on the developer
-//! host (`/usr/lib/chromium/chromium`) and not on the remote build host — and are `#[ignore]`d so
-//! they never run in the offload gate. `tests/browser_rung_canary.rs` is the live one: it proves the
+//! The chromium tests that drive real Chromium run **locally** — a browser is installed on the developer
+//! host and not on the remote build host — and are `#[ignore]`d so
+//! they never run in the offload gate. Whether a host has one at all is a question for
+//! [`browser_available`], which asks the same search the screen does ([`browser_discovery`]); no
+//! part of this module spells a browser path itself. `tests/browser_rung_canary.rs` is the live one: it proves the
 //! browser rung reads a page whose text only exists after JavaScript runs, and that the plain path
 //! does **not**.
 //!
@@ -71,6 +73,14 @@ use hx_core::ids::SessionId;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// How much room the rungs get on top of a person's budget when one is attached.
+///
+/// The budget bounds the *wait*; this bounds the work either side of it — launching the browser that
+/// shows the wall, reading it, and the rung's own report after the answer. Without it the two bounds
+/// would be the same number, and a person answering in the last second of their budget would lose to
+/// the fetcher's clock instead. See [`BrowserFetcher::with_pane`].
+pub const PANE_TIMEOUT_GRACE: Duration = Duration::from_secs(30);
 
 /// Default per-fetch timeout for page extraction.
 pub const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -374,9 +384,9 @@ fn transport_error(err: reqwest::Error) -> SearchError {
 ///
 /// ## Where the chromium tests run
 ///
-/// A real browser is at `/usr/lib/chromium/chromium` on the **developer host** (bigwhite) and not on
-/// the build host (garlic-clove), so any test of this fetcher that would touch the rung runs
-/// **locally**. The server-side tests below therefore drive the *decision* with a browser-launching
+/// A real browser is installed on the **developer host** (bigwhite) and not on the build host
+/// (garlic-clove), so any test of this fetcher that would touch the rung runs **locally** — and
+/// *which* binary is a question [`browser_discovery`] answers, not a path written down here. The server-side tests below therefore drive the *decision* with a browser-launching
 /// double and serve all pages from a local stub — no test depends on a third-party site — and the
 /// live run (real Chromium end to end, both rungs, against a local server whose page is filled in by
 /// JavaScript) is `crates/hx-search/tests/browser_rung_canary.rs`, `#[ignore]`d for the local host.
@@ -386,18 +396,115 @@ pub struct BrowserFetcher {
     root: PoolRoot,
     /// The policy the pool **and** every rung were built on.
     admission: Admission,
+    /// The binary the Chromium rung drives, or `None` for the host's own search.
+    ///
+    /// A *named* path is used verbatim: it is an operator's statement about where their browser is,
+    /// and quietly searching when the named path is wrong would hide the typo that made it wrong.
+    browser: Option<std::path::PathBuf>,
     /// Whether the ladder is browser-only (`FetchMode::Browser`) or starts at the cheap rung (`Auto`).
     browser_first: bool,
+    /// The person a refused page may summon, if this fetcher has one. Kept beside the shape for the
+    /// same reason `browser_first` is: both are ladder properties, and a rebuild that dropped either
+    /// would change what the ladder *is* rather than what it was pointed at.
+    human: Option<HumanRequest>,
     pool: BrowserPool,
     timeout: Duration,
     max_body_bytes: usize,
+}
+
+/// A person to hand a wall to, and how long they get.
+///
+/// The daemon's half of `hx-browser`'s interactive contract: [`hx_browser::HumanPane`] is what a
+/// climb asks, and this is the *fact* that one is available — a fetcher built without it keeps the
+/// fail-closed rung, which reports that nobody could help rather than waiting for someone who is not
+/// there. See `crates/hx-server/src/pane.rs` for the daemon's implementation.
+#[derive(Clone)]
+pub struct HumanRequest {
+    pub pane: Arc<dyn hx_browser::HumanPane>,
+    pub budget: Duration,
+}
+
+impl std::fmt::Debug for HumanRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The pane's *name* and budget, never the pane: `HumanPane::name` is documented to be safe for
+        // a report, which is exactly why it is the one thing printed here.
+        f.debug_struct("HumanRequest")
+            .field("pane", &self.pane.name())
+            .field("budget", &self.budget)
+            .finish()
+    }
+}
+
+/// What the research path may fetch with: who a target may be, and which browser drives the rungs.
+///
+/// The daemon's `fetch:` config section, in `hx-browser`'s vocabulary. One carrier rather than two
+/// loose parameters because the two travel together from the same place to the same builders — the
+/// plain rung, the pool, and the Chromium rung all take the policy's admission — and a call that set
+/// one and forgot the other would be a fetch running on a policy nobody wrote down.
+///
+/// `hx-core`'s config model cannot name [`Admission`] directly (it does not depend on `hx-browser`;
+/// the dependency runs the other way), so [`FetchPolicy::from_config`] is the one mapping between the
+/// two vocabularies, in the one crate that has both in scope.
+#[derive(Clone, Debug)]
+pub struct FetchPolicy {
+    admission: Admission,
+    browser: Option<std::path::PathBuf>,
+}
+
+impl Default for FetchPolicy {
+    /// The default an in-code caller gets: the public internet only, and the host's own browser
+    /// search. The same pair `FetchConfig::default()` gives a config that omits the section.
+    fn default() -> Self {
+        Self {
+            admission: Admission::default(),
+            browser: None,
+        }
+    }
+}
+
+impl FetchPolicy {
+    /// The policy `hx-core`'s config describes.
+    pub fn from_config(config: &hx_core::config::FetchConfig) -> Self {
+        Self {
+            admission: match config.admission {
+                hx_core::config::FetchAdmission::PublicInternet => Admission::PublicInternet,
+                hx_core::config::FetchAdmission::AllowLocal => Admission::AllowLocal,
+            },
+            browser: config.browser_binary().map(std::path::Path::to_path_buf),
+        }
+    }
+
+    /// The same policy with another admission rule. Test and hermetic-suite hatch; the daemon
+    /// reaches this through [`FetchPolicy::from_config`].
+    pub fn with_admission(mut self, admission: Admission) -> Self {
+        self.admission = admission;
+        self
+    }
+
+    /// The same policy with a named browser binary.
+    pub fn with_browser(mut self, browser: impl Into<std::path::PathBuf>) -> Self {
+        self.browser = Some(browser.into());
+        self
+    }
+
+    /// Who a fetched target may be.
+    pub fn admission(&self) -> Admission {
+        self.admission
+    }
+
+    /// The binary to drive, or `None` for the host's own search.
+    pub fn browser(&self) -> Option<&std::path::Path> {
+        self.browser.as_deref()
+    }
 }
 
 impl std::fmt::Debug for BrowserFetcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BrowserFetcher")
             .field("pool", &self.pool)
+            .field("browser", &self.browser)
             .field("browser_first", &self.browser_first)
+            .field("human", &self.human)
             .field("timeout", &self.timeout)
             .field("max_body_bytes", &self.max_body_bytes)
             .finish()
@@ -408,7 +515,7 @@ impl BrowserFetcher {
     /// The `Auto` shape: a browser-backed fetcher over `root` (the pool's profile root) with the
     /// default cap, escalating from the plain rung to Chromium only on a refusal.
     pub fn new(root: impl Into<std::path::PathBuf>) -> Result<Self, std::io::Error> {
-        Self::assemble(root, Admission::default(), false)
+        Self::assemble(root, &FetchPolicy::default(), false, None)
     }
 
     /// The `Browser` shape: a real Chromium for **every** page, with no plain rung in front of it.
@@ -416,7 +523,68 @@ impl BrowserFetcher {
     /// This is what [`FetchMode::Browser`] selects. A caller that builds it directly is opting into
     /// a browser launch per fetched page, which is the cost the mode documents.
     pub fn browser_first(root: impl Into<std::path::PathBuf>) -> Result<Self, std::io::Error> {
-        Self::assemble(root, Admission::default(), true)
+        Self::assemble(root, &FetchPolicy::default(), true, None)
+    }
+
+    /// Run under `policy`: who a target may be, and which browser the rungs drive.
+    ///
+    /// Rebuilds the pool's ladder rather than relabelling it, for the reason
+    /// [`BrowserFetcher::with_admission`] gives — and now for the browser too: a rung built to search
+    /// for a binary while the pool claims one was configured would be a fetcher whose report and
+    /// whose behaviour disagreed.
+    pub fn with_policy(mut self, policy: &FetchPolicy) -> Result<Self, std::io::Error> {
+        self.pool = Self::build_pool(
+            &self.root,
+            policy,
+            self.browser_first,
+            self.human.clone(),
+        )?;
+        self.admission = policy.admission();
+        self.browser = policy.browser().map(std::path::Path::to_path_buf);
+        Ok(self)
+    }
+
+    /// The binary the Chromium rung will drive, or `None` when it searches for one.
+    pub fn browser(&self) -> Option<&std::path::Path> {
+        self.browser.as_deref()
+    }
+
+    /// Give this fetcher a person to ask, rebuilding the pool's ladder to carry them.
+    ///
+    /// The rung is appended rather than replacing anything: the climb is unchanged up to the point
+    /// where every automated rung has been refused, and *then* someone is asked. A fetcher without
+    /// this keeps the fail-closed rung, so the two states differ in whether help can arrive, not in
+    /// how a page is fetched.
+    pub fn with_pane(
+        mut self,
+        pane: Arc<dyn hx_browser::HumanPane>,
+        budget: Duration,
+    ) -> Result<Self, std::io::Error> {
+        let human = Some(HumanRequest { pane, budget });
+        let policy = self.policy();
+        self.pool = Self::build_pool(&self.root, &policy, self.browser_first, human.clone())?;
+        // A waiting person is not a hang, so the bound around the whole fetch has to clear the wait
+        // the rung enforces. This was wrong first, and the shape of the bug is worth keeping: the
+        // fetcher's default bound (10s) is *shorter* than any sane `challenge_budget_secs`, so a
+        // person who took longer than ten seconds lost to the timeout — the report said the fetch
+        // timed out while somebody was still deciding, and the config key that named their budget
+        // was a promise the fetcher broke first.
+        self.timeout = self.timeout.max(budget + PANE_TIMEOUT_GRACE);
+        self.human = human;
+        Ok(self)
+    }
+
+    /// This fetcher's two policy knobs, as the carrier [`BrowserFetcher::build_pool`] takes.
+    fn policy(&self) -> FetchPolicy {
+        FetchPolicy {
+            admission: self.admission,
+            browser: self.browser.clone(),
+        }
+    }
+
+    /// The person this fetcher would ask, if it has one.
+    pub fn human(&self) -> Option<&HumanRequest> {
+        self.human.as_ref()
     }
 
     /// Admit loopback and private targets as well, rebuilding the pool's ladder on the same policy.
@@ -428,9 +596,11 @@ impl BrowserFetcher {
     /// a loaded page makes) and a pool that admits a host its rung then refuses would be a fetcher
     /// that silently drops a page's subresources.
     pub fn with_admission(mut self, admission: Admission) -> Result<Self, std::io::Error> {
-        let pool = Self::build_pool(&self.root, admission, self.browser_first)?;
+        // The policy's *other* half is kept: widening the target rule must not forget a browser the
+        // caller named, and this method's whole point is that it changes one thing.
         self.admission = admission;
-        self.pool = pool;
+        let policy = self.policy();
+        self.pool = Self::build_pool(&self.root, &policy, self.browser_first, self.human.clone())?;
         Ok(self)
     }
 
@@ -464,7 +634,9 @@ impl BrowserFetcher {
         Self {
             root,
             admission,
+            browser: None,
             browser_first: false,
+            human: None,
             pool,
             timeout: DEFAULT_FETCH_TIMEOUT,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
@@ -473,15 +645,18 @@ impl BrowserFetcher {
 
     fn assemble(
         root: impl Into<std::path::PathBuf>,
-        admission: Admission,
+        policy: &FetchPolicy,
         browser_first: bool,
+        human: Option<HumanRequest>,
     ) -> Result<Self, std::io::Error> {
         let root = PoolRoot::new(root).map_err(|err| std::io::Error::other(err.to_string()))?;
-        let pool = Self::build_pool(&root, admission, browser_first)?;
+        let pool = Self::build_pool(&root, policy, browser_first, human.clone())?;
         Ok(Self {
             root,
-            admission,
+            admission: policy.admission(),
+            browser: policy.browser().map(std::path::Path::to_path_buf),
             browser_first,
+            human,
             pool,
             timeout: DEFAULT_FETCH_TIMEOUT,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
@@ -495,25 +670,60 @@ impl BrowserFetcher {
     /// that separates `Auto` from `Browser`.
     fn build_pool(
         root: &PoolRoot,
-        admission: Admission,
+        policy: &FetchPolicy,
         browser_first: bool,
+        human: Option<HumanRequest>,
     ) -> Result<BrowserPool, std::io::Error> {
-        let chromium = Arc::new(
-            hx_browser::ChromiumRung::with_admission(admission)
-                .map_err(|_| std::io::Error::other("could not build the Chromium rung"))?,
-        );
+        let admission = policy.admission();
+        // A named binary is used as given; otherwise the rung finds this host's browser when the
+        // fetch runs. Both are one line here because the decision is the policy's, not the pool's.
+        let chromium = match policy.browser() {
+            Some(path) => hx_browser::ChromiumRung::with_path_and_admission(path, admission),
+            None => hx_browser::ChromiumRung::with_admission(admission),
+        }
+        .map_err(|err| std::io::Error::other(format!("could not build the Chromium rung: {err}")))?;
+        let chromium = Arc::new(chromium);
 
-        let ladder = if browser_first {
-            RungLadder::new(vec![chromium])
+        let mut rungs: Vec<Arc<dyn hx_browser::rung::Fetcher>> = if browser_first {
+            vec![chromium]
         } else {
             let http = Arc::new(
                 hx_browser::HttpRung::with_admission(admission)
                     .map_err(|_| std::io::Error::other("could not build the HTTP rung"))?,
             );
-            RungLadder::new(vec![http, chromium])
+            vec![http, chromium]
         };
 
-        Ok(BrowserPool::new(root.clone(), ladder).with_admission(admission))
+        // The last rung is a person, and it is present in **both** states rather than only when one
+        // is attached: the fail-closed rung is what makes a report say *"nobody was available to
+        // help"* instead of ending at a Chromium refusal and leaving the reader to guess whether a
+        // person could have been asked. Costing nothing when nobody is there, it is the honest
+        // element to always carry — see `hx_browser::interactive`.
+        rungs.push(match &human {
+            Some(request) => Arc::new(hx_browser::InteractiveFetcher::with_pane(
+                Arc::clone(&request.pane),
+                request.budget,
+            )),
+            None => Arc::new(hx_browser::InteractiveFetcher::unattached()),
+        });
+
+        // The ladder enforces its own per-rung deadline (`DEFAULT_RUNG_TIMEOUT`, 20s), and that is
+        // the right bound for the machine rungs: a hung browser launch must not hold a session
+        // forever. It is the *wrong* bound for the person's rung — a budget of 90s cut off at 20s is
+        // the fetcher breaking the screen section's promise a second time, one layer down, where the
+        // first fix (`with_pane`'s outer bound) could not reach. So when a person is attached, the
+        // ladder's deadline widens to clear their budget by the same grace; the outer bound below
+        // still ends the climb, and a rung with nobody attached keeps the machine deadline.
+        let ladder_timeout = match &human {
+            Some(request) => {
+                hx_browser::DEFAULT_RUNG_TIMEOUT.max(request.budget + PANE_TIMEOUT_GRACE)
+            }
+            None => hx_browser::DEFAULT_RUNG_TIMEOUT,
+        };
+        Ok(
+            BrowserPool::new(root.clone(), RungLadder::new(rungs).with_timeout(ladder_timeout))
+                .with_admission(admission),
+        )
     }
 }
 
@@ -640,14 +850,45 @@ impl std::fmt::Display for FetchRouteError {
 
 impl std::error::Error for FetchRouteError {}
 
-/// True when a runnable Chromium binary is installed on **this** host.
+/// The browser this host would drive, or the refusal naming every path the search looked at.
 ///
-/// Chromium is at `/usr/lib/chromium/chromium` on the developer host and **not** on the remote
-/// build host nor necessarily in a deployment, so the routing below must not assume it exists. This
-/// check is the honest gate the fallback rules key off: a browser that is not installed can neither
-/// be selected for `Auto` nor fulfil an explicit `Browser` request.
+/// The search is `hx-browser`'s, not this crate's: [`hx_browser::browser::discover_browser`] is the
+/// same list — Chrome before Edge on Windows, the `/usr/bin/*` family on Linux — that
+/// [`hx_browser::screen`] uses to start a screen, and [`hx_browser::ChromiumRung`] uses to launch a
+/// fetch. It used to be spelled here as one hardcoded Linux path, which meant a daemon on a host
+/// whose browser was somewhere else could show a person a screen and still never select a browser
+/// rung: `fetch_mode: browser` was a `503` and `auto` degraded to plain HTTP.
+///
+/// Returned as a path rather than a bool because the caller that refuses an explicit `Browser`
+/// request has to say *where it looked* — see [`select_fetcher`].
+pub fn browser_discovery() -> Result<std::path::PathBuf, hx_browser::BrowserError> {
+    hx_browser::browser::discover_browser(None)
+}
+
+/// True when a runnable Chromium-class browser is installed on **this** host.
+///
+/// The honest gate the fallback rules key off: a browser that is not installed can neither be
+/// selected for `Auto` nor fulfil an explicit `Browser` request. See [`browser_discovery`] for
+/// which browser, and where it was looked for. A host with none is not an error here — the router
+/// below documents what each mode does about it.
+///
+/// This is the answer for the *default* policy, with no binary configured. A policy that names one
+/// is checked against that path instead ([`browser_check`]) — an operator who writes down where
+/// their browser is has answered this question themselves, and the search must not overrule them.
+#[must_use]
 pub fn browser_available() -> bool {
-    std::path::Path::new(hx_browser::rungs::chromium::DEFAULT_CHROMIUM_PATH).is_file()
+    browser_discovery().is_ok()
+}
+
+/// The gate [`select_fetcher`] hands [`select_fetcher_by`]: available, or the reason it is not.
+///
+/// A **configured** binary is checked as the path it is. That is the whole point of naming one: an
+/// operator whose browser is somewhere the search does not look gets a browser rung out of it, and a
+/// gate that ignored the name would refuse the very configuration it was handed. With no binary
+/// named this is the host's own search, the one a screen uses; the refusal is that search's own
+/// words, naming every path it looked at ([`browser_discovery`] for the policy-free question).
+fn browser_check(policy: &FetchPolicy) -> Result<(), hx_browser::BrowserError> {
+    hx_browser::browser::discover_browser(policy.browser()).map(|_| ())
 }
 
 /// Where the browser pool keeps its per-session profiles, for [`select_fetcher`]'s `BrowserFetcher`.
@@ -670,6 +911,10 @@ pub fn default_pool_root() -> std::path::PathBuf {
 /// | `Browser` | yes | browser-first `BrowserFetcher` | explicit opt-in: a real browser for **every** page, including one a plain fetch could read. |
 /// | `Browser` | no | **error** | a caller that explicitly asked for a browser must not silently get a plain fetch; that would be lying about what it fetched. |
 ///
+/// "Browser installed?" is [`browser_available`]: the host's own search, so *"yes"* means the same
+/// thing here as it does to a screen. The `Browser`-without-a-browser refusal carries the search's
+/// own words, which name every path that was looked at.
+///
 /// The runtime honesty — a browser that runs but cannot fetch a page is a `Refused`, never an empty
 /// body — is enforced by [`BrowserFetcher`] itself (and its rungs), not by this selector.
 pub fn select_fetcher(
@@ -677,54 +922,116 @@ pub fn select_fetcher(
     mode: FetchMode,
     pool_root: impl Into<std::path::PathBuf>,
 ) -> Result<FetchSelection, FetchRouteError> {
-    select_fetcher_by(client, mode, pool_root, browser_available)
+    select_fetcher_with_policy(client, mode, pool_root, &FetchPolicy::default(), None)
+}
+
+/// [`select_fetcher`] under an explicit [`FetchPolicy`] — the daemon's entry point.
+///
+/// `policy` is the operator's `fetch:` section: who a target may be, and which browser to drive. It
+/// reaches every rung the selection builds, including the plain one — a target rule that applied to
+/// the browser and not to a `GET` would be two different policies wearing one config key. `human` is
+/// the pane a refused page may summon, or `None` to keep the rung that fails closed.
+///
+/// Everything else — which fetcher, on what evidence, degrading how — is [`select_fetcher`]'s
+/// decision, unchanged.
+pub fn select_fetcher_with_policy(
+    client: &reqwest::Client,
+    mode: FetchMode,
+    pool_root: impl Into<std::path::PathBuf>,
+    policy: &FetchPolicy,
+    human: Option<HumanRequest>,
+) -> Result<FetchSelection, FetchRouteError> {
+    select_fetcher_by(client, mode, pool_root, policy, || browser_check(policy), human)
+}
+
+/// [`select_fetcher`], with a person behind the last rung.
+///
+/// The daemon's entry point: `human` is the screen pane, so a site that refuses every automated rung
+/// opens a screen on the daemon's host and waits for someone to clear the wall in it. Everything else
+/// — which fetcher, on what evidence, degrading how — is `select_fetcher`'s decision, unchanged; this
+/// only says that help is available.
+pub fn select_fetcher_with_pane(
+    client: &reqwest::Client,
+    mode: FetchMode,
+    pool_root: impl Into<std::path::PathBuf>,
+    human: HumanRequest,
+) -> Result<FetchSelection, FetchRouteError> {
+    select_fetcher_with_policy(client, mode, pool_root, &FetchPolicy::default(), Some(human))
 }
 
 /// The [`select_fetcher`] decision under an injected browser-availability check, so the choice is
 /// brittleness-proof in tests rather than depending on which host the test happens to run on.
+///
+/// The check answers with the *reason* there is no browser rather than a bool, so the
+/// `Browser`-without-a-browser refusal can carry the search's own words — the paths it looked at —
+/// instead of a second, thinner message about a binary this crate never went looking for.
 pub(crate) fn select_fetcher_by(
     client: &reqwest::Client,
     mode: FetchMode,
     pool_root: impl Into<std::path::PathBuf>,
-    available: impl Fn() -> bool,
+    policy: &FetchPolicy,
+    available: impl Fn() -> Result<(), hx_browser::BrowserError>,
+    human: Option<HumanRequest>,
 ) -> Result<FetchSelection, FetchRouteError> {
+    let plain = || HttpFetcher::new(client.clone()).with_admission(policy.admission());
+    let build = |root: std::path::PathBuf, browser_first: bool| -> Result<BrowserFetcher, FetchRouteError> {
+        let fetcher = if browser_first {
+            BrowserFetcher::browser_first(root)
+        } else {
+            BrowserFetcher::new(root)
+        }
+        .map_err(|err| FetchRouteError {
+            reason: format!("could not build the browser fetcher: {err}"),
+        })?
+        .with_policy(policy)
+        .map_err(|err| FetchRouteError {
+            reason: format!("could not build the browser fetcher: {err}"),
+        })?;
+        match &human {
+            Some(request) => fetcher
+                .with_pane(Arc::clone(&request.pane), request.budget)
+                .map_err(|err| FetchRouteError {
+                    reason: format!("could not build the browser fetcher: {err}"),
+                }),
+            None => Ok(fetcher),
+        }
+    };
+
     match mode {
         FetchMode::Http => Ok(FetchSelection {
-            fetcher: Arc::new(HttpFetcher::new(client.clone())),
+            fetcher: Arc::new(plain()),
             kind: SelectedFetcher::Http,
             note: "http: plain fetch policy, no escalation",
         }),
-        FetchMode::Auto if available() => {
-            let fetcher = BrowserFetcher::new(pool_root).map_err(|err| FetchRouteError {
-                reason: format!("could not build the browser fetcher: {err}"),
-            })?;
-            Ok(FetchSelection {
-                fetcher: Arc::new(fetcher),
-                kind: SelectedFetcher::Browser,
-                note: "auto: browser available, escalating plain-HTTP-then-Chromium",
-            })
-        }
-        FetchMode::Auto => Ok(FetchSelection {
-            fetcher: Arc::new(HttpFetcher::new(client.clone())),
-            kind: SelectedFetcher::Http,
-            note: "auto: no browser on this host, degraded to plain fetch (honest default)",
+        FetchMode::Auto if available().is_ok() => Ok(FetchSelection {
+            fetcher: Arc::new(build(pool_root.into(), false)?),
+            kind: SelectedFetcher::Browser,
+            note: "auto: browser available, escalating plain-HTTP-then-Chromium",
         }),
-        FetchMode::Browser if available() => {
-            let fetcher =
-                BrowserFetcher::browser_first(pool_root).map_err(|err| FetchRouteError {
-                    reason: format!("could not build the browser fetcher: {err}"),
-                })?;
-            Ok(FetchSelection {
-                fetcher: Arc::new(fetcher),
-                kind: SelectedFetcher::Browser,
-                note: "browser: explicit opt-in, driving Chromium for every page",
-            })
-        }
+        FetchMode::Auto => Ok(FetchSelection {
+            fetcher: Arc::new(plain()),
+            kind: SelectedFetcher::Http,
+            // "No browser" covers both a host without one and a configured binary that is not
+            // there, because the two are the same fact at this point in the decision: there is
+            // nothing to escalate to. Which of them it is, and where it looked, is in the
+            // `browser`-mode refusal — the mode that must not degrade.
+            note: "auto: no browser to escalate to, degraded to plain fetch (honest default)",
+        }),
+        FetchMode::Browser if available().is_ok() => Ok(FetchSelection {
+            fetcher: Arc::new(build(pool_root.into(), true)?),
+            kind: SelectedFetcher::Browser,
+            note: "browser: explicit opt-in, driving Chromium for every page",
+        }),
         FetchMode::Browser => Err(FetchRouteError {
-            reason: format!(
-                "browser mode requested but no Chromium is installed at {}",
-                hx_browser::rungs::chromium::DEFAULT_CHROMIUM_PATH
-            ),
+            reason: match available() {
+                // The real case: the host's search found nothing, and its refusal already names
+                // every path it looked at.
+                Err(err) => format!("browser mode requested but {err}"),
+                // Reachable only when the check was injected and says no while the host itself has
+                // a browser — a test, or a caller with a check of its own. Saying so is better than
+                // inventing a search nobody ran.
+                Ok(()) => "browser mode requested but the browser was not available".to_string(),
+            },
         }),
     }
 }
@@ -1281,7 +1588,9 @@ mod browser_fetcher_tests {
 #[cfg(test)]
 mod fetch_router_tests {
     use super::*;
+    use hx_browser::rungs::chromium::DEFAULT_CHROMIUM_PATH;
     use hx_browser::{Admission, RungKind};
+    use std::path::Path;
 
     fn client() -> reqwest::Client {
         reqwest::Client::new()
@@ -1291,11 +1600,81 @@ mod fetch_router_tests {
         std::env::temp_dir().join(format!("hx-fetch-router-test-{}", std::process::id()))
     }
 
+    /// The injected check's "a browser is installed" answer, so the routing assertions hold on a
+    /// host with no browser (the build host) and on the developer host alike.
+    fn a_browser_is_installed() -> Result<(), hx_browser::BrowserError> {
+        Ok(())
+    }
+
+    /// The injected check's "no browser here" answer, with the same refusal the real search makes:
+    /// one path it looked at, named.
+    fn no_browser_here() -> Result<(), hx_browser::BrowserError> {
+        Err(hx_browser::BrowserError::NoBrowser {
+            searched: vec![std::path::PathBuf::from(DEFAULT_CHROMIUM_PATH)],
+        })
+    }
+
+    /// A page server that refuses everything, on a loopback port.
+    ///
+    /// The input to a climb: `403` is what `HttpRung` classifies as a refusal rather than a
+    /// transport failure, so the ladder escalates instead of stopping. It is on loopback, which is
+    /// precisely the address a policy is what decides about — `PublicInternet` refuses it before any
+    /// socket, `AllowLocal` reaches it and lets the site do the refusing.
+    struct RefusingPage {
+        addr: std::net::SocketAddr,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl RefusingPage {
+        async fn start() -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            const BODY: &str =
+                "<html><head><title>Just a moment…</title></head><body>captcha</body></html>";
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a loopback listener on a free port");
+            let addr = listener.local_addr().expect("the bound address");
+            let task = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 4096];
+                        let _ = socket.read(&mut buf).await;
+                        let response = format!(
+                            "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+                            BODY.len()
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
+                        let _ = socket.shutdown().await;
+                    });
+                }
+            });
+            Self { addr, task }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}/wall", self.addr)
+        }
+    }
+
+    impl Drop for RefusingPage {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
     /// Http mode must always select the plain fetcher and never a browser, even on a host that has one.
     #[test]
     fn http_mode_selects_the_plain_fetcher_even_when_a_browser_is_installed() {
-        let selection = select_fetcher_by(&client(), FetchMode::Http, pool_root(), || true)
-            .expect("http mode never fails");
+        let selection = select_fetcher_by(
+            &client(),
+            FetchMode::Http,
+            pool_root(),
+            &FetchPolicy::default(),
+            a_browser_is_installed,
+            None,
+        )
+        .expect("http mode never fails");
         assert_eq!(selection.kind, SelectedFetcher::Http);
         assert!(
             !selection.note.contains("browser"),
@@ -1308,8 +1687,15 @@ mod fetch_router_tests {
     /// Auto mode escalates to the browser exactly when one is available — the case the rung exists for.
     #[test]
     fn auto_mode_selects_the_browser_fetcher_when_a_browser_is_available() {
-        let selection = select_fetcher_by(&client(), FetchMode::Auto, pool_root(), || true)
-            .expect("auto mode with a browser succeeds");
+        let selection = select_fetcher_by(
+            &client(),
+            FetchMode::Auto,
+            pool_root(),
+            &FetchPolicy::default(),
+            a_browser_is_installed,
+            None,
+        )
+        .expect("auto mode with a browser succeeds");
         assert_eq!(selection.kind, SelectedFetcher::Browser);
         assert!(
             selection.note.contains("escalat"),
@@ -1322,8 +1708,15 @@ mod fetch_router_tests {
     /// Auto mode degrades to plain HTTP when no browser is installed — an honest default, never a lie.
     #[test]
     fn auto_mode_without_a_browser_degrades_to_plain_http() {
-        let selection = select_fetcher_by(&client(), FetchMode::Auto, pool_root(), || false)
-            .expect("auto mode without a browser degrades, it does not fail");
+        let selection = select_fetcher_by(
+            &client(),
+            FetchMode::Auto,
+            pool_root(),
+            &FetchPolicy::default(),
+            no_browser_here,
+            None,
+        )
+        .expect("auto mode without a browser degrades, it does not fail");
         assert_eq!(
             selection.kind,
             SelectedFetcher::Http,
@@ -1340,11 +1733,25 @@ mod fetch_router_tests {
     /// ask for — that would be returning a page it did not fetch the way the caller intended.
     #[test]
     fn explicit_browser_mode_without_a_browser_fails_honestly() {
-        let err = select_fetcher_by(&client(), FetchMode::Browser, pool_root(), || false)
-            .expect_err("explicit browser with no browser must not silently degrade");
+        let err = select_fetcher_by(
+            &client(),
+            FetchMode::Browser,
+            pool_root(),
+            &FetchPolicy::default(),
+            no_browser_here,
+            None,
+        )
+        .expect_err("explicit browser with no browser must not silently degrade");
         assert!(
             err.reason.contains("no Chromium"),
             "the error must name the missing browser: {}",
+            err.reason
+        );
+        // And where it looked: the refusal is the search's own, so an operator is told which paths
+        // were tried rather than only that there is no browser.
+        assert!(
+            err.reason.contains(DEFAULT_CHROMIUM_PATH),
+            "the error must carry the search's list: {}",
             err.reason
         );
     }
@@ -1352,8 +1759,15 @@ mod fetch_router_tests {
     /// Explicit Browser with a browser honours the request.
     #[test]
     fn explicit_browser_mode_with_a_browser_selects_the_browser_fetcher() {
-        let selection = select_fetcher_by(&client(), FetchMode::Browser, pool_root(), || true)
-            .expect("explicit browser with a browser succeeds");
+        let selection = select_fetcher_by(
+            &client(),
+            FetchMode::Browser,
+            pool_root(),
+            &FetchPolicy::default(),
+            a_browser_is_installed,
+            None,
+        )
+        .expect("explicit browser with a browser succeeds");
         assert_eq!(selection.kind, SelectedFetcher::Browser);
         assert!(
             selection.note.contains("every page"),
@@ -1378,13 +1792,21 @@ mod fetch_router_tests {
 
         assert_eq!(
             escalating.pool().ladder().rungs(),
-            vec![RungKind::Http, RungKind::Interactive],
-            "Auto escalates: the cheap rung first, Chromium on a refusal"
+            vec![RungKind::Http, RungKind::Interactive, RungKind::Interactive],
+            "Auto escalates: the cheap rung first, Chromium on a refusal, and a person only after \
+             Chromium was refused too"
         );
         assert_eq!(
             browser_first.pool().ladder().rungs(),
-            vec![RungKind::Interactive],
+            vec![RungKind::Interactive, RungKind::Interactive],
             "Browser must not have a plain rung in front of the browser"
+        );
+        // Two rungs of one kind is the shape `Attempt::rung_name` exists for, so the names are \
+        // asserted too: a report that said `interactive` twice would hide whether anyone was asked.
+        assert_eq!(
+            escalating.pool().ladder().rung_names(),
+            vec!["http", "chromium", "interactive-cdp"],
+            "the person is the last rung, and named as the person"
         );
     }
 
@@ -1406,7 +1828,7 @@ mod fetch_router_tests {
         );
         assert_eq!(
             fetcher.pool().ladder().rungs(),
-            vec![RungKind::Interactive],
+            vec![RungKind::Interactive, RungKind::Interactive],
             "rebuilding must keep the shape it was built with"
         );
 
@@ -1416,14 +1838,160 @@ mod fetch_router_tests {
             .expect("the widened shape");
         assert_eq!(
             escalating.pool().ladder().rungs(),
-            vec![RungKind::Http, RungKind::Interactive],
+            vec![RungKind::Http, RungKind::Interactive, RungKind::Interactive],
             "and the other shape's plain rung must survive the rebuild"
+        );
+    }
+
+    /// A person's budget is a real wait, so the bound around the fetch has to clear it.
+    ///
+    /// Asserted on the bound rather than by waiting ten seconds: the property is arithmetic, and the
+    /// behavioural half — a person answering ends the run — is driven for real through the daemon in
+    /// `hx-server`'s `research_api`.
+    #[test]
+    fn a_person_widens_the_fetch_bound_to_cover_their_budget() {
+        let budget = Duration::from_secs(300);
+        let without = BrowserFetcher::new(pool_root()).expect("the auto shape");
+        assert_eq!(
+            without.timeout, DEFAULT_FETCH_TIMEOUT,
+            "no person means the ordinary bound is all a fetch needs"
+        );
+
+        let with_person = BrowserFetcher::new(pool_root())
+            .expect("the auto shape")
+            .with_pane(Arc::new(hx_browser::NoPane), budget)
+            .expect("a fetcher with a person");
+        assert!(
+            with_person.timeout >= budget + PANE_TIMEOUT_GRACE,
+            "the rung's budget must be reachable: {:?} does not clear {budget:?} + grace",
+            with_person.timeout
+        );
+    }
+
+    /// The ladder's own per-rung deadline must clear the person's budget too.
+    ///
+    /// Found by driving a real daemon: the fetcher's outer bound was widened first (the test above),
+    /// but the ladder *inside* the pool still ended every rung at `DEFAULT_RUNG_TIMEOUT` (20s) — so a
+    /// person with a 90s budget was cut off at 20s, one layer down, and the report blamed the rung
+    /// rather than the wait. The machine rungs keep the machine deadline; only a person widens it.
+    #[test]
+    fn the_ladders_own_deadline_clears_a_persons_budget_but_not_the_machine_rungs() {
+        let budget = Duration::from_secs(90);
+        let with_person = BrowserFetcher::new(pool_root())
+            .expect("the auto shape")
+            .with_pane(Arc::new(hx_browser::NoPane), budget)
+            .expect("a fetcher with a person");
+        assert!(
+            with_person.pool().ladder().timeout() >= budget + PANE_TIMEOUT_GRACE,
+            "a person answering in their last seconds must not lose to the ladder's clock: {:?}",
+            with_person.pool().ladder().timeout()
+        );
+
+        let without = BrowserFetcher::new(pool_root()).expect("the auto shape");
+        assert_eq!(
+            without.pool().ladder().timeout(),
+            hx_browser::DEFAULT_RUNG_TIMEOUT,
+            "no person means the machine deadline: a hung rung must still be bounded"
+        );
+    }
+
+    /// A pane given to a fetcher is carried into the pool's ladder, and survives a rebuild.
+    ///
+    /// This is the wiring the daemon depends on, asserted on the ladder rather than by fetching: the
+    /// hermetic suite has no browser, and "a person is reachable" is a property of the ladder's shape.
+    #[test]
+    fn a_pane_reaches_the_ladder_and_survives_a_rebuild() {
+        use hx_browser::{HumanChallenge, HumanOutcome, HumanPane, PaneError};
+
+        struct SilentPane;
+
+        #[async_trait::async_trait]
+        impl HumanPane for SilentPane {
+            fn name(&self) -> &str {
+                "silent-pane"
+            }
+
+            async fn present(&self, _challenge: HumanChallenge) -> Result<HumanOutcome, PaneError> {
+                Err(PaneError::NotAttached)
+            }
+        }
+
+        let with_pane = BrowserFetcher::new(pool_root())
+            .expect("the auto shape")
+            .with_pane(Arc::new(SilentPane), Duration::from_secs(7))
+            .expect("a fetcher with a person behind it");
+
+        assert_eq!(
+            with_pane.pool().ladder().rungs().len(),
+            3,
+            "a person is a rung, not a replacement for one"
+        );
+        assert_eq!(
+            with_pane.human().expect("the pane is kept").budget,
+            Duration::from_secs(7),
+            "the budget the rung enforces is the one the caller gave"
+        );
+        assert_eq!(
+            with_pane.human().expect("the pane is kept").pane.name(),
+            "silent-pane"
+        );
+
+        // A rebuild for another admission must not quietly drop the person: the two are independent
+        // properties, and a widened fetcher that stopped asking would be a silent change of behaviour.
+        let widened = with_pane
+            .with_admission(Admission::AllowLocal)
+            .expect("the widened shape");
+        assert!(
+            widened.human().is_some(),
+            "rebuilding the rungs must keep the person among them"
+        );
+        assert_eq!(widened.pool().ladder().rungs().len(), 3);
+
+        // And a fetcher built without one holds the fail-closed rung, which is what makes a report
+        // say nobody was available rather than ending at the browser's refusal.
+        let without = BrowserFetcher::new(pool_root()).expect("the auto shape");
+        assert!(without.human().is_none());
+        assert_eq!(without.pool().ladder().rungs().len(), 3);
+    }
+
+    /// The gate, the rung and the screen ask one question of one search.
+    ///
+    /// This is the property the router used to get wrong: `browser_available()` looked at
+    /// `/usr/lib/chromium/chromium` while the *screen* searched the platform's real places, so a
+    /// host whose browser was elsewhere could watch a screen and still never select a browser rung.
+    /// Here the host's discovery is the oracle, and it holds on a host with no browser too — all
+    /// three say so, rather than two of them disagreeing about which path matters.
+    #[test]
+    fn the_gate_the_rung_and_the_screen_share_one_browser_search() {
+        let discovered = hx_browser::browser::discover_browser(None);
+
+        assert_eq!(
+            browser_available(),
+            discovered.is_ok(),
+            "the availability gate must be the host's own search, not a path spelled again here"
+        );
+        assert_eq!(
+            browser_discovery().ok(),
+            discovered.clone().ok(),
+            "and it must answer with the browser itself, not only with whether there is one"
+        );
+
+        // The rung the selector's `BrowserFetcher` carries resolves the same way. Constructed
+        // directly because a `Ladder` holds its rungs as trait objects — the point is that *this*
+        // rung, built the way the pool builds it, launches what the gate promised.
+        let rung = hx_browser::ChromiumRung::with_admission(hx_browser::Admission::PublicInternet)
+            .expect("a rung is buildable on any host");
+        assert_eq!(
+            rung.browser().ok(),
+            discovered.ok(),
+            "the rung's binary and the gate's answer must be the same browser"
         );
     }
 
     /// The public, host-real selector agrees with the injected one on this host: if Chromium is present
     /// here, Auto escalates and Browser succeeds; if it is not, Auto degrades to plain and Browser fails.
-    /// This is gated on the real host's browser so it never fails on a host without Chromium.
+    /// This is gated on the real host's browser so it never fails on a host without Chromium — and
+    /// "present" now means what the shared search says, which is what a screen would launch.
     #[test]
     fn the_public_selector_tracks_the_real_host_browser() {
         let real_available = browser_available();
@@ -1450,14 +2018,158 @@ mod fetch_router_tests {
         }
     }
 
+    /// The `fetch:` section, in `hx-browser`'s vocabulary: both halves, and the default.
+    ///
+    /// One test for the mapping because there is one mapping ([`FetchPolicy::from_config`]), and a
+    /// second spelling of it anywhere else would be a second answer to *"may this fetch reach
+    /// loopback"*.
+    #[test]
+    fn a_config_becomes_a_policy_without_losing_either_half() {
+        use hx_core::config::{FetchAdmission, FetchConfig};
+
+        let default = FetchPolicy::from_config(&FetchConfig::default());
+        assert_eq!(default.admission(), Admission::PublicInternet);
+        assert_eq!(default.browser(), None, "no binary named means: search");
+
+        let configured = FetchConfig {
+            browser: Some("/opt/chrome/chrome".to_string()),
+            admission: FetchAdmission::AllowLocal,
+        };
+        let policy = FetchPolicy::from_config(&configured);
+        assert_eq!(policy.admission(), Admission::AllowLocal);
+        assert_eq!(policy.browser(), Some(Path::new("/opt/chrome/chrome")));
+    }
+
+    /// A named binary is checked as the path it is, in both directions.
+    ///
+    /// The failure this pins is the one the key would otherwise introduce: a host whose browser is
+    /// *not* where the search looks would have `fetch.browser` accepted by the config and then
+    /// refused by the gate, which is a setting an operator can write and cannot use.
+    #[test]
+    fn a_policy_that_names_a_browser_is_gated_on_that_path() {
+        let named = FetchPolicy::default().with_browser("/nonexistent/hx-not-a-browser");
+        let err = browser_check(&named).expect_err("a path that is not there is not a browser");
+        assert!(
+            err.to_string().contains("/nonexistent/hx-not-a-browser"),
+            "the refusal names the path the operator wrote: {err}"
+        );
+
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let present = FetchPolicy::default().with_browser(&manifest);
+        assert!(
+            browser_check(&present).is_ok(),
+            "a named path that exists is available, whatever the host's own search finds"
+        );
+
+        // And the default policy still asks the host, which is the question `browser_available`
+        // answers — the two must not disagree about a host with no browser configured.
+        assert_eq!(
+            browser_check(&FetchPolicy::default()).is_ok(),
+            browser_available()
+        );
+    }
+
+    /// The policy reaches every rung the selector builds — the pool's, and the plain fetcher's.
+    ///
+    /// Asserted on the fetcher and on a real fetch rather than on the selection's note: the note is
+    /// what a report says, and this is about what the rungs *do*.
+    #[tokio::test]
+    async fn the_policy_reaches_the_ladder_and_the_plain_rung() {
+        let wall = RefusingPage::start().await;
+        let policy = FetchPolicy::default().with_admission(Admission::AllowLocal);
+
+        let fetcher = BrowserFetcher::new(pool_root())
+            .expect("the auto shape")
+            .with_policy(&policy)
+            .expect("the configured shape");
+        assert_eq!(fetcher.admission, Admission::AllowLocal);
+        assert_eq!(fetcher.browser(), None, "no binary was named");
+        assert_eq!(fetcher.pool().admission(), Admission::AllowLocal);
+
+        // The plain rung is built from the same policy: under `AllowLocal` it reaches the loopback
+        // stub and is refused *by the site*, which is a different sentence from the admission
+        // refusal the default policy gives (and the default's is asserted in
+        // `the_plain_fetchers_the_selector_hands_out_admit_their_targets`).
+        let selection = select_fetcher_with_policy(
+            &client(),
+            FetchMode::Http,
+            pool_root(),
+            &policy,
+            None,
+        )
+        .expect("http mode never fails");
+        let err = selection
+            .fetcher()
+            .fetch(&wall.url())
+            .await
+            .expect_err("the stub refuses everything");
+        let reason = format!("{err}");
+        assert!(
+            reason.contains("403"),
+            "the widened policy must let the plain rung reach the stub: {reason}"
+        );
+        assert!(
+            !reason.contains("not on the public internet"),
+            "an admission refusal would mean the policy never reached the rung: {reason}"
+        );
+    }
+
+    /// The binary a policy names is the binary the Chromium rung tries to launch.
+    ///
+    /// This is the assertion the config key exists for, and it is made where it can be made on any
+    /// host: a deliberately-missing path is named, the ladder is driven against a loopback wall under
+    /// `AllowLocal`, and the chromium *attempt* — not the report's summary — is asked what it tried.
+    /// A rung that had searched for a browser instead would have found one here and never mentioned
+    /// the configured path at all.
+    #[tokio::test]
+    async fn a_named_browser_is_what_the_chromium_rung_tries_to_launch() {
+        let wall = RefusingPage::start().await;
+        let policy = FetchPolicy::default()
+            .with_browser("/nonexistent/hx-not-a-browser")
+            .with_admission(Admission::AllowLocal);
+        let fetcher = BrowserFetcher::new(pool_root())
+            .expect("the auto shape")
+            .with_policy(&policy)
+            .expect("the configured shape");
+        assert_eq!(
+            fetcher.browser(),
+            Some(Path::new("/nonexistent/hx-not-a-browser"))
+        );
+
+        let session = SessionId::from_raw("configured-browser-test");
+        let report = fetcher.pool().fetch(&session, &wall.url()).await;
+        let names: Vec<&str> = report
+            .attempts
+            .iter()
+            .map(|attempt| attempt.rung_name.as_str())
+            .collect();
+        let chromium = report
+            .attempts
+            .iter()
+            .find(|attempt| attempt.rung_name == "chromium")
+            .unwrap_or_else(|| panic!("the ladder must have tried the browser: {names:?}"));
+        let failure = chromium.failure.clone().unwrap_or_default();
+        assert!(
+            failure.contains("/nonexistent/hx-not-a-browser"),
+            "the rung must launch the configured path and say so when it cannot: {failure}"
+        );
+    }
+
     /// The plain fetchers the selector hands out admit their targets: `select_fetcher`
     /// builds `HttpFetcher::new(client)` with no cache — the production uncached path — so
     /// the fetcher it returns must still refuse a loopback target rather than `GET` it.
     #[tokio::test]
     async fn the_plain_fetchers_the_selector_hands_out_admit_their_targets() {
         for mode in [FetchMode::Http, FetchMode::Auto] {
-            let selection = select_fetcher_by(&client(), mode, pool_root(), || false)
-                .expect("http/auto never fail without a browser");
+            let selection = select_fetcher_by(
+                &client(),
+                mode,
+                pool_root(),
+                &FetchPolicy::default(),
+                no_browser_here,
+                None,
+            )
+            .expect("http/auto never fail without a browser");
             assert_eq!(selection.kind, SelectedFetcher::Http);
             let err = selection
                 .fetcher()
