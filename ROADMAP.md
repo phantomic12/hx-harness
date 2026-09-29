@@ -1176,3 +1176,60 @@ driving a terminal, browser or remote desktop frame-per-frame, or a cheap classi
 slower rungs. That needs screen→state encoding and per-frame pipelining and is the explicit follow-up, as a
 `hx-browser` rung that consumes `hx-core`'s decision helper. Laya remains orthogonal to the
 model-pool/fan-out spawner (it is not an LLM and speaks no chat API).
+
+## M11 — A major UI overhaul
+
+The interface has grown one pane at a time, and it shows: the page is a pile of independently
+landed surfaces (transcript, terminal, screens, approvals, challenges, review, hosts, tasks, the
+session rail) that share almost nothing visually — no consistent layout system, no information
+density discipline, duplicated styling per pane, and a single-file `index.html` that has become the
+product's largest artifact. Nothing is *broken*; the state of the interface is simply worse than
+the state of the daemon, and this milestone is about closing that gap rather than adding a
+feature.
+
+**Goal:** one interface a person can read at a glance and be productive in, with the single-file
+`include_str!` delivery model kept — the binary is the whole daemon and a deploy cannot half-succeed
+(see M2), so the overhaul restructures *within* that constraint rather than trading it away.
+
+- ⬜ **A real front-end structure inside the single file.** Split `index.html` into
+  compile-time-included partials (CSS, per-pane JS modules) via `include_str!` composition at build
+  time, so the file stays one artifact but stops being one unreviewable blob. Every pane keeps the
+  protocol contract it already has (the frames and routes are pinned by `check_web_client.py` and
+  the integration tests, which is what makes this refactor safe to attempt).
+- ⬜ **A design system, however small.** One CSS custom-property layer (spacing, type scale,
+  colour tokens — the dark palette that exists is the seed), one card/panel primitive, one status
+  vocabulary (the amber/green markers, the banner tones) applied everywhere instead of per-pane
+  one-offs. The measure: a new pane can be built without inventing styles.
+- ⬜ **Layout and information architecture.** The left rail, the header and the pane stack are
+  redrawn around what a person does: watch the task, answer the daemon's questions, then inspect.
+  Approvals and challenges are the moments the interface exists for — they should surface with
+  weight, not as one more drawer. Density controls and pane collapse/expand; mobile and
+  narrow-viewport behaviour stated rather than accidental.
+- ⬜ **Interaction polish that pays rent.** Keyboard navigation (switch tasks, answer/reject, jump
+  to the pane asking), loading and reconnect states that are visible instead of silent, toast/undo
+  consistency, focus management when a question appears, and the notification title treatment
+  (`paintChallengeTitle` and friends) generalised to every waiting state.
+- ⬜ **Accessibility pass.** Contrast audited against the tokens, focus outlines never suppressed,
+  the challenge and approval banners readable by a screen reader (they are the highest-stakes text
+  on the page), ARIA roles on the rail and tabs.
+- ⬜ **Parity with the desktop shell.** `apps/hx-desktop` references this same bundle via
+  `frontendDist`, so every visual change lands there for free — and every Tauri-specific assumption
+  (window sizing, the tray's notification text) must be re-checked against the new layout rather
+  than assumed.
+- ⬜ **A rendered-browser gate.** M2's oldest open item ("a rendered-browser check of the row
+  markers, the activity chip, the review tab and the plan toggle") becomes a **required exit
+  criterion**: the overhauled UI is driven in headless Chromium (it is available on this host), and
+  `check_web_client.py`'s served-page marker checks are extended to the new structure — a redesign
+  that silently drops a marker must fail a run, not a person's patience.
+- ⬜ **Before/after, measured.** A before/after table in `TESTING.md`: first-contentful-paint on a
+  cold daemon, time-to-first-transcript-frame, the file's line count, the number of distinct
+  colours/spacing values in the CSS, and each existing check still green against the new page.
+
+**Exit criteria:** every existing web-client check passes unchanged against the new page; the
+rendered-browser gate is green on the panes M2 left uncovered; the design tokens are the only way
+panes get styling (a grep for raw hex outside the token layer returns nothing); and a person who
+has never seen the daemon can find "what does it want from me right now" in under five seconds.
+The functional surface does not change: routes, frames and pane behaviour are exactly as they
+were, verified by the tests that already pin them.
+
+---
