@@ -26,9 +26,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 tauri = { version = "2.11.5", features = ["tray-icon"] }
-tauri-plugin-dialog = "=2.7.3"
-tauri-plugin-global-shortcut = "=2.3.2"
-tauri-plugin-notification = "=2.4.0"
+tauri-plugin-dialog = "=2.8.1"
+tauri-plugin-global-shortcut = "=2.4.0"
+tauri-plugin-notification = "=2.5.1"
 
 [build-dependencies]
 tauri-build = "2"
