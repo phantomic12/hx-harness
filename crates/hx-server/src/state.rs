@@ -18,13 +18,13 @@ use hx_search::BackendRegistry;
 use hx_secrets::{EnvSecrets, SecretStores};
 use hx_store::Store;
 use hx_tools::ToolRegistry;
+use indexmap::IndexMap;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use tokio::sync::broadcast;
 use tokio::sync::Mutex as AsyncMutex;
-use indexmap::IndexMap;
 
 /// One event on the live bus, tagged with the session it belongs to and its store sequence.
 ///
@@ -305,12 +305,11 @@ impl AppState {
         };
 
         let router = Arc::new(Mutex::new(router));
-        let models: Arc<dyn crate::chat::ModelFactory> =
-            Arc::new(crate::chat::RouterModels::new(
-                Arc::clone(&router),
-                Arc::clone(&providers),
-                Arc::clone(&secrets),
-            ));
+        let models: Arc<dyn crate::chat::ModelFactory> = Arc::new(crate::chat::RouterModels::new(
+            Arc::clone(&router),
+            Arc::clone(&providers),
+            Arc::clone(&secrets),
+        ));
 
         // M5's webhook half: every `kind: webhook` connector is registered once here, so
         // `POST /v1/connectors/{id}/webhook` can authenticate against its own token and push into the
@@ -361,8 +360,7 @@ impl AppState {
 
         let ws_allowed_origins = config.api.allowed_origins.clone();
         let provider_configs = config.providers.clone();
-        let providers: Arc<RwLock<ProviderRegistry>> =
-            Arc::new(RwLock::new((*providers).clone()));
+        let providers: Arc<RwLock<ProviderRegistry>> = Arc::new(RwLock::new((*providers).clone()));
         Ok(Self::from_parts(AppStateParts {
             config,
             router,
@@ -991,26 +989,24 @@ impl AppState {
                 HxError::Config(format!("could not build the provider HTTP client: {e}"))
             })?;
 
-        let registry: Arc<ProviderRegistry> =
-            Arc::new(hx_provider::ProviderRegistry::from_config(&full, provider_client)?);
+        let registry: Arc<ProviderRegistry> = Arc::new(hx_provider::ProviderRegistry::from_config(
+            &full,
+            provider_client,
+        )?);
         let router = hx_provider::ModelRouter::from_config(&full, now)?;
 
         // A model factory over the *new* registry and router, so a swap keeps all three consistent.
-        let models: Arc<dyn crate::chat::ModelFactory> =
-            Arc::new(crate::chat::RouterModels::new(
-                Arc::clone(&self.router),
-                Arc::clone(&registry),
-                Arc::clone(&self.secrets),
-            ));
+        let models: Arc<dyn crate::chat::ModelFactory> = Arc::new(crate::chat::RouterModels::new(
+            Arc::clone(&self.router),
+            Arc::clone(&registry),
+            Arc::clone(&self.secrets),
+        ));
 
         // Swap the live surface: registry, router, model factory, then the visible provider configs.
         *self.providers.write().expect("providers lock") = (*registry).clone();
         *self.router.lock().expect("router lock") = router;
         *self.models.write().expect("model factory lock") = models;
-        *self
-            .provider_configs
-            .write()
-            .expect("provider config lock") = provider_configs.clone();
+        *self.provider_configs.write().expect("provider config lock") = provider_configs.clone();
 
         // Persist, but only if there is a real file to write back to. A config assembled in memory
         // (a test, or a `--check`) is not a file the daemon owns.
@@ -1043,7 +1039,10 @@ impl AppState {
         } else {
             Default::default()
         };
-        entries.insert(format!("HX_PROVIDER_{}_KEY", name.to_uppercase()), key.to_string());
+        entries.insert(
+            format!("HX_PROVIDER_{}_KEY", name.to_uppercase()),
+            key.to_string(),
+        );
         let contents = entries
             .iter()
             .map(|(k, v)| format!("{k}={v}"))
@@ -1060,10 +1059,7 @@ impl AppState {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &secrets_path,
-                std::fs::Permissions::from_mode(0o600),
-            );
+            let _ = std::fs::set_permissions(&secrets_path, std::fs::Permissions::from_mode(0o600));
         }
         Ok(())
     }

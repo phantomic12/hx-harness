@@ -137,7 +137,8 @@ async fn the_cancel_route_is_mounted() {
     let json: serde_json::Value =
         serde_json::from_slice(&bytes).expect("a handler answers JSON, not an empty 404 body");
     assert_eq!(
-        json["cancelled"], serde_json::json!(false),
+        json["cancelled"],
+        serde_json::json!(false),
         "nothing was running: {json}"
     );
     assert_eq!(
@@ -251,17 +252,15 @@ async fn the_usage_route_is_mounted() {
     let json: serde_json::Value =
         serde_json::from_slice(&bytes).expect("a handler answers JSON, not an empty 404 body");
     for key in ["since", "total", "by_day", "by_model", "by_session"] {
-        assert!(json.get(key).is_some(), "the report carries `{key}`: {json}");
+        assert!(
+            json.get(key).is_some(),
+            "the report carries `{key}`: {json}"
+        );
     }
 
     // A malformed window is the handler's 400 naming the field — never the 404 fallback.
-    let (status, bytes) = request(
-        Arc::clone(&state),
-        "GET",
-        "/v1/usage?since=yesterday",
-        None,
-    )
-    .await;
+    let (status, bytes) =
+        request(Arc::clone(&state), "GET", "/v1/usage?since=yesterday", None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "`since` must be RFC3339");
     let body = error_body(&bytes);
     assert!(

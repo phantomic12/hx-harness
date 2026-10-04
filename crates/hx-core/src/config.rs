@@ -2033,7 +2033,10 @@ sandbox_profiles:
         // operator who has not decided a name yet, which is exactly the fallback's case.
         let blank = Config::from_yaml("screen:\n  operator: \"   \"\n").unwrap();
         assert_eq!(blank.challenge_operator(), "admin");
-        assert!(blank.screen.operator.is_some(), "and the key itself is kept");
+        assert!(
+            blank.screen.operator.is_some(),
+            "and the key itself is kept"
+        );
     }
 
     #[test]
@@ -2052,7 +2055,11 @@ screen:
 
         let roster = config.challenge_operators();
         let names: Vec<&str> = roster.iter().map(|o| o.name.as_str()).collect();
-        assert_eq!(names, vec!["yoav", "dana"], "order is kept: it is the rotation order");
+        assert_eq!(
+            names,
+            vec!["yoav", "dana"],
+            "order is kept: it is the rotation order"
+        );
         assert_eq!(
             roster[1].push_url.as_deref(),
             Some("https://relay.test/dana"),
@@ -2076,7 +2083,11 @@ screen:
         )
         .unwrap();
         let roster = mixed.challenge_operators();
-        assert_eq!(roster.len(), 1, "the roster is the whole truth once it is written");
+        assert_eq!(
+            roster.len(),
+            1,
+            "the roster is the whole truth once it is written"
+        );
         assert_eq!(roster[0].name, "yoav");
         assert_eq!(
             roster[0].push_url, None,
@@ -2091,7 +2102,10 @@ screen:
         let nobody = Config::from_yaml("screen: {}").unwrap();
         let roster = nobody.challenge_operators();
         assert_eq!(roster.len(), 1);
-        assert_eq!(roster[0].name, "admin", "and it is the account the daemon authenticates");
+        assert_eq!(
+            roster[0].name, "admin",
+            "and it is the account the daemon authenticates"
+        );
 
         // Blank and repeated names are dropped here rather than in the pane, so a name on a listing
         // always resolves to exactly one channel.
@@ -2108,7 +2122,11 @@ screen:
         .unwrap();
         let roster = messy.challenge_operators();
         let names: Vec<&str> = roster.iter().map(|o| o.name.as_str()).collect();
-        assert_eq!(names, vec!["yoav", "dana"], "blank is nobody; a repeat is the same person");
+        assert_eq!(
+            names,
+            vec!["yoav", "dana"],
+            "blank is nobody; a repeat is the same person"
+        );
         assert_eq!(
             roster[0].push_url.as_deref(),
             Some("https://relay.test/first"),
@@ -2121,10 +2139,13 @@ screen:
         // A list is written, and every row in it is unusable. That is not "no operators" — it is an
         // operator who meant to write one and did not — so the fallback still applies rather than
         // leaving the daemon with nobody to ask.
-        let config = Config::from_yaml("screen:
+        let config = Config::from_yaml(
+            "screen:
   operators:
     - { name: \"   \" }
-").unwrap();
+",
+        )
+        .unwrap();
         let roster = config.challenge_operators();
         assert_eq!(roster.len(), 1);
         assert_eq!(roster[0].name, "admin");
@@ -2141,7 +2162,10 @@ approval:
         let roster = single.challenge_operators();
         assert_eq!(roster.len(), 1);
         assert_eq!(roster[0].name, "yoav");
-        assert_eq!(roster[0].push_url.as_deref(), Some("https://relay.test/yoav"));
+        assert_eq!(
+            roster[0].push_url.as_deref(),
+            Some("https://relay.test/yoav")
+        );
     }
 
     #[test]
@@ -2163,7 +2187,10 @@ approval:
             None,
             "zero means nobody is asked, not a person asked with no time"
         );
-        assert_eq!(off.screen.challenge_budget_secs, 0, "and the raw value is kept");
+        assert_eq!(
+            off.screen.challenge_budget_secs, 0,
+            "and the raw value is kept"
+        );
 
         let short = Config::from_yaml("screen:\n  challenge_budget_secs: 45\n").unwrap();
         assert_eq!(
@@ -2182,10 +2209,9 @@ approval:
         assert_eq!(omitted.fetch.browser, None, "no binary named means: search");
         assert_eq!(omitted.fetch.browser_binary(), None);
 
-        let named = Config::from_yaml(
-            "fetch:\n  browser: /opt/chrome/chrome\n  admission: allow_local\n",
-        )
-        .unwrap();
+        let named =
+            Config::from_yaml("fetch:\n  browser: /opt/chrome/chrome\n  admission: allow_local\n")
+                .unwrap();
         assert_eq!(named.fetch.admission, FetchAdmission::AllowLocal);
         assert_eq!(
             named.fetch.browser_binary(),
@@ -2205,7 +2231,10 @@ approval:
         // decision rather than a boolean — `allow_local: true` is not a spelling this accepts, which
         // is what stops a guess from being a widening.
         let typo = Config::from_yaml("fetch:\n  allow_local: true\n");
-        assert!(typo.is_err(), "a key nobody reads must fail loudly: {typo:?}");
+        assert!(
+            typo.is_err(),
+            "a key nobody reads must fail loudly: {typo:?}"
+        );
 
         let unknown = Config::from_yaml("fetch:\n  admission: anything_goes\n");
         assert!(
@@ -2218,8 +2247,8 @@ approval:
             ("public_internet", FetchAdmission::PublicInternet),
             ("allow_local", FetchAdmission::AllowLocal),
         ] {
-            let parsed =
-                Config::from_yaml(&format!("fetch:\n  admission: {yaml}\n")).expect("a named policy");
+            let parsed = Config::from_yaml(&format!("fetch:\n  admission: {yaml}\n"))
+                .expect("a named policy");
             assert_eq!(parsed.fetch.admission, expected, "{yaml}");
         }
 

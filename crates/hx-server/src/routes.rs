@@ -29,9 +29,7 @@ use hx_core::ids::SessionId;
 use hx_sandbox::SandboxSpec;
 use hx_search::{
     default_pool_root, select_fetcher_with_policy, FetchMode, FetchPolicy, FetchRouteError,
-    HumanRequest,
-    Recency, ResearchRequest,
-    ResearchTask, SearchQuery,
+    HumanRequest, Recency, ResearchRequest, ResearchTask, SearchQuery,
 };
 use hx_secrets::Redactor;
 use serde::{Deserialize, Serialize};
@@ -105,7 +103,10 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v1/usage", get(usage))
         .route("/v1/ws-ticket", post(ws_ticket))
         .route("/v1/providers", get(list_providers))
-        .route("/v1/providers/{name}", put(upsert_provider).delete(remove_provider))
+        .route(
+            "/v1/providers/{name}",
+            put(upsert_provider).delete(remove_provider),
+        )
         .route("/v1/login", post(login))
         .route("/v1/hosts", get(hosts))
         // A host is a machine, not just a row: the detail route reports what it is (OS, shell, home,
@@ -356,19 +357,19 @@ async fn login(
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized"));
     };
     // No configured password -> refuse every attempt (never compare to a blank).
-    let Some(admin_password) = hx_secrets::resolve_admin_password(&state.config, &state.secrets)
-        .unwrap_or(None)
+    let Some(admin_password) =
+        hx_secrets::resolve_admin_password(&state.config, &state.secrets).unwrap_or(None)
     else {
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized"));
     };
-    let username_ok = hx_core::ApiToken::new(state.config.api.admin_username_or_default()).matches(&body.username);
+    let username_ok = hx_core::ApiToken::new(state.config.api.admin_username_or_default())
+        .matches(&body.username);
     let password_ok = admin_password.matches(&body.password);
     if !(username_ok && password_ok) {
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized"));
     }
     Ok(Json(serde_json::json!({ "token": api_token.expose() })))
 }
-
 
 /// A request to add or edit a provider from the web UI.
 #[derive(Debug, Deserialize)]
@@ -646,11 +647,7 @@ async fn chat(
     // the run to finish and file every message — the alternative is a run torn out the moment its
     // observer disconnects, mid tool-call, leaving a call with no result. (`POST /v1/chat/stream`
     // has always run this way.) The reply is lost with its request; the session keeps the run.
-    let run = tokio::spawn(crate::chat::run_chat(
-        state,
-        request,
-        chrono::Utc::now(),
-    ));
+    let run = tokio::spawn(crate::chat::run_chat(state, request, chrono::Utc::now()));
     match run.await {
         Ok(reply) => Ok(Json(reply?)),
         // The run task itself died — a panic in the loop, not a client's doing.
@@ -993,7 +990,10 @@ async fn create_screen(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let id = body.id.trim().to_string();
     if id.is_empty() {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "a screen id cannot be empty"));
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "a screen id cannot be empty",
+        ));
     }
     let config = &state.config.screen;
     let user_data_dir = crate::screen::profile_dir_for(&config.profile_root_or_default(), &id)
@@ -1019,7 +1019,11 @@ async fn create_screen(
         quality: config.quality,
         startup_timeout: hx_browser::screen::BROWSER_SCREEN_STARTUP_TIMEOUT,
     };
-    let screen = state.screens.create(&id, options).await.map_err(ApiError::from)?;
+    let screen = state
+        .screens
+        .create(&id, options)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(serde_json::json!({
         "created": true,
         "screen": screen.summary(),
@@ -1092,29 +1096,28 @@ async fn answer_challenge(
         .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?;
 
     let outcome = match params.token.as_deref() {
-        Some(token) => state.challenges.answer_with_token(&id, token, body.outcome()),
+        Some(token) => state
+            .challenges
+            .answer_with_token(&id, token, body.outcome()),
         None => state.challenges.answer(&id, body.outcome()),
     };
-    let answered = match outcome {
-        crate::pane::AnswerOutcome::Delivered => true,
-        crate::pane::AnswerOutcome::NobodyWaiting => {
-            return Err(ApiError::new(
+    let answered =
+        match outcome {
+            crate::pane::AnswerOutcome::Delivered => true,
+            crate::pane::AnswerOutcome::NobodyWaiting => return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 "the challenge is over: nobody is waiting for this answer any more (the budget \
                  expired, or the screen was closed)",
-            ))
-        }
-        crate::pane::AnswerOutcome::Unknown => {
-            return Err(ApiError::new(StatusCode::NOT_FOUND, "no such challenge"))
-        }
-        crate::pane::AnswerOutcome::WrongToken => {
-            return Err(ApiError::new(
+            )),
+            crate::pane::AnswerOutcome::Unknown => {
+                return Err(ApiError::new(StatusCode::NOT_FOUND, "no such challenge"))
+            }
+            crate::pane::AnswerOutcome::WrongToken => return Err(ApiError::new(
                 StatusCode::FORBIDDEN,
                 "that token is not the one this challenge published: it answers the challenge it \
                  was minted for, and this one is still waiting",
-            ))
-        }
-    };
+            )),
+        };
     Ok(Json(serde_json::json!({ "answered": answered })))
 }
 
@@ -1731,9 +1734,14 @@ async fn research_inner(
     // fail-closed default, and a refused page ends at the browser's refusal. Anything else means a
     // site that refuses every automated rung opens a screen on this machine and waits — a visible
     // thing to happen, which is why the budget is configured rather than assumed.
-    let selection =
-        select_fetcher_with_policy(&client, mode, default_pool_root(), &policy, human_request(&state))
-            .map_err(research_route_error)?;
+    let selection = select_fetcher_with_policy(
+        &client,
+        mode,
+        default_pool_root(),
+        &policy,
+        human_request(&state),
+    )
+    .map_err(research_route_error)?;
     let task = ResearchTask::new(state.search.all(), client, selection.fetcher());
     let report = task.run(&request).await;
 
@@ -2307,7 +2315,9 @@ search:
     async fn build_state(config: hx_core::config::Config) -> Arc<AppState> {
         std::env::remove_var(hx_core::api_auth::API_TOKEN_ENV);
         let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        AppState::build(config, None, now).await.expect("state builds")
+        AppState::build(config, None, now)
+            .await
+            .expect("state builds")
     }
 
     async fn test_state() -> Arc<AppState> {
@@ -2406,7 +2416,11 @@ search:
             serde_json::json!({ "username": "admin", "password": "hunter2" }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "login with correct credentials succeeds");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "login with correct credentials succeeds"
+        );
         assert_eq!(body["token"], "secret-token-123");
 
         // A wrong password must be refused, and a wrong username too.
@@ -2429,7 +2443,10 @@ search:
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert!(body.get("token").is_none(), "no token when no password is set");
+        assert!(
+            body.get("token").is_none(),
+            "no token when no password is set"
+        );
     }
 
     #[tokio::test]

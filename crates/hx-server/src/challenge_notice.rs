@@ -283,9 +283,7 @@ impl std::fmt::Display for RedactedWebhook<'_> {
             // shape instead — a reader learns that a path was configured and nothing else.
             return write!(f, "<not a URL>");
         };
-        let origin_len = rest
-            .find(['/', '?', '#'])
-            .unwrap_or(rest.len());
+        let origin_len = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         write!(f, "{scheme}://{}", &rest[..origin_len])
     }
 }
@@ -356,11 +354,7 @@ impl WebhookNotices {
     /// Built separately from the send so a test can pin the shape — the token inside `respond_url`,
     /// the deep link, the addressee — without a socket, which is the same reason
     /// [`crate::phone::PushPayload`] is built where it is.
-    pub fn notice(
-        &self,
-        challenge: &ChallengeSummary,
-        token: &NoticeToken,
-    ) -> ChallengeNotice {
+    pub fn notice(&self, challenge: &ChallengeSummary, token: &NoticeToken) -> ChallengeNotice {
         ChallengeNotice {
             kind: "challenge",
             id: challenge.id.clone(),
@@ -381,11 +375,7 @@ impl WebhookNotices {
     }
 
     /// The resolution as it goes on the wire.
-    pub fn resolution(
-        &self,
-        challenge: &ChallengeSummary,
-        outcome: &Outcome,
-    ) -> ChallengeResolved {
+    pub fn resolution(&self, challenge: &ChallengeSummary, outcome: &Outcome) -> ChallengeResolved {
         ChallengeResolved {
             kind: "challenge_resolved",
             id: challenge.id.clone(),
@@ -530,8 +520,14 @@ mod tests {
         let token = NoticeToken::new();
         let notice = notices.notice(&summary(), &token);
 
-        assert_eq!(notice.kind, "challenge", "a relay routes by this and nothing else");
-        assert_eq!(notice.operator, "yoav", "addressed to a person, not to a page");
+        assert_eq!(
+            notice.kind, "challenge",
+            "a relay routes by this and nothing else"
+        );
+        assert_eq!(
+            notice.operator, "yoav",
+            "addressed to a person, not to a page"
+        );
         assert_eq!(notice.session, "browser_abc");
         assert_eq!(notice.url, "https://example.test/verify");
         assert_eq!(notice.seconds_left, 42);
@@ -554,7 +550,9 @@ mod tests {
         assert_eq!(other.operator, "dana", "{other:?}");
         assert_eq!(other.id, notice.id, "everything else is the same question");
         assert_eq!(
-            notices.resolution(&summary_for("dana"), &Outcome::Solved).operator,
+            notices
+                .resolution(&summary_for("dana"), &Outcome::Solved)
+                .operator,
             "dana",
             "and so is the resolution, which is a separate payload built the same way"
         );
@@ -647,7 +645,11 @@ mod tests {
             "https://daemon.test".to_string(),
         );
         assert_eq!(notices.route_for("yoav"), Some("https://relay.test/first"));
-        assert_eq!(notices.routes.len(), 2, "and the table holds two people, not three rows");
+        assert_eq!(
+            notices.routes.len(),
+            2,
+            "and the table holds two people, not three rows"
+        );
 
         // Every webhook is redacted in a `Debug`, because a relay URL is a credential for somebody's
         // chat room far more often than it is a public address.
@@ -659,7 +661,10 @@ mod tests {
         ] {
             assert!(!printed.contains(url), "{url} leaked into {printed}");
         }
-        assert!(printed.contains("yoav"), "the names are identifiers, and are worth logging: {printed}");
+        assert!(
+            printed.contains("yoav"),
+            "the names are identifiers, and are worth logging: {printed}"
+        );
     }
 
     #[test]
@@ -700,7 +705,10 @@ mod tests {
         // page knows they are the only chance the run has.
         let nobody = WebhookNotices::new(&[], "http://127.0.0.1:7721".to_string());
         assert!(!nobody.reachable());
-        assert!(!nobody.reaches("yoav"), "and there is no one to reach, by name or otherwise");
+        assert!(
+            !nobody.reaches("yoav"),
+            "and there is no one to reach, by name or otherwise"
+        );
 
         let blank = WebhookNotices::new(
             &[operator("yoav", "   ")],
@@ -723,7 +731,11 @@ mod tests {
     fn every_outcome_has_a_word_for_the_notification() {
         assert_eq!(Outcome::Solved.label(), "solved");
         assert_eq!(Outcome::Withdrawn.label(), "withdrawn");
-        assert_eq!(Outcome::Solved.note(), "", "nothing a person wrote to quote");
+        assert_eq!(
+            Outcome::Solved.note(),
+            "",
+            "nothing a person wrote to quote"
+        );
         assert_eq!(
             Outcome::Abandoned {
                 note: "no thanks".to_string()
