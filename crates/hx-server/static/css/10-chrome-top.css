@@ -1,0 +1,306 @@
+/* ==============================================================================================
+   Chrome — everything that frames the work: the top bar, the attention strip, the connection
+   state, toasts, and the left rail. Markup lives in index.mid.html.
+   ============================================================================================== */
+
+/* ---- top bar ------------------------------------------------------------------------------------ */
+
+.top {
+  display: flex; align-items: center; gap: var(--sp-3); flex: none;
+  height: var(--top-h); padding: 0 var(--sp-4); position: relative; z-index: 30;
+  background: color-mix(in srgb, var(--bg-1) 88%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--line-0);
+}
+.brand { display: flex; align-items: baseline; gap: var(--sp-2); user-select: none; }
+.brand b { font-size: var(--fs-xl); font-weight: 800; letter-spacing: .02em; }
+.brand span {
+  font-size: var(--fs-xs); color: var(--tx-2); letter-spacing: .14em;
+  text-transform: uppercase; font-weight: var(--fw-med);
+}
+
+/* Connection state: the dot carries the glance, the word carries the truth. Click it for the
+   reconnect detail (the connbar). */
+.status {
+  display: inline-flex; align-items: center; gap: 7px;
+  font-size: var(--fs-sm); color: var(--tx-1); font-family: var(--mono);
+  background: transparent; border: 1px solid var(--line-0); border-radius: var(--r-pill);
+  padding: 3px var(--sp-3) 3px var(--sp-2); cursor: default;
+}
+.status:hover { border-color: var(--line-1); }
+.status .dot.on { background: var(--ok); box-shadow: 0 0 0 3px rgba(127,217,135,.16); }
+.status .dot { background: var(--bad); box-shadow: 0 0 0 3px rgba(255,138,128,.16); }
+
+#instance-version { font-size: var(--fs-xs); color: var(--tx-2); font-family: var(--mono); }
+#spend-ticker { font-family: var(--mono); font-size: var(--fs-xs); color: var(--tx-1); cursor: default; }
+
+/* The view switcher: which panes the page is showing. Buttons keep `data-view` (JS keys off it). */
+.top-views { display: flex; gap: 2px; margin-left: var(--sp-2); }
+.top-views button {
+  background: transparent; color: var(--tx-1); border: 1px solid transparent;
+  border-radius: var(--r-2); font-size: var(--fs-sm); padding: 4px 10px;
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.top-views button:hover { color: var(--tx-0); background: var(--bg-2); }
+.top-views button.active { color: var(--tx-0); border-color: var(--line-0); background: var(--bg-2); }
+/* A pane is hiding something that needs a person: the tab that would open it says so. */
+.top-views button.need { color: var(--warn-ink); }
+
+.spacer { flex: 1; }
+
+.token-button {
+  background: transparent; color: var(--tx-1);
+  border: 1px solid var(--line-0); border-radius: var(--r-2);
+  padding: 4px var(--sp-3); font-size: var(--fs-sm); font-family: var(--mono);
+}
+.token-button:hover { color: var(--tx-0); border-color: var(--accent); }
+.token-button.has-token { color: var(--ok-ink); border-color: rgba(127,217,135,.4); }
+
+/* ---- account panel ------------------------------------------------------------------------------ */
+
+.token-panel {
+  display: flex; align-items: center; gap: var(--sp-2); flex: none;
+  padding: var(--sp-2) var(--sp-4);
+  background: var(--bg-1); border-bottom: 1px solid var(--line-0); font-size: var(--fs-sm);
+}
+.token-panel[hidden] { display: none; }
+.token-panel input {
+  flex: 1; max-width: 460px; background: var(--bg-0); color: var(--tx-0);
+  border: 1px solid var(--line-0); border-radius: var(--r-2);
+  padding: 6px var(--sp-3); font-family: var(--mono); font-size: var(--fs-sm);
+}
+.token-panel input:focus { border-color: var(--accent); box-shadow: var(--ring); }
+.token-panel input#login-user { flex: none; width: 160px; }
+.token-panel input#login-pass { flex: none; width: 220px; }
+.token-panel #token-status.err { color: var(--bad-ink); }
+.token-panel details.adv { margin-left: auto; }
+.token-panel details.adv summary {
+  cursor: pointer; color: var(--tx-2); font-size: var(--fs-xs); font-family: var(--mono);
+}
+.token-panel details.adv summary:hover { color: var(--tx-0); }
+.token-panel details.adv input { margin-top: 6px; }
+.token-panel button {
+  background: transparent; color: var(--tx-0); border: 1px solid var(--line-0);
+  border-radius: var(--r-2); padding: 5px var(--sp-3); font-size: var(--fs-sm);
+}
+.token-panel button:hover { border-color: var(--accent); }
+
+/* ---- attention strip: what the daemon wants from a person right now ------------------------------
+
+   The strip is the answer to "what does it want from me": waiting approvals and a live challenge
+   each get a row between the header and the panes, at the tone the question deserves. It is a
+   *window* on the same queues the rail and the screen pane own — answering here is answering
+   there, so the two never disagree. */
+.attention { flex: none; border-bottom: 1px solid var(--line-0); background: var(--bg-1); }
+.attention[hidden] { display: none; }
+.attn {
+  display: flex; align-items: center; gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-4); border-left: 3px solid var(--warn);
+  font-size: var(--fs-sm); animation: attn-in var(--dur) var(--ease);
+}
+.attn + .attn { border-top: 1px solid var(--line-0); }
+.attn.bad { border-left-color: var(--bad); }
+.attn .attn-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attn .attn-text b { font-weight: var(--fw-med); }
+.attn .attn-sub { color: var(--tx-2); font-family: var(--mono); font-size: var(--fs-xs); flex: none; }
+.attn .attn-acts { display: flex; gap: 6px; flex: none; }
+.attn .attn-acts button {
+  background: transparent; color: var(--tx-0); border: 1px solid var(--line-1);
+  border-radius: var(--r-2); font-size: var(--fs-sm); padding: 3px var(--sp-3);
+}
+.attn .attn-acts button:hover { border-color: var(--accent); color: var(--accent-ink); }
+.attn .attn-acts button.deny { color: var(--bad-ink); }
+.attn .attn-acts button.deny:hover { border-color: var(--bad); color: var(--bad-ink); }
+@keyframes attn-in { from { opacity: 0; transform: translateY(-4px); } }
+
+/* ---- connection banner --------------------------------------------------------------------------
+
+   Silent failure is the enemy state: when requests start failing or a socket drops, the page says
+   so out loud and counts attempts instead of spinning quietly. */
+.connbar {
+  position: fixed; top: calc(var(--top-h) + var(--sp-2)); left: 50%; transform: translateX(-50%);
+  z-index: 90; display: flex; align-items: center; gap: var(--sp-2);
+  background: var(--bg-3); color: var(--tx-0);
+  border: 1px solid var(--line-1); border-left: 3px solid var(--bad);
+  border-radius: var(--r-pill); padding: 6px var(--sp-4);
+  font-size: var(--fs-sm); box-shadow: var(--shadow-2);
+}
+.connbar[hidden] { display: none; }
+.connbar .dot { background: var(--bad); box-shadow: 0 0 0 3px rgba(255,138,128,.16); animation: hx-pulse 1.2s ease-in-out infinite; }
+.connbar button { color: var(--accent-ink); background: transparent; border: 0; font-size: var(--fs-sm); text-decoration: underline; }
+.connbar button:hover { color: var(--tx-0); }
+
+/* ---- toasts -------------------------------------------------------------------------------------- */
+
+#toasts {
+  position: fixed; right: var(--sp-4); bottom: var(--sp-4); z-index: 95;
+  display: flex; flex-direction: column; gap: var(--sp-2); align-items: flex-end;
+  pointer-events: none;
+}
+.toast {
+  pointer-events: auto; display: flex; align-items: center; gap: var(--sp-3);
+  background: var(--bg-3); color: var(--tx-0);
+  border: 1px solid var(--line-1); border-radius: var(--r-2);
+  padding: var(--sp-2) var(--sp-3); font-size: var(--fs-sm);
+  box-shadow: var(--shadow-2); max-width: min(420px, 90vw);
+  animation: toast-in .18s var(--ease);
+}
+.toast.ok   { border-left: 3px solid var(--ok); }
+.toast.warn { border-left: 3px solid var(--warn); }
+.toast.bad  { border-left: 3px solid var(--bad); }
+.toast.info { border-left: 3px solid var(--accent); }
+.toast.leaving { opacity: 0; transform: translateY(4px); transition: opacity .18s, transform .18s; }
+.toast button {
+  background: transparent; border: 0; color: var(--accent-ink); font-size: var(--fs-sm);
+  font-weight: var(--fw-med); white-space: nowrap;
+}
+.toast button:hover { text-decoration: underline; }
+@keyframes toast-in { from { opacity: 0; transform: translateY(6px); } }
+
+/* ---- help overlay ------------------------------------------------------------------------------- */
+
+.help { z-index: 80; }
+.help .modal-box { width: min(480px, 92vw); }
+.help table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
+.help td { padding: 5px 0; border-bottom: 1px solid var(--line-0); color: var(--tx-1); }
+.help td:first-child { width: 45%; color: var(--tx-0); }
+.help tr:last-child td { border-bottom: 0; }
+
+/* ---- app grid ------------------------------------------------------------------------------------ */
+
+.app { flex: 1; display: flex; min-height: 0; }
+
+/* ---- left rail: the task list and its instruments ------------------------------------------------ */
+
+.side {
+  width: var(--rail-w); flex: none; border-right: 1px solid var(--line-0);
+  background: var(--bg-1); display: flex; flex-direction: column; min-height: 0; overflow: hidden;
+}
+.side[hidden] { display: none; }
+
+.sessions-head { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3) var(--sp-4) var(--sp-2); flex: none; }
+.sessions-head h2 {
+  margin: 0; flex: 1; font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .1em;
+  color: var(--tx-2); font-weight: var(--fw-bold); display: flex; align-items: baseline; gap: 6px;
+}
+.sessions-head h2 span { color: var(--tx-1); font-family: var(--mono); }
+.new-task {
+  background: var(--paper); color: var(--tx-inv); border: 0; border-radius: var(--r-2);
+  font-size: var(--fs-sm); font-weight: var(--fw-bold); padding: 4px var(--sp-3);
+}
+.new-task:hover { background: var(--paper-hot); }
+.new-task:disabled { opacity: .45; cursor: default; }
+
+#sessions { flex: 1; overflow-y: auto; min-height: 0; padding: 0 var(--sp-2) var(--sp-2); }
+.sess {
+  display: flex; flex-direction: column; gap: 2px; width: 100%; text-align: left;
+  background: transparent; border: 1px solid transparent; border-radius: var(--r-3);
+  padding: var(--sp-2) var(--sp-3); margin: 1px 0; color: var(--tx-0);
+  transition: background var(--dur) var(--ease);
+}
+.sess:hover { background: var(--bg-2); }
+.sess.active { background: var(--bg-3); border-color: var(--line-1); }
+.sess.active .stitle { color: var(--tx-0); }
+.sess .stitle {
+  font-size: var(--fs-md); font-weight: var(--fw-med); color: var(--tx-1);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sess .srow { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
+.sess .srow .stitle { flex: 1; }
+/* The task's status marker: run = it is working, wait = it is asking a person something. The amber
+   marker is the whole "what does it want" contract on a task nobody is watching. */
+.sess .mark { flex: none; width: 7px; height: 7px; border-radius: 50%; }
+.sess .mark.wait { background: var(--warn); box-shadow: 0 0 0 3px rgba(240,196,108,.18); animation: hx-pulse 1.4s ease-in-out infinite; }
+.sess .mark.run  { background: var(--ok);   box-shadow: 0 0 0 3px rgba(127,217,135,.15); }
+.sess .smeta { color: var(--tx-2); font-size: var(--fs-xs); font-family: var(--mono); display: flex; gap: var(--sp-2); }
+
+.sess-actions { display: flex; gap: var(--sp-1); padding: var(--sp-1) var(--sp-3) var(--sp-2); flex: none; }
+.sess-actions button {
+  background: transparent; color: var(--tx-2); border: 1px solid var(--line-0);
+  border-radius: var(--r-1); padding: 2px var(--sp-2); font-size: var(--fs-xs);
+}
+.sess-actions button:hover { color: var(--tx-0); border-color: var(--accent); }
+.sess-actions button.danger:hover { color: var(--bad-ink); border-color: var(--bad); }
+
+.side-fold {
+  border-top: 1px solid var(--line-0); flex: none; max-height: 44%;
+  overflow-y: auto; background: var(--bg-1);
+}
+/* Foldable cards: the h2 doubles as the collapse toggle (button inside, ARIA managed by JS). */
+.card > h2 button.fold {
+  background: transparent; border: 0; color: var(--tx-2); font-size: var(--fs-sm);
+  padding: 0 var(--sp-1); line-height: 1;
+}
+.card > h2 button.fold:hover { color: var(--tx-0); }
+.card[data-folded="1"] > .card-body { display: none; }
+.card { border-bottom: 1px solid var(--line-0); }
+
+#hosts { padding: 0 var(--sp-4) var(--sp-3); font-size: var(--fs-md); }
+#approvals { padding: 0 var(--sp-4) var(--sp-3); }
+.host { padding: 7px 0; border-bottom: 1px solid var(--line-0); }
+.host:last-child { border-bottom: 0; }
+.host .hid { font-weight: var(--fw-med); color: var(--tx-0); font-family: var(--mono); font-size: var(--fs-sm); }
+.host .row { display: flex; align-items: baseline; gap: var(--sp-2); cursor: pointer; }
+.host .row:hover .hid { color: var(--accent-ink); }
+.host .row .open { margin-left: auto; color: var(--tx-2); font-size: var(--fs-xs); }
+.host .kind {
+  display: inline-block; font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .05em;
+  font-weight: var(--fw-bold); padding: 0 6px; border-radius: var(--r-1); margin-left: 6px;
+  background: var(--accent-soft); color: var(--accent-ink);
+}
+.host .desc { color: var(--tx-1); font-size: var(--fs-sm); margin-top: 2px; }
+.host .unconf { color: var(--bad-ink); font-size: var(--fs-xs); margin-top: 2px; }
+
+/* ---- rail fold cards: spend, sandboxes, approvals ------------------------------------------------ */
+
+.spend-row { padding: 3px var(--sp-4); font-family: var(--mono); font-size: var(--fs-xs); color: var(--tx-1); }
+.spend-row .line { display: flex; justify-content: space-between; gap: var(--sp-2); }
+.spend-row .line span:first-child { color: var(--tx-0); overflow-wrap: anywhere; }
+.spend-row .line b { color: var(--tx-0); font-weight: var(--fw-med); white-space: nowrap; }
+.spend-row .counts { font-size: var(--fs-xs); color: var(--tx-2); }
+.spend-row .unpriced, .unpriced { color: var(--tx-2); font-style: italic; }
+.spend-head {
+  padding: 2px var(--sp-4); font-size: var(--fs-xs); letter-spacing: .08em;
+  text-transform: uppercase; color: var(--tx-2); margin-top: var(--sp-2);
+}
+
+.sandbox { padding: 0 var(--sp-4) var(--sp-2); font-size: var(--fs-sm); color: var(--tx-1); font-family: var(--mono); }
+.sandbox .live { color: var(--ok-ink); }
+.sandbox .off { color: var(--bad-ink); }
+.sandbox .box { margin-top: var(--sp-1); padding-top: var(--sp-1); border-top: 1px solid var(--line-0); }
+.sandbox .box .line { display: flex; align-items: center; gap: 6px; }
+.sandbox .box .id { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sandbox .box .runs { margin-top: 1px; color: var(--accent-ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sandbox .box button {
+  font-size: var(--fs-xs); background: transparent; color: var(--tx-1); border: 1px solid var(--line-0);
+  border-radius: var(--r-1); padding: 1px 7px; font-family: var(--mono); flex: none;
+}
+.sandbox .box button:hover { color: var(--tx-0); border-color: var(--accent); }
+
+/* An approval card: the question the daemon is holding a run for. The rail shows the full queue;
+   the attention strip (10-chrome) carries the same question to wherever the person is looking. */
+.approval {
+  border: 1px solid var(--line-0); border-left: 3px solid var(--warn);
+  border-radius: var(--r-2); padding: var(--sp-3); margin: var(--sp-2) 0;
+  background: var(--bg-2);
+}
+.approval .risk {
+  display: inline-block; font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .05em;
+  font-weight: var(--fw-bold); padding: 2px 6px; border-radius: var(--r-1); margin-bottom: 6px;
+}
+.risk.low { background: var(--ok-soft); color: var(--ok-ink); }
+.risk.medium { background: var(--warn-soft); color: var(--warn-ink); }
+.risk.high, .risk.critical { background: var(--bad-soft); color: var(--bad-ink); }
+.approval .tool { font-weight: var(--fw-med); font-family: var(--mono); font-size: var(--fs-sm); }
+.approval .summary { color: var(--tx-0); margin: var(--sp-1) 0; font-size: var(--fs-md); }
+.approval .reason { color: var(--tx-1); font-size: var(--fs-sm); }
+.approval .undo { color: var(--tx-1); font-size: var(--fs-sm); font-style: italic; margin-top: 3px; }
+.approval .unattended { color: var(--tx-1); font-size: var(--fs-sm); margin-top: 3px; }
+.approval .opts { display: flex; gap: 6px; margin-top: var(--sp-2); flex-wrap: wrap; }
+.approval .opts button {
+  font-size: var(--fs-sm); padding: 4px var(--sp-3); border-radius: var(--r-2); cursor: pointer;
+  background: transparent; color: var(--tx-0); border: 1px solid var(--line-1);
+}
+.approval .opts button:hover { border-color: var(--accent); color: var(--accent-ink); }
+.approval .opts button.deny { color: var(--bad-ink); }
+.approval .opts button.deny:hover { border-color: var(--bad); }

@@ -1015,6 +1015,54 @@ That output is what makes the two defects in §7 of `docs/approvals.md` *visible
 single `*rm -rf /*` that also matched `/tmp`, and a config with no `agent:` section printed no rules at
 all until `AgentConfig::default()` was fixed.
 
+## The web client, reworked (M11)
+
+The page at `GET /` was one 3,957-line `index.html`. It is now composed at build time from 25
+partials — three HTML fragments, five CSS layers, seventeen JS modules — concatenated by
+`include_str!` in `crates/hx-server/src/routes.rs`. Serving, routes, frames and pane behaviour are
+unchanged; the split is invisible to the wire (`split.py --verify` round-tripped the served bytes
+before the restyle began).
+
+| Measure | Before | After |
+|---|---|---|
+| Source shape | 1 file, 3,957 lines, 174,613 bytes | 25 partials, 4,999 lines, 222,938 bytes |
+| Raw hex colours | 16, scattered through rules | 22, **all inside `css/00-tokens.css`** — a grep for hex outside the token layer returns nothing |
+| CSS custom properties | 16 | 86 (surfaces, intents, type scale, spacing, radii, shadows, motion, density) |
+| Distinct `font-size` values | 14 | 11 (all token references) |
+| First contentful paint (headless Chromium, warm daemon) | ~65–80 ms | ~72–90 ms |
+| Time to first transcript event | not measured | ~1.1 s — the paint is fast; the wait is the session socket's replay, and it now says so instead of sitting silent |
+| Console errors on load | not checked | 0 — asserted by the gate on every run |
+
+What the person gets that the before did not offer: an **attention strip** above the workspace that
+renders "what does it want from me right now" — approvals with allow-once/deny/queue and challenges
+with a one-click jump to the screen pane — a **reconnect pill** that owns every socket's drop state
+instead of three silent stalls, **toasts** for write actions (rename, delete, provider save,
+approval/challenge answers), a `?` **shortcut sheet**, a density toggle, collapsible rail sections,
+and a keyboard map (`ctrl+1..7` panes, `ctrl+\` drawer, `ctrl+/` prompt, `alt+↑↓` tasks, `y`/`n`
+answer, `esc` unwinds). Title-flash is generalised to every waiting state by a shared painter, and
+the live-announce region makes banners readable to a screen reader. Below 980 px both flanking
+panels become overlay sheets so the transcript keeps the width.
+
+**The rendered-browser gate** (`scripts/check_web_client.py`, check 15) is the part that is new
+evidence, not just new code: headless Chromium loads the served page and asserts (a) **zero
+console errors**, (b) JS-rendered contents exist — `.sess` rows are empty in the markup and only
+exist after boot code fetched — (c) the new surfaces' markers survive render (`#attention`,
+`#connbar`, `#toasts`, `#sr-live`, `role="tablist"`), and (d) the page paints (PNG magic + size,
+kept at `/tmp/hx-render-<port>.png`). It already caught a real defect the marker checks could not
+see — a leftover `visibilitychange` listener calling a function the rework had removed — which is
+exactly the class of failure the gate exists for. `HX_WEB_CHECK_BROWSER` overrides the binary; the
+xterm CDN fetch is exempted from the console assertion because a daemon host without internet is a
+valid deployment, not a page defect.
+
+A real turn was driven through the page end to end: prompt sent from the composer, `TURN_STARTED`
+→ `USAGE` → `TEXT` → `TURN_FINISHED` events rendered in order, `stop` appearing mid-run, tokens
+flowing in the spend panel — through the opencode zen keyless endpoint (`nemotron-3.5-lightning-free`
+via a local OpenAI-compatible shim).
+
+What it does not prove: the screen pane is still skipped here (no browser driver on this host —
+the pane's own honest `503` path), and "a person can find 'what does it want from me' in five
+seconds" is a design claim argued by the attention strip, not a measured one.
+
 ## Running the suite
 
 ```bash

@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hx</title>
+<!--
+  The hx web client.
+
+  One file, no build step and no bundler. The daemon serves it directly, so there is no toolchain
+  between a change and seeing it, and no `node_modules` for a deploy to get wrong. xterm.js is the
+  one dependency and it comes from a CDN; if that is unavailable the terminal pane says so rather
+  than silently rendering nothing.
+
+  This is a *client*. It owns no state the daemon does not: the session, its events, the terminal,
+  and its scrollback all live in `hxd`. Closing this tab must not lose any of them, which is why
+  the terminal is created once by id and reattached rather than recreated on every connect — and
+  why the reconnect logic asks for `since_seq` rather than assuming a fresh stream.
+-->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<style>

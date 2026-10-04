@@ -1,0 +1,187 @@
+/* ==============================================================================================
+   The center column — the transcript and the composer. This is where a person watches a task
+   work; it gets the most width, the most air, and the only place prose leads.
+   ============================================================================================== */
+
+.center { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+
+/* Task header: the title is an input so renaming is "click the name", not a hidden command. */
+.thead {
+  display: flex; align-items: center; gap: var(--sp-3); flex: none;
+  width: min(var(--chat-w), 100%); margin: 0 auto; padding: var(--sp-3) var(--sp-5) var(--sp-2);
+}
+.tlabel {
+  font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .1em;
+  color: var(--tx-2); font-weight: var(--fw-bold);
+}
+#session-label {
+  flex: 1; min-width: 0; background: transparent; border: 0; border-bottom: 1px solid transparent;
+  color: var(--tx-0); font-size: var(--fs-lg); font-weight: var(--fw-med); padding: 2px var(--sp-1);
+  overflow: hidden; text-overflow: ellipsis;
+}
+#session-label:hover { border-bottom-color: var(--line-1); }
+#session-label:focus { border-bottom-color: var(--accent); }
+#session-meta { font-family: var(--mono); font-size: var(--fs-xs); color: var(--tx-2); flex: none; }
+
+#events {
+  flex: 1; overflow-y: auto; min-height: 0;
+  width: min(var(--chat-w), 100%); margin: 0 auto;
+  padding: var(--sp-2) var(--sp-5) var(--sp-5); font-size: var(--fs-md);
+}
+
+/* ---- transcript events ---------------------------------------------------------------------------
+
+   One card shape, one marker per role: user = accent edge + slight indent (the person's words),
+   agent = ok edge (the worker's answers), tool = inset mono well (machine evidence), system =
+   bare annotation line. The edges are how a feed of mixed voices stays scannable. */
+.event {
+  padding: var(--sp-3) var(--sp-4); margin: var(--sp-2) 0;
+  border: 1px solid var(--line-0); border-left: 2px solid var(--line-1);
+  border-radius: var(--r-3); background: var(--bg-1);
+}
+.event.role-user { background: var(--bg-2); border-left-color: var(--accent); margin-left: var(--sp-10); }
+.event.role-agent { border-left-color: var(--ok); }
+.event.role-tool {
+  background: transparent; border-style: dashed; border-color: var(--line-0);
+  font-family: var(--mono); font-size: var(--fs-sm);
+}
+.event.role-system {
+  background: transparent; border: 0; color: var(--tx-2);
+  font-size: var(--fs-sm); padding: var(--sp-1) var(--sp-4);
+}
+.event .meta { display: flex; align-items: baseline; gap: var(--sp-2); margin-bottom: var(--sp-1); }
+.event .kind {
+  color: var(--accent-ink); font-weight: var(--fw-bold); font-size: var(--fs-xs);
+  text-transform: uppercase; letter-spacing: .07em; font-family: var(--mono);
+}
+.event.role-user .kind { color: var(--tx-0); }
+.event .seq { color: var(--tx-2); font-size: var(--fs-xs); font-family: var(--mono); }
+.event .body { white-space: pre-wrap; word-break: break-word; }
+.event pre {
+  margin: var(--sp-2) 0 0; white-space: pre-wrap; word-break: break-word;
+  font-family: var(--mono); font-size: var(--fs-sm); line-height: var(--lh-loose);
+  color: var(--tx-1); background: var(--bg-inset);
+  border: 1px solid var(--line-0); border-radius: var(--r-2); padding: var(--sp-2) var(--sp-3);
+  max-height: 320px; overflow: auto;
+}
+.event .thinking { color: var(--tx-2); font-style: italic; font-family: var(--serif); }
+.event .actions { display: flex; gap: 6px; margin-top: var(--sp-2); }
+.event .actions button {
+  background: transparent; color: var(--tx-1); border: 1px solid var(--line-0);
+  border-radius: var(--r-2); padding: 2px var(--sp-3); font-size: var(--fs-xs);
+  opacity: .55; transition: opacity var(--dur) var(--ease);
+}
+.event:hover .actions button { opacity: 1; }
+.event .actions button:hover { color: var(--tx-0); border-color: var(--accent); }
+.event .note { color: var(--tx-1); font-size: var(--fs-sm); font-family: var(--mono); }
+
+/* ---- markdown inside events ---------------------------------------------------------------------- */
+
+.md { line-height: var(--lh-loose); }
+.md p { margin: 6px 0 0; }
+.md p:first-child { margin: 0; }
+.md h1, .md h2, .md h3, .md h4 { margin: var(--sp-3) 0 var(--sp-1); line-height: var(--lh-tight); font-size: 1.02em; font-weight: var(--fw-med); }
+.md h1 { font-size: 1.15em; }
+.md h2 { font-size: 1.08em; }
+.md ul, .md ol { margin: 6px 0 0; padding-left: var(--sp-5); }
+.md li { margin: 2px 0; }
+.md blockquote { margin: 6px 0 0; padding: 2px var(--sp-3); border-left: 2px solid var(--line-1); color: var(--tx-1); }
+.md code {
+  font-family: var(--mono); font-size: var(--fs-sm);
+  background: var(--bg-3); border-radius: var(--r-1); padding: 1px 5px;
+}
+.md-pre { position: relative; margin: var(--sp-2) 0 0; }
+.md-pre pre {
+  margin: 0; padding: var(--sp-3); overflow: auto;
+  background: var(--bg-inset); border: 1px solid var(--line-0); border-radius: var(--r-3);
+}
+.md-pre pre code { background: none; padding: 0; font-size: var(--fs-sm); line-height: var(--lh-loose); }
+.md-copy {
+  position: absolute; top: 6px; right: 6px; font-size: var(--fs-xs); padding: 2px var(--sp-2);
+  background: var(--bg-2); color: var(--tx-1); border: 1px solid var(--line-0); border-radius: var(--r-2);
+}
+.md-copy:hover { color: var(--tx-0); border-color: var(--accent); }
+.md hr { border: 0; border-top: 1px solid var(--line-0); margin: var(--sp-3) 0; }
+.md a { color: var(--accent-ink); text-decoration: none; }
+.md a:hover { text-decoration: underline; }
+
+/* ---- the follow-up queue ------------------------------------------------------------------------- */
+
+.queue { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 var(--sp-5); width: min(var(--chat-w), 100%); margin: 0 auto; }
+.queue:empty { display: none; }
+.queue .chip {
+  display: inline-flex; align-items: center; gap: 6px; max-width: 100%;
+  background: var(--bg-2); border: 1px solid var(--line-0); border-radius: var(--r-pill);
+  padding: 3px 6px 3px var(--sp-3); font-size: var(--fs-sm); color: var(--tx-1);
+}
+.queue .chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 320px; }
+.queue .chip button {
+  background: transparent; border: 0; color: var(--tx-2); font-size: var(--fs-md);
+  border-radius: 50%; width: 18px; height: 18px; line-height: 1;
+}
+.queue .chip button:hover { color: var(--bad-ink); }
+
+/* ---- composer -------------------------------------------------------------------------------------
+
+   The single most-used control on the page: it gets the raised surface, the inset shadow, and a
+   layout that reads [mode | what to do | send]. */
+.cwrap {
+  flex: none; border-top: 1px solid var(--line-0);
+  background: linear-gradient(to top, var(--bg-0) 72%, transparent);
+  padding: var(--sp-3) 0 var(--sp-2);
+}
+.composer { display: flex; gap: var(--sp-2); width: min(var(--chat-w), 100%); margin: 0 auto; padding: 0 var(--sp-5); }
+.composer textarea {
+  flex: 1; background: var(--bg-2); color: var(--tx-0);
+  border: 1px solid var(--line-0); border-radius: var(--r-3);
+  padding: var(--sp-3) var(--sp-4); font-size: var(--fs-md); resize: none;
+  min-height: 46px; max-height: 200px; line-height: var(--lh-normal);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, .35);
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.composer textarea:focus { border-color: var(--accent); box-shadow: var(--ring); }
+.composer textarea::placeholder { color: var(--tx-2); }
+.composer button {
+  background: var(--paper); color: var(--tx-inv); border: 0; border-radius: var(--r-3);
+  padding: 0 var(--sp-4); font-weight: var(--fw-bold); font-size: var(--fs-md);
+}
+.composer button:hover { background: var(--paper-hot); }
+.composer button:disabled { opacity: .45; cursor: default; }
+.composer button.stop { background: var(--bg-3); color: var(--bad-ink); border: 1px solid var(--line-1); }
+.composer button.stop:hover { border-color: var(--bad); }
+
+.mode {
+  display: flex; background: var(--bg-2); border: 1px solid var(--line-0);
+  border-radius: var(--r-3); overflow: hidden; flex: none;
+}
+.mode button {
+  background: transparent; color: var(--tx-1); border: 0;
+  padding: 0 var(--sp-3); font-weight: var(--fw-med); font-size: var(--fs-sm);
+}
+.mode button + button { border-left: 1px solid var(--line-0); }
+.mode button.active { background: var(--accent-soft); color: var(--accent-ink); }
+.mode button:hover { color: var(--tx-0); }
+
+.activity {
+  width: min(var(--chat-w), 100%); margin: 0 auto var(--sp-1); padding: 0 var(--sp-5);
+  font-size: var(--fs-sm); color: var(--tx-1); font-family: var(--mono);
+  display: flex; align-items: center; gap: var(--sp-2); min-height: 0;
+}
+.activity:empty { display: none; }
+.activity .pulse {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: none;
+  box-shadow: 0 0 0 3px rgba(127,217,135,.15);
+  animation: hx-pulse 1.4s ease-in-out infinite;
+}
+.activity.wait .pulse { background: var(--warn); box-shadow: 0 0 0 3px rgba(240,196,108,.18); }
+@keyframes hx-pulse { 50% { opacity: .35; } }
+
+.hint {
+  width: min(var(--chat-w), 100%); margin: var(--sp-1) auto 0; padding: 0 var(--sp-5);
+  font-size: var(--fs-xs); color: var(--tx-2); font-family: var(--mono);
+  display: flex; justify-content: space-between; gap: var(--sp-3);
+}
+.hint .keys { flex: none; }
+.hint .keys kbd { margin-left: var(--sp-1); }
+
+.scroll { overflow-y: auto; }

@@ -1,0 +1,326 @@
+</style>
+</head>
+<body>
+<a class="skip" href="#events">skip to the transcript</a>
+<header class="top" role="banner">
+  <div class="brand"><b>hx</b><span>harness</span></div>
+  <button type="button" class="status" id="conn-status" title="connection state — details when things drop"><span class="dot" id="dot"></span><span id="status-text">connecting…</span></button>
+  <span id="instance-version" title="daemon instance / version"></span>
+  <span id="spend-ticker" title="spend over the last 30 days — see the spend panel for the breakdown"></span>
+  <nav class="top-views" aria-label="panels">
+    <button data-view="side" class="active" aria-pressed="true" aria-keyshortcuts="Control+1" title="toggle the task list (ctrl+1)">tasks</button>
+    <button data-view="terminal" class="active" aria-pressed="true" aria-keyshortcuts="Control+2" title="terminal (ctrl+2)">terminal</button>
+    <button data-view="screen" aria-pressed="false" aria-keyshortcuts="Control+3" title="a live browser the daemon runs (ctrl+3)">screen</button>
+    <button data-view="diff" aria-pressed="false" aria-keyshortcuts="Control+4" title="diff/review (ctrl+4)">diff</button>
+    <button data-view="review" aria-pressed="false" aria-keyshortcuts="Control+5" title="what this task changed (ctrl+5)">review</button>
+    <button data-view="fanout" aria-pressed="false" aria-keyshortcuts="Control+6" title="fan-out (ctrl+6)">fan-out</button>
+    <button data-view="providers" aria-pressed="false" aria-keyshortcuts="Control+7" title="providers / settings (ctrl+7)">providers</button>
+  </nav>
+  <div class="spacer"></div>
+  <button id="density-toggle" class="token-button" title="density — comfortable ↔ compact">density</button>
+  <button id="help-open" class="token-button" title="keyboard shortcuts (?)">?</button>
+  <button id="token-button" class="token-button" title="account — log in / out">login</button>
+</header>
+<div id="token-panel" class="token-panel" hidden>
+  <span class="dim">account</span>
+  <input id="login-user" placeholder="username" autocomplete="username" spellcheck="false">
+  <input id="login-pass" type="password" placeholder="password" autocomplete="current-password" spellcheck="false">
+  <button id="token-save">log in</button>
+  <button id="token-clear">log out</button>
+  <span id="token-status" class="dim"></span>
+  <details class="adv">
+    <summary>advanced: paste token</summary>
+    <input id="token-input" type="password" placeholder="bearer token" autocomplete="off" spellcheck="false">
+  </details>
+</div>
+<!-- The attention strip: what the daemon wants from a person, at page weight. Approvals and
+     challenges render here as rows (window onto the same queues the panes own), so "what does it
+     need" is answered in one glance regardless of which pane is open. -->
+<div id="attention" class="attention" hidden role="region" aria-label="needs an answer"></div>
+<div id="connbar" class="connbar" hidden role="status">
+  <span class="dot"></span><span id="connbar-text">connection lost</span><button id="connbar-retry" type="button">retry now</button>
+</div>
+<div class="app">
+  <aside class="side" id="side" aria-label="tasks and daemon state">
+    <div class="sessions-head">
+      <h2>tasks<span id="session-count"></span></h2>
+      <button id="new-session" class="new-task" title="open a new task">+ new</button>
+    </div>
+    <div id="sessions" role="list" aria-label="tasks"></div>
+    <div class="sess-actions">
+      <button id="session-rename" title="rename the open task">rename</button>
+      <button id="session-delete" class="danger" title="delete the open task">delete</button>
+    </div>
+    <div class="side-fold">
+      <section class="card" data-card="hosts">
+        <h2>hosts<span id="host-count"></span><button type="button" class="fold" aria-expanded="true" title="collapse">▾</button></h2>
+        <div class="card-body"><div id="hosts"></div></div>
+      </section>
+      <section class="card" data-card="spend">
+        <h2>spend<span id="spend-total"></span><button type="button" class="fold" aria-expanded="true" title="collapse">▾</button></h2>
+        <div class="card-body">
+          <div id="spend-body"></div>
+          <div class="spend-row"><span class="unpriced">unpriced = tokens ran, no rate card covered them</span></div>
+        </div>
+      </section>
+      <section class="card" data-card="approvals">
+        <h2>approvals<span id="approval-count"></span><button type="button" class="fold" aria-expanded="true" title="collapse">▾</button></h2>
+        <div class="card-body">
+          <div id="sandbox-status" class="sandbox"></div>
+          <div id="approvals"></div>
+          <div class="error" id="approval-error" style="width:auto;margin:0;padding:4px 14px 10px"></div>
+        </div>
+      </section>
+    </div>
+  </aside>
+  <main class="center" aria-label="transcript">
+    <div class="thead">
+      <input id="session-label" spellcheck="false" autocomplete="off" placeholder="untitled task" aria-label="task title — editable" title="click to rename this task">
+      <span id="session-meta"></span>
+    </div>
+    <div id="events" role="log" aria-live="off" aria-label="task transcript" tabindex="-1"></div>
+    <div class="cwrap">
+      <div class="activity" id="activity" role="status"></div>
+      <div class="composer">
+        <div class="mode" role="group" aria-label="how this prompt runs">
+          <button type="button" data-mode="act" class="active" title="the agent may edit files">act</button>
+          <button type="button" data-mode="plan" title="read-only: the agent looks, it does not change anything">plan</button>
+        </div>
+        <textarea id="prompt" rows="1" placeholder="Ask hx to do something…   Enter sends, Shift+Enter for a new line" autocomplete="off"></textarea>
+        <button id="send">Send</button>
+        <button id="stop" class="stop" hidden title="stop the run in flight on this task">stop</button>
+      </div>
+      <div class="queue" id="queue"></div>
+      <div class="hint"><span>one task per conversation · prompts typed mid-run queue below · Enter sends</span><span class="keys"><kbd>?</kbd> shortcuts <kbd>ctrl+/</kbd> prompt <kbd>ctrl+\</kbd> panel</span></div>
+      <div class="error" id="error" role="alert"></div>
+    </div>
+  </main>
+  <aside class="drawer" id="drawer" aria-label="tools">
+    <button type="button" class="drawer-edge" id="drawer-edge" title="collapse panel (ctrl+\)">❯</button>
+    <div class="tabs" role="tablist" aria-label="tools">
+      <button data-tab="terminal" id="tab-terminal" role="tab" aria-selected="true" aria-controls="dp-terminal" class="active">terminal</button>
+      <button data-tab="screen" id="tab-screen" role="tab" aria-selected="false" aria-controls="dp-screen">screen</button>
+      <button data-tab="diff" id="tab-diff" role="tab" aria-selected="false" aria-controls="dp-diff">diff</button>
+      <button data-tab="review" id="tab-review" role="tab" aria-selected="false" aria-controls="dp-review">review</button>
+      <button data-tab="fanout" id="tab-fanout" role="tab" aria-selected="false" aria-controls="dp-fanout">fan-out</button>
+      <button data-tab="providers" id="tab-providers" role="tab" aria-selected="false" aria-controls="dp-providers">providers</button>
+    </div>
+    <section class="dpane" id="dp-terminal" role="tabpanel" aria-labelledby="tab-terminal">
+      <h2>terminal<span><span id="term-where" title="which machine this terminal is on"></span><button id="new-term">new</button></span></h2>
+      <div id="terminal"></div>
+    </section>
+    <section class="dpane" id="dp-screen" role="tabpanel" aria-labelledby="tab-screen" hidden>
+      <h2>screen<span><span id="screen-where" title="the page this browser is showing"></span><button id="screen-close">close</button></span></h2>
+      <div class="screen-pane">
+        <div class="challenge" id="challenge" hidden role="group" aria-label="a site needs a person">
+          <div class="challenge-top">
+            <strong id="challenge-what">a site needs a person</strong>
+            <span class="challenge-left" id="challenge-left"></span>
+          </div>
+            <div class="challenge-for" id="challenge-for"></div>
+            <div class="challenge-why" id="challenge-why"></div>
+          <div class="challenge-actions">
+            <button id="challenge-watch" hidden>watch it</button>
+            <input id="challenge-note" placeholder="only to decline: why not" autocomplete="off" spellcheck="false">
+            <button id="challenge-solved" title="you cleared the wall in the browser — the task re-runs the ladder in this session">it is cleared</button>
+            <button id="challenge-give-up" title="decline, with a reason the report will quote">give up</button>
+          </div>
+        </div>
+        <div class="screen-bar">
+          <input id="screen-url" placeholder="https://example.com — Enter opens it" autocomplete="off" spellcheck="false">
+          <button id="screen-open">open</button>
+        </div>
+        <div class="screen-stage"><canvas id="screen-canvas" tabindex="0"></canvas></div>
+        <div class="screen-note" id="screen-note">
+          A browser the <b>daemon</b> runs and streams — click the picture to give it the keyboard,
+          then type; the page gets your clicks, wheel and keys. Nothing here is judged or filtered:
+          it can go anywhere the daemon's machine can reach. The browser keeps its own profile per
+          screen, so a login stays with the screen it was made in.
+        </div>
+        <div class="error" id="screen-error" style="width:auto;margin:0;padding:0 14px 8px"></div>
+      </div>
+    </section>
+    <section class="dpane" id="dp-diff" role="tabpanel" aria-labelledby="tab-diff" hidden>
+      <h2>diff/review</h2>
+      <div class="diff-pane">
+        <div class="diff-input">
+          <input id="diff-path" placeholder="path to an existing file" autocomplete="off" spellcheck="false">
+          <button id="diff-run">diff</button>
+        </div>
+        <textarea id="diff-proposed" spellcheck="false" placeholder="proposed contents…"></textarea>
+        <div class="error" id="diff-error" style="width:auto;margin:0;padding:4px 14px"></div>
+        <div id="diff-out" class="scroll diff-out"></div>
+      </div>
+    </section>
+
+    <section class="dpane" id="dp-review" role="tabpanel" aria-labelledby="tab-review" hidden>
+      <h2>review<span id="review-count"></span></h2>
+      <div class="review-pane">
+        <div class="review-head">
+          <button id="review-run">refresh</button>
+          <span class="review-note" id="review-note">files this task's agent wrote or patched</span>
+        </div>
+        <div class="error" id="review-error" style="width:auto;margin:0;padding:4px 14px"></div>
+        <div id="review-out" class="scroll diff-out"></div>
+      </div>
+    </section>
+    <section class="dpane" id="dp-fanout" role="tabpanel" aria-labelledby="tab-fanout" hidden>
+      <h2>fan-out</h2>
+      <div class="fanout-pane">
+        <div id="fanout-rows"></div>
+        <div class="fanout-input">
+          <button id="fanout-add">add row</button>
+          <button id="fanout-run">run</button>
+        </div>
+        <div class="error" id="fanout-error" style="width:auto;margin:0;padding:4px 14px"></div>
+        <div id="fanout-out" class="scroll fanout-out"></div>
+      </div>
+    </section>
+    <section class="dpane" id="dp-providers" role="tabpanel" aria-labelledby="tab-providers" hidden>
+      <h2>providers<span id="provider-count"></span></h2>
+      <div class="prov-pane">
+        <div id="providers" class="scroll"></div>
+        <div class="prov-form">
+          <div class="row">
+            <input id="prov-name" placeholder="name" autocomplete="off" spellcheck="false">
+            <select id="prov-kind" title="provider kind">
+              <option value="openai">openai</option>
+              <option value="anthropic">anthropic</option>
+              <option value="google">google</option>
+              <option value="ollama">ollama</option>
+              <option value="custom">custom</option>
+            </select>
+          </div>
+          <input id="prov-base-url" placeholder="base_url (optional)" autocomplete="off" spellcheck="false">
+          <input id="prov-models" placeholder="models, comma-separated (optional)" autocomplete="off" spellcheck="false">
+          <input id="prov-api-key" type="password" placeholder="leave blank to keep existing" autocomplete="off" spellcheck="false">
+          <div class="row">
+            <select id="prov-routing" title="routing strategy">
+              <option value="least_loaded">least_loaded</option>
+              <option value="priority">priority</option>
+              <option value="round_robin">round_robin</option>
+              <option value="weighted">weighted</option>
+              <option value="cheapest_capable">cheapest_capable</option>
+            </select>
+          </div>
+          <div class="actions">
+            <button id="prov-save">save</button>
+            <button id="prov-clear" class="ghost">clear</button>
+            <span id="prov-msg"></span>
+          </div>
+        </div>
+        <div class="error" id="prov-error" style="width:auto;margin:0;padding:4px 14px"></div>
+      </div>
+    </section>
+  </aside>
+</div>
+<div id="host-modal" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="host-modal-title">
+  <div class="modal-box">
+    <div class="modal-head">
+      <strong id="host-modal-title">host</strong>
+      <span id="host-modal-meta" class="dim"></span>
+      <button id="host-modal-close">close</button>
+    </div>
+    <div class="modal-path">
+      <input id="host-path" placeholder="/" autocomplete="off" spellcheck="false">
+      <button id="host-go">open</button>
+      <button id="host-up">up</button>
+    </div>
+    <div class="modal-body">
+      <div id="host-entries" class="modal-list"></div>
+      <div class="modal-right">
+        <textarea id="host-file" spellcheck="false" placeholder="select a file to view or edit"></textarea>
+        <div class="modal-actions">
+          <span id="host-file-status" class="dim"></span>
+          <button id="host-save">save</button>
+        </div>
+        <div class="modal-cmd">
+          <input id="host-cmd" placeholder="run a command on this host" autocomplete="off">
+          <button id="host-run">run</button>
+        </div>
+        <pre id="host-out" class="modal-out"></pre>
+      </div>
+    </div>
+    <div class="error" id="host-error" style="width:auto"></div>
+  </div>
+</div>
+<div id="help" class="modal help" hidden role="dialog" aria-modal="true" aria-labelledby="help-title">
+  <div class="modal-box">
+    <div class="modal-head">
+      <strong id="help-title">keyboard shortcuts</strong>
+      <span class="dim">from anywhere a text field is not focused</span>
+      <button id="help-close">close</button>
+    </div>
+    <div style="padding:var(--sp-4)">
+      <table>
+        <tr><td><kbd>/</kbd> or <kbd>ctrl</kbd><kbd>/</kbd></td><td>jump to the prompt</td></tr>
+        <tr><td><kbd>ctrl</kbd><kbd>1–7</kbd></td><td>open a pane — tasks, terminal, screen, diff, review, fan-out, providers</td></tr>
+        <tr><td><kbd>ctrl</kbd><kbd>\</kbd></td><td>collapse / reopen the right panel</td></tr>
+        <tr><td><kbd>alt</kbd><kbd>↑</kbd> <kbd>alt</kbd><kbd>↓</kbd></td><td>switch task</td></tr>
+        <tr><td><kbd>y</kbd> <kbd>n</kbd> <kbd>r</kbd></td><td>with an approval showing — allow once, deny, or open the queue</td></tr>
+        <tr><td><kbd>?</kbd></td><td>this list</td></tr>
+        <tr><td><kbd>esc</kbd></td><td>close the topmost open thing</td></tr>
+      </table>
+    </div>
+  </div>
+</div>
+<div id="onboard" class="onboard" hidden role="dialog" aria-modal="true" aria-label="first run setup">
+  <div class="ob-card">
+    <div class="ob-kicker">hx · first run</div>
+    <h1>Ship work from <em>one prompt.</em></h1>
+    <p class="ob-sub">Three steps and you're talking to the agent: authenticate, connect a model provider, start prompting.</p>
+    <div class="ob-steps"><i id="ob-s1" class="now"></i><i id="ob-s2"></i><i id="ob-s3"></i></div>
+    <div class="ob-step" id="ob-step-1">
+      <h3>1 · Log in to your account</h3>
+      <p>The daemon binds non-loopback, so every /v1/* call needs auth. The token from login is stored only in this browser's localStorage.</p>
+      <input id="ob-username" placeholder="username" autocomplete="username" spellcheck="false">
+      <input id="ob-password" type="password" placeholder="password" autocomplete="current-password" spellcheck="false">
+      <details class="adv">
+        <summary style="cursor:pointer;color:var(--faint);font-size:11px;font-family:var(--mono)">advanced: paste token instead</summary>
+        <input id="ob-token" type="password" placeholder="bearer token" autocomplete="off" spellcheck="false">
+      </details>
+    </div>
+    <div class="ob-step" id="ob-step-2" hidden>
+      <h3>2 · Add your first model provider</h3>
+      <p>Same PUT /v1/providers flow as the providers pane. The key is write-only — it is sent, never displayed.</p>
+      <input id="ob-prov-name" placeholder="name (e.g. default)" autocomplete="off" spellcheck="false">
+      <div class="ob-grid">
+        <select id="ob-prov-kind" title="provider kind">
+          <option value="openai">openai</option>
+          <option value="anthropic">anthropic</option>
+          <option value="google">google</option>
+          <option value="ollama">ollama</option>
+          <option value="custom">custom</option>
+        </select>
+        <select id="ob-prov-routing" title="routing strategy">
+          <option value="least_loaded">least_loaded</option>
+          <option value="priority">priority</option>
+          <option value="round_robin">round_robin</option>
+          <option value="weighted">weighted</option>
+          <option value="cheapest_capable">cheapest_capable</option>
+        </select>
+      </div>
+      <input id="ob-prov-base-url" placeholder="base_url (optional)" autocomplete="off" spellcheck="false">
+      <input id="ob-prov-models" placeholder="models, comma-separated (optional)" autocomplete="off" spellcheck="false">
+      <input id="ob-prov-key" type="password" placeholder="api key (write-only)" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="ob-step" id="ob-step-3" hidden>
+      <h3>3 · You're in</h3>
+      <p>The transcript is live on the session socket. Ask for something small first — e.g. "list the hosts".</p>
+    </div>
+    <div id="ob-msg"></div>
+    <div class="ob-actions">
+      <button id="ob-next" class="primary">Log in · continue</button>
+      <button id="ob-back" class="ghost" hidden>back</button>
+      <button id="ob-skip" class="ghost">skip → main UI</button>
+    </div>
+    <div class="ob-note">never shows stored secrets · secret_set only · token lives in localStorage</div>
+  </div>
+</div>
+<div id="toasts"></div>
+<div id="sr-live" class="visually-hidden" aria-live="polite"></div>
+
+
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
+<script>

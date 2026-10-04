@@ -37,11 +37,40 @@ use hx_secrets::Redactor;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// The web client: one self-contained page.
+/// The web client: one self-contained page, composed at compile time from the `static/` partials.
 ///
-/// `include_str!` rather than a runtime read, so the binary is the whole daemon and a deployment
-/// cannot half-succeed (a working API with a missing UI, or a UI from an older build).
-const WEB_CLIENT: &str = include_str!("../static/index.html");
+/// The page ships as one artifact (no runtime file reads, no per-pane requests), but it is not one
+/// file on disk any more: the markup is `index.head/mid/tail.html`, the stylesheet lives under
+/// `static/css/` cut by layer, and the script under `static/js/` cut by pane, so a review can read
+/// the piece it is changing instead of a four-thousand-line blob. `concat!` splices them into one
+/// `&str` at build time — the served bytes are exactly what a single `index.html` would serve.
+const WEB_CLIENT: &str = concat!(
+    include_str!("../static/index.head.html"),
+    include_str!("../static/css/00-tokens.css"),
+    include_str!("../static/css/10-chrome-top.css"),
+    include_str!("../static/css/40-transcript.css"),
+    include_str!("../static/css/50-drawer.css"),
+    include_str!("../static/css/60-overlays.css"),
+    include_str!("../static/index.mid.html"),
+    include_str!("../static/js/00-auth.js"),
+    include_str!("../static/js/05-attention.js"),
+    include_str!("../static/js/10-terminal.js"),
+    include_str!("../static/js/15-screen.js"),
+    include_str!("../static/js/18-challenge.js"),
+    include_str!("../static/js/20-markdown.js"),
+    include_str!("../static/js/30-sessions.js"),
+    include_str!("../static/js/35-prompt.js"),
+    include_str!("../static/js/40-approvals.js"),
+    include_str!("../static/js/45-hosts.js"),
+    include_str!("../static/js/50-host-browser.js"),
+    include_str!("../static/js/55-diff-review.js"),
+    include_str!("../static/js/60-session-review.js"),
+    include_str!("../static/js/65-plan-act.js"),
+    include_str!("../static/js/70-fanout.js"),
+    include_str!("../static/js/75-providers.js"),
+    include_str!("../static/js/80-chrome.js"),
+    include_str!("../static/index.tail.html"),
+);
 
 /// Hard cap on a single file served by the host/diff HTTP routes, mirroring the agent
 /// `read_file` tool's 512 KiB bound so the HTTP surfaces cannot be used to exhaust the
