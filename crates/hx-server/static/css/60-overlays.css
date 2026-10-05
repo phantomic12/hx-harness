@@ -62,6 +62,42 @@
 }
 .modal-out:empty { display: none; }
 
+/* ---- command palette ------------------------------------------------------------------------------
+   One box that jumps to anything: tasks, panes, actions (the Codex command menu / Synara's
+   recent-view switcher). Sits under the modals' z-index so a real dialog never hides behind it. */
+.palette {
+  position: fixed; inset: 0; z-index: 55;
+  background: rgba(4, 6, 10, .45);
+  display: flex; justify-content: center; align-items: flex-start; padding: 12vh var(--sp-4) 0;
+}
+.palette[hidden] { display: none; }
+.pal-box {
+  width: min(580px, 94vw); overflow: hidden;
+  background: var(--bg-1); border: 1px solid var(--line-1); border-radius: var(--r-4);
+  box-shadow: var(--shadow-2); animation: modal-in .14s var(--ease);
+}
+#pal-input {
+  width: 100%; background: var(--bg-2); color: var(--tx-0);
+  border: 0; border-bottom: 1px solid var(--line-0);
+  padding: var(--sp-3) var(--sp-4); font-size: var(--fs-md); outline: none;
+}
+#pal-input::placeholder { color: var(--tx-2); }
+#pal-list { max-height: min(46vh, 420px); overflow-y: auto; padding: var(--sp-1) 0 var(--sp-2); }
+.pal-sec {
+  padding: var(--sp-2) var(--sp-4) var(--sp-1);
+  font-family: var(--mono); font-size: var(--fs-xs); color: var(--tx-2);
+  text-transform: uppercase; letter-spacing: .08em;
+}
+.pal-row {
+  display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-3);
+  width: 100%; background: transparent; border: 0; text-align: left;
+  color: var(--tx-1); padding: var(--sp-2) var(--sp-4); font-size: var(--fs-sm);
+}
+.pal-row > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pal-row.sel, .pal-row:hover { background: var(--bg-2); color: var(--tx-0); }
+.pal-row kbd { background: transparent; border: 0; box-shadow: none; color: var(--tx-2); font-size: var(--fs-xs); padding: 0; }
+.pal-empty { padding: var(--sp-5) var(--sp-4); color: var(--tx-2); font-size: var(--fs-sm); text-align: center; }
+
 /* ---- onboarding ----------------------------------------------------------------------------------- */
 
 .onboard {

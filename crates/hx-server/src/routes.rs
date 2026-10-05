@@ -67,6 +67,7 @@ const WEB_CLIENT: &str = concat!(
     include_str!("../static/js/70-fanout.js"),
     include_str!("../static/js/75-providers.js"),
     include_str!("../static/js/80-chrome.js"),
+    include_str!("../static/js/85-palette.js"),
     include_str!("../static/index.tail.html"),
 );
 

@@ -503,8 +503,12 @@ def check_rendered(check):
         "no .sess elements in the rendered DOM",
     )
     # The surfaces a compile check cannot see wired: the attention strip, the reconnect pill, the
-    # toast region and the live announcement region a screen reader reads.
-    for marker in ('id="attention"', 'id="connbar"', 'id="toasts"', 'id="sr-live"', 'role="tablist"'):
+    # toast region and the live announcement region a screen reader reads, plus the jump surfaces
+    # added in the second pass (command palette, new-events pill).
+    for marker in (
+        'id="attention"', 'id="connbar"', 'id="toasts"', 'id="sr-live"', 'role="tablist"',
+        'id="palette"', 'id="pal-input"', 'id="new-events"',
+    ):
         check(f"the rendered page keeps {marker}", marker in dom, "missing from the rendered DOM")
 
     try:

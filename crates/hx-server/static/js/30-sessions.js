@@ -15,6 +15,9 @@ const runningTools = new Map();
 let waitingSessions = new Set();
 // Tasks with a run in flight (turn started, no turn finished yet) — what the stop button is for.
 const activeRuns = new Set();
+// Unsent composer text per task — the Codex draft marker. Switching tasks must not eat a
+// half-written prompt, and the rail marks which tasks hold one (the grey dot, quiet on purpose).
+const drafts = new Map();
 
 const sidOf = (s) => (typeof s === "string" ? s : (s && (s.id || s.session))) || "";
 const titleOf = (s) => {
@@ -77,7 +80,9 @@ function renderSessions() {
     if (state) {
       const mark = document.createElement("span");
       mark.className = "mark " + state;
-      mark.title = state === "wait" ? "waiting on you" : "working";
+      mark.title =
+        state === "wait" ? "waiting on you" :
+        state === "draft" ? "unsent text in the composer" : "working";
       row.appendChild(mark);
     }
     row.appendChild(title);
@@ -111,18 +116,34 @@ async function refreshSessions() {
 // A no-op when it is already the open one, so a poll cannot wipe a live transcript.
 async function openSession(id) {
   if (!id || id === sessionId) { renderSessions(); return; }
+  noteDraft(); // bank whatever the composer holds against the task it was typed on
   sessionId = id;
   lastSeq = 0;
   streaming = null;
   try { localStorage.setItem(SESSION_KEY, id); } catch (_) {}
   const events = $("events");
   if (events) events.innerHTML = "";
+  setUnseen(0);
+  $("prompt").value = drafts.get(id) || "";
   showError("");
   renderSessions();
   paintActivity();
   paintMode();
   attachSession();
 }
+
+// The composer's unsent text is per task: an input event banks it, a send spends it, and the
+// rail re-marks only when the has-a-draft state flips — repainting the list on every keystroke
+// would be work nobody can see.
+function noteDraft() {
+  const input = $("prompt");
+  if (!sessionId || !input) return;
+  const had = drafts.has(sessionId);
+  if (input.value.trim()) drafts.set(sessionId, input.value);
+  else drafts.delete(sessionId);
+  if (drafts.has(sessionId) !== had) renderSessions();
+}
+$("prompt").addEventListener("input", noteDraft);
 
 async function createSession() {
   const btn = $("new-session");
@@ -187,6 +208,7 @@ async function deleteSession() {
     streaming = null;
     runningTools.delete(gone);
     activeRuns.delete(gone);
+    drafts.delete(gone);
     try { localStorage.removeItem(SESSION_KEY); } catch (_) {}
     $("events").innerHTML = "";
     if (eventSocket) { try { eventSocket.close(); } catch (_) {} eventSocket = null; }
@@ -239,11 +261,13 @@ async function attachSession() {
       appendDelta(frame.seq, arrived.text);
     } else {
       streaming = null;
-      $("events").appendChild(renderEvent(frame));
+      const el = renderEvent(frame);
+      $("events").appendChild(el);
+      clampBody(el);
     }
     noteActivity(sessionId, arrived);
     noteAttention(arrived);
-    $("events").scrollTop = $("events").scrollHeight;
+    followEvents();
   };
   eventSocket.onclose = (e) => {
     // A deliberate close (switching tasks reattaches under a fresh socket) is not a lost

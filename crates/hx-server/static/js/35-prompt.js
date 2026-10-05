@@ -56,6 +56,8 @@ function sendPrompt() {
   const prompt = input.value.trim();
   if (!prompt) return;
   input.value = "";
+  noteDraft();          // the draft is spent — drop the rail's grey dot
+  jumpToLatest();       // sending means "I want to watch this", so rejoin the live edge
   submitPrompt(prompt);
 }
 

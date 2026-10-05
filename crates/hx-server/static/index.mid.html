@@ -78,7 +78,10 @@
       <input id="session-label" spellcheck="false" autocomplete="off" placeholder="untitled task" aria-label="task title — editable" title="click to rename this task">
       <span id="session-meta"></span>
     </div>
-    <div id="events" role="log" aria-live="off" aria-label="task transcript" tabindex="-1"></div>
+    <div class="events-zone">
+      <div id="events" role="log" aria-live="off" aria-label="task transcript" tabindex="-1"></div>
+      <button id="new-events" class="new-events" type="button" hidden></button>
+    </div>
     <div class="cwrap">
       <div class="activity" id="activity" role="status"></div>
       <div class="composer">
@@ -91,7 +94,7 @@
         <button id="stop" class="stop" hidden title="stop the run in flight on this task">stop</button>
       </div>
       <div class="queue" id="queue"></div>
-      <div class="hint"><span>one task per conversation · prompts typed mid-run queue below · Enter sends</span><span class="keys"><kbd>?</kbd> shortcuts <kbd>ctrl+/</kbd> prompt <kbd>ctrl+\</kbd> panel</span></div>
+      <div class="hint"><span>one task per conversation · prompts typed mid-run queue below · Enter sends</span><span class="keys"><kbd>?</kbd> shortcuts <kbd>ctrl+k</kbd> jump <kbd>ctrl+/</kbd> prompt <kbd>ctrl+\</kbd> panel</span></div>
       <div class="error" id="error" role="alert"></div>
     </div>
   </main>
@@ -254,6 +257,7 @@
     <div style="padding:var(--sp-4)">
       <table>
         <tr><td><kbd>/</kbd> or <kbd>ctrl</kbd><kbd>/</kbd></td><td>jump to the prompt</td></tr>
+        <tr><td><kbd>ctrl</kbd><kbd>k</kbd></td><td>command palette — tasks, panes, and actions in one box</td></tr>
         <tr><td><kbd>ctrl</kbd><kbd>1–7</kbd></td><td>open a pane — tasks, terminal, screen, diff, review, fan-out, providers</td></tr>
         <tr><td><kbd>ctrl</kbd><kbd>\</kbd></td><td>collapse / reopen the right panel</td></tr>
         <tr><td><kbd>alt</kbd><kbd>↑</kbd> <kbd>alt</kbd><kbd>↓</kbd></td><td>switch task</td></tr>
@@ -315,6 +319,13 @@
       <button id="ob-skip" class="ghost">skip → main UI</button>
     </div>
     <div class="ob-note">never shows stored secrets · secret_set only · token lives in localStorage</div>
+  </div>
+</div>
+<div id="palette" class="palette" hidden role="dialog" aria-modal="true" aria-label="command palette">
+  <div class="pal-box">
+    <input id="pal-input" placeholder="jump to a task, pane, or action…" autocomplete="off" spellcheck="false"
+           role="combobox" aria-expanded="true" aria-controls="pal-list" aria-activedescendant="">
+    <div id="pal-list" role="listbox" aria-label="commands"></div>
   </div>
 </div>
 <div id="toasts"></div>

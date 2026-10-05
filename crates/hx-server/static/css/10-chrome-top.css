@@ -212,6 +212,9 @@
 .sess .mark { flex: none; width: 7px; height: 7px; border-radius: 50%; }
 .sess .mark.wait { background: var(--warn); box-shadow: 0 0 0 3px rgba(240,196,108,.18); animation: hx-pulse 1.4s ease-in-out infinite; }
 .sess .mark.run  { background: var(--ok);   box-shadow: 0 0 0 3px rgba(127,217,135,.15); }
+/* Draft is quiet on purpose: it is information about this browser's composer, not the daemon's
+   state — a grey dot beside "waiting" (amber, pulses) and "working" (green). */
+.sess .mark.draft { background: var(--tx-2); box-shadow: none; }
 .sess .smeta { color: var(--tx-2); font-size: var(--fs-xs); font-family: var(--mono); display: flex; gap: var(--sp-2); }
 
 .sess-actions { display: flex; gap: var(--sp-1); padding: var(--sp-1) var(--sp-3) var(--sp-2); flex: none; }

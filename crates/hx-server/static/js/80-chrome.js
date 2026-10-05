@@ -498,7 +498,8 @@ const inField = () => {
   const el = document.activeElement;
   return el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable);
 };
-const anyOverlayOpen = () => !$("host-modal").hidden || !$("help").hidden || !$("onboard").hidden;
+const anyOverlayOpen = () =>
+  !$("host-modal").hidden || !$("help").hidden || !$("onboard").hidden || !$("palette").hidden;
 
 function switchTask(step) {
   const rows = Array.from(document.querySelectorAll("#sessions .sess"));
@@ -511,6 +512,7 @@ function switchTask(step) {
 document.addEventListener("keydown", (e) => {
   // Escape unwinds the topmost open thing: help → host modal → token panel → drawer.
   if (e.key === "Escape") {
+    if (!$("palette").hidden) { closePalette(); return; }
     if (!$("help").hidden) { closeHelp(); return; }
     if (!$("host-modal").hidden) { $("host-modal-close").click(); return; }
     if (!$("token-panel").hidden) { $("token-panel").hidden = true; return; }
@@ -542,6 +544,12 @@ document.addEventListener("keydown", (e) => {
   }
   if (e.ctrlKey && !e.shiftKey && e.key === "/") {
     $("prompt").focus();
+    e.preventDefault();
+    return;
+  }
+  // ctrl+k works inside fields like the other chords — it is the jump box, not a bare key.
+  if (e.ctrlKey && !e.shiftKey && (e.key === "k" || e.key === "K")) {
+    if (!$("palette").hidden) closePalette(); else openPalette();
     e.preventDefault();
     return;
   }

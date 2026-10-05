@@ -108,12 +108,80 @@ function kindOf(event) {
   return String((event && (event.event || event.type)) || "event");
 }
 
-// "wait" outranks "run": an unanswered question is the one state a person can act on.
+// "wait" outranks "run" outranks "draft": an unanswered question is the one state a person can
+// act on, a running tool is the daemon's business, and unsent composer text is only a reminder.
 function taskState(id) {
   if (waitingSessions.has(id)) return "wait";
   const tools = runningTools.get(id);
   if (tools && tools.size) return "run";
+  if (typeof drafts !== "undefined" && drafts.has(id)) return "draft";
   return "";
+}
+
+// ---- scroll pinning --------------------------------------------------------------------------------
+// The transcript follows new events only while the reader is already at the bottom — a person
+// scrolled up to read must never be yanked to the live edge mid-sentence. What arrives while
+// scrolled up counts on the pill, so "3 new" is one click back to live.
+let unseen = 0;
+const NEAR_BOTTOM_PX = 90;
+
+function nearBottom() {
+  const ev = $("events");
+  return !ev || ev.scrollTop + ev.clientHeight >= ev.scrollHeight - NEAR_BOTTOM_PX;
+}
+
+function setUnseen(n) {
+  unseen = n;
+  const pill = $("new-events");
+  if (!pill) return;
+  pill.hidden = n <= 0;
+  pill.textContent = n > 0 ? `↓ ${n} new` : "";
+}
+
+function jumpToLatest() {
+  const ev = $("events");
+  if (ev) ev.scrollTop = ev.scrollHeight;
+  setUnseen(0);
+}
+
+// Called for every event that lands in the transcript: autoscroll when pinned, count when not.
+function followEvents() {
+  if (nearBottom()) { jumpToLatest(); return; }
+  setUnseen(unseen + 1);
+}
+
+// Reaching the bottom by hand reads the backlog — the pill's count is spent.
+$("events").addEventListener("scroll", () => { if (nearBottom()) setUnseen(0); });
+$("new-events").addEventListener("click", jumpToLatest);
+
+// ---- long bodies -------------------------------------------------------------------------------------
+// A card taller than a screenful of transcript folds to a preview with a fade — the pattern
+// Hermes uses for tool rows. The choice lives on the card (.clamped/.open), so a streaming body
+// that re-renders on every delta keeps whatever the reader picked.
+const CLAMP_PX = 300;
+
+function clampBody(el) {
+  const body = el.querySelector(":scope > .body");
+  if (!body) return;
+  const tall = body.scrollHeight > CLAMP_PX;
+  let tog = el.querySelector(":scope > .body-toggle");
+  if (!tall) {
+    if (tog) { tog.remove(); }
+    el.classList.remove("clamped", "open");
+    return;
+  }
+  el.classList.add("clamped");
+  if (!tog) {
+    tog = document.createElement("button");
+    tog.type = "button";
+    tog.className = "body-toggle";
+    tog.addEventListener("click", () => {
+      el.classList.toggle("open");
+      tog.textContent = el.classList.contains("open") ? "show less ↑" : "show all ↓";
+    });
+    tog.textContent = "show all ↓";
+    el.appendChild(tog);
+  }
 }
 
 // Collapse a burst of tool events into one line. A start names the tool; the matching finish
@@ -204,6 +272,8 @@ function appendDelta(seq, text) {
   // word, so the accumulated source has to survive each render.
   streamingText += text;
   streaming.innerHTML = mdToHtml(esc(streamingText));
+  // The streaming card is the one that grows past the fold — re-check the clamp on every delta.
+  if (streaming.parentElement) clampBody(streaming.parentElement);
 }
 
 function renderEvent(frame) {
