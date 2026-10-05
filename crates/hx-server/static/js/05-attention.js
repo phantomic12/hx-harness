@@ -98,9 +98,8 @@ function paintAttention() {
     watch.textContent = `watch ${attnChallenge.screen || "it"}`;
     watch.addEventListener("click", () => {
       // Reveal the pane first — the person clears the wall in the screen, not in this row.
-      const btn = document.querySelector('.top-views button[data-view="screen"]');
       const pane = $("dp-screen");
-      if (btn && ($("drawer").hidden || (pane && pane.hidden))) btn.click();
+      if (($("drawer").hidden || (pane && pane.hidden)) && window.__showTab) window.__showTab("screen");
       watchChallenge();
     });
     acts.appendChild(watch);

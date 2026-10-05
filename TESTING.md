@@ -1059,6 +1059,23 @@ Deliberately not borrowed: split panes (hx's transcript is a single stream), art
 (hx approvals gate capabilities, not file diffs), and a per-message model switcher (provider
 selection is task-level config, not composer-level).
 
+A third pass removed chrome instead of adding it — the palette already centralizes commands, so
+the buttons it replaced came out rather than staying as duplicates:
+
+- **one pane switcher**: the top bar rendered the same pane list the drawer's tabs own. The bar
+  now keeps only `tasks` (the rail toggle); `ctrl+2..7`, the palette's pane rows, the challenge
+  deep link, and `watch it` all call the drawer's `showTab` — one place panes live, not two.
+- **one menu**: `density` + `?` + `login` became a single `☰ menu` button that opens the palette —
+  the mouse's door to the same command list `ctrl+k` gives the keyboard. Auth state survives as a
+  `has-token` cue + title on that button (the old account button's job).
+- **quiet rail**: `hosts` and `spend` now start folded (choice still remembered per card);
+  `approvals` stays open — it's the queue that can wait on a person, so it earns its space.
+- **composer footer**: the hint reads `enter sends · prompts typed mid-run queue below` +
+  `ctrl+k everything else`.
+- **prose, not ledger**: agent text events drop their `#N KIND` headers (`.flow` — seq/kind/raw-JSON
+  door still there on hover/focus-within); approvals, turns, tool calls and user prompts keep
+  headers, so control reads as control.
+
 **The rendered-browser gate** (`scripts/check_web_client.py`, check 15) is the part that is new
 evidence, not just new code: headless Chromium loads the served page and asserts (a) **zero
 console errors**, (b) JS-rendered contents exist — `.sess` rows are empty in the markup and only

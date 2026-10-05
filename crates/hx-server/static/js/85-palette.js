@@ -14,7 +14,12 @@ function palCommands() {
   const cmds = [];
   const pane = (label, hint, view) => cmds.push({
     section: "panes", label, hint,
-    run: () => { const b = document.querySelector(`.top-views button[data-view="${view}"]`); if (b) b.click(); },
+    run: () => {
+      if (view === "side") {
+        const b = document.querySelector('.top-views button[data-view="side"]');
+        if (b) b.click();
+      } else if (window.__showTab) window.__showTab(view);
+    },
   });
   const act = (label, hint, fn) => cmds.push({ section: "actions", label, hint, run: fn });
 
@@ -41,9 +46,9 @@ function palCommands() {
   act("delete task", "", deleteSession);
   act("focus the prompt", "ctrl+/", () => $("prompt").focus());
   if (sessionId && activeRuns.has(sessionId)) act("stop the run", "", stopRun);
-  act("toggle density", "", () => $("density-toggle").click());
+  act("toggle density", "", () => setDensity(document.body.dataset.density === "compact" ? "" : "compact"));
   act("keyboard shortcuts", "?", openHelp);
-  act("log in / out", "", () => $("token-button").click());
+  act("log in / out", "", toggleAccountPanel);
   return cmds;
 }
 

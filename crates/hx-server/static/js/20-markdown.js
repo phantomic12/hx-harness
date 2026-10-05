@@ -249,7 +249,7 @@ function appendDelta(seq, text) {
   const host = $("events");
   if (!streaming || !streaming.isConnected) {
     const el = document.createElement("div");
-    el.className = "event role-agent";
+    el.className = "event role-agent flow";
     const meta = document.createElement("div");
     meta.className = "meta";
     const s = document.createElement("span");
@@ -285,7 +285,12 @@ function renderEvent(frame) {
   if (k === "message_received" || /(user|prompt|human|input)/.test(k)) role = "user";
   else if (/(tool|exec|command|call|result|output)/.test(k)) role = "tool";
   else if (/(system|status|notice|error|approval)/.test(k)) role = "system";
-  el.className = `event role-${role}`;
+  // Text-shaped agent output gets no header row — the answer reads as flowing prose, and the
+  // seq/kind/meta still exist on hover (the kind label remains the door to the raw event).
+  // Control events — approvals, turns, tool calls, user prompts — keep their headers: the
+  // kind badge is how a person tells "the daemon did something" from "the daemon said something".
+  const flow = role === "agent" && /(text|delta|token)/.test(k);
+  el.className = `event role-${role}${flow ? " flow" : ""}`;
   const meta = document.createElement("div");
   meta.className = "meta";
   const seq = document.createElement("span");

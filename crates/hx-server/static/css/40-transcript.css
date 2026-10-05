@@ -84,6 +84,15 @@
 .event .actions button:hover { color: var(--tx-0); border-color: var(--accent); }
 .event .note { color: var(--tx-1); font-size: var(--fs-sm); font-family: var(--mono); }
 
+/* Flow events (agent text) read as prose: the meta row is demoted to a hover affordance, so a
+   transcript of answers looks like an answer, not a ledger. The kind badge still works — it is
+   the same element, just quiet until asked. */
+.event.flow > .meta {
+  opacity: 0; max-height: 0; margin: 0; overflow: hidden;
+  transition: opacity var(--dur) var(--ease), max-height var(--dur) var(--ease);
+}
+.event.flow:hover > .meta, .event.flow:focus-within > .meta { opacity: 1; max-height: 2em; }
+
 /* Long bodies fold to a preview (the Hermes tool-row pattern): the toggle only exists on cards
    tall enough to need one, and the collapsed fade signals there is more below the fold. The
    `.clamped`/`.open` classes live on the event card, so a streaming body that re-renders keeps

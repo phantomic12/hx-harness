@@ -225,10 +225,14 @@ const narrowMQ = window.matchMedia("(max-width: 980px)");
 
 // ---- account panel wiring -----------------------------------------------------------------------
 
-$("token-button").addEventListener("click", () => {
+// The palette's "log in / out" action and the removed account button share this path.
+function toggleAccountPanel() {
   $("token-panel").hidden = !$("token-panel").hidden;
   if (!$("token-panel").hidden) ($("login-user").value ? $("login-pass") : $("login-user")).focus();
-});
+}
+// The hamburger is the palette's mouse door — every command a top-bar button used to own lives
+// behind it, so there is exactly one place "everything else" can come from.
+$("menu-open").addEventListener("click", () => openPalette());
 async function panelLogin() {
   // Advanced fallback: a pasted bearer token is stored directly, no login round-trip.
   const pasted = $("token-input").value.trim();
@@ -444,27 +448,26 @@ const DENSITY_KEY = "hx.density";
 function setDensity(mode) {
   document.body.dataset.density = mode;
   try { localStorage.setItem(DENSITY_KEY, mode); } catch (_) {}
-  const b = $("density-toggle");
-  b.textContent = mode === "compact" ? "compact" : "density";
-  b.setAttribute("aria-pressed", mode === "compact" ? "true" : "false");
   if (typeof fit !== "undefined" && fit) setTimeout(() => { try { fit.fit(); } catch (_) {} }, 30);
 }
 try {
   const saved = localStorage.getItem(DENSITY_KEY);
   if (saved === "compact") setDensity("compact");
 } catch (_) {}
-$("density-toggle").addEventListener("click", () => {
-  setDensity(document.body.dataset.density === "compact" ? "" : "compact");
-});
 
 // ---- rail card folds ------------------------------------------------------------------------------
 // Each section header's chevron folds its card; the choice is remembered per card.
 const FOLD_KEY = "hx.folds";
 let folds = {};
 try { folds = JSON.parse(localStorage.getItem(FOLD_KEY) || "{}"); } catch (_) {}
+// Reference cards the rail carries but nobody opens first — hosts and spend start folded; a
+// first visit should read as "tasks, and only tasks". Approvals stays open: it's the queue that
+// can wait on a person, so it earns the space it takes.
+const FOLDED_BY_DEFAULT = new Set(["hosts", "spend"]);
 for (const card of document.querySelectorAll(".card[data-card]")) {
   const name = card.dataset.card;
   const btn = card.querySelector("h2 button.fold");
+  if (!(name in folds)) folds[name] = FOLDED_BY_DEFAULT.has(name);
   const apply = () => {
     const folded = !!folds[name];
     card.dataset.folded = folded ? "1" : "0";
@@ -487,7 +490,6 @@ function openHelp() {
   $("help-close").focus();
 }
 function closeHelp() { $("help").hidden = true; }
-$("help-open").addEventListener("click", openHelp);
 $("help-close").addEventListener("click", closeHelp);
 $("help").addEventListener("click", (e) => { if (e.target === $("help")) closeHelp(); });
 
@@ -525,11 +527,17 @@ document.addEventListener("keydown", (e) => {
     return;
   }
   // Pane chords work even inside fields — that is the point of a chord rather than a bare key.
+  // The drawer owns pane switching: ctrl+1 toggles the rail, ctrl+2..7 land on drawer tabs.
   if (e.ctrlKey && !e.shiftKey && !e.altKey && e.key >= "1" && e.key <= "7") {
     const order = ["side", "terminal", "screen", "diff", "review", "fanout", "providers"];
     const v = order[Number(e.key) - 1];
-    const btn = document.querySelector(`.top-views button[data-view="${v}"]`);
-    if (btn) { btn.click(); e.preventDefault(); }
+    if (v === "side") {
+      const btn = document.querySelector('.top-views button[data-view="side"]');
+      if (btn) { btn.click(); e.preventDefault(); }
+    } else if (window.__showTab) {
+      window.__showTab(v);
+      e.preventDefault();
+    }
     return;
   }
   if (e.ctrlKey && !e.shiftKey && e.key === "\\") {
@@ -571,6 +579,6 @@ document.addEventListener("keydown", (e) => {
     const side = $("side");
     const btn = document.querySelector('.top-views button[data-view="side"]');
     if (side.hidden && btn) btn.click();
-    if (attnChallenge) document.querySelector('.top-views button[data-view="screen"]')?.click();
+    if (attnChallenge && window.__showTab) window.__showTab("screen");
   }
 });

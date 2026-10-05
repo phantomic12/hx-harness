@@ -94,7 +94,7 @@ function paintChallengeStale() {
 
 /// Say so on the tab that is hiding the banner.
 function markChallengeTabs(needed) {
-  document.querySelectorAll('[data-view="screen"], [data-tab="screen"]').forEach((el) => {
+  document.querySelectorAll('[data-tab="screen"]').forEach((el) => {
     el.classList.toggle("need", needed);
   });
 }
@@ -146,9 +146,8 @@ async function followScreenLink() {
   if (!id) return false;
   const drawer = $("drawer");
   const pane = $("dp-screen");
-  if (drawer && (drawer.hidden || (pane && pane.hidden))) {
-    const button = document.querySelector('.top-views button[data-view="screen"]');
-    if (button) button.click();
+  if (drawer && (drawer.hidden || (pane && pane.hidden)) && window.__showTab) {
+    window.__showTab("screen");
   }
   screenEnded = false;
   screenId = id;

@@ -9,17 +9,9 @@
   <span id="spend-ticker" title="spend over the last 30 days — see the spend panel for the breakdown"></span>
   <nav class="top-views" aria-label="panels">
     <button data-view="side" class="active" aria-pressed="true" aria-keyshortcuts="Control+1" title="toggle the task list (ctrl+1)">tasks</button>
-    <button data-view="terminal" class="active" aria-pressed="true" aria-keyshortcuts="Control+2" title="terminal (ctrl+2)">terminal</button>
-    <button data-view="screen" aria-pressed="false" aria-keyshortcuts="Control+3" title="a live browser the daemon runs (ctrl+3)">screen</button>
-    <button data-view="diff" aria-pressed="false" aria-keyshortcuts="Control+4" title="diff/review (ctrl+4)">diff</button>
-    <button data-view="review" aria-pressed="false" aria-keyshortcuts="Control+5" title="what this task changed (ctrl+5)">review</button>
-    <button data-view="fanout" aria-pressed="false" aria-keyshortcuts="Control+6" title="fan-out (ctrl+6)">fan-out</button>
-    <button data-view="providers" aria-pressed="false" aria-keyshortcuts="Control+7" title="providers / settings (ctrl+7)">providers</button>
   </nav>
   <div class="spacer"></div>
-  <button id="density-toggle" class="token-button" title="density — comfortable ↔ compact">density</button>
-  <button id="help-open" class="token-button" title="keyboard shortcuts (?)">?</button>
-  <button id="token-button" class="token-button" title="account — log in / out">login</button>
+  <button id="menu-open" class="token-button" title="everything else — tasks, panes, actions (ctrl+k)">☰ menu</button>
 </header>
 <div id="token-panel" class="token-panel" hidden>
   <span class="dim">account</span>
@@ -94,7 +86,7 @@
         <button id="stop" class="stop" hidden title="stop the run in flight on this task">stop</button>
       </div>
       <div class="queue" id="queue"></div>
-      <div class="hint"><span>one task per conversation · prompts typed mid-run queue below · Enter sends</span><span class="keys"><kbd>?</kbd> shortcuts <kbd>ctrl+k</kbd> jump <kbd>ctrl+/</kbd> prompt <kbd>ctrl+\</kbd> panel</span></div>
+      <div class="hint"><span>enter sends · prompts typed mid-run queue below</span><span class="keys"><kbd>ctrl+k</kbd> everything else</span></div>
       <div class="error" id="error" role="alert"></div>
     </div>
   </main>

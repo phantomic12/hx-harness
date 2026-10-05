@@ -51,8 +51,10 @@ async function doLogin(username, password) {
   return data.token;
 }
 
-// Single place that reflects auth state: panel status text + top-bar account button.
-// Runs on load and on every setToken, so the button reads login/logout without a reload.
+// Single place that reflects auth state: panel status text + the menu button's account hint.
+// Runs on load and on every setToken, so the menu button hints account state without a reload —
+// a green dot on the hamburger is the only top-bar cue auth still gets after the triplet folded
+// into the palette.
 function refreshAuthUI() {
   const has = !!apiToken();
   try {
@@ -60,11 +62,12 @@ function refreshAuthUI() {
     if (st) { st.textContent = has ? "logged in" : "not logged in"; st.classList.toggle("err", false); }
   } catch (_) {}
   try {
-    const btn = document.getElementById("token-button");
+    const btn = document.getElementById("menu-open");
     if (btn) {
       btn.classList.toggle("has-token", has);
-      btn.textContent = has ? "account ✓" : "login";
-      btn.title = has ? "account — logged in (click to log out / switch)" : "account — log in";
+      btn.title = has
+        ? "everything else — tasks, panes, actions (ctrl+k) · account: logged in"
+        : "everything else — tasks, panes, actions (ctrl+k) · account: not logged in";
     }
   } catch (_) {}
 }
