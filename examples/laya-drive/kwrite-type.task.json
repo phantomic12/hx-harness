@@ -18,7 +18,7 @@
   "on_true": "wait",
   "on_false": "type_greeting",
   "done_question": "has_greeting",
-  "done_threshold": 0.55,
+  "done_threshold": 0.45,
   "threshold": 0.6,
   "min_confidence": 0.0,
   "tick_ms": 700,

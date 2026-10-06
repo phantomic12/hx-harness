@@ -12,7 +12,7 @@
   "questions": {
     "save_dialog": {
       "type": "noul",
-      "instructions": "A dialog offers 'Save', 'Discard' and 'Cancel' \u2014 the document wants to be saved or discarded before closing."
+      "instructions": "A button labelled 'Discard' is showing \u2014 the editor is blocked by a save-or-discard dialog."
     },
     "document_gone": {
       "type": "noul",
@@ -23,8 +23,8 @@
   "on_true": "click_save",
   "on_false": "close_doc",
   "done_question": "document_gone",
-  "done_threshold": 0.6,
-  "threshold": 0.6,
+  "done_threshold": 0.65,
+  "threshold": 0.55,
   "min_confidence": 0.0,
   "tick_ms": 800,
   "max_steps": 10,
