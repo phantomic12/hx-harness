@@ -217,6 +217,21 @@ enum Command {
         threshold: f32,
     },
 
+    /// Drive a terminal program with Laya: sense a tmux pane each tick, let the
+    /// sidecar pick the next action from a fixed set, and send the keys — the
+    /// consumer rung on top of `hx decision` ("accelerated computer use").
+    ///
+    /// The task spec is a JSON file bundling the tmux target, the question set,
+    /// and a keyspec per action id (see docs/laya.md for a worked example).
+    Drive {
+        /// The sidecar base URL. Defaults to `HX_LAYA_URL`, then `http://127.0.0.1:8770`.
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Path to the drive task spec JSON.
+        task: String,
+    },
+
     /// Show the configured hosts.
     Hosts,
 
@@ -530,6 +545,14 @@ async fn main() -> Result<()> {
                 .or_else(|| std::env::var("HX_LAYA_URL").ok())
                 .unwrap_or_else(|| "http://127.0.0.1:8770".to_string());
             commands::run_decision(&base, &state, &questions, threshold).await?;
+        }
+
+        Command::Drive { url, task } => {
+            let base = url
+                .clone()
+                .or_else(|| std::env::var("HX_LAYA_URL").ok())
+                .unwrap_or_else(|| "http://127.0.0.1:8770".to_string());
+            commands::run_drive(&base, &task).await?;
         }
 
         Command::Hosts => print!("{}", commands::render_hosts(&config)),

@@ -10,9 +10,9 @@ small loopback HTTP **sidecar** (the only process that imports `laya`). The Rust
 `crates/hx-decision` (typed schema + `LayaClient`), the CLI surface is `hx decision`, and the
 self-check is the `hx doctor` Laya probe.
 
-> Milestone scope: this is the **decision substrate**. Laya is *not* yet wired as a screen/browser
-> rung — that is the documented follow-up (see ROADMAP). This milestone gives you a typed decision layer in
-> front of LLMs and a CLI to drive it.
+> Milestone scope: the decision substrate plus the first consumer rung — `hx drive` senses a tmux
+> pane each tick and presses keys from Laya's answers (below). Browser/desktop control and faster
+> frame rates remain the follow-up (see ROADMAP).
 
 ## What Laya is not
 
@@ -96,6 +96,57 @@ pay LLM latency and cost on, so measure it.
   subtle/graded ones are not (35% five-level star rating).
 * Measure before shipping: run 50–200 real examples, record accuracy per question and how often the top
   probability clears your threshold and is right when it does.
+
+## `hx drive` — terminal control
+
+`hx drive <task.json>` runs the loop: sense the last N lines of a tmux pane → ask the sidecar one
+question set → press the winning action's keys (`tmux send-keys`) → repeat until the done question
+fires, the gate escalates too many times in a row, or `max_steps` is hit.
+
+```json
+{
+  "tmux": { "target": "hx-ops", "lines": 40 },
+  "actions": { "confirm": "y Enter", "decline": "n Enter", "wait": null },
+  "questions": {
+    "step_pending":  { "type": "noul", "instructions": "A runbook step waits for a yes or no keypress." },
+    "mentions_delete": { "type": "noul", "instructions": "The pending step's text asks to drop, delete, destroy, wipe, or recreate a database or volume." },
+    "finished":      { "type": "noul", "instructions": "The pane shows RUNBOOK COMPLETE or DECLINED and a shell prompt." }
+  },
+  "action_question": "step_pending",
+  "on_true": "confirm", "on_false": "wait",
+  "guard_question": "mentions_delete", "guard_action": "decline", "guard_threshold": 0.8,
+  "done_question": "finished", "done_threshold": 0.8,
+  "threshold": 0.7, "tick_ms": 800, "max_steps": 40, "max_escalations": 3
+}
+```
+
+* `actions` maps action ids to tmux keyspecs (`"y Enter"`, `"C-c"`); `null` means press nothing.
+  Interactive prompts often line-buffer — send `y Enter`, not `y`.
+* `action_question` may be a `choice` (winner's option id runs) or a `noul` (confident side runs
+  `on_true`/`on_false`; an ambiguous middle escalates). Binary nouls read much sharper than
+  two-option choices — prefer them.
+* `guard_question` + `guard_action` + `guard_threshold`: a veto checked before the action answer
+  each tick — when P(guard) clears its threshold the guard action runs *instead of* the model's
+  pick. This is the deny-list layer: a confident-but-wrong pick cannot override it.
+* `done_question`/`done_threshold`: a noul that ends the drive early when the program exits.
+* `threshold`/`min_confidence`/`tick_ms`/`max_steps`/`max_escalations` bound the loop; the last
+  escalation stops the drive rather than guessing.
+
+Two worked specs ship in `examples/laya-drive/` (`ops-console` — a runbook whose destructive step
+gets vetoed; `git-add-p` — stage hunks but skip ones adding secrets), with the live traces in
+TESTING.md. What they teach:
+
+* **Keep the sense window tight** (`lines`: 10–20). Scrollback dilutes every question — a veto that
+  reads 0.80 on the live hunk can fall to 0.63 under a screen of history, and a done question can
+  misfire on an old prompt line. Aim the window at where the live decision text sits.
+* **Quote the literal prompt shape** in questions. "A shell prompt ending in a dollar sign"
+  separates cleanly where "the program finished" does not — the model reads scrollback, not just
+  the last line, so name the visible cue.
+* **Veto phrasing is mention-detection, not judgment.** "asks to drop, delete, destroy…" scored
+  0.87 where "permanently destroys data" scored 0.22 on the same screen.
+* **CPU is too slow for real-time games.** At ~0.5–1.5 s/tick, prompt-driven and turn-based
+  programs drive correctly; moon-buggy crashes on the first crater while `obstacle_ahead` can't
+  read ASCII art. Frame-rate play needs the GPU path and a prose state encoder.
 
 ## How it fits hx
 

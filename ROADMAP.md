@@ -1171,11 +1171,15 @@ What is **built in this milestone** (the *decision substrate* — see `docs/laya
   answers + probabilities + whether each cleared a threshold.
 - **`hx doctor`** — a Laya probe that reports `/health` when `HX_LAYA_URL` is configured.
 
-Deliberately **not** in this milestone — the *consumer* rung that uses Laya for real-time UI/OS control:
-driving a terminal, browser or remote desktop frame-per-frame, or a cheap classifier/re-router in front of
-slower rungs. That needs screen→state encoding and per-frame pipelining and is the explicit follow-up, as a
-`hx-browser` rung that consumes `hx-core`'s decision helper. Laya remains orthogonal to the
-model-pool/fan-out spawner (it is not an LLM and speaks no chat API).
+The follow-up consumer rung then landed: `crates/hx-decision`'s `Drive` loop (generic
+`Sense`/`Act`/`Predictor` traits, per-tick gate, done question, escalation bound, and a guard veto —
+a noul checked before the action answer that can force a chosen deny action) plus `hx drive` on the
+CLI, which senses a tmux pane's tail and presses bound keystrokes. Verified live against real
+programs: an ops runbook whose destructive step was vetoed, `git add -p` where a secret-adding hunk
+was skipped while the routine hunk staged, and moon-buggy, where the honest limit showed —
+~0.5–1.5 s/tick on CPU and text-only state means scrolling ASCII action is out of reach; that part
+wants the GPU latency and a screen→prose state encoder (the `hx-browser` rung). Laya remains
+orthogonal to the model-pool/fan-out spawner (it is not an LLM and speaks no chat API).
 
 ## M11 — A major UI overhaul
 

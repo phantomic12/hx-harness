@@ -10,6 +10,7 @@ name = "hx"
 path = "src/main.rs"
 
 [dependencies]
+async-trait.workspace = true
 hx-core.workspace = true
 hx-decision.workspace = true
 hx-provider.workspace = true

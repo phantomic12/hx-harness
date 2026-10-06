@@ -1,0 +1,35 @@
+{
+  "tmux": { "target": "hx-ops", "lines": 40 },
+  "actions": {
+    "confirm": "y Enter",
+    "decline": "n Enter",
+    "wait": null
+  },
+  "questions": {
+    "step_pending": {
+      "type": "noul",
+      "instructions": "A runbook step is displayed on the terminal and it waits for a yes or no keypress to proceed."
+    },
+    "mentions_delete": {
+      "type": "noul",
+      "instructions": "The pending step's text asks to drop, delete, destroy, wipe, or recreate a database or volume."
+    },
+    "finished": {
+      "type": "noul",
+      "instructions": "The runbook has ended: the pane shows RUNBOOK COMPLETE or DECLINED and a shell prompt."
+    }
+  },
+  "action_question": "step_pending",
+  "on_true": "confirm",
+  "on_false": "wait",
+  "guard_question": "mentions_delete",
+  "guard_action": "decline",
+  "guard_threshold": 0.8,
+  "done_question": "finished",
+  "done_threshold": 0.8,
+  "threshold": 0.7,
+  "min_confidence": 0.0,
+  "tick_ms": 800,
+  "max_steps": 40,
+  "max_escalations": 3
+}

@@ -504,24 +504,7 @@ pub async fn run_decision(
         .map_err(|e| anyhow::anyhow!("reading questions file {}: {e}", questions_path))?;
     let parsed: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| anyhow::anyhow!("parsing questions file {}: {e}", questions_path))?;
-    let mut questions: Vec<Question> = Vec::new();
-    match parsed {
-        serde_json::Value::Object(map) => {
-            for (id, qv) in map {
-                let q: Question = serde_json::from_value(qv)
-                    .map_err(|e| anyhow::anyhow!("question '{id}' is not valid: {e}"))?;
-                questions.push(q);
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            for qv in arr {
-                let q: Question = serde_json::from_value(qv)
-                    .map_err(|e| anyhow::anyhow!("question is not valid: {e}"))?;
-                questions.push(q);
-            }
-        }
-        _ => anyhow::bail!("questions file must be a JSON object or array of questions"),
-    }
+    let questions: Vec<Question> = parse_questions(&parsed)?;
 
     let qs = QuestionSet::new(state_text, questions);
     let client = LayaClient::new(base_url);
@@ -578,6 +561,337 @@ pub async fn run_decision(
     }
     let _ = writeln!(out, "input_tokens: {}", res.usage_input_tokens);
     print!("{out}");
+    anyhow::Ok(())
+}
+
+// ---- hx drive: the Laya consumer loop --------------------------------------
+//
+// `hx decision` asks once; `hx drive` closes the loop — sense a tmux pane, let
+// Laya pick the next action from a fixed set, send the keys — the "accelerated
+// computer use" rung the ROADMAP names as M10's consumer. One tmux pane is both
+// sensor (`capture-pane`) and actuator (`send-keys`).
+
+/// The `hx drive` task spec (`task.json`). See docs/laya.md for a worked one.
+#[derive(Debug, serde::Deserialize)]
+struct DriveTask {
+    /// Which pane to drive.
+    tmux: DriveTmux,
+    /// Maps each option id of the action question to a `tmux send-keys`
+    /// argument list ("Enter", "y Enter", "C-c") — `null` means "do nothing
+    /// this tick" (the wait/no-op action).
+    actions: std::collections::HashMap<String, Option<String>>,
+    /// Question set: an object `id -> question`, or an array of questions —
+    /// the same shape `hx decision --questions` accepts.
+    questions: serde_json::Value,
+    /// The question whose answer selects the action: a `choice` runs the
+    /// winning option's id; a `noul` runs `on_true` or `on_false`.
+    action_question: String,
+    /// For a noul `action_question`: the action id to run when the answer is
+    /// true. Must name an entry in `actions`.
+    #[serde(default)]
+    on_true: Option<String>,
+    /// For a noul `action_question`: the action id to run when the answer is
+    /// false. The drive acts on whichever side is confident — a muddled
+    /// middle (the screen is unclear) escalates instead of pressing anything.
+    #[serde(default)]
+    on_false: Option<String>,
+    /// Optional noul question ("is it finished?") that ends the drive early.
+    #[serde(default)]
+    done_question: Option<String>,
+    /// P(true) on `done_question` that ends the drive (default 0.8).
+    #[serde(default = "default_done_threshold")]
+    done_threshold: f32,
+    /// Top-probability the action answer must clear to execute (default 0.8).
+    #[serde(default = "default_threshold")]
+    threshold: f32,
+    /// Confidence floor — flat distributions escalate even above `threshold`.
+    #[serde(default)]
+    min_confidence: f32,
+    /// Minimum spacing between ticks, milliseconds (default 400).
+    #[serde(default = "default_tick_ms")]
+    tick_ms: u64,
+    /// Hard cap on loop iterations (default 60).
+    #[serde(default = "default_max_steps")]
+    max_steps: usize,
+    /// Consecutive escalations tolerated before the drive stops (default 0:
+    /// the first escalate stops). A transient ambiguous frame resolves on the
+    /// next sense, so a small value like 2–3 is right for noisy programs.
+    #[serde(default)]
+    max_escalations: usize,
+    /// Optional guard: a noul question id checked *before* the action answer
+    /// each tick. When its P(true) reaches `guard_threshold`, `guard_action`
+    /// runs instead of the action answer — a fast veto for "this step is on
+    /// the deny list" that a confident-but-wrong pick cannot override.
+    #[serde(default)]
+    guard_question: Option<String>,
+    /// P(true) on `guard_question` that fires the veto (default 0.8).
+    #[serde(default = "default_done_threshold")]
+    guard_threshold: f32,
+    /// The action id executed when the guard fires.
+    #[serde(default)]
+    guard_action: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DriveTmux {
+    /// A tmux target: `session`, `session:window`, or `session:window.pane`.
+    target: String,
+    /// How many lines of scrollback `capture-pane` hands the model (default 40).
+    #[serde(default = "default_lines")]
+    lines: usize,
+}
+
+fn default_done_threshold() -> f32 {
+    0.8
+}
+fn default_threshold() -> f32 {
+    0.8
+}
+fn default_tick_ms() -> u64 {
+    400
+}
+fn default_max_steps() -> usize {
+    60
+}
+fn default_lines() -> usize {
+    40
+}
+
+/// The sensor half of a tmux pane: `capture-pane` is the eyes.
+struct TmuxSense {
+    target: String,
+    lines: usize,
+}
+
+/// The actuator half: `send-keys` is the hands, one keyspec per action id.
+struct TmuxAct {
+    target: String,
+    keys: std::collections::HashMap<String, Option<String>>,
+}
+
+async fn tmux(args: &[&str]) -> std::io::Result<std::process::Output> {
+    tokio::process::Command::new("tmux")
+        .args(args)
+        .output()
+        .await
+}
+
+#[async_trait::async_trait]
+impl hx_decision::Sense for TmuxSense {
+    async fn sense(&mut self) -> hx_core::error::Result<String> {
+        use hx_core::error::HxError;
+        let span = format!("-{}", self.lines);
+        let out = tmux(&["capture-pane", "-p", "-t", &self.target, "-S", &span])
+            .await
+            .map_err(|e| HxError::Decision(format!("running tmux capture-pane: {e}")))?;
+        if !out.status.success() {
+            return Err(HxError::Decision(format!(
+                "tmux capture-pane -t {} failed: {}",
+                self.target,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        let text = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+        if text.is_empty() {
+            return Err(HxError::Decision(format!(
+                "tmux capture-pane -t {} returned an empty pane",
+                self.target
+            )));
+        }
+        Ok(text)
+    }
+}
+
+#[async_trait::async_trait]
+impl hx_decision::Act for TmuxAct {
+    async fn act(&mut self, action_id: &str) -> hx_core::error::Result<()> {
+        use hx_core::error::HxError;
+        let spec = self
+            .keys
+            .get(action_id)
+            .ok_or_else(|| HxError::Decision(format!("no key binding for action '{action_id}'")))?;
+        let Some(spec) = spec else {
+            return Ok(()); // bound to null: the do-nothing action
+        };
+        let mut args: Vec<&str> = vec!["send-keys", "-t", &self.target];
+        args.extend(spec.split_whitespace());
+        let out = tmux(&args)
+            .await
+            .map_err(|e| HxError::Decision(format!("running tmux send-keys: {e}")))?;
+        if !out.status.success() {
+            return Err(HxError::Decision(format!(
+                "tmux send-keys -t {} failed: {}",
+                self.target,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Parse a question set: an object mapping `id -> question`, or an array of
+/// questions each carrying its own id (the `hx decision --questions` shape).
+/// Choice `criteria` accepts either form a person would naturally write —
+/// `[{"id": "billing", "description": "…"}]` or `{"billing": "…"}` — the map
+/// is normalized to the list form `Question` deserializes from.
+fn parse_questions(v: &serde_json::Value) -> anyhow::Result<Vec<hx_decision::Question>> {
+    /// Inject the map key as `id` when the question doesn't carry one inline.
+    fn normalize(qv: &serde_json::Value, key: Option<&str>) -> serde_json::Value {
+        let mut qv = qv.clone();
+        if let (Some(k), Some(obj)) = (key, qv.as_object_mut()) {
+            obj.entry("id".to_string())
+                .or_insert_with(|| serde_json::json!(k));
+        }
+        let criteria = qv.get("criteria");
+        if qv.get("type").and_then(|t| t.as_str()) == Some("choice")
+            && matches!(criteria, Some(serde_json::Value::Object(_)))
+        {
+            let list: Vec<serde_json::Value> = criteria
+                .and_then(|c| c.as_object())
+                .map(|m| {
+                    m.iter()
+                        .map(|(id, desc)| {
+                            serde_json::json!({"id": id, "description": desc.as_str().unwrap_or_default()})
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            qv.as_object_mut()
+                .map(|o| o.insert("criteria".to_string(), serde_json::json!(list)));
+        }
+        qv
+    }
+
+    let mut questions = Vec::new();
+    match v {
+        serde_json::Value::Object(map) => {
+            for (id, qv) in map {
+                let q = serde_json::from_value(normalize(qv, Some(id)))
+                    .map_err(|e| anyhow::anyhow!("question '{id}' is not valid: {e}"))?;
+                questions.push(q);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for qv in arr {
+                let q = serde_json::from_value(normalize(qv, None))
+                    .map_err(|e| anyhow::anyhow!("question is not valid: {e}"))?;
+                questions.push(q);
+            }
+        }
+        _ => anyhow::bail!("questions must be a JSON object or array of questions"),
+    }
+    Ok(questions)
+}
+
+pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
+    use hx_core::decision::{DecisionGate, Threshold};
+    use hx_decision::{Drive, LayaClient, Outcome, Question};
+
+    let raw = std::fs::read_to_string(task_path)
+        .map_err(|e| anyhow::anyhow!("reading task file {}: {e}", task_path))?;
+    let task: DriveTask = serde_json::from_str(&raw)
+        .map_err(|e| anyhow::anyhow!("parsing task file {}: {e}", task_path))?;
+    let questions: Vec<Question> = parse_questions(&task.questions)?;
+
+    // Every option the action question can pick must have a key binding (null
+    // counts — it binds "do nothing").
+    let action_options: Vec<String> = questions
+        .iter()
+        .find_map(|q| match q {
+            Question::Choice { id, criteria, .. } if *id == task.action_question => {
+                Some(criteria.iter().map(|o| o.id.clone()).collect())
+            }
+            _ => None,
+        })
+        .unwrap_or_default();
+    for option in &action_options {
+        if !task.actions.contains_key(option) {
+            anyhow::bail!(
+                "action question '{}' has option '{option}' but the task spec binds no keys for it",
+                task.action_question
+            );
+        }
+    }
+
+    let client = LayaClient::new(base_url);
+    client.health().await.map_err(|e| {
+        anyhow::anyhow!("{e} — is the sidecar running? see docs/laya.md (examples/laya-sidecar.py)")
+    })?;
+
+    let drive = Drive {
+        questions,
+        action_question: task.action_question.clone(),
+        done_question: task.done_question.clone(),
+        done_threshold: task.done_threshold,
+        gate: DecisionGate::new(Threshold::new(task.threshold), task.min_confidence),
+        tick: Duration::from_millis(task.tick_ms),
+        max_steps: task.max_steps,
+        max_escalations: task.max_escalations,
+        guard_question: task.guard_question.clone(),
+        guard_threshold: task.guard_threshold,
+        guard_action: task.guard_action.clone(),
+        noul_actions: match (task.on_true, task.on_false) {
+            (Some(t), Some(f)) => Some((t, f)),
+            _ => None,
+        },
+    };
+    drive.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut sensor = TmuxSense {
+        target: task.tmux.target.clone(),
+        lines: task.tmux.lines,
+    };
+    let mut actuator = TmuxAct {
+        target: task.tmux.target.clone(),
+        keys: task.actions.clone(),
+    };
+
+    println!(
+        "hx drive: {} on tmux '{}' (tick {}ms, max {} steps, threshold {:.2})",
+        task_path, task.tmux.target, task.tick_ms, task.max_steps, task.threshold
+    );
+
+    let mut printer = |step: &hx_decision::Step| {
+        let picked = step.action.as_deref().unwrap_or("-");
+        let verdict = if step.decision.escalated() {
+            "escalate"
+        } else if step.via_guard {
+            "guard"
+        } else {
+            "act"
+        };
+        println!(
+            "  #{:<3} {:<8} p={:.3} conf={:.3} {:>6}ms  {}",
+            step.index,
+            picked,
+            step.top_probability,
+            step.confidence,
+            step.elapsed.as_millis(),
+            verdict,
+        );
+    };
+
+    let report = drive
+        .run(&mut sensor, &mut actuator, &client, Some(&mut printer))
+        .await?;
+
+    let outcome = match &report.outcome {
+        Outcome::Done { steps } => format!("done after {steps} steps"),
+        Outcome::Escalated => format!(
+            "escalated after {} steps ({} consecutive gate failures)",
+            report.steps.len(),
+            task.max_escalations + 1
+        ),
+        Outcome::MaxSteps => format!("hit max_steps ({})", report.steps.len()),
+        Outcome::Failed(msg) => format!("failed: {msg}"),
+    };
+    println!(
+        "drive {}: {} — {} steps, {:.1}s",
+        task_path,
+        outcome,
+        report.steps.len(),
+        report.total_elapsed.as_secs_f32()
+    );
     anyhow::Ok(())
 }
 
