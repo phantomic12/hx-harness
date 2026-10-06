@@ -43,7 +43,7 @@
       "on_true": "wait",
       "on_false": "open_saveas",
       "done_question": "chooser",
-      "done_threshold": 0.7,
+      "done_threshold": 0.55,
       "threshold": 0.4,
       "max_steps": 8,
       "max_escalations": 3,
