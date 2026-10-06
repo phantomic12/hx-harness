@@ -1094,6 +1094,23 @@ A fourth pass kept cutting — the bar now reads `hx · connected · tasks · �
   buried button waits forever. Consecutive ops share a hairline so a run of them reads as one
   rail, not a stack of cards.
 
+A fifth pass took the mobile floor up from "it fits" to "it's a phone app":
+
+- **tap-away scrim**: below 980px the rail/drawer sheets got a dim scrim (`#sheet-scrim`,
+  MutationObserver-driven) — tapping the uncovered transcript closes the rail first, then the
+  drawer, the same order Esc unwinds them. A touchscreen has no Esc.
+- **touch targets**: ops rows, task rows, fold headers, drawer tabs, top-bar buttons, palette
+  rows and the `↓ new` pill all grow at the 980px breakpoint; drawer tabs become a
+  single-row scroller instead of wrapping.
+- **iOS details**: `viewport-fit=cover` + `env(safe-area-inset-*)` on the top bar and composer
+  for notched phones; the composer, palette, onboarding and title inputs pin to 16px at ≤640px
+  so focusing never triggers Safari's page zoom.
+- **replay isn't "new"**: frames replayed during a (re)attach no longer count on the `↓ N new`
+  pill — `snapToBottom` pins the transcript to the live edge until the socket has been quiet
+  400ms. (Also fixes the reload-time false unread count found in testing.)
+- **stale errors clear**: `turn_started` arriving now clears the composer error line — a run
+  starting is proof the last send landed (the queued-prompt path never reset it).
+
 **The rendered-browser gate** (`scripts/check_web_client.py`, check 15) is the part that is new
 evidence, not just new code: headless Chromium loads the served page and asserts (a) **zero
 console errors**, (b) JS-rendered contents exist — `.sess` rows are empty in the markup and only

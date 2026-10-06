@@ -92,6 +92,27 @@ const narrowMQ = window.matchMedia("(max-width: 980px)");
   if (narrowMQ.addEventListener) narrowMQ.addEventListener("change", applyNarrow);
   else if (narrowMQ.addListener) narrowMQ.addListener(applyNarrow);
 
+  // The tap-away door for narrow sheets — a touchscreen has no Esc. The scrim exists whenever
+  // either sheet covers the transcript; tapping it closes the rail first, then the drawer,
+  // the same order the Escape key unwinds them.
+  const scrim = $("sheet-scrim");
+  const paintScrim = () => {
+    if (!scrim) return;
+    scrim.hidden = !(narrowMQ.matches && (!$("side").hidden || !$("drawer").hidden));
+  };
+  if (scrim) {
+    new MutationObserver(paintScrim).observe($("side"), { attributes: true, attributeFilter: ["hidden"] });
+    new MutationObserver(paintScrim).observe($("drawer"), { attributes: true, attributeFilter: ["hidden"] });
+    scrim.addEventListener("click", () => {
+      if (!$("side").hidden) {
+        const b = document.querySelector('.top-views button[data-view="side"]');
+        if (b) { b.click(); return; }
+      }
+      if (!$("drawer").hidden) $("drawer-edge").click();
+    });
+    paintScrim();
+  }
+
   // Token button reflects stored state without ever showing the secret.
   try { refreshAuthUI(); } catch (_) {}
 

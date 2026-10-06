@@ -177,6 +177,25 @@
   }
   .drawer-edge { display: none; }
   .top-views { overflow-x: auto; scrollbar-width: none; }
+
+  /* A sheet with no Esc key behind it: the scrim is the tap-away door. It sits under the sheets
+     (z 35 < 40) so tapping the uncovered transcript closes whatever is open. */
+  .sheet-scrim {
+    position: fixed; z-index: 35; top: var(--top-h); right: 0; bottom: 0; left: 0;
+    background: rgba(4, 6, 10, .45);
+  }
+  .sheet-scrim[hidden] { display: none; }
+
+  /* Touch targets: a fingertip is ~7mm, not a pixel. Ops rows, tasks, fold headers, tabs and
+     palette rows all grow to meet it. */
+  .event.op { padding-top: 9px; padding-bottom: 9px; }
+  .sess { padding: var(--sp-3) var(--sp-3); }
+  .card > h2 button.fold { padding: var(--sp-2) var(--sp-3); margin: calc(-1 * var(--sp-1)); }
+  .tabs { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+  .tabs button { padding: 8px var(--sp-3); flex: none; }
+  .top-views button { padding: 8px 12px; }
+  .pal-row { padding: var(--sp-3) var(--sp-4); }
+  .new-events { padding: 8px var(--sp-5); bottom: var(--sp-4); }
 }
 @media (max-width: 640px) {
   .top { padding: 0 var(--sp-2); gap: var(--sp-2); }
@@ -186,4 +205,17 @@
   .composer-text { flex-basis: 100%; }
   .attn { flex-wrap: wrap; }
   .attn .attn-text { flex-basis: 100%; }
+
+  /* iOS Safari zooms the whole page when a focused field is under 16px — pin the fields a
+     phone user actually types in so focusing never re-scales the layout. */
+  .composer textarea, #pal-input, .ob-step input, .ob-step select, #session-label { font-size: 16px; }
+
+  /* Notched phones: keep the bar and the composer clear of the rounded corners and the home
+     indicator (viewport-fit=cover makes these insets real). */
+  .top {
+    padding-left: calc(var(--sp-2) + env(safe-area-inset-left, 0px));
+    padding-right: calc(var(--sp-2) + env(safe-area-inset-right, 0px));
+  }
+  .cwrap { padding-bottom: calc(var(--sp-2) + env(safe-area-inset-bottom, 0px)); }
+  .side { width: min(86vw, 340px); }
 }

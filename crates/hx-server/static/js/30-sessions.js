@@ -22,6 +22,11 @@ const drafts = new Map();
 // Remember the latest per task so the header can name what's answering without waiting for the
 // next frame.
 const sessionModels = new Map();
+// Frames that arrive while a (re)attach replays history must not count as "unseen" — the
+// browser restores scroll position mid-transcript on reload, which would otherwise flag the
+// whole backlog as new. The flag clears once the socket has been quiet for a beat.
+let snapToBottom = true;
+let snapTimer = 0;
 
 const sidOf = (s) => (typeof s === "string" ? s : (s && (s.id || s.session))) || "";
 const titleOf = (s) => {
@@ -125,6 +130,7 @@ async function openSession(id) {
   sessionId = id;
   lastSeq = 0;
   streaming = null;
+  snapToBottom = true;
   try { localStorage.setItem(SESSION_KEY, id); } catch (_) {}
   const events = $("events");
   if (events) events.innerHTML = "";
@@ -260,12 +266,14 @@ async function attachSession() {
       lastSeq = frame.seq;
     }
     const arrived = frame.event || {};
-    if (kindOf(arrived) === "usage" && arrived.model) {
+    const arrivedKind = kindOf(arrived);
+    if (arrivedKind === "usage" && arrived.model) {
       if (sessionModels.get(sessionId) !== arrived.model) {
         sessionModels.set(sessionId, arrived.model);
         paintTaskHeader();
       }
     }
+    if (arrivedKind === "turn_started") showError(""); // a turn starting proves the last send landed
     if (kindOf(arrived) === "text_delta" && typeof arrived.text === "string") {
       // Deltas append. A card per token would be one bordered box per word, which is how a
       // transcript becomes unreadable exactly when the model is busiest.
@@ -278,7 +286,13 @@ async function attachSession() {
     }
     noteActivity(sessionId, arrived);
     noteAttention(arrived);
-    followEvents();
+    if (snapToBottom) {
+      jumpToLatest();
+      clearTimeout(snapTimer);
+      snapTimer = setTimeout(() => { snapToBottom = false; }, 400);
+    } else {
+      followEvents();
+    }
   };
   eventSocket.onclose = (e) => {
     // A deliberate close (switching tasks reattaches under a fresh socket) is not a lost
