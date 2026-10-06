@@ -1,0 +1,64 @@
+{
+  "gui": {
+    "app": "kwrite",
+    "max_elements": 24,
+    "coord_scale": 2.0,
+    "skip_roles": ["table cell", "list item"]
+  },
+  "actions": {
+    "type_greeting": "seq:click:Untitled|text:Devin was here",
+    "open_saveas": "click:Save As...",
+    "fill_and_save": "seq:click:File name:|ctrl+a|text:devin-note.txt|click:Save",
+    "wait": null
+  },
+  "questions": {
+    "has_greeting": {
+      "type": "noul",
+      "instructions": "The document text mentions 'Devin was here'."
+    },
+    "chooser": {
+      "type": "noul",
+      "instructions": "A 'Parent Directory' button is showing."
+    },
+    "named_doc": {
+      "type": "noul",
+      "instructions": "The editor's document is named 'devin-note'."
+    }
+  },
+  "tick_ms": 700,
+  "min_confidence": 0.0,
+  "stages": [
+    {
+      "action_question": "has_greeting",
+      "on_true": "wait",
+      "on_false": "type_greeting",
+      "done_question": "has_greeting",
+      "done_threshold": 0.5,
+      "threshold": 0.55,
+      "max_steps": 6,
+      "max_escalations": 3
+    },
+    {
+      "action_question": "chooser",
+      "on_true": "wait",
+      "on_false": "open_saveas",
+      "done_question": "chooser",
+      "done_threshold": 0.7,
+      "threshold": 0.4,
+      "max_steps": 8,
+      "max_escalations": 3,
+      "window": "Save File"
+    },
+    {
+      "action_question": "chooser",
+      "on_true": "fill_and_save",
+      "on_false": "wait",
+      "done_question": "named_doc",
+      "done_threshold": 0.6,
+      "threshold": 0.4,
+      "max_steps": 8,
+      "max_escalations": 3,
+      "window": "Save File"
+    }
+  ]
+}

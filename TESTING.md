@@ -1124,6 +1124,41 @@ drive's gate held: it escalated rather than clicking the wrong button — the ca
 planner — shape tasks as state-detection → bound action, and leave sequences to the spec's
 bindings.
 
+**Multi-phase task — type, save as, name it** (`kwrite-save-as.task.json`): a `stages` spec
+composing three reactive drives — stage 1 types `Devin was here` until `has_greeting` clears;
+stage 2 senses with `window: "Save File"` (falls back to the whole app while the dialog is
+absent) and clicks the toolbar `Save As...` until `chooser` (`'Parent Directory'` showing)
+clears; stage 3 fires `fill_and_save` (`seq:click:File name:|ctrl+a|text:devin-note.txt|
+click:Save`) once `chooser` holds, and ends when `named_doc` sees the title flip:
+
+```console
+-- stage 1: has_greeting
+  #0   type_greeting  p=0.923  1404ms  act
+  #1   -              p=0.628  1427ms  act
+   stage done after 2 steps
+-- stage 2: chooser
+  #0   open_saveas    p=0.632  1868ms  act
+  #1   -              p=0.725   913ms  act
+   stage done after 2 steps
+-- stage 3: chooser
+  #0   fill_and_save  p=0.725   851ms  act
+  #1   -              p=0.843  1545ms  act
+   stage done after 2 steps
+drive …: done — 6 steps, 12.4s
+```
+
+`~/devin-note.txt` landed on disk (15 bytes) and the KWrite title flipped. The same noul
+(`chooser`) drove both dialog stages with opposite bindings — open it when absent, fill it
+when present. Two sense-side additions made this tractable: `gui.window` restricts a stage's
+element table to a dialog subtree (the save chooser's ~70 elements → 11) while falling back
+to the whole app when no matching frame exists, and `gui.skip_roles` drops grid roles
+(`table cell`, `list item`) so file rows can't crowd the cap — unfiltered, the state
+overflows the 512-token window and questions get `truncated_questions`. Phrasing probes
+that stayed mushy (~0.6–0.7 both states on "menu open", filename-in-field strings like
+`devin-note.txt`) were dropped for signals naming widgets unique to one state —
+`'Parent Directory'`, the post-save title — a lexical-presence rule that also explains why
+menu-open nouls can't separate (drop-down item names collide with toolbar ones).
+
 ## Running the suite
 
 ```bash

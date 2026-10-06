@@ -202,6 +202,61 @@ What the live suite taught (all runs on this box, kwrite/kcalc on a 3200×2400 K
   SHOWING-state filter a closed menu looks open.
 * **Hidden state traps**: windows stacked under others take stale clicks — click-to-focus raises
   whatever's topmost at the point, which is why the drive raises the target app at start.
+* **Sense filters keep the state small**: `gui.window` restricts sensing to frames whose name
+  contains it (e.g. `"Save File"` — the save dialog subtree, ~11 elements instead of ~70);
+  while no such frame exists the whole app is sensed, so a stage aimed at a dialog still sees
+  the toolbar before it opens and the editor after it closes. `gui.skip_roles` drops uniform
+  grid roles (`["table cell", "list item"]`) so a file chooser's rows don't eat the element
+  cap. The model degrades on long states — a save dialog unfiltered is ~70 elements and
+  pushes the 512-token state past `truncated_questions`.
+
+### Multi-phase tasks — `stages`
+
+A single `action_question`/`done_question` pair is one reactive loop. `stages` composes
+several in order — each stage runs its own sense→decide→act drive and ends when its
+`done_question` clears; the next starts on the state it left behind. The model still makes
+every decision — stages compose reactive steps, they do not plan. Every field except
+`action_question` falls back to the task-level value; middle stages must declare their own
+`done_question` (the last may inherit the task's).
+
+```jsonc
+"stages": [
+  // type text into a fresh document until it's in the buffer
+  { "action_question": "has_greeting", "on_true": "wait", "on_false": "type_greeting",
+    "done_question": "has_greeting", "done_threshold": 0.5 },
+  // no save dialog yet? click 'Save As...'; stop when it is up
+  { "action_question": "chooser", "on_true": "wait", "on_false": "open_saveas",
+    "done_question": "chooser", "done_threshold": 0.7, "window": "Save File" },
+  // dialog up → fill the name field and click Save; stop when the title flips
+  { "action_question": "chooser", "on_true": "fill_and_save", "on_false": "wait",
+    "done_question": "named_doc", "done_threshold": 0.6, "window": "Save File" }
+]
+```
+
+`examples/laya-drive/kwrite-save-as.task.json` runs this end-to-end on a real desktop —
+type → Save As → fill Name → click Save — five GUI states, 6 steps, ~12 s, and the file
+lands on disk.
+
+What tuning it taught:
+
+* **Detection only separates on unique tokens**. Laya does lexical presence-matching: a
+  question's phrasing overlaps the menubar/statusbar words, so "is the File menu open"
+  reads ~0.7 on both states. Signals that split cleanly name a widget that exists in
+  exactly one state — `'Parent Directory'` (0.52 closed / 0.87 dialog), `'Discard'`
+  (0.31 / 0.86), the saved doc's title (0.89). Nothing in a spec should hinge on verbs
+  like "open"/"closed" — the drop-down marker the sensor emits (`drop-down menu under
+  File is open:`) helps the human reading the trace, but the model still keys on the
+  unique item names.
+* **The same question can drive opposite stages** — `chooser` is "open the dialog" in
+  stage 2 (fire when absent) and "fill it" in stage 3 (fire when present): noul sides
+  do the inverting, no new phrasing needed.
+* **`seq:` resolves against the sensed table at fire time** — a chord like
+  `click:File name:|ctrl+a|text:devin-note.txt|click:Save` is deterministic inside the
+  tick; the model only decides whether to fire it. Multi-tick sequencing across element
+  picks stays out of reach (the kcalc ceiling), but a chord covering click→select→type
+  →click is fine because every binding lands on a name that exists in one state only.
+* **Batched decode shifts probabilities ~0.18** vs single-question probes — probe to find
+  which phrasings separate, then set thresholds from live ticks, not the probe numbers.
 
 ## How it fits hx
 

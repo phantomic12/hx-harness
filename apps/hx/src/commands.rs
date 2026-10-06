@@ -590,7 +590,16 @@ struct DriveTask {
     questions: serde_json::Value,
     /// The question whose answer selects the action: a `choice` runs the
     /// winning option's id; a `noul` runs `on_true` or `on_false`.
+    /// Required for single-phase tasks; ignored when `stages` is set.
+    #[serde(default)]
     action_question: String,
+    /// Multi-phase tasks: each stage runs its own sense→decide→act loop in
+    /// order; a stage ends when its `done_question` clears and the next
+    /// starts on the state that stage left behind. The model still makes
+    /// every decision — stages compose reactive steps, they do not plan.
+    /// Stage fields fall back to the task-level values when omitted.
+    #[serde(default)]
+    stages: Vec<DriveStage>,
     /// For a noul `action_question`: the action id to run when the answer is
     /// true. Must name an entry in `actions`.
     #[serde(default)]
@@ -637,6 +646,41 @@ struct DriveTask {
     guard_action: Option<String>,
 }
 
+/// One phase of a `stages` task: its own action question and done check.
+/// Every field except `action_question` falls back to the task-level value.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct DriveStage {
+    /// The question whose answer selects the action this stage.
+    action_question: String,
+    #[serde(default)]
+    on_true: Option<String>,
+    #[serde(default)]
+    on_false: Option<String>,
+    /// Noul question that ends this stage when its P(true) clears
+    /// `done_threshold`. Required on every stage — the last may inherit the
+    /// task-level `done_question`.
+    #[serde(default)]
+    done_question: Option<String>,
+    #[serde(default)]
+    done_threshold: Option<f32>,
+    #[serde(default)]
+    threshold: Option<f32>,
+    #[serde(default)]
+    max_steps: Option<usize>,
+    #[serde(default)]
+    max_escalations: Option<usize>,
+    #[serde(default)]
+    guard_question: Option<String>,
+    #[serde(default)]
+    guard_threshold: Option<f32>,
+    #[serde(default)]
+    guard_action: Option<String>,
+    /// Override the gui `window` filter for this stage (e.g. sense only the
+    /// "Save File" dialog while filling it). Falls back to the task value.
+    #[serde(default)]
+    window: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 struct DriveTmux {
     /// A tmux target: `session`, `session:window`, or `session:window.pane`.
@@ -666,6 +710,17 @@ struct DriveGui {
     /// a 200%-scaled desktop). Default 1.0.
     #[serde(default = "default_coord_scale")]
     coord_scale: f64,
+    /// Restrict sensing to frames whose name contains this (e.g. "Save File"
+    /// for a save dialog) — the whole task's default; stages may override.
+    /// While no such frame exists the whole app is sensed, so a stage whose
+    /// window is a dialog also sees the app once the dialog closes.
+    #[serde(default)]
+    window: Option<String>,
+    /// Roles dropped with their subtrees while sensing — e.g.
+    /// ["table cell", "list item"] keeps a file chooser's row grid out of
+    /// the element cap and the model's context.
+    #[serde(default)]
+    skip_roles: Vec<String>,
 }
 
 fn default_coord_scale() -> f64 {
@@ -805,6 +860,13 @@ fn atspi_script_path() -> std::io::Result<std::path::PathBuf> {
 /// the actuator clicks `e<N>` by its centre.
 struct GuiSense {
     app: Option<String>,
+    /// Restrict sensing to a named frame's subtree (e.g. "Save File") — set
+    /// per stage via a shared slot so dialog stages see only the dialog.
+    /// Absent window falls back to the whole app.
+    window: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Roles dropped with their subtrees (e.g. "table cell" — a file
+    /// chooser's row grid floods the element cap and the model's context).
+    skip_roles: Vec<String>,
     max_elements: usize,
     elements: std::sync::Arc<std::sync::Mutex<Vec<GuiElement>>>,
 }
@@ -833,6 +895,14 @@ impl hx_decision::Sense for GuiSense {
         if let Some(app) = &self.app {
             args.push("--app".to_string());
             args.push(app.clone());
+        }
+        if let Some(w) = self.window.lock().unwrap().clone() {
+            args.push("--window".to_string());
+            args.push(w);
+        }
+        if !self.skip_roles.is_empty() {
+            args.push("--skip-roles".to_string());
+            args.push(self.skip_roles.join(","));
         }
         let out = run_prog("python3", &args)
             .await
@@ -1075,72 +1145,132 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
         (None, Some(_)) => true,
         _ => anyhow::bail!("task spec: set exactly one of 'tmux' or 'gui'"),
     };
-    if !gui {
-        // Every option the action question can pick must have a key binding
-        // (null counts — it binds "do nothing"). GUI specs skip this: their
-        // options are the live element ids plus bound actions, injected per tick.
-        let action_options: Vec<String> = questions
-            .iter()
-            .find_map(|q| match q {
-                Question::Choice { id, criteria, .. } if *id == task.action_question => {
-                    Some(criteria.iter().map(|o| o.id.clone()).collect())
-                }
-                _ => None,
-            })
-            .unwrap_or_default();
-        for option in &action_options {
-            if !task.actions.contains_key(option) {
-                anyhow::bail!(
-                    "action question '{}' has option '{option}' but the task spec binds no keys for it",
-                    task.action_question
-                );
-            }
+
+    // Resolve the stage list: an explicit `stages` array (each entry's unset
+    // fields inherit the task-level values), or the flat fields wrapped as a
+    // single stage.
+    struct StageCfg {
+        action_question: String,
+        on_true: Option<String>,
+        on_false: Option<String>,
+        done_question: Option<String>,
+        done_threshold: f32,
+        threshold: f32,
+        max_steps: usize,
+        max_escalations: usize,
+        guard_question: Option<String>,
+        guard_threshold: f32,
+        guard_action: Option<String>,
+        window: Option<String>,
+    }
+    let stage_count = task.stages.len();
+    let task_window = task.gui.as_ref().and_then(|g| g.window.clone());
+    let stages: Vec<StageCfg> = if stage_count == 0 {
+        if task.action_question.is_empty() {
+            anyhow::bail!("task spec: set 'action_question' or a non-empty 'stages' array");
         }
-        match questions.iter().find(|q| q.id() == task.action_question) {
-            Some(Question::Noul { .. }) => {
+        vec![StageCfg {
+            action_question: task.action_question.clone(),
+            on_true: task.on_true.clone(),
+            on_false: task.on_false.clone(),
+            done_question: task.done_question.clone(),
+            done_threshold: task.done_threshold,
+            threshold: task.threshold,
+            max_steps: task.max_steps,
+            max_escalations: task.max_escalations,
+            guard_question: task.guard_question.clone(),
+            guard_threshold: task.guard_threshold,
+            guard_action: task.guard_action.clone(),
+            window: task_window.clone(),
+        }]
+    } else {
+        let last = stage_count - 1;
+        task.stages
+            .iter()
+            .enumerate()
+            .map(|(i, s)| StageCfg {
+                action_question: s.action_question.clone(),
+                on_true: s.on_true.clone(),
+                on_false: s.on_false.clone(),
+                // The last stage may inherit the task's done_question; middle
+                // stages must declare their own or they'd run to max_steps.
+                done_question: s.done_question.clone().or_else(|| {
+                    if i == last {
+                        task.done_question.clone()
+                    } else {
+                        None
+                    }
+                }),
+                done_threshold: s.done_threshold.unwrap_or(task.done_threshold),
+                threshold: s.threshold.unwrap_or(task.threshold),
+                max_steps: s.max_steps.unwrap_or(task.max_steps),
+                max_escalations: s.max_escalations.unwrap_or(task.max_escalations),
+                guard_question: s.guard_question.clone().or_else(|| task.guard_question.clone()),
+                guard_threshold: s.guard_threshold.unwrap_or(task.guard_threshold),
+                guard_action: s.guard_action.clone().or_else(|| task.guard_action.clone()),
+                window: s.window.clone().or_else(|| task_window.clone()),
+            })
+            .collect()
+    };
+
+    for (i, stage) in stages.iter().enumerate() {
+        let stage_q = questions
+            .iter()
+            .find(|q| q.id() == stage.action_question)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "task spec: action question '{}' is not in the question set",
+                    stage.action_question
+                )
+            })?;
+        // Every option the action question can pick must have a binding
+        // (null counts — it binds "do nothing"). For noul questions both
+        // sides must be bound; for tmux choice questions every option needs
+        // a keystroke (GUI choice options are live element ids injected per
+        // tick, plus the bound actions).
+        match stage_q {
+            Question::Noul { .. } => {
                 for (side, name) in [
-                    ("on_true", task.on_true.as_deref()),
-                    ("on_false", task.on_false.as_deref()),
+                    ("on_true", stage.on_true.as_deref()),
+                    ("on_false", stage.on_false.as_deref()),
                 ] {
                     match name {
                         Some(id) if task.actions.contains_key(id) => {}
                         Some(id) => {
-                            anyhow::bail!(
-                                "task spec: {side} action '{id}' has no keystroke binding"
-                            )
+                            anyhow::bail!("task spec: {side} action '{id}' has no binding")
                         }
-                        None => anyhow::bail!("task spec: noul action question needs '{side}' set"),
+                        None => anyhow::bail!(
+                            "task spec: noul action question '{}' needs '{side}' set",
+                            stage.action_question
+                        ),
+                    }
+                }
+            }
+            Question::Choice { criteria, .. } if !gui => {
+                for option in criteria.iter().map(|o| &o.id) {
+                    if !task.actions.contains_key(option) {
+                        anyhow::bail!(
+                            "action question '{}' has option '{option}' but the task spec binds no keys for it",
+                            stage.action_question
+                        );
                     }
                 }
             }
             _ => {}
         }
-    } else {
-        // GUI: a noul action question (the reactive shape — "is the menu
-        // open?" → click item : open menu) needs both sides bound, same as
-        // tmux specs. Choice action questions get live element options.
-        if questions
-            .iter()
-            .any(|q| matches!(q, Question::Noul { .. }) && q.id() == task.action_question)
-        {
-            for (side, name) in [
-                ("on_true", task.on_true.as_deref()),
-                ("on_false", task.on_false.as_deref()),
-            ] {
-                match name {
-                    Some(id) if task.actions.contains_key(id) => {}
-                    Some(id) => {
-                        anyhow::bail!("task spec: {side} action '{id}' has no binding")
-                    }
-                    None => anyhow::bail!("task spec: noul action question needs '{side}' set"),
-                }
-            }
+        if stage.done_question.is_none() {
+            anyhow::bail!(
+                "task spec: stage {i} ('{}') needs a done_question — a stage only ends on its done check",
+                stage.action_question
+            );
         }
-        if let Some(ga) = &task.guard_action {
-            if !task.actions.contains_key(ga) && !ga.starts_with('e') {
-                anyhow::bail!(
-                    "task spec: guard_action '{ga}' has no binding (element ids are unstable)"
-                );
+        if gui {
+            if let Some(ga) = &stage.guard_action {
+                if !task.actions.contains_key(ga) && !ga.starts_with('e') {
+                    anyhow::bail!(
+                        "task spec: guard_action '{ga}' has no binding (element ids are unstable)"
+                    );
+                }
             }
         }
     }
@@ -1149,25 +1279,6 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
     client.health().await.map_err(|e| {
         anyhow::anyhow!("{e} — is the sidecar running? see docs/laya.md (examples/laya-sidecar.py)")
     })?;
-
-    let drive = Drive {
-        questions,
-        action_question: task.action_question.clone(),
-        done_question: task.done_question.clone(),
-        done_threshold: task.done_threshold,
-        gate: DecisionGate::new(Threshold::new(task.threshold), task.min_confidence),
-        tick: Duration::from_millis(task.tick_ms),
-        max_steps: task.max_steps,
-        max_escalations: task.max_escalations,
-        guard_question: task.guard_question.clone(),
-        guard_threshold: task.guard_threshold,
-        guard_action: task.guard_action.clone(),
-        noul_actions: match (task.on_true, task.on_false) {
-            (Some(t), Some(f)) => Some((t, f)),
-            _ => None,
-        },
-    };
-    drive.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let tmux_spec = task.tmux.clone();
     let mut sensor_t = TmuxSense {
@@ -1188,8 +1299,17 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
     // GUI backend: shared element table — sense fills it, the pick hook reads
     // it to rebuild options, act reads it to click e<N>.
     let elements = std::sync::Arc::new(std::sync::Mutex::new(Vec::<GuiElement>::new()));
+    let window_slot = std::sync::Arc::new(std::sync::Mutex::new(
+        stages.first().and_then(|s| s.window.clone()),
+    ));
     let mut sensor_g = GuiSense {
         app: task.gui.as_ref().and_then(|g| g.app.clone()),
+        window: window_slot.clone(),
+        skip_roles: task
+            .gui
+            .as_ref()
+            .map(|g| g.skip_roles.clone())
+            .unwrap_or_default(),
         max_elements: task
             .gui
             .as_ref()
@@ -1214,14 +1334,22 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
 
     // The pick hook: each tick, rebuild the action question's options as the
     // live element ids + the bound actions — the model then answers "which
-    // element or op comes next".
-    let action_q = task.action_question.clone();
+    // element or op comes next". The action question id comes from a shared
+    // slot so each stage of a `stages` task swaps its own question in.
+    let current_action_q = std::sync::Arc::new(std::sync::Mutex::new(
+        stages
+            .first()
+            .map(|s| s.action_question.clone())
+            .unwrap_or_default(),
+    ));
+    let action_q_slot = current_action_q.clone();
     let bound = task.actions.clone();
     let els_for_hook = elements.clone();
     let history: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
     let history_for_hook = history.clone();
     let mut pick_hook = move |set: &mut hx_decision::QuestionSet| {
         let pick_names = &pick_names;
+        let action_q = action_q_slot.lock().unwrap().clone();
         let mut options: Vec<hx_decision::ChoiceOption> = els_for_hook
             .lock()
             .unwrap()
@@ -1328,45 +1456,93 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
         );
     };
 
-    let report = if gui {
-        drive
-            .run(
-                &mut sensor_g,
-                &mut actuator_g,
-                &client,
-                Some(&mut printer),
-                Some(&mut pick_hook),
-            )
-            .await?
-    } else {
-        drive
-            .run(
-                &mut sensor_t,
-                &mut actuator_t,
-                &client,
-                Some(&mut printer),
-                None,
-            )
-            .await?
-    };
-
-    let outcome = match &report.outcome {
-        Outcome::Done { steps } => format!("done after {steps} steps"),
-        Outcome::Escalated => format!(
-            "escalated after {} steps ({} consecutive gate failures)",
-            report.steps.len(),
-            task.max_escalations + 1
-        ),
-        Outcome::MaxSteps => format!("hit max_steps ({})", report.steps.len()),
-        Outcome::Failed(msg) => format!("failed: {msg}"),
-    };
-    println!(
-        "drive {}: {} — {} steps, {:.1}s",
-        task_path,
-        outcome,
-        report.steps.len(),
-        report.total_elapsed.as_secs_f32()
-    );
+    // Run each stage in order — every stage is its own drive; the task ends
+    // when the last stage's done check clears, or early on a stage failing
+    // (escalated / max_steps / error all abort the pipeline).
+    let multi = stages.len() > 1;
+    let mut total_steps = 0usize;
+    let task_started = std::time::Instant::now();
+    for (i, stage) in stages.iter().enumerate() {
+        *current_action_q.lock().unwrap() = stage.action_question.clone();
+        *window_slot.lock().unwrap() = stage.window.clone();
+        if multi {
+            println!("-- stage {}: {}", i + 1, stage.action_question);
+        }
+        let drive = Drive {
+            questions: questions.clone(),
+            action_question: stage.action_question.clone(),
+            done_question: stage.done_question.clone(),
+            done_threshold: stage.done_threshold,
+            gate: DecisionGate::new(Threshold::new(stage.threshold), task.min_confidence),
+            tick: Duration::from_millis(task.tick_ms),
+            max_steps: stage.max_steps,
+            max_escalations: stage.max_escalations,
+            guard_question: stage.guard_question.clone(),
+            guard_threshold: stage.guard_threshold,
+            guard_action: stage.guard_action.clone(),
+            noul_actions: match (stage.on_true.clone(), stage.on_false.clone()) {
+                (Some(t), Some(f)) => Some((t, f)),
+                _ => None,
+            },
+        };
+        drive.validate().map_err(|e| anyhow::anyhow!("stage {i}: {e}"))?;
+        let report = if gui {
+            drive
+                .run(
+                    &mut sensor_g,
+                    &mut actuator_g,
+                    &client,
+                    Some(&mut printer),
+                    Some(&mut pick_hook),
+                )
+                .await?
+        } else {
+            drive
+                .run(
+                    &mut sensor_t,
+                    &mut actuator_t,
+                    &client,
+                    Some(&mut printer),
+                    None,
+                )
+                .await?
+        };
+        total_steps += report.steps.len();
+        match &report.outcome {
+            Outcome::Done { steps } => {
+                if multi {
+                    println!("   stage done after {steps} steps");
+                }
+                if i + 1 == stages.len() {
+                    println!(
+                        "drive {}: done — {} steps, {:.1}s",
+                        task_path,
+                        total_steps,
+                        task_started.elapsed().as_secs_f32()
+                    );
+                }
+            }
+            outcome => {
+                let text = match outcome {
+                    Outcome::Escalated => format!(
+                        "escalated after {} steps ({} consecutive gate failures)",
+                        report.steps.len(),
+                        stage.max_escalations + 1
+                    ),
+                    Outcome::MaxSteps => format!("hit max_steps ({})", report.steps.len()),
+                    Outcome::Failed(msg) => format!("failed: {msg}"),
+                    Outcome::Done { .. } => unreachable!(),
+                };
+                println!(
+                    "drive {}: {text} — {} steps, {:.1}s",
+                    task_path,
+                    total_steps,
+                    task_started.elapsed().as_secs_f32()
+                );
+                break;
+            }
+        }
+    }
     anyhow::Ok(())
 }
 
