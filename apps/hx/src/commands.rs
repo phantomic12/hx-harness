@@ -1205,7 +1205,10 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
                 threshold: s.threshold.unwrap_or(task.threshold),
                 max_steps: s.max_steps.unwrap_or(task.max_steps),
                 max_escalations: s.max_escalations.unwrap_or(task.max_escalations),
-                guard_question: s.guard_question.clone().or_else(|| task.guard_question.clone()),
+                guard_question: s
+                    .guard_question
+                    .clone()
+                    .or_else(|| task.guard_question.clone()),
                 guard_threshold: s.guard_threshold.unwrap_or(task.guard_threshold),
                 guard_action: s.guard_action.clone().or_else(|| task.guard_action.clone()),
                 window: s.window.clone().or_else(|| task_window.clone()),
@@ -1485,7 +1488,9 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
                 _ => None,
             },
         };
-        drive.validate().map_err(|e| anyhow::anyhow!("stage {i}: {e}"))?;
+        drive
+            .validate()
+            .map_err(|e| anyhow::anyhow!("stage {i}: {e}"))?;
         let report = if gui {
             drive
                 .run(
