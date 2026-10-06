@@ -290,7 +290,11 @@ function renderEvent(frame) {
   // Control events — approvals, turns, tool calls, user prompts — keep their headers: the
   // kind badge is how a person tells "the daemon did something" from "the daemon said something".
   const flow = role === "agent" && /(text|delta|token)/.test(k);
-  el.className = `event role-${role}${flow ? " flow" : ""}`;
+  // Everything that is neither the answer nor a person's words is an ops row: one line with a
+  // caret, click to open — the Hermes tool-row shape. Approvals and challenges stay open: a
+  // buried button is a button nobody presses, and they are the frames that can wait on you.
+  const ops = !flow && role !== "user" && !/(approval|challenge)/.test(k);
+  el.className = `event role-${role}${flow ? " flow" : ops ? " op" : ""}`;
   const meta = document.createElement("div");
   meta.className = "meta";
   const seq = document.createElement("span");
@@ -308,10 +312,28 @@ function renderEvent(frame) {
     const raw = document.createElement("pre");
     raw.className = "raw";
     raw.textContent = JSON.stringify(event, null, 2);
+    el.classList.add("open");
     el.appendChild(raw);
   });
   meta.appendChild(seq);
   meta.appendChild(kk);
+  if (ops) {
+    // The row IS the affordance: click anywhere on it to open the body; the kind label still
+    // keeps its own door to the raw JSON (which opens the row it lives in). A row with no body
+    // reveals the raw event instead — opening must always show something.
+    meta.addEventListener("click", (e) => {
+      if (e.target === kk) return;
+      el.classList.toggle("open");
+      if (!el.classList.contains("open")) return;
+      if (!el.querySelector(":scope > .body") && !el.querySelector(":scope > pre.raw")) {
+        const raw = document.createElement("pre");
+        raw.className = "raw";
+        raw.textContent = JSON.stringify(event, null, 2);
+        el.appendChild(raw);
+      }
+      clampBody(el);
+    });
+  }
   const note = oneLine(event);
   if (note) {
     const n = document.createElement("span");

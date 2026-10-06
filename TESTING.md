@@ -1087,6 +1087,12 @@ A fourth pass kept cutting — the bar now reads `hx · connected · tasks · �
   title, filled from `s.model` when the record has one and from the latest `usage` frame
   (`sessionModels` map) when it doesn't — the model a task runs is visible next to the chat it
   answers, not three panes away in providers.
+- **ops become rows, not cards**: every frame that is neither the answer nor a person's words
+  (turns, usage, tool calls, system notices) collapses to a one-line `▸` summary — the Hermes
+  tool-row shape. Click the row to open it; a row with no body reveals the raw event JSON
+  instead, so opening always shows something. Approvals and challenges stay expanded — a
+  buried button waits forever. Consecutive ops share a hairline so a run of them reads as one
+  rail, not a stack of cards.
 
 **The rendered-browser gate** (`scripts/check_web_client.py`, check 15) is the part that is new
 evidence, not just new code: headless Chromium loads the served page and asserts (a) **zero

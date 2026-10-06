@@ -65,6 +65,24 @@
 }
 .event.role-user .kind { color: var(--tx-0); }
 .event .seq { color: var(--tx-2); font-size: var(--fs-xs); font-family: var(--mono); }
+
+/* Ops rows — the frames that are neither the answer nor a person's words (turns, usage, tool
+   calls, system notices). One line each until opened; the caret says there is more inside.
+   Hermes renders tool calls the same way: a summary line, expanded on demand. */
+.event.op {
+  border: none; background: transparent; margin: 0; padding: 3px var(--sp-4);
+  border-left: 2px solid transparent; border-radius: 0;
+}
+.event.op > .meta { cursor: pointer; margin-bottom: 0; }
+.event.op > .meta::before { content: "▸"; color: var(--tx-2); flex: none; width: 12px; }
+.event.op.open > .meta::before { content: "▾"; }
+.event.op:not(.open) > .body,
+.event.op:not(.open) > .actions,
+.event.op:not(.open) > .body-toggle,
+.event.op:not(.open) > pre.raw { display: none; }
+.event.op.open { background: var(--bg-1); border-left-color: var(--line-1); }
+/* A run of ops reads as one rail, not a stack of cards. */
+.event.op + .event.op { border-top: 1px solid var(--line-0); }
 .event .body { white-space: pre-wrap; word-break: break-word; }
 .event pre {
   margin: var(--sp-2) 0 0; white-space: pre-wrap; word-break: break-word;
