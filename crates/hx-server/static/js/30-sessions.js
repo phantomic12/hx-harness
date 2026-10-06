@@ -18,6 +18,10 @@ const activeRuns = new Set();
 // Unsent composer text per task — the Codex draft marker. Switching tasks must not eat a
 // half-written prompt, and the rail marks which tasks hold one (the grey dot, quiet on purpose).
 const drafts = new Map();
+// The session record does not carry the model — the usage frames that land while a task runs do.
+// Remember the latest per task so the header can name what's answering without waiting for the
+// next frame.
+const sessionModels = new Map();
 
 const sidOf = (s) => (typeof s === "string" ? s : (s && (s.id || s.session))) || "";
 const titleOf = (s) => {
@@ -44,7 +48,8 @@ function paintTaskHeader() {
   const meta = $("session-meta");
   if (meta) {
     const bits = [];
-    if (s && s.model) bits.push(s.model);
+    const model = (s && s.model) || sessionModels.get(sessionId);
+    if (model) bits.push(model);
     if (s && s.turns) bits.push(`${s.turns} turns`);
     meta.textContent = bits.join(" · ");
   }
@@ -255,6 +260,12 @@ async function attachSession() {
       lastSeq = frame.seq;
     }
     const arrived = frame.event || {};
+    if (kindOf(arrived) === "usage" && arrived.model) {
+      if (sessionModels.get(sessionId) !== arrived.model) {
+        sessionModels.set(sessionId, arrived.model);
+        paintTaskHeader();
+      }
+    }
     if (kindOf(arrived) === "text_delta" && typeof arrived.text === "string") {
       // Deltas append. A card per token would be one bordered box per word, which is how a
       // transcript becomes unreadable exactly when the model is busiest.

@@ -180,7 +180,7 @@
 }
 @media (max-width: 640px) {
   .top { padding: 0 var(--sp-2); gap: var(--sp-2); }
-  .brand span, #instance-version, #spend-ticker { display: none; }
+  .brand span { display: none; }
   .event.role-user { margin-left: var(--sp-4); }
   .composer-inner { flex-wrap: wrap; }
   .composer-text { flex-basis: 100%; }

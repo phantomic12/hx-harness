@@ -5,8 +5,6 @@
 <header class="top" role="banner">
   <div class="brand"><b>hx</b><span>harness</span></div>
   <button type="button" class="status" id="conn-status" title="connection state — details when things drop"><span class="dot" id="dot"></span><span id="status-text">connecting…</span></button>
-  <span id="instance-version" title="daemon instance / version"></span>
-  <span id="spend-ticker" title="spend over the last 30 days — see the spend panel for the breakdown"></span>
   <nav class="top-views" aria-label="panels">
     <button data-view="side" class="active" aria-pressed="true" aria-keyshortcuts="Control+1" title="toggle the task list (ctrl+1)">tasks</button>
   </nav>
@@ -39,10 +37,6 @@
       <button id="new-session" class="new-task" title="open a new task">+ new</button>
     </div>
     <div id="sessions" role="list" aria-label="tasks"></div>
-    <div class="sess-actions">
-      <button id="session-rename" title="rename the open task">rename</button>
-      <button id="session-delete" class="danger" title="delete the open task">delete</button>
-    </div>
     <div class="side-fold">
       <section class="card" data-card="hosts">
         <h2>hosts<span id="host-count"></span><button type="button" class="fold" aria-expanded="true" title="collapse">▾</button></h2>
@@ -86,7 +80,6 @@
         <button id="stop" class="stop" hidden title="stop the run in flight on this task">stop</button>
       </div>
       <div class="queue" id="queue"></div>
-      <div class="hint"><span>enter sends · prompts typed mid-run queue below</span><span class="keys"><kbd>ctrl+k</kbd> everything else</span></div>
       <div class="error" id="error" role="alert"></div>
     </div>
   </main>

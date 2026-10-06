@@ -1076,6 +1076,18 @@ the buttons it replaced came out rather than staying as duplicates:
   door still there on hover/focus-within); approvals, turns, tool calls and user prompts keep
   headers, so control reads as control.
 
+A fourth pass kept cutting — the bar now reads `hx · connected · tasks · ☰ menu` and nothing else:
+
+- `#instance-version` and `#spend-ticker` left the header (the spend card carries the number, one
+  fold away; `/v1/status` carries the version for whoever wants it).
+- The rail's `rename`/`delete` row left — the palette's task actions and the editable title input
+  cover both, so the rail is now: tasks, folds, done.
+- The composer hint line left entirely — the input's own placeholder already says Enter sends.
+- **the model answers in the header**: `#session-meta` paints `model · N turns` beside the task
+  title, filled from `s.model` when the record has one and from the latest `usage` frame
+  (`sessionModels` map) when it doesn't — the model a task runs is visible next to the chat it
+  answers, not three panes away in providers.
+
 **The rendered-browser gate** (`scripts/check_web_client.py`, check 15) is the part that is new
 evidence, not just new code: headless Chromium loads the served page and asserts (a) **zero
 console errors**, (b) JS-rendered contents exist — `.sess` rows are empty in the markup and only

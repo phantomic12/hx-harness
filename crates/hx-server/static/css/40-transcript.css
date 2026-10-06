@@ -210,12 +210,4 @@
 .activity.wait .pulse { background: var(--warn); box-shadow: 0 0 0 3px rgba(240,196,108,.18); }
 @keyframes hx-pulse { 50% { opacity: .35; } }
 
-.hint {
-  width: min(var(--chat-w), 100%); margin: var(--sp-1) auto 0; padding: 0 var(--sp-5);
-  font-size: var(--fs-xs); color: var(--tx-2); font-family: var(--mono);
-  display: flex; justify-content: space-between; gap: var(--sp-3);
-}
-.hint .keys { flex: none; }
-.hint .keys kbd { margin-left: var(--sp-1); }
-
 .scroll { overflow-y: auto; }

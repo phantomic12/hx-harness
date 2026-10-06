@@ -31,9 +31,6 @@
 .status .dot.on { background: var(--ok); box-shadow: 0 0 0 3px rgba(127,217,135,.16); }
 .status .dot { background: var(--bad); box-shadow: 0 0 0 3px rgba(255,138,128,.16); }
 
-#instance-version { font-size: var(--fs-xs); color: var(--tx-2); font-family: var(--mono); }
-#spend-ticker { font-family: var(--mono); font-size: var(--fs-xs); color: var(--tx-1); cursor: default; }
-
 /* The view switcher: which panes the page is showing. Buttons keep `data-view` (JS keys off it). */
 .top-views { display: flex; gap: 2px; margin-left: var(--sp-2); }
 .top-views button {
@@ -216,14 +213,6 @@
    state — a grey dot beside "waiting" (amber, pulses) and "working" (green). */
 .sess .mark.draft { background: var(--tx-2); box-shadow: none; }
 .sess .smeta { color: var(--tx-2); font-size: var(--fs-xs); font-family: var(--mono); display: flex; gap: var(--sp-2); }
-
-.sess-actions { display: flex; gap: var(--sp-1); padding: var(--sp-1) var(--sp-3) var(--sp-2); flex: none; }
-.sess-actions button {
-  background: transparent; color: var(--tx-2); border: 1px solid var(--line-0);
-  border-radius: var(--r-1); padding: 2px var(--sp-2); font-size: var(--fs-xs);
-}
-.sess-actions button:hover { color: var(--tx-0); border-color: var(--accent); }
-.sess-actions button.danger:hover { color: var(--bad-ink); border-color: var(--bad); }
 
 .side-fold {
   border-top: 1px solid var(--line-0); flex: none; max-height: 44%;

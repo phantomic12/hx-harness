@@ -92,20 +92,6 @@ const narrowMQ = window.matchMedia("(max-width: 980px)");
   if (narrowMQ.addEventListener) narrowMQ.addEventListener("change", applyNarrow);
   else if (narrowMQ.addListener) narrowMQ.addListener(applyNarrow);
 
-  // Instance / version in the top bar. Best-effort: never breaks boot.
-  (async () => {
-    try {
-      const res = await apiFetch(`${API}/v1/status`);
-      if (!res.ok) return;
-      const s = await res.json();
-      const bits = [];
-      if (s.instance) bits.push(s.instance);
-      if (s.version) bits.push(`v${s.version}`);
-      else if (s.hx_version) bits.push(`v${s.hx_version}`);
-      if (bits.length) $("instance-version").textContent = bits.join(" · ");
-    } catch (_) {}
-  })();
-
   // Token button reflects stored state without ever showing the secret.
   try { refreshAuthUI(); } catch (_) {}
 
@@ -343,8 +329,6 @@ document.addEventListener("click", (e) => {
   }
 });
 $("new-session").addEventListener("click", createSession);
-$("session-delete").addEventListener("click", deleteSession);
-$("session-rename").addEventListener("click", () => { const el = $("session-label"); el.focus(); el.select(); });
 $("session-label").addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); renameSession(e.target.value); e.target.blur(); }
   if (e.key === "Escape") { paintTaskHeader(); e.target.blur(); }
