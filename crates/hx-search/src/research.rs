@@ -533,12 +533,7 @@ impl BrowserFetcher {
     /// for a binary while the pool claims one was configured would be a fetcher whose report and
     /// whose behaviour disagreed.
     pub fn with_policy(mut self, policy: &FetchPolicy) -> Result<Self, std::io::Error> {
-        self.pool = Self::build_pool(
-            &self.root,
-            policy,
-            self.browser_first,
-            self.human.clone(),
-        )?;
+        self.pool = Self::build_pool(&self.root, policy, self.browser_first, self.human.clone())?;
         self.admission = policy.admission();
         self.browser = policy.browser().map(std::path::Path::to_path_buf);
         Ok(self)
@@ -681,7 +676,9 @@ impl BrowserFetcher {
             Some(path) => hx_browser::ChromiumRung::with_path_and_admission(path, admission),
             None => hx_browser::ChromiumRung::with_admission(admission),
         }
-        .map_err(|err| std::io::Error::other(format!("could not build the Chromium rung: {err}")))?;
+        .map_err(|err| {
+            std::io::Error::other(format!("could not build the Chromium rung: {err}"))
+        })?;
         let chromium = Arc::new(chromium);
 
         let mut rungs: Vec<Arc<dyn hx_browser::rung::Fetcher>> = if browser_first {
@@ -720,10 +717,11 @@ impl BrowserFetcher {
             }
             None => hx_browser::DEFAULT_RUNG_TIMEOUT,
         };
-        Ok(
-            BrowserPool::new(root.clone(), RungLadder::new(rungs).with_timeout(ladder_timeout))
-                .with_admission(admission),
+        Ok(BrowserPool::new(
+            root.clone(),
+            RungLadder::new(rungs).with_timeout(ladder_timeout),
         )
+        .with_admission(admission))
     }
 }
 
@@ -941,7 +939,14 @@ pub fn select_fetcher_with_policy(
     policy: &FetchPolicy,
     human: Option<HumanRequest>,
 ) -> Result<FetchSelection, FetchRouteError> {
-    select_fetcher_by(client, mode, pool_root, policy, || browser_check(policy), human)
+    select_fetcher_by(
+        client,
+        mode,
+        pool_root,
+        policy,
+        || browser_check(policy),
+        human,
+    )
 }
 
 /// [`select_fetcher`], with a person behind the last rung.
@@ -956,7 +961,13 @@ pub fn select_fetcher_with_pane(
     pool_root: impl Into<std::path::PathBuf>,
     human: HumanRequest,
 ) -> Result<FetchSelection, FetchRouteError> {
-    select_fetcher_with_policy(client, mode, pool_root, &FetchPolicy::default(), Some(human))
+    select_fetcher_with_policy(
+        client,
+        mode,
+        pool_root,
+        &FetchPolicy::default(),
+        Some(human),
+    )
 }
 
 /// The [`select_fetcher`] decision under an injected browser-availability check, so the choice is
@@ -974,7 +985,9 @@ pub(crate) fn select_fetcher_by(
     human: Option<HumanRequest>,
 ) -> Result<FetchSelection, FetchRouteError> {
     let plain = || HttpFetcher::new(client.clone()).with_admission(policy.admission());
-    let build = |root: std::path::PathBuf, browser_first: bool| -> Result<BrowserFetcher, FetchRouteError> {
+    let build = |root: std::path::PathBuf,
+                 browser_first: bool|
+     -> Result<BrowserFetcher, FetchRouteError> {
         let fetcher = if browser_first {
             BrowserFetcher::browser_first(root)
         } else {
@@ -2090,14 +2103,9 @@ mod fetch_router_tests {
         // stub and is refused *by the site*, which is a different sentence from the admission
         // refusal the default policy gives (and the default's is asserted in
         // `the_plain_fetchers_the_selector_hands_out_admit_their_targets`).
-        let selection = select_fetcher_with_policy(
-            &client(),
-            FetchMode::Http,
-            pool_root(),
-            &policy,
-            None,
-        )
-        .expect("http mode never fails");
+        let selection =
+            select_fetcher_with_policy(&client(), FetchMode::Http, pool_root(), &policy, None)
+                .expect("http mode never fails");
         let err = selection
             .fetcher()
             .fetch(&wall.url())

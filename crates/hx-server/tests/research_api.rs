@@ -253,7 +253,8 @@ async fn harness(search: Arc<BackendRegistry>) -> Arc<AppState> {
         router: Arc::clone(&router),
         providers: Arc::new(RwLock::new(hx_provider::ProviderRegistry::new())),
         provider_configs: Default::default(),
-        config_path: None,        secrets: Arc::new(hx_secrets::SecretStores::new()),
+        config_path: None,
+        secrets: Arc::new(hx_secrets::SecretStores::new()),
         store,
         models: Arc::new(RwLock::new(Arc::new(hx_server::chat::RouterModels::new(
             router,

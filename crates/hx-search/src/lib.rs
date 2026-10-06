@@ -51,10 +51,9 @@ pub use extract::{
 };
 pub use research::{
     browser_available, browser_discovery, default_pool_root, research, research_with_fetch_mode,
-    select_fetcher, select_fetcher_with_policy, FetchPolicy,
-    select_fetcher_with_pane, BackendOutcome, BrowserFetcher, Citation, FetchMode, FetchRouteError,
-    FetchSelection, Fetcher, HumanRequest, HttpFetcher, ResearchReport, ResearchRequest, ResearchTask,
-    SelectedFetcher,
+    select_fetcher, select_fetcher_with_pane, select_fetcher_with_policy, BackendOutcome,
+    BrowserFetcher, Citation, FetchMode, FetchPolicy, FetchRouteError, FetchSelection, Fetcher,
+    HttpFetcher, HumanRequest, ResearchReport, ResearchRequest, ResearchTask, SelectedFetcher,
     DEFAULT_FETCH_CONCURRENCY, DEFAULT_FETCH_TIMEOUT, DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_SOURCES,
     DEFAULT_SNIPPET_MAX_CHARS,
 };
