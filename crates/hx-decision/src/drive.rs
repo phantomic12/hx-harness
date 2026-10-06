@@ -675,7 +675,10 @@ mod tests {
         let (p, mut s, mut a, _) = rig(vec![], vec!["s1", "s2", "s3", "s4", "s5"]);
         let mut d = drive(0);
         d.max_steps = 3;
-        let report = d.run(&mut s, &mut a, &p, None, None).await.expect("drive runs");
+        let report = d
+            .run(&mut s, &mut a, &p, None, None)
+            .await
+            .expect("drive runs");
         assert!(matches!(report.outcome, Outcome::MaxSteps));
         assert_eq!(report.steps.len(), 3);
     }
@@ -722,7 +725,10 @@ mod tests {
         d.done_question = None;
         d.noul_actions = Some(("go".to_string(), "wait".to_string()));
         // script: done_p is the noul value for 'done' — 0.9 -> 'go', 0.1 -> 'wait', 0.5 -> escalate
-        let report = d.run(&mut s, &mut a, &p, None, None).await.expect("drive runs");
+        let report = d
+            .run(&mut s, &mut a, &p, None, None)
+            .await
+            .expect("drive runs");
         // First scripted answer: noul 0.9 -> 'go'. The default entries emit
         // done_p = 0.0 -> 'wait' for the remaining ticks until max_steps.
         let actions = ran.lock().unwrap().clone();
@@ -756,7 +762,10 @@ mod tests {
         let mut d = drive(0);
         d.guard_question = Some("guard".to_string());
         d.guard_action = Some("deny".to_string());
-        let report = d.run(&mut s, &mut a, &p, None, None).await.expect("drive runs");
+        let report = d
+            .run(&mut s, &mut a, &p, None, None)
+            .await
+            .expect("drive runs");
         assert!(matches!(report.outcome, Outcome::Done { steps: 3 }));
         // tick 0 ran the veto, not the model's confident 'go'.
         assert_eq!(ran.lock().unwrap().as_slice(), &["deny", "go"]);
