@@ -281,7 +281,7 @@ async function attachSession() {
     } else {
       streaming = null;
       const el = renderEvent(frame);
-      $("events").appendChild(el);
+      appendEvent(el);
       clampBody(el);
     }
     noteActivity(sessionId, arrived);

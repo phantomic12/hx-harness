@@ -1110,6 +1110,10 @@ A fifth pass took the mobile floor up from "it fits" to "it's a phone app":
   400ms. (Also fixes the reload-time false unread count found in testing.)
 - **stale errors clear**: `turn_started` arriving now clears the composer error line — a run
   starting is proof the last send landed (the queued-prompt path never reset it).
+- **ops group together**: consecutive ops frames land in one `<details class="op-group">`
+  rather than a run of separate rows — `▸ 4 ops · usage` is one line until opened, with the
+  individual rows (still individually expandable) inside. Prose, prompts and approvals are
+  not ops, so they end the group: what needs a reader stays ungrouped.
 
 **The rendered-browser gate** (`scripts/check_web_client.py`, check 15) is the part that is new
 evidence, not just new code: headless Chromium loads the served page and asserts (a) **zero

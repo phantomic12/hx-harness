@@ -384,6 +384,32 @@ function renderEvent(frame) {
   return el;
 }
 
+// Consecutive ops frames land in one <details> group rather than a run of separate rows —
+// "4 ops · usage" is the whole sentence a burst of turn/usage/tool frames was trying to say.
+// Prose, prompts and approvals are not ops, so they end the group: what needs a reader stays
+// ungrouped; what needs a glance folds together.
+function appendEvent(el) {
+  const host = $("events");
+  if (!el.classList.contains("op")) { host.appendChild(el); return; }
+  let group = host.lastElementChild;
+  if (!group || !group.classList.contains("op-group")) {
+    group = document.createElement("details");
+    group.className = "op-group";
+    const sum = document.createElement("summary");
+    sum.className = "group-sum";
+    const body = document.createElement("div");
+    body.className = "group-body";
+    group.appendChild(sum);
+    group.appendChild(body);
+    host.appendChild(group);
+  }
+  group.querySelector(":scope > .group-body").appendChild(el);
+  const n = group.querySelectorAll(":scope > .group-body > .event").length;
+  const lastKind = (el.querySelector(".kind") || {}).textContent || "";
+  group.querySelector(":scope > .group-sum").textContent =
+    `${n} ops · ${lastKind.toLowerCase()}`;
+}
+
 // One compact human line per structural event — what the raw JSON used to dump under every
 // card. ""` means the card's body already says it. The full event is one click on the kind label
 // away, so nothing is hidden by being tidy.
