@@ -1,0 +1,32 @@
+{
+  "gui": {
+    "app": "kwrite",
+    "max_elements": 24,
+    "coord_scale": 2.0
+  },
+  "actions": {
+    "click_save": "click:Save",
+    "close_doc": "ctrl+w",
+    "wait": null
+  },
+  "questions": {
+    "save_dialog": {
+      "type": "noul",
+      "instructions": "A dialog offers 'Save', 'Discard' and 'Cancel' \u2014 the document wants to be saved or discarded before closing."
+    },
+    "document_gone": {
+      "type": "noul",
+      "instructions": "The document 'gui-demo.txt' is no longer open \u2014 the editor area shows no document."
+    }
+  },
+  "action_question": "save_dialog",
+  "on_true": "click_save",
+  "on_false": "close_doc",
+  "done_question": "document_gone",
+  "done_threshold": 0.6,
+  "threshold": 0.6,
+  "min_confidence": 0.0,
+  "tick_ms": 800,
+  "max_steps": 10,
+  "max_escalations": 4
+}

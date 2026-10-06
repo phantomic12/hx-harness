@@ -1072,6 +1072,58 @@ the same decision as one noul reads 0.91/0.09. Judgment nouls ("this step perman
 data") score ~0.22 where mention nouls ("the step's text asks to drop, delete, destroy, wipe, or
 recreate a database") score 0.87 — the guard veto exists because that gap is real.
 
+### Laya desktop driving — real mouse and keyboard (2026-10-06)
+
+`hx drive` with a `gui` spec senses the app's AT-SPI accessibility tree each tick (a pyatspi
+helper under `apps/hx/src/atspi_sense.py`), lets the model answer typed questions about it, and
+actuates with xdotool — mousemove+click on a widget's centre, `type`, or a bare keyspec. Target
+apps launch with `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`; the spec's `coord_scale` maps a11y logical
+pixels to the real 3200×2400 display (2.0 here); the window is raised at start because
+click-to-focus raises whatever is topmost at the point.
+
+**Type into a document** (`kwrite-type.task.json` — doc must gain the line `Devin was here`;
+noul `has_greeting` doubles as action question (on_false → `seq:click:gui-demo.txt|text:Devin
+was here`) and done question):
+
+```console
+  #0   type_greeting  p=0.962   978ms  act
+  #1   -              p=0.559   839ms  act
+drive …: done after 2 steps — 2 steps, 3.6s
+```
+
+The a11y tree afterwards reads `shows 'line one Devin was here'` — the click hit the text area's
+centre and the typed text landed.
+
+**Handle a modal save dialog** (`kwrite-close-save.task.json` — close the doc keeping the text;
+`save_dialog` detects "a dialog offers 'Save', 'Discard' and 'Cancel'" → on_true `click:Save`,
+on_false `ctrl+w`; `document_gone` ends it):
+
+```console
+  #0   click_save  p=0.850  1660ms  act
+  #1   -           p=0.631  1418ms  act
+drive …: done after 2 steps — 2 steps, 3.2s
+```
+
+`cat /tmp/gui-demo.txt` afterwards: `line one` + `Devin was herex` — the click hit the *dialog's*
+Save, not the toolbar's same-named button (name lookup takes the last match — dialogs append
+late in the a11y tree), the buffer went to disk, and the editor was back to `Untitled`.
+
+**Open a menu and pick an item** (`kwrite-menu.task.json` — `menu_open` noul → on_true
+`click:Save As...` : on_false `click:File`): the drive reached done in 3 steps (4.8 s) with the
+Save File chooser open — tick 0 answered `menu_open` true at 0.629 (a borderline false positive)
+and clicked `Save As...`, which resolved to the *toolbar* button — the outcome the spec wanted
+via a shortcut the environment offered. Menu-state nouls hover near the gate; a cleaner signal is
+a signature unique to the open menu.
+
+**Calculator sequencing — the honest ceiling** (`kcalc.task.json` — "press 7, ×, 8, =" with the
+pick filtered to those four buttons): escalated at p=0.447/conf=0.104 every tick — probed
+standalone, the pick shows a persistent `AC`-then-`=` prior (~0.4–0.5) no matter what the
+"pressed so far" history says; 322M doesn't sequence button presses from an element list. The
+drive's gate held: it escalated rather than clicking the wrong button — the calc display stayed
+`0`. Same conclusion moon-buggy reached for real-time: the loop is a reactive controller, not a
+planner — shape tasks as state-detection → bound action, and leave sequences to the spec's
+bindings.
+
 ## Running the suite
 
 ```bash

@@ -226,12 +226,18 @@ impl Drive {
     /// Run the loop until done, escalated, capped, or failed. `on_step`, when
     /// given, sees each [`Step`] as it completes — the CLI uses it for live
     /// progress; tests pass `None`.
+    ///
+    /// `question_hook`, when given, mutates a fresh copy of the question set
+    /// between sense and predict each tick — how a GUI driver rebuilds a
+    /// "which element" choice as the screen's widgets change.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run<S, A, P>(
         &self,
         sense: &mut S,
         act: &mut A,
         predictor: &P,
         mut on_step: Option<&mut dyn FnMut(&Step)>,
+        mut question_hook: Option<&mut dyn FnMut(&mut QuestionSet)>,
     ) -> Result<DriveReport>
     where
         S: Sense,
@@ -264,7 +270,10 @@ impl Drive {
                 }
             };
 
-            let set = QuestionSet::new(state.clone(), self.questions.clone());
+            let mut set = QuestionSet::new(state.clone(), self.questions.clone());
+            if let Some(hook) = &mut question_hook {
+                hook(&mut set);
+            }
             let result = match predictor.predict(&set).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -617,7 +626,7 @@ mod tests {
             vec!["s1", "s2", "s3"],
         );
         let report = drive(0)
-            .run(&mut s, &mut a, &p, None)
+            .run(&mut s, &mut a, &p, None, None)
             .await
             .expect("drive runs");
         assert!(matches!(report.outcome, Outcome::Done { steps: 3 }));
@@ -634,7 +643,7 @@ mod tests {
             vec!["s1", "s2"],
         );
         let report = drive(1)
-            .run(&mut s, &mut a, &p, None)
+            .run(&mut s, &mut a, &p, None, None)
             .await
             .expect("drive runs");
         assert!(matches!(report.outcome, Outcome::Escalated));
@@ -654,7 +663,7 @@ mod tests {
             vec!["s1", "s2", "s3"],
         );
         let report = drive(1)
-            .run(&mut s, &mut a, &p, None)
+            .run(&mut s, &mut a, &p, None, None)
             .await
             .expect("drive runs");
         assert!(matches!(report.outcome, Outcome::Done { steps: 3 }));
@@ -666,7 +675,7 @@ mod tests {
         let (p, mut s, mut a, _) = rig(vec![], vec!["s1", "s2", "s3", "s4", "s5"]);
         let mut d = drive(0);
         d.max_steps = 3;
-        let report = d.run(&mut s, &mut a, &p, None).await.expect("drive runs");
+        let report = d.run(&mut s, &mut a, &p, None, None).await.expect("drive runs");
         assert!(matches!(report.outcome, Outcome::MaxSteps));
         assert_eq!(report.steps.len(), 3);
     }
@@ -676,7 +685,7 @@ mod tests {
         let (p, mut s, mut a, _) = rig(vec![], vec!["s1"]);
         a.fail = true;
         let report = drive(0)
-            .run(&mut s, &mut a, &p, None)
+            .run(&mut s, &mut a, &p, None, None)
             .await
             .expect("drive runs");
         match report.outcome {
@@ -713,7 +722,7 @@ mod tests {
         d.done_question = None;
         d.noul_actions = Some(("go".to_string(), "wait".to_string()));
         // script: done_p is the noul value for 'done' — 0.9 -> 'go', 0.1 -> 'wait', 0.5 -> escalate
-        let report = d.run(&mut s, &mut a, &p, None).await.expect("drive runs");
+        let report = d.run(&mut s, &mut a, &p, None, None).await.expect("drive runs");
         // First scripted answer: noul 0.9 -> 'go'. The default entries emit
         // done_p = 0.0 -> 'wait' for the remaining ticks until max_steps.
         let actions = ran.lock().unwrap().clone();
@@ -727,7 +736,7 @@ mod tests {
         // top prob clears the threshold but confidence is below the floor.
         let (p, mut s, mut a, ran) = rig(vec![("go".to_string(), 0.95, 0.2, 0.0, 0.0)], vec!["s1"]);
         let report = drive(0)
-            .run(&mut s, &mut a, &p, None)
+            .run(&mut s, &mut a, &p, None, None)
             .await
             .expect("drive runs");
         assert!(matches!(report.outcome, Outcome::Escalated));
@@ -747,7 +756,7 @@ mod tests {
         let mut d = drive(0);
         d.guard_question = Some("guard".to_string());
         d.guard_action = Some("deny".to_string());
-        let report = d.run(&mut s, &mut a, &p, None).await.expect("drive runs");
+        let report = d.run(&mut s, &mut a, &p, None, None).await.expect("drive runs");
         assert!(matches!(report.outcome, Outcome::Done { steps: 3 }));
         // tick 0 ran the veto, not the model's confident 'go'.
         assert_eq!(ran.lock().unwrap().as_slice(), &["deny", "go"]);

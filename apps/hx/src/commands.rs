@@ -574,8 +574,13 @@ pub async fn run_decision(
 /// The `hx drive` task spec (`task.json`). See docs/laya.md for a worked one.
 #[derive(Debug, serde::Deserialize)]
 struct DriveTask {
-    /// Which pane to drive.
-    tmux: DriveTmux,
+    /// Which pane to drive (terminal backend).
+    #[serde(default)]
+    tmux: Option<DriveTmux>,
+    /// Which application window to drive (GUI backend: AT-SPI sense +
+    /// xdotool mouse/keyboard — the element the model picks gets clicked).
+    #[serde(default)]
+    gui: Option<DriveGui>,
     /// Maps each option id of the action question to a `tmux send-keys`
     /// argument list ("Enter", "y Enter", "C-c") — `null` means "do nothing
     /// this tick" (the wait/no-op action).
@@ -632,13 +637,43 @@ struct DriveTask {
     guard_action: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 struct DriveTmux {
     /// A tmux target: `session`, `session:window`, or `session:window.pane`.
     target: String,
     /// How many lines of scrollback `capture-pane` hands the model (default 40).
     #[serde(default = "default_lines")]
     lines: usize,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DriveGui {
+    /// Only elements of applications whose a11y name contains this substring
+    /// (case-insensitive) are sensed. Empty/absent senses the whole desktop.
+    #[serde(default)]
+    app: Option<String>,
+    /// Cap on clickable elements offered per tick (default 18 — the model
+    /// degrades past ~20 options).
+    #[serde(default = "default_max_elements")]
+    max_elements: usize,
+    /// When the action question is a choice, only elements whose a11y name is
+    /// one of these exact strings are offered as options — narrows the pick to
+    /// the task-relevant widgets (the model can't plan, so don't dilute it).
+    #[serde(default)]
+    pick_names: Vec<String>,
+    /// AT-SPI extents come in the app's logical space; under Qt scaling the
+    /// real display is bigger. Click coordinates multiply by this (e.g. 2.0 on
+    /// a 200%-scaled desktop). Default 1.0.
+    #[serde(default = "default_coord_scale")]
+    coord_scale: f64,
+}
+
+fn default_coord_scale() -> f64 {
+    1.0
+}
+
+fn default_max_elements() -> usize {
+    18
 }
 
 fn default_done_threshold() -> f32 {
@@ -729,6 +764,248 @@ impl hx_decision::Act for TmuxAct {
     }
 }
 
+// ─── GUI driving: AT-SPI sense + xdotool act ────────────────────────────────
+// The screen→state encoder: a pyatspi walker turns the desktop's accessibility
+// tree into a numbered element list ([e3] push button 'Save' at (648,388)) the
+// model reads as text; the action question's options are rebuilt from that
+// list each tick; xdotool clicks the picked element's centre — a mouse.
+
+/// The a11y-tree sensor helper. Python because AT-SPI's only usable binding is
+/// pyatspi; hx never embeds Python — same pattern as the sidecar.
+const ATSPI_SENSE_PY: &str = include_str!("atspi_sense.py");
+
+/// One actionable widget as the a11y tree reports it.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct GuiElement {
+    id: String,
+    role: String,
+    name: String,
+    x: i64,
+    y: i64,
+    w: i64,
+    h: i64,
+    #[serde(default)]
+    text: String,
+}
+
+/// Where the sense helper is materialised on first use.
+fn atspi_script_path() -> std::io::Result<std::path::PathBuf> {
+    let dir = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("hx"));
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("atspi_sense.py");
+    std::fs::write(&path, ATSPI_SENSE_PY)?;
+    Ok(path)
+}
+
+/// Senses the desktop (or one application's) a11y tree. Shares the latest
+/// element table with the actuator and the pick-option hook via `Rc`s — every
+/// tick: sense fills the table, the hook rebuilds the choice options from it,
+/// the actuator clicks `e<N>` by its centre.
+struct GuiSense {
+    app: Option<String>,
+    max_elements: usize,
+    elements: std::sync::Arc<std::sync::Mutex<Vec<GuiElement>>>,
+}
+
+struct GuiAct {
+    elements: std::sync::Arc<std::sync::Mutex<Vec<GuiElement>>>,
+    keys: std::collections::HashMap<String, Option<String>>,
+    scale: f64,
+}
+
+async fn run_prog(prog: &str, args: &[String]) -> std::io::Result<std::process::Output> {
+    tokio::process::Command::new(prog).args(args).output().await
+}
+
+#[async_trait::async_trait]
+impl hx_decision::Sense for GuiSense {
+    async fn sense(&mut self) -> hx_core::error::Result<String> {
+        use hx_core::error::HxError;
+        let script = atspi_script_path()
+            .map_err(|e| HxError::Decision(format!("materialising atspi helper: {e}")))?;
+        let mut args = vec![
+            script.to_string_lossy().into_owned(),
+            "--max".to_string(),
+            self.max_elements.to_string(),
+        ];
+        if let Some(app) = &self.app {
+            args.push("--app".to_string());
+            args.push(app.clone());
+        }
+        let out = run_prog("python3", &args)
+            .await
+            .map_err(|e| HxError::Decision(format!("running atspi helper: {e}")))?;
+        if !out.status.success() {
+            return Err(HxError::Decision(format!(
+                "atspi helper failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .map_err(|e| HxError::Decision(format!("atspi helper printed bad JSON: {e}")))?;
+        let elements: Vec<GuiElement> = serde_json::from_value(v["elements"].clone())
+            .map_err(|e| HxError::Decision(format!("atspi helper element list: {e}")))?;
+        let text = v["text"].as_str().unwrap_or_default().to_string();
+        *self.elements.lock().unwrap() = elements;
+        if text.trim().is_empty() {
+            return Err(HxError::Decision(
+                "a11y tree came back empty — is the app up with accessibility enabled?".into(),
+            ));
+        }
+        Ok(text)
+    }
+}
+
+fn describe_gui_action(spec: Option<&String>) -> String {
+    match spec.map(|s| s.as_str()) {
+        None => "press nothing — wait a tick".to_string(),
+        Some(s) if s.starts_with("text:") => {
+            format!("type the text '{}'", &s[5..])
+        }
+        Some(s) if s.starts_with("click:") => {
+            format!("click the '{}' element", &s[6..])
+        }
+        Some(s) => format!("press keys: {s}"),
+    }
+}
+
+#[async_trait::async_trait]
+impl hx_decision::Act for GuiAct {
+    async fn act(&mut self, action_id: &str) -> hx_core::error::Result<()> {
+        use hx_core::error::HxError;
+        // e<N> → click element N's centre, like a mouse.
+        if action_id.starts_with('e') && action_id[1..].chars().all(|c| c.is_ascii_digit()) {
+            let el = self
+                .elements
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|e| e.id == action_id)
+                .cloned()
+                .ok_or_else(|| {
+                    HxError::Decision(format!("element '{action_id}' left the screen"))
+                })?;
+            let (cx, cy) = (
+                ((el.x + el.w / 2) as f64 * self.scale) as i64,
+                ((el.y + el.h / 2) as f64 * self.scale) as i64,
+            );
+            let out = run_prog(
+                "xdotool",
+                &[
+                    "mousemove".into(),
+                    cx.to_string(),
+                    cy.to_string(),
+                    "click".into(),
+                    "1".into(),
+                ],
+            )
+            .await
+            .map_err(|e| HxError::Decision(format!("xdotool click: {e}")))?;
+            if !out.status.success() {
+                return Err(HxError::Decision(format!(
+                    "xdotool click failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            return Ok(());
+        }
+        let spec = self
+            .keys
+            .get(action_id)
+            .ok_or_else(|| HxError::Decision(format!("no key binding for action '{action_id}'")))?;
+        let Some(spec) = spec else {
+            return Ok(()); // null binding = the wait action
+        };
+        // seq:a|b|c — a human action that is really a chord: click to focus,
+        // then type; open a menu, then pick. Each part re-dispatches.
+        if let Some(rest) = spec.strip_prefix("seq:") {
+            for part in rest.split('|') {
+                Box::pin(GuiAct {
+                    elements: self.elements.clone(),
+                    keys: [("_".to_string(), Some(part.to_string()))]
+                        .into_iter()
+                        .collect(),
+                    scale: self.scale,
+                })
+                .act("_")
+                .await?;
+                tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+            }
+            return Ok(());
+        }
+        if let Some(text) = spec.strip_prefix("text:") {
+            let out = run_prog(
+                "xdotool",
+                &[
+                    "type".into(),
+                    "--delay".into(),
+                    "15".into(),
+                    text.to_string(),
+                ],
+            )
+            .await
+            .map_err(|e| HxError::Decision(format!("xdotool type: {e}")))?;
+            if !out.status.success() {
+                return Err(HxError::Decision(format!(
+                    "xdotool type failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            return Ok(());
+        }
+        if let Some(name) = spec.strip_prefix("click:") {
+            let el = self
+                .elements
+                .lock()
+                .unwrap()
+                .iter()
+                // Last match wins: modal dialogs append after the toolbar, so
+                // 'Save' resolves to the dialog's button, not the toolbar's.
+                .rfind(|e| e.name == name)
+                .cloned()
+                .ok_or_else(|| HxError::Decision(format!("no element named '{name}' on screen")))?;
+            let (cx, cy) = (
+                ((el.x + el.w / 2) as f64 * self.scale) as i64,
+                ((el.y + el.h / 2) as f64 * self.scale) as i64,
+            );
+            let out = run_prog(
+                "xdotool",
+                &[
+                    "mousemove".into(),
+                    cx.to_string(),
+                    cy.to_string(),
+                    "click".into(),
+                    "1".into(),
+                ],
+            )
+            .await
+            .map_err(|e| HxError::Decision(format!("xdotool click: {e}")))?;
+            if !out.status.success() {
+                return Err(HxError::Decision(format!(
+                    "xdotool click failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            return Ok(());
+        }
+        // Bare keyspec → xdotool key.
+        let mut args: Vec<String> = vec!["key".into()];
+        args.extend(spec.split_whitespace().map(|s| s.to_string()));
+        let out = run_prog("xdotool", &args)
+            .await
+            .map_err(|e| HxError::Decision(format!("xdotool key: {e}")))?;
+        if !out.status.success() {
+            return Err(HxError::Decision(format!(
+                "xdotool key '{spec}' failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Parse a question set: an object mapping `id -> question`, or an array of
 /// questions each carrying its own id (the `hx decision --questions` shape).
 /// Choice `criteria` accepts either form a person would naturally write —
@@ -793,23 +1070,78 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("parsing task file {}: {e}", task_path))?;
     let questions: Vec<Question> = parse_questions(&task.questions)?;
 
-    // Every option the action question can pick must have a key binding (null
-    // counts — it binds "do nothing").
-    let action_options: Vec<String> = questions
-        .iter()
-        .find_map(|q| match q {
-            Question::Choice { id, criteria, .. } if *id == task.action_question => {
-                Some(criteria.iter().map(|o| o.id.clone()).collect())
+    let gui = match (&task.tmux, &task.gui) {
+        (Some(_), None) => false,
+        (None, Some(_)) => true,
+        _ => anyhow::bail!("task spec: set exactly one of 'tmux' or 'gui'"),
+    };
+    if !gui {
+        // Every option the action question can pick must have a key binding
+        // (null counts — it binds "do nothing"). GUI specs skip this: their
+        // options are the live element ids plus bound actions, injected per tick.
+        let action_options: Vec<String> = questions
+            .iter()
+            .find_map(|q| match q {
+                Question::Choice { id, criteria, .. } if *id == task.action_question => {
+                    Some(criteria.iter().map(|o| o.id.clone()).collect())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        for option in &action_options {
+            if !task.actions.contains_key(option) {
+                anyhow::bail!(
+                    "action question '{}' has option '{option}' but the task spec binds no keys for it",
+                    task.action_question
+                );
             }
-            _ => None,
-        })
-        .unwrap_or_default();
-    for option in &action_options {
-        if !task.actions.contains_key(option) {
-            anyhow::bail!(
-                "action question '{}' has option '{option}' but the task spec binds no keys for it",
-                task.action_question
-            );
+        }
+        match questions.iter().find(|q| q.id() == task.action_question) {
+            Some(Question::Noul { .. }) => {
+                for (side, name) in [
+                    ("on_true", task.on_true.as_deref()),
+                    ("on_false", task.on_false.as_deref()),
+                ] {
+                    match name {
+                        Some(id) if task.actions.contains_key(id) => {}
+                        Some(id) => {
+                            anyhow::bail!(
+                                "task spec: {side} action '{id}' has no keystroke binding"
+                            )
+                        }
+                        None => anyhow::bail!("task spec: noul action question needs '{side}' set"),
+                    }
+                }
+            }
+            _ => {}
+        }
+    } else {
+        // GUI: a noul action question (the reactive shape — "is the menu
+        // open?" → click item : open menu) needs both sides bound, same as
+        // tmux specs. Choice action questions get live element options.
+        if questions
+            .iter()
+            .any(|q| matches!(q, Question::Noul { .. }) && q.id() == task.action_question)
+        {
+            for (side, name) in [
+                ("on_true", task.on_true.as_deref()),
+                ("on_false", task.on_false.as_deref()),
+            ] {
+                match name {
+                    Some(id) if task.actions.contains_key(id) => {}
+                    Some(id) => {
+                        anyhow::bail!("task spec: {side} action '{id}' has no binding")
+                    }
+                    None => anyhow::bail!("task spec: noul action question needs '{side}' set"),
+                }
+            }
+        }
+        if let Some(ga) = &task.guard_action {
+            if !task.actions.contains_key(ga) && !ga.starts_with('e') {
+                anyhow::bail!(
+                    "task spec: guard_action '{ga}' has no binding (element ids are unstable)"
+                );
+            }
         }
     }
 
@@ -837,21 +1169,146 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
     };
     drive.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let mut sensor = TmuxSense {
-        target: task.tmux.target.clone(),
-        lines: task.tmux.lines,
+    let tmux_spec = task.tmux.clone();
+    let mut sensor_t = TmuxSense {
+        target: tmux_spec
+            .as_ref()
+            .map(|t| t.target.clone())
+            .unwrap_or_default(),
+        lines: tmux_spec.as_ref().map(|t| t.lines).unwrap_or(0),
     };
-    let mut actuator = TmuxAct {
-        target: task.tmux.target.clone(),
+    let mut actuator_t = TmuxAct {
+        target: tmux_spec
+            .as_ref()
+            .map(|t| t.target.clone())
+            .unwrap_or_default(),
         keys: task.actions.clone(),
     };
 
-    println!(
-        "hx drive: {} on tmux '{}' (tick {}ms, max {} steps, threshold {:.2})",
-        task_path, task.tmux.target, task.tick_ms, task.max_steps, task.threshold
-    );
+    // GUI backend: shared element table — sense fills it, the pick hook reads
+    // it to rebuild options, act reads it to click e<N>.
+    let elements = std::sync::Arc::new(std::sync::Mutex::new(Vec::<GuiElement>::new()));
+    let mut sensor_g = GuiSense {
+        app: task.gui.as_ref().and_then(|g| g.app.clone()),
+        max_elements: task
+            .gui
+            .as_ref()
+            .map(|g| g.max_elements)
+            .unwrap_or_else(default_max_elements),
+        elements: elements.clone(),
+    };
+    let pick_names: std::collections::HashSet<String> = task
+        .gui
+        .as_ref()
+        .map(|g| g.pick_names.iter().cloned().collect())
+        .unwrap_or_default();
+    let mut actuator_g = GuiAct {
+        elements: elements.clone(),
+        keys: task.actions.clone(),
+        scale: task
+            .gui
+            .as_ref()
+            .map(|g| g.coord_scale)
+            .unwrap_or_else(default_coord_scale),
+    };
 
+    // The pick hook: each tick, rebuild the action question's options as the
+    // live element ids + the bound actions — the model then answers "which
+    // element or op comes next".
+    let action_q = task.action_question.clone();
+    let bound = task.actions.clone();
+    let els_for_hook = elements.clone();
+    let history: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let history_for_hook = history.clone();
+    let mut pick_hook = move |set: &mut hx_decision::QuestionSet| {
+        let pick_names = &pick_names;
+        let mut options: Vec<hx_decision::ChoiceOption> = els_for_hook
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| pick_names.is_empty() || pick_names.contains(&e.name))
+            .map(|e| hx_decision::ChoiceOption {
+                id: e.id.clone(),
+                description: {
+                    let what = if e.name.is_empty() {
+                        format!("{} at ({},{})", e.role, e.x, e.y)
+                    } else {
+                        format!("{} '{}'", e.role, e.name)
+                    };
+                    if e.text.is_empty() {
+                        what
+                    } else {
+                        format!("{what} — shows '{}'", e.text)
+                    }
+                },
+            })
+            .collect();
+        for (id, spec) in &bound {
+            options.push(hx_decision::ChoiceOption {
+                id: id.clone(),
+                description: describe_gui_action(spec.as_ref()),
+            });
+        }
+        for q in set.questions.iter_mut() {
+            if let Question::Choice { id, criteria, .. } = q {
+                if *id == action_q {
+                    *criteria = options.clone();
+                }
+            }
+        }
+        // The model has no memory of prior ticks — prepend its own action
+        // history so multi-step GUI tasks (7, ×, 8, =) can be sequenced.
+        let hist = history_for_hook.lock().unwrap();
+        if !hist.is_empty() {
+            set.state = format!(
+                "actions already taken: {}\n\n{}",
+                hist.join(", "),
+                set.state
+            );
+        }
+    };
+
+    if let Some(app) = task.gui.as_ref().and_then(|g| g.app.clone()) {
+        // Raise the target app first: clicks land on whatever window is
+        // topmost at those coordinates.
+        let _ = run_prog("wmctrl", &["-a".into(), app]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    match &task.tmux {
+        Some(t) => println!(
+            "hx drive: {} on tmux '{}' (tick {}ms, max {} steps, threshold {:.2})",
+            task_path, t.target, task.tick_ms, task.max_steps, task.threshold
+        ),
+        None => println!(
+            "hx drive: {} on gui '{}' (tick {}ms, max {} steps, threshold {:.2})",
+            task_path,
+            task.gui
+                .as_ref()
+                .and_then(|g| g.app.clone())
+                .unwrap_or_else(|| "<desktop>".into()),
+            task.tick_ms,
+            task.max_steps,
+            task.threshold
+        ),
+    }
+
+    let els_for_history = elements.clone();
+    let history_for_step = history.clone();
     let mut printer = |step: &hx_decision::Step| {
+        if let Some(a) = &step.action {
+            let label = if a.starts_with('e') {
+                els_for_history
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e.id == *a)
+                    .map(|e| format!("{a} '{}'", e.name))
+                    .unwrap_or_else(|| a.clone())
+            } else {
+                a.clone()
+            };
+            history_for_step.lock().unwrap().push(label);
+        }
         let picked = step.action.as_deref().unwrap_or("-");
         let verdict = if step.decision.escalated() {
             "escalate"
@@ -871,9 +1328,27 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
         );
     };
 
-    let report = drive
-        .run(&mut sensor, &mut actuator, &client, Some(&mut printer))
-        .await?;
+    let report = if gui {
+        drive
+            .run(
+                &mut sensor_g,
+                &mut actuator_g,
+                &client,
+                Some(&mut printer),
+                Some(&mut pick_hook),
+            )
+            .await?
+    } else {
+        drive
+            .run(
+                &mut sensor_t,
+                &mut actuator_t,
+                &client,
+                Some(&mut printer),
+                None,
+            )
+            .await?
+    };
 
     let outcome = match &report.outcome {
         Outcome::Done { steps } => format!("done after {steps} steps"),

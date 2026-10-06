@@ -148,6 +148,61 @@ TESTING.md. What they teach:
   programs drive correctly; moon-buggy crashes on the first crater while `obstacle_ahead` can't
   read ASCII art. Frame-rate play needs the GPU path and a prose state encoder.
 
+## `hx drive` on the desktop — GUI control
+
+The same loop drives real windows: instead of a pane's text, each tick senses the app's
+**accessibility tree** (AT-SPI) — every actionable widget as `[e3] push button 'Save' at
+(728,579)` plus readable labels — and acts through **xdotool** (`mousemove`/`click`/`type`/`key`),
+i.e. a real mouse and keyboard. `hx` never embeds Python: the sense helper is a small pyatspi
+script (`apps/hx/src/atspi_sense.py`, materialized to the cache dir on first run), same pattern
+as the sidecar.
+
+```jsonc
+{
+  "gui": { "app": "kwrite", "max_elements": 24, "coord_scale": 2.0 },
+  "actions": {
+    "click_save": "click:Save",
+    "close_doc": "ctrl+w",
+    "wait": null
+  },
+  "questions": {
+    "save_dialog":    { "type": "noul", "instructions": "A dialog offers 'Save', 'Discard' and 'Cancel' — the document wants to be saved or discarded before closing." },
+    "document_gone":  { "type": "noul", "instructions": "The document 'gui-demo.txt' is no longer open." }
+  },
+  "action_question": "save_dialog", "on_true": "click_save", "on_false": "close_doc",
+  "done_question": "document_gone", "done_threshold": 0.6,
+  "threshold": 0.6, "tick_ms": 800, "max_steps": 10
+}
+```
+
+* `gui.app` is a substring of the app's a11y name; the window is raised (`wmctrl -a`) at start.
+  `coord_scale` converts a11y logical pixels to real display pixels (2.0 on 200%-scaled desktops).
+* Bindings: `click:<name>` clicks the element whose a11y name matches — **last** match wins
+  (modal dialogs append after toolbars, so `'Save'` resolves to the dialog's button);
+  `text:<s>` types; `seq:a|b|c` runs a chord (click to focus → type); a bare keyspec goes to
+  `xdotool key`; `e<N>` clicks element N's centre; `null` waits.
+* Apps must launch with accessibility on: `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 QT_ACCESSIBILITY=1`
+  and a live at-spi bus (`DBUS_SESSION_BUS_ADDRESS`, `/usr/libexec/at-spi-bus-launcher`).
+
+What the live suite taught (all runs on this box, kwrite/kcalc on a 3200×2400 KDE desktop):
+
+* **The reactive shape is the one that works**: a noul detects the *state* ("a dialog offers
+  'Save', 'Discard' and 'Cancel'" — 0.93 when up), and the two bound actions cover both worlds —
+  e.g. "menu open?" → `click:Save As...` : `click:File` walks open-menu→pick-item across ticks.
+  The `kwrite-close-save` spec ran dialog-detect→click-Save→document-gone→done in 3.2 s and the
+  file hit disk.
+* **Detection beats intention**: ask what IS on screen, not what SHOULD happen. Forward
+  statements score sharply ("the document mentions X" → 0.05 false / 0.81 true); negations
+  ("does not contain") collapse to ~0 — invert the noul so detection is the true side.
+* **A choice across screen elements does not plan**: 'pick which button next' across calculator
+  keys stays under 0.55 with a persistent `AC`-then-`=` bias regardless of history — multi-step
+  sequencing is out of 322M's reach (same ceiling as real-time games). The drive escalates
+  instead of clicking wrong — safe failure.
+* **Only SHOWING widgets are offered** — Qt pre-creates menu items offscreen; without the
+  SHOWING-state filter a closed menu looks open.
+* **Hidden state traps**: windows stacked under others take stale clicks — click-to-focus raises
+  whatever's topmost at the point, which is why the drive raises the target app at start.
+
 ## How it fits hx
 
 * `crates/hx-decision` — typed question/answer schema + `LayaClient` (HTTP to the sidecar).
