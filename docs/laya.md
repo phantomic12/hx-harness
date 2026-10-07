@@ -345,3 +345,52 @@ three drive bugs and taught four spec rules:
 
 Result: 18 steps, ~3 min — live HN front page searched, top story + comments
 fetched, digest written into KWrite, saved, marker-verified.
+
+## Containerized browser (fox-nyt-nav)
+
+`queue/fox-nyt-nav/` — a 4-stage drive against **nytimes.com, which 403s
+curl**, running in `examples/laya-drive/kasm-fox` — a Kasm-style container:
+firefox-esr in debian on the host X server + a11y bus. `hx drive` senses and
+clicks it exactly like a local app; see the image README for the docker run
+recipe and the `xprop -root AT_SPI_BUS` socket discovery (the a11y bus is not
+the session bus — the session bus is AppArmor-mediated and rejects the
+container). Stages: `ctrl+l|type|Return` to the homepage → **choice pick of a
+headline link** → Back → Forward. Verify greps the live a11y tree for an
+article tab/doc pair that is not the homepage.
+
+Findings that earned new spec machinery:
+
+- **The model's real ceiling is a ~512-token state budget, not option count.**
+  Sidecar `/predict` responses carry `state_tokens_dropped` + a
+  `truncated_questions` list — at ~85 options the criteria dict was clipped
+  mid-range and the article links were literally invisible to the model
+  (it had ranked `go_back` because it could only see bound actions). Probe
+  with the real option list before blaming phrasing.
+- **`pick_roles`** (gui spec) — restricts choice options to element roles;
+  `["link"]` on a news page drops buttons/paragraphs.
+- **`pick_min_len`** (gui spec) — restricts options to names ≥ N chars; on a
+  news page the story links are the long-named ones and the one-word nav
+  items drop out, taking the criteria under the token clip.
+- **`choice_actions`** (stage spec) — whitelist of bound action ids offered
+  alongside element picks. Bound ops read as verbs and outbid element ids
+  (`go_back` beat `e66` at 0.57 vs 0.30); offer only `["scroll_down","wait"]`
+  during a pick stage.
+- **Pick-any tasks split the vote.** Six equivalent headline candidates put
+  the top pick at ~0.30 — below the 0.45 gate but perfectly correct. Threshold
+  for "pick any" stages belongs at ~0.18, not ~0.5.
+- **`click_roles`** (gui spec) — extra roles offered as click targets when a
+  page exposes tappable text (`paragraph`/`static`) instead of link elements;
+  NYT doesn't need it (headlines are named `link` nodes once maximized) but
+  it's available for sites that don't expose anchors.
+- **`click:` names fall back to substring match** — Firefox renames the
+  address bar per page ('Search or enter address' → 'Search with Google or
+  enter address'); exact-match died on the rename, so matching degrades to a
+  shared-substring lookup. Prefer `ctrl+l` for the address bar anyway.
+- **Maximize the container window** — article links stay virtual/not-SHOWING
+  (zero extents, dropped by the sensor) until rendered; a maximized viewport
+  renders ~6 headline links on the NYT homepage.
+- **Container setup needs an a11y-registration wait** — the window appears in
+  `wmctrl -l` seconds before its tree registers; a tick-0 empty sense makes
+  the model fire actions at a lookup table of zero.
+- Fresh profiles open **Welcome + Privacy Notice tabs** — denylist them in
+  verify scripts or they false-positive "not homepage" checks.

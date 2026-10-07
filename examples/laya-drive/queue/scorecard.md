@@ -1,6 +1,6 @@
 # Drive queue scorecard
 
-10/10 tasks verified
+11/11 tasks verified
 
 | task | drive outcome | verified | time |
 |---|---|---|---|
@@ -14,3 +14,4 @@
 | os-organize-logs | done | PASS | 9.5s |
 | os-php-lines | stopped | PASS | 16.5s |
 | os-rename-dir | done | PASS | 8.0s |
+| fox-nyt-nav | done | PASS | 100.6s |

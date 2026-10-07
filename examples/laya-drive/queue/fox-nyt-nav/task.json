@@ -1,0 +1,96 @@
+{
+  "gui": {
+    "app": "firefox",
+    "max_elements": 80,
+    "coord_scale": 1.0,
+    "skip_roles": [
+      "table cell"
+    ],
+    "pick_roles": [
+      "link"
+    ],
+    "pick_min_len": 20
+  },
+  "actions": {
+    "goto_nyt": "seq:ctrl+l|text:nytimes.com|Return",
+    "go_back": "click:Back",
+    "go_forward": "click:Forward",
+    "scroll_down": "Page_Down",
+    "wait": null
+  },
+  "questions": {
+    "nyt_home": {
+      "type": "noul",
+      "instructions": "The page shows 'The New York Times' \u2014 its title or section links like 'U.S.' and 'INTERNATIONAL' are visible."
+    },
+    "article_link": {
+      "type": "choice",
+      "instructions": "Pick the e<N> link whose name is a news headline \u2014 a story title, not a nav item.",
+      "criteria": {
+        "wait": "press nothing \u2014 wait for the page"
+      }
+    },
+    "article_open": {
+      "type": "noul",
+      "instructions": "The page shows a news article \u2014 a story headline and article text, not the homepage's section links."
+    },
+    "home_again": {
+      "type": "noul",
+      "instructions": "The homepage is showing again \u2014 the document lists section links like 'U.S.' and 'INTERNATIONAL'."
+    },
+    "fwd_again": {
+      "type": "noul",
+      "instructions": "An article page is showing again \u2014 story text, not the homepage's section list."
+    }
+  },
+  "stages": [
+    {
+      "action_question": "nyt_home",
+      "on_true": "wait",
+      "on_false": "goto_nyt",
+      "done_question": "nyt_home",
+      "done_threshold": 0.6,
+      "threshold": 0.5,
+      "max_steps": 12,
+      "max_escalations": 4,
+      "warmup": 1
+    },
+    {
+      "action_question": "article_link",
+      "done_question": "article_open",
+      "done_threshold": 0.6,
+      "threshold": 0.18,
+      "max_steps": 12,
+      "max_escalations": 5,
+      "warmup": 1,
+      "choice_actions": [
+        "scroll_down",
+        "wait"
+      ]
+    },
+    {
+      "action_question": "home_again",
+      "on_true": "wait",
+      "on_false": "go_back",
+      "done_question": "home_again",
+      "done_threshold": 0.6,
+      "threshold": 0.5,
+      "max_steps": 10,
+      "max_escalations": 4,
+      "warmup": 1
+    },
+    {
+      "action_question": "fwd_again",
+      "on_true": "wait",
+      "on_false": "go_forward",
+      "done_question": "fwd_again",
+      "done_threshold": 0.6,
+      "threshold": 0.5,
+      "max_steps": 10,
+      "max_escalations": 4,
+      "warmup": 1
+    }
+  ],
+  "warmup": 1,
+  "tick_ms": 1000
+}

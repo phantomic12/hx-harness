@@ -1,0 +1,34 @@
+--- setup (rc=0)
+
+--- drive (outcome=done, 100.6s)
+hx drive: /home/ubuntu/laya-work/examples/laya-drive/queue/fox-nyt-nav/task.json on gui 'firefox' (tick 1000ms, max 60 steps, threshold 0.80)
+-- stage 1: nyt_home
+  #0   goto_nyt p=0.801 conf=0.800   3254ms  act
+  #1   -        p=0.601 conf=0.601  11250ms  act
+   stage done after 2 steps
+-- stage 2: article_link
+  #0   e66      p=0.304 conf=0.126   4935ms  act
+  #1   e66      p=0.734 conf=0.486  12117ms  act
+  #2   e19      p=0.316 conf=0.010   5792ms  act
+  #3   e19      p=0.540 conf=0.138   5039ms  act
+  #4   e19      p=0.458 conf=0.074   4296ms  act
+  #5   e19      p=0.419 conf=0.051   3544ms  act
+  #6   -        p=0.661 conf=0.661   3377ms  act
+   stage done after 7 steps
+-- stage 3: home_again
+  #0   wait     p=0.608 conf=0.608   3298ms  act
+  #1   wait     p=0.592 conf=0.592   3987ms  act
+  #2   wait     p=0.569 conf=0.569   4638ms  act
+  #3   wait     p=0.583 conf=0.583   4758ms  act
+  #4   wait     p=0.595 conf=0.595   6335ms  act
+  #5   wait     p=0.598 conf=0.598   5466ms  act
+  #6   -        p=0.612 conf=0.612   5410ms  act
+   stage done after 7 steps
+-- stage 4: fwd_again
+  #0   wait     p=0.862 conf=0.862   4543ms  act
+  #1   -        p=0.864 conf=0.864   3498ms  act
+   stage done after 2 steps
+drive /home/ubuntu/laya-work/examples/laya-drive/queue/fox-nyt-nav/task.json: done — 18 steps, 100.0s
+
+--- verify (pass=True)
+

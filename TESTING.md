@@ -1236,3 +1236,29 @@ HX_SSH_TEST_HOST=<host> HX_SSH_TEST_USER=<user> HX_SSH_TEST_KEY=~/.ssh/id_ed2551
   on both the near and the far host, but the proxy matches hostnames, so those entries are refused
   rather than pretended — plus keyless scraping that survives a TLS-fingerprint bot wall (browser-pool
   work), the vault opened in a new process, and provider calls to a real model API.
+### Cross-app research drive (news-research)
+
+Five stages across two apps: konsole `curl` search of the HN front page →
+fetch top story + comments into a digest file → KWrite type the digest →
+save → shell marker verify. Live result: 18 steps / ~3 min, file verified
+on disk (`news-writeup.txt`, a real front-page headline + comment excerpts).
+Exercise surfaced three drive bugs fixed in the same commit: terminal sense
+read only the top 600 buffer chars (markers past the fold were invisible),
+stage done checks re-fired on stale markers from earlier stages (distinct
+per-stage markers now), and stage app-switches clicked the window that was
+on top rather than the stage's app (stages now `wmctrl -a` their app).
+New binding `typefile:<path>` types a file's contents — the mechanism for a
+research stage to hand live findings to a writing stage.
+
+### Containerized browser drive (fox-nyt-nav)
+
+Four stages inside a Kasm-style container (`examples/laya-drive/kasm-fox`:
+firefox-esr on the host X11 + a11y bus) against nytimes.com — a site that
+403s curl. Live result: `done` in 18 steps / ~100 s, verify PASS — the model
+typed the URL via ctrl+l, picked headline link `e66` ('Trump's Retreat…'),
+then Back→homepage→Forward→article. The drive surfaced the option-clipping
+limit (`state_tokens_dropped` — the ~512-token state budget had silently cut
+the mid-range options, including the article links) and three bound-op
+failure modes (ops outbidding element picks, window-cover races, a11y
+registration lag). New spec fields: `pick_roles`, `pick_min_len`,
+`choice_actions`, `click_roles`; `click:` now degrades to substring match.

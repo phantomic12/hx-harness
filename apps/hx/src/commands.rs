@@ -694,6 +694,12 @@ struct DriveStage {
     /// Falls back to the task value; an explicit "" senses the whole desktop.
     #[serde(default)]
     app: Option<String>,
+    /// Bound action ids offered as options during this stage's choice
+    /// question — e.g. ["scroll_down","wait"] keeps navigation helpers out
+    /// of an element pick (bound ops read as verbs and outbid headline
+    /// links). Absent offers every bound action (legacy behaviour).
+    #[serde(default)]
+    choice_actions: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -720,6 +726,18 @@ struct DriveGui {
     /// the task-relevant widgets (the model can't plan, so don't dilute it).
     #[serde(default)]
     pick_names: Vec<String>,
+    /// When the action question is a choice, only elements of these a11y
+    /// roles are offered as options — e.g. ["link"] on a news page keeps
+    /// every story link but drops buttons/paragraphs from the pick (the
+    /// model degrades past ~20 options).
+    #[serde(default)]
+    pick_roles: Vec<String>,
+    /// When the action question is a choice, only elements whose name is at
+    /// least this many chars are offered — e.g. 20 on a news page keeps the
+    /// long headline links and drops the one-word nav items, which keeps
+    /// the option list inside the model's token budget.
+    #[serde(default)]
+    pick_min_len: usize,
     /// AT-SPI extents come in the app's logical space; under Qt scaling the
     /// real display is bigger. Click coordinates multiply by this (e.g. 2.0 on
     /// a 200%-scaled desktop). Default 1.0.
@@ -736,6 +754,12 @@ struct DriveGui {
     /// the element cap and the model's context.
     #[serde(default)]
     skip_roles: Vec<String>,
+    /// Extra roles offered as click targets — web pages expose article
+    /// cards as 'paragraph'/'static' text inside a link wrapper, so a
+    /// browser task may mark them clickable and the model picks the
+    /// headline it wants.
+    #[serde(default)]
+    click_roles: Vec<String>,
 }
 
 fn default_coord_scale() -> f64 {
@@ -884,6 +908,9 @@ struct GuiSense {
     /// Roles dropped with their subtrees (e.g. "table cell" — a file
     /// chooser's row grid floods the element cap and the model's context).
     skip_roles: Vec<String>,
+    /// Extra roles offered as click targets (e.g. "paragraph" on a web
+    /// page — article cards sit inside link wrappers).
+    click_roles: Vec<String>,
     max_elements: usize,
     elements: std::sync::Arc<std::sync::Mutex<Vec<GuiElement>>>,
 }
@@ -922,6 +949,10 @@ impl hx_decision::Sense for GuiSense {
         if !self.skip_roles.is_empty() {
             args.push("--skip-roles".to_string());
             args.push(self.skip_roles.join(","));
+        }
+        if !self.click_roles.is_empty() {
+            args.push("--click-roles".to_string());
+            args.push(self.click_roles.join(","));
         }
         let out = run_prog("python3", &args)
             .await
@@ -1098,16 +1129,26 @@ impl hx_decision::Act for GuiAct {
             let Some(name) = spec.strip_prefix(prefix) else {
                 continue;
             };
-            let el = self
-                .elements
-                .lock()
-                .unwrap()
-                .iter()
-                // Last match wins: modal dialogs append after the toolbar, so
-                // 'Save' resolves to the dialog's button, not the toolbar's.
-                .rfind(|e| e.name == name)
-                .cloned()
-                .ok_or_else(|| HxError::Decision(format!("no element named '{name}' on screen")))?;
+            let el = {
+                let els = self.elements.lock().unwrap();
+                els.iter()
+                    // Last match wins: modal dialogs append after the toolbar, so
+                    // 'Save' resolves to the dialog's button, not the toolbar's.
+                    .rfind(|e| e.name == name)
+                    // Dynamic UIs rename elements (a browser address bar reads
+                    // 'Search or enter address' on one page and 'Search with Google
+                    // or enter address' on the next) — degrade to a shared-
+                    // substring match rather than dying on the rename.
+                    .or_else(|| els.iter().rfind(|e| e.name.contains(name)))
+                    .or_else(|| {
+                        els.iter()
+                            .rfind(|e| !e.name.is_empty() && name.contains(e.name.as_str()))
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        HxError::Decision(format!("no element named '{name}' on screen"))
+                    })?
+            };
             let (cx, cy) = (
                 ((el.x + el.w / 2) as f64 * self.scale) as i64,
                 ((el.y + el.h / 2) as f64 * self.scale) as i64,
@@ -1236,6 +1277,7 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
         guard_action: Option<String>,
         window: Option<String>,
         app: Option<String>,
+        choice_actions: Option<Vec<String>>,
     }
     let stage_count = task.stages.len();
     let task_window = task.gui.as_ref().and_then(|g| g.window.clone());
@@ -1259,6 +1301,7 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
             guard_action: task.guard_action.clone(),
             window: task_window.clone(),
             app: task_app.clone(),
+            choice_actions: None,
         }]
     } else {
         let last = stage_count - 1;
@@ -1291,6 +1334,7 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
                 guard_action: s.guard_action.clone().or_else(|| task.guard_action.clone()),
                 window: s.window.clone().or_else(|| task_window.clone()),
                 app: s.app.clone().or_else(|| task_app.clone()),
+                choice_actions: s.choice_actions.clone(),
             })
             .collect()
     };
@@ -1395,6 +1439,11 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
             .as_ref()
             .map(|g| g.skip_roles.clone())
             .unwrap_or_default(),
+        click_roles: task
+            .gui
+            .as_ref()
+            .map(|g| g.click_roles.clone())
+            .unwrap_or_default(),
         max_elements: task
             .gui
             .as_ref()
@@ -1406,6 +1455,16 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
         .gui
         .as_ref()
         .map(|g| g.pick_names.iter().cloned().collect())
+        .unwrap_or_default();
+    let pick_roles: std::collections::HashSet<String> = task
+        .gui
+        .as_ref()
+        .map(|g| g.pick_roles.iter().cloned().collect())
+        .unwrap_or_default();
+    let pick_min_len: usize = task
+        .gui
+        .as_ref()
+        .map(|g| g.pick_min_len)
         .unwrap_or_default();
     let mut actuator_g = GuiAct {
         elements: elements.clone(),
@@ -1428,18 +1487,26 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
             .unwrap_or_default(),
     ));
     let action_q_slot = current_action_q.clone();
+    // Bound ids offered during a choice stage — None = all (legacy), Some
+    // = the stage's `choice_actions` whitelist. Set per stage below.
+    let bound_offer: std::sync::Arc<std::sync::Mutex<Option<Vec<String>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let bound_offer_slot = bound_offer.clone();
     let bound = task.actions.clone();
     let els_for_hook = elements.clone();
     let history: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
     let history_for_hook = history.clone();
     let mut pick_hook = move |set: &mut hx_decision::QuestionSet| {
         let pick_names = &pick_names;
+        let pick_roles = &pick_roles;
         let action_q = action_q_slot.lock().unwrap().clone();
         let mut options: Vec<hx_decision::ChoiceOption> = els_for_hook
             .lock()
             .unwrap()
             .iter()
             .filter(|e| pick_names.is_empty() || pick_names.contains(&e.name))
+            .filter(|e| pick_roles.is_empty() || pick_roles.contains(&e.role))
+            .filter(|e| e.name.chars().count() >= pick_min_len)
             .map(|e| hx_decision::ChoiceOption {
                 id: e.id.clone(),
                 description: {
@@ -1456,7 +1523,13 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
                 },
             })
             .collect();
+        let allowed = bound_offer_slot.lock().unwrap().clone();
         for (id, spec) in &bound {
+            if let Some(list) = &allowed {
+                if !list.contains(id) {
+                    continue;
+                }
+            }
             options.push(hx_decision::ChoiceOption {
                 id: id.clone(),
                 description: describe_gui_action(spec.as_ref()),
@@ -1551,6 +1624,7 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
         *current_action_q.lock().unwrap() = stage.action_question.clone();
         *window_slot.lock().unwrap() = stage.window.clone();
         *app_slot.lock().unwrap() = stage.app.clone();
+        *bound_offer.lock().unwrap() = stage.choice_actions.clone();
         // A stage crossing apps must raise the new target's window — clicks
         // land on whatever is topmost at those coordinates, and the previous
         // stage's app may still cover the element the spec names.

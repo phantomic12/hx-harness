@@ -27,7 +27,7 @@ TEXTY = {"text", "entry", "password text", "terminal", "document frame",
 
 
 def walk(node, app_name, out, elements, cap, depth=0, max_depth=12,
-         skip_roles=frozenset()):
+         skip_roles=frozenset(), click_roles=frozenset()):
     if depth > max_depth or len(elements) >= cap:
         return
     try:
@@ -88,7 +88,8 @@ def walk(node, app_name, out, elements, cap, depth=0, max_depth=12,
                 owner = ""
         out.append(f"    drop-down menu under {owner or '?'} is open:")
 
-    if role in ACTIONABLE and showing and w > 0 and h > 0 and x >= 0 and y >= 0:
+    if (role in ACTIONABLE or role in click_roles) and showing \
+            and w > 0 and h > 0 and x >= 0 and y >= 0:
         eid = f"e{len(elements)}"
         elements.append(
             {"id": eid, "role": role, "name": name, "x": x, "y": y,
@@ -109,7 +110,7 @@ def walk(node, app_name, out, elements, cap, depth=0, max_depth=12,
     for i in range(min(n, 40)):
         try:
             walk(node.getChildAtIndex(i), app_name, out, elements, cap,
-                 depth + 1, max_depth, skip_roles)
+                 depth + 1, max_depth, skip_roles, click_roles)
         except Exception:
             continue
 
@@ -132,8 +133,18 @@ def main():
         help="comma-separated roles to drop with their subtrees — e.g. "
         "'table cell,list item' shrinks a file chooser's row grid",
     )
+    ap.add_argument(
+        "--click-roles",
+        default="",
+        help="comma-separated extra roles to offer as click targets — "
+        "web pages expose article cards as 'paragraph'/'static' text "
+        "inside a link wrapper, so a browser task may mark them "
+        "clickable and the model picks the headline it wants",
+    )
     args = ap.parse_args()
     skip = frozenset(r.strip() for r in args.skip_roles.split(",") if r.strip())
+    click_roles = frozenset(
+        r.strip() for r in args.click_roles.split(",") if r.strip())
 
     desktop = pyatspi.Registry.getDesktop(0)
     out, elements = [], []
@@ -162,7 +173,7 @@ def main():
                     matched = True
                     out.append(f"    window titled {fname!r}")
                     walk(frame, name, out, elements, args.max,
-                         skip_roles=skip)
+                         skip_roles=skip, click_roles=click_roles)
             if matched:
                 continue
         else:
@@ -178,7 +189,8 @@ def main():
                         continue
             except Exception:
                 pass
-        walk(app, name, out, elements, args.max, skip_roles=skip)
+        walk(app, name, out, elements, args.max,
+             skip_roles=skip, click_roles=click_roles)
     json.dump({"text": "\n".join(out), "elements": elements}, sys.stdout)
 
 
