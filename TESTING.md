@@ -1159,6 +1159,34 @@ that stayed mushy (~0.6–0.7 both states on "menu open", filename-in-field stri
 `'Parent Directory'`, the post-save title — a lexical-presence rule that also explains why
 menu-open nouls can't separate (drop-down item names collide with toolbar ones).
 
+**OSWorld-adapted queue — 10/10 verified** (`examples/laya-drive/queue/`): ten tasks
+shaped like OSWorld's harness — `setup.sh` fixture, `hx drive` phase, `verify.sh`
+execution check on the filesystem. `run_queue.py` runs them and writes the scorecard:
+
+| task | domain | what it drives | drive | verify |
+|---|---|---|---|---|
+| kwrite-save-as | editor dialog | type → Save As → name it → Save | done 13.0s | PASS |
+| os-append-br | editor | `End`+type `<br/>` on 3 lines → `ctrl+s` | done 8.1s | PASS |
+| os-chmod-644 | terminal | `find -type f -exec chmod 644` | done 10.7s | PASS |
+| os-compress-old | terminal | `find -mtime +30` to file | done 11.2s | PASS |
+| os-failed-ipynb | terminal | `cp --parents` failed.ipynb tree | done 10.8s | PASS |
+| os-jpg-collect | terminal | recursive `*.jpg` → one dir | done 10.3s | PASS |
+| os-nano-edit | TUI (4 stages) | nano open → type → `ctrl+o` save → `ctrl+x` exit | done 12.7s | PASS |
+| os-organize-logs | terminal | `mkdir` + `mv *.log` | done 9.5s | PASS |
+| os-php-lines | terminal | `find -name '*.php' -exec wc -l` | stopped* 16.5s | PASS |
+| os-rename-dir | terminal | `mv` rename | done 8.0s | PASS |
+
+*php-lines verified but ended `stopped` — the done read stayed conservative on a real
+result; the filesystem check is the arbiter, same as OSWorld's execution-based scoring.
+
+Failures burned down along the way (each changed the sensor or the spec, not the model):
+`terminal shows` truncating at 80 chars hid every output line — now head+tail; markers
+inside their own `echo` command confabulated — output-only `==BENCH-DO""NE==` idiom plus
+prompt-below-output phrasing; `warmup: 1` ended tick-0 "done" reads (0.82 on a blank
+prompt); goal-state claims ("the edit is applied") confabulated where current-state
+claims ("last line is plain `gamma`") split; window titles/tab labels (`br-doc.txt *`,
+`bench : nano`) turned out to be the most readable state signals of all.
+
 ## Running the suite
 
 ```bash

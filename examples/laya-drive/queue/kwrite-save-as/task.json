@@ -3,7 +3,10 @@
     "app": "kwrite",
     "max_elements": 24,
     "coord_scale": 2.0,
-    "skip_roles": ["table cell", "list item"]
+    "skip_roles": [
+      "table cell",
+      "list item"
+    ]
   },
   "actions": {
     "type_greeting": "seq:click:Untitled|text:Devin was here",
@@ -60,5 +63,6 @@
       "max_escalations": 3,
       "window": "Save File"
     }
-  ]
+  ],
+  "warmup": 1
 }

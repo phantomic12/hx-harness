@@ -121,6 +121,11 @@ pub struct Drive {
     pub done_question: Option<String>,
     /// P(true) that ends the drive as done (default 0.8).
     pub done_threshold: f32,
+    /// Ticks to run before the done check is trusted (default 0). A model
+    /// can confabulate "finished" on the first state it sees — e.g. claiming
+    /// a marker is present on a blank screen — so a queue that needs at
+    /// least one action sets this to 1.
+    pub warmup: usize,
     /// The cascade gate applied to the action answer each tick.
     pub gate: DecisionGate,
     /// Minimum spacing between ticks (the loop runs faster than `tick` never;
@@ -286,7 +291,7 @@ impl Drive {
             // action question picked this tick — the tick is recorded so the
             // report shows why the drive ended (action `None`, probability and
             // confidence from the done answer).
-            if let Some(done_id) = &self.done_question {
+            if let Some(done_id) = self.done_question.as_ref().filter(|_| index >= self.warmup) {
                 let done_answer = result.get(done_id);
                 let (p_done, done_conf) = done_answer
                     .map(|a| {
@@ -584,6 +589,7 @@ mod tests {
             action_question: "act".to_string(),
             done_question: Some("done".to_string()),
             done_threshold: 0.8,
+            warmup: 0,
             gate: DecisionGate::new(Threshold(0.8), 0.5),
             tick: Duration::ZERO,
             max_steps: 10,

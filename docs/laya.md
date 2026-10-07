@@ -258,6 +258,53 @@ What tuning it taught:
 * **Batched decode shifts probabilities ~0.18** vs single-question probes — probe to find
   which phrasings separate, then set thresholds from live ticks, not the probe numbers.
 
+## The OSWorld-adapted queue — `examples/laya-drive/queue/`
+
+Ten tasks shaped like OSWorld's own harness — a `setup.sh` fixture, the `hx drive`
+agent phase, and a `verify.sh` execution check that reads the filesystem (never the
+agent's claim). `run_queue.py` runs them in order and writes `scorecard.md`.
+
+Latest full run: **10/10 verified** (9 ended `done`, one ended `stopped` but still
+passed verify — a conservative done-read, not a task failure). Per-task logs sit next
+to each spec. See TESTING.md for the scorecard.
+
+What the queue taught — the hard-won spec rules:
+
+* **Claim on the CURRENT state, not the goal state.** "the last line is plain
+  `gamma`" / "the command `failed.ipynb` is visible in the terminal" separates far
+  better than "the edit is applied" — goal-state claims invite confabulation ~0.5–0.7
+  on unedited screens. Action question = "the work still needs doing" → `on_true` fires
+  the work, `on_false` waits.
+* **`warmup: 1`** (task or per-stage) skips the done check until an action has fired —
+  kills tick-0 "done" reads on blank screens (observed 0.82 on a fresh prompt).
+* **Markers must differ from their own command text.** `echo ==BENCH-DO""NE==` renders
+  as `==BENCH-DONE==` in output but the typed line visibly contains `DO""NE` — a marker
+  that literally appears inside its own `echo` command confabulates "it printed".
+  Better still: phrase done on *prompt-below-output* — "a new `ubuntu@devin-box`
+  prompt sits below the command's output" — because the prompt always returns, even on
+  error, while `&&`-chained markers don't.
+* **Window titles and tab labels are the best anchors.** The sensor now emits
+  `window titled '<frame name>'` lines: KWrite's `br-doc.txt *` dirty marker and
+  Konsole's `bench : nano` program label are states the model can actually verify —
+  `'GNU nano'` as text was unreadable (0.5–0.6 both ways) but `: nano` in the title
+  split cleanly.
+* **The terminal text is head+tail, not a scrollback.** Konsole's a11y buffer only
+  exposes the visible screen — and its first ~80 chars used to cut the output line off
+  entirely. The sensor reads the last 600 chars and shows head 110 + tail 110 joined
+  with `…` — enough for prompt-return detection and app banners (`GNU nano`, TUI
+  status bars like nano's `^X Exit`).
+* **Idempotent `seq:` beats a fragile gate.** For the nano save, `seq:ctrl+o|Return`
+  re-firing harmlessly (re-save is a no-op) mattered more than detecting "already
+  written" — when a claim can't separate, make the action safe to repeat and let the
+  done-check own the truth.
+* **File pickers flood the element cap head-first.** The dialog's ~40 file rows eat
+  `max_elements` before `File name:`/`Save` are ever sensed — `skip_roles:
+  ["table cell","list item"]` keeps the controls reachable (used in save-as and the
+  chooser stages).
+* **`text:` goes to whichever window has focus** — launch apps with the a11y env in
+  `setup.sh` and wait for the window (`wmctrl -l | grep`) before driving; a spec
+  racing a not-yet-open app confabulates "already sent" on an empty screen.
+
 ## How it fits hx
 
 * `crates/hx-decision` — typed question/answer schema + `LayaClient` (HTTP to the sidecar).

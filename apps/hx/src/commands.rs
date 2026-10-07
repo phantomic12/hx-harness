@@ -632,6 +632,12 @@ struct DriveTask {
     /// next sense, so a small value like 2–3 is right for noisy programs.
     #[serde(default)]
     max_escalations: usize,
+    /// Ticks to run before the done check is trusted (default 0): a model can
+    /// confabulate "finished" on the first state it sees — e.g. claiming a
+    /// marker is present on a blank screen — so a task that needs at least
+    /// one action sets this to 1.
+    #[serde(default)]
+    warmup: usize,
     /// Optional guard: a noul question id checked *before* the action answer
     /// each tick. When its P(true) reaches `guard_threshold`, `guard_action`
     /// runs instead of the action answer — a fast veto for "this step is on
@@ -669,6 +675,10 @@ struct DriveStage {
     max_steps: Option<usize>,
     #[serde(default)]
     max_escalations: Option<usize>,
+    /// Ticks before this stage's done check is trusted; falls back to the
+    /// task-level `warmup`.
+    #[serde(default)]
+    warmup: Option<usize>,
     #[serde(default)]
     guard_question: Option<String>,
     #[serde(default)]
@@ -1025,7 +1035,10 @@ impl hx_decision::Act for GuiAct {
             }
             return Ok(());
         }
-        if let Some(name) = spec.strip_prefix("click:") {
+        for (prefix, button) in [("click:", "1"), ("rclick:", "3")] {
+            let Some(name) = spec.strip_prefix(prefix) else {
+                continue;
+            };
             let el = self
                 .elements
                 .lock()
@@ -1047,7 +1060,7 @@ impl hx_decision::Act for GuiAct {
                     cx.to_string(),
                     cy.to_string(),
                     "click".into(),
-                    "1".into(),
+                    button.into(),
                 ],
             )
             .await
@@ -1158,6 +1171,7 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
         threshold: f32,
         max_steps: usize,
         max_escalations: usize,
+        warmup: usize,
         guard_question: Option<String>,
         guard_threshold: f32,
         guard_action: Option<String>,
@@ -1178,6 +1192,7 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
             threshold: task.threshold,
             max_steps: task.max_steps,
             max_escalations: task.max_escalations,
+            warmup: task.warmup,
             guard_question: task.guard_question.clone(),
             guard_threshold: task.guard_threshold,
             guard_action: task.guard_action.clone(),
@@ -1205,6 +1220,7 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
                 threshold: s.threshold.unwrap_or(task.threshold),
                 max_steps: s.max_steps.unwrap_or(task.max_steps),
                 max_escalations: s.max_escalations.unwrap_or(task.max_escalations),
+                warmup: s.warmup.unwrap_or(task.warmup),
                 guard_question: s
                     .guard_question
                     .clone()
@@ -1480,6 +1496,7 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
             tick: Duration::from_millis(task.tick_ms),
             max_steps: stage.max_steps,
             max_escalations: stage.max_escalations,
+            warmup: stage.warmup,
             guard_question: stage.guard_question.clone(),
             guard_threshold: stage.guard_threshold,
             guard_action: stage.guard_action.clone(),

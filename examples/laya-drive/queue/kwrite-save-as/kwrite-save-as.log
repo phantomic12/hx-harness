@@ -1,0 +1,20 @@
+--- setup (rc=0)
+
+--- drive (outcome=done, 13.0s)
+hx drive: /home/ubuntu/laya-work/examples/laya-drive/queue/kwrite-save-as/task.json on gui 'kwrite' (tick 700ms, max 60 steps, threshold 0.80)
+-- stage 1: has_greeting
+  #0   type_greeting p=0.907 conf=0.907   1419ms  act
+  #1   -        p=0.672 conf=0.672   1408ms  act
+   stage done after 2 steps
+-- stage 2: chooser
+  #0   open_saveas p=0.555 conf=0.555   1326ms  act
+  #1   -        p=0.760 conf=0.760    834ms  act
+   stage done after 2 steps
+-- stage 3: chooser
+  #0   fill_and_save p=0.760 conf=0.760    816ms  act
+  #1   -        p=0.852 conf=0.852   1352ms  act
+   stage done after 2 steps
+drive /home/ubuntu/laya-work/examples/laya-drive/queue/kwrite-save-as/task.json: done — 6 steps, 12.4s
+
+--- verify (pass=True)
+

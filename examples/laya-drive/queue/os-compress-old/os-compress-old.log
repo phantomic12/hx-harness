@@ -1,0 +1,13 @@
+--- setup (rc=0)
+
+--- drive (outcome=done, 11.2s)
+hx drive: /home/ubuntu/laya-work/examples/laya-drive/queue/os-compress-old/task.json on gui 'konsole' (tick 900ms, max 10 steps, threshold 0.50)
+  #0   run_cmd  p=0.769 conf=0.769    785ms  act
+  #1   wait     p=0.839 conf=0.839    885ms  act
+  #2   wait     p=0.837 conf=0.837    765ms  act
+  #3   wait     p=0.887 conf=0.887    767ms  act
+  #4   -        p=0.682 conf=0.682    742ms  act
+drive /home/ubuntu/laya-work/examples/laya-drive/queue/os-compress-old/task.json: done — 5 steps, 10.7s
+
+--- verify (pass=True)
+

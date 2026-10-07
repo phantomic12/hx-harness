@@ -58,7 +58,14 @@ def walk(node, app_name, out, elements, cap, depth=0, max_depth=12,
     if role in TEXTY or (role in ACTIONABLE and not name):
         try:
             t = node.queryText()
-            snippet = (t.getText(0, 300) or "").strip().replace("\n", " ")
+            raw = (t.getText(0, 600) or "").strip()
+            # A terminal's signals sit at both edges: app banners/mode lines
+            # at the top, newest command output at the bottom — show both.
+            if role == "terminal":
+                snippet = (raw[:110] + " … " + raw[-110:]) if len(raw) > 230 else raw
+            else:
+                snippet = raw[:300]
+            snippet = snippet.replace("\n", " ")
         except Exception:
             snippet = ""
 
@@ -85,7 +92,8 @@ def walk(node, app_name, out, elements, cap, depth=0, max_depth=12,
             line += f" — shows {snippet[:80]!r}"
         out.append(line)
     elif role in TEXTY and (name or snippet):
-        out.append(f"    {role} shows {name or snippet[:80]!r}")
+        shown = snippet[:230] if role == "terminal" else snippet[:80]
+        out.append(f"    {role} shows {name or shown!r}")
 
     try:
         n = node.childCount
@@ -145,10 +153,24 @@ def main():
                     continue
                 if args.window.lower() in fname.lower():
                     matched = True
+                    out.append(f"    window titled {fname!r}")
                     walk(frame, name, out, elements, args.max,
                          skip_roles=skip)
             if matched:
                 continue
+        else:
+            # Window titles are strong state anchors — an editor's modified
+            # marker, a terminal's running program all live there.
+            try:
+                for c in range(app.childCount):
+                    try:
+                        fr = app.getChildAtIndex(c)
+                        if fr.getRoleName() == "frame" and (fr.name or ""):
+                            out.append(f"    window titled {fr.name!r}")
+                    except Exception:
+                        continue
+            except Exception:
+                pass
         walk(app, name, out, elements, args.max, skip_roles=skip)
     json.dump({"text": "\n".join(out), "elements": elements}, sys.stdout)
 
