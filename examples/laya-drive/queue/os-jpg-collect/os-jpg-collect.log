@@ -1,10 +1,10 @@
 --- setup (rc=0)
 
---- drive (outcome=done, 10.3s)
+--- drive (outcome=done, 10.7s)
 hx drive: /home/ubuntu/laya-work/examples/laya-drive/queue/os-jpg-collect/task.json on gui 'konsole' (tick 900ms, max 10 steps, threshold 0.50)
-  #0   run_cmd  p=0.828 conf=0.828    831ms  act
-  #1   -        p=0.703 conf=0.703    748ms  act
-drive /home/ubuntu/laya-work/examples/laya-drive/queue/os-jpg-collect/task.json: done — 2 steps, 9.7s
+  #0   run_cmd  p=0.828 conf=0.828    980ms  act
+  #1   -        p=0.703 conf=0.703    959ms  act
+drive /home/ubuntu/laya-work/examples/laya-drive/queue/os-jpg-collect/task.json: done — 2 steps, 10.1s
 
 --- verify (pass=True)
 

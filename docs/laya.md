@@ -313,3 +313,35 @@ What the queue taught — the hard-won spec rules:
   answers + probabilities + whether each cleared a threshold.
 * `hx doctor` — Laya probe: if `HX_LAYA_URL` (or the config default) is set, probe `/health`;
   skip gracefully when unset.
+
+## Cross-app research task (news-research)
+
+`queue/news-research/` — a 5-stage research drive: search HN front page → fetch
+top story + comments into `/tmp/digest.txt` → switch to KWrite and type the
+digest → `ctrl+s` → shell-side `[ -s file ] && echo marker` verify. It found
+three drive bugs and taught four spec rules:
+
+- **Terminal text lives in the whole visible buffer, not the first 600 chars.**
+  `getText(0, 600)` read only the top of the screen — a marker/prompt past
+  offset 600 was invisible and every done check stalled. The sensor now pulls
+  `characterCount` (bounded at 4000) before head+tail trimming.
+- **Markers must be per-stage distinct.** Stage 2's done check fired on
+  stage 1's `==BENCH-DONE==` still on screen — stale markers satisfy
+  identical claims. Use `==NEWS1-DONE==`, `==NEWS2-DONE==`, …
+- **`actions already taken:` history shifts probabilities ~0.1.** A done claim
+  at 0.72 bare read 0.62 with the prefix — tune thresholds with the prefix in
+  place, and prefer presence claims over absence ("title ends with X").
+- **Stage app-switch needs a raise.** `app` on a stage now re-scopes the sense
+  AND runs `wmctrl -a` — without it, `click:` lands on whatever's topmost
+  (the digest was once typed into the konsole prompt instead of the doc).
+- **`typefile:<path>`** types a file's current contents — the mechanism that
+  lets a fetch stage hand live findings to a write stage. Newlines land via
+  real Return presses; a `--` guard keeps `-`-leading lines out of xdotool's
+  option parser.
+- **Deterministic-save pattern**: fire the idempotent action every tick
+  (`ctrl+s` on both sides) so one real save always lands before done can
+  fire, then let a shell `[ -s file ] && echo marker` stage vouch — the
+  filesystem answers the question the title can't.
+
+Result: 18 steps, ~3 min — live HN front page searched, top story + comments
+fetched, digest written into KWrite, saved, marker-verified.

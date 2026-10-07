@@ -1,21 +1,21 @@
 --- setup (rc=0)
 
---- drive (outcome=done, 12.7s)
+--- drive (outcome=done, 25.1s)
 hx drive: /home/ubuntu/laya-work/examples/laya-drive/queue/os-nano-edit/task.json on gui 'konsole' (tick 400ms, max 60 steps, threshold 0.80)
 -- stage 1: cmd_sent
-  #0   open_nano p=0.869 conf=0.869   1212ms  act
-  #1   wait     p=0.546 conf=0.546   1129ms  act
-  #2   -        p=0.556 conf=0.556   1025ms  act
+  #0   open_nano p=0.869 conf=0.869   1912ms  act
+  #1   wait     p=0.546 conf=0.546   1910ms  act
+  #2   -        p=0.556 conf=0.556   8418ms  act
    stage done after 3 steps
 -- stage 2: has_text
-  #0   type_line p=0.951 conf=0.951   1018ms  act
-  #1   -        p=0.778 conf=0.778   1090ms  act
+  #0   type_line p=0.951 conf=0.951   1899ms  act
+  #1   -        p=0.778 conf=0.778   2057ms  act
    stage done after 2 steps
 -- stage 3: prompt_back
-  #0   save_and_exit p=0.679 conf=0.679   1082ms  act
-  #1   -        p=0.697 conf=0.697   1165ms  act
+  #0   save_and_exit p=0.679 conf=0.679   1860ms  act
+  #1   -        p=0.697 conf=0.697   2011ms  act
    stage done after 2 steps
-drive /home/ubuntu/laya-work/examples/laya-drive/queue/os-nano-edit/task.json: done — 7 steps, 12.2s
+drive /home/ubuntu/laya-work/examples/laya-drive/queue/os-nano-edit/task.json: done — 7 steps, 24.5s
 
 --- verify (pass=True)
 

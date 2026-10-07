@@ -1,10 +1,10 @@
 --- setup (rc=0)
 
---- drive (outcome=done, 8.0s)
+--- drive (outcome=done, 8.3s)
 hx drive: /home/ubuntu/laya-work/examples/laya-drive/queue/os-rename-dir/task.json on gui 'konsole' (tick 900ms, max 10 steps, threshold 0.50)
-  #0   run_cmd  p=0.701 conf=0.701    885ms  act
-  #1   -        p=0.682 conf=0.682    874ms  act
-drive /home/ubuntu/laya-work/examples/laya-drive/queue/os-rename-dir/task.json: done — 2 steps, 7.4s
+  #0   run_cmd  p=0.701 conf=0.701   1065ms  act
+  #1   -        p=0.682 conf=0.682   1004ms  act
+drive /home/ubuntu/laya-work/examples/laya-drive/queue/os-rename-dir/task.json: done — 2 steps, 7.8s
 
 --- verify (pass=True)
 

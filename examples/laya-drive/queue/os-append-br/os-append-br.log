@@ -1,10 +1,10 @@
 --- setup (rc=0)
 
---- drive (outcome=done, 8.1s)
+--- drive (outcome=done, 10.0s)
 hx drive: /home/ubuntu/laya-work/examples/laya-drive/queue/os-append-br/task.json on gui 'kwrite' (tick 900ms, max 8 steps, threshold 0.50)
-  #0   append_and_save p=0.541 conf=0.541   1258ms  act
-  #1   -        p=0.732 conf=0.732   1152ms  act
-drive /home/ubuntu/laya-work/examples/laya-drive/queue/os-append-br/task.json: done — 2 steps, 7.5s
+  #0   append_and_save p=0.541 conf=0.541   2003ms  act
+  #1   -        p=0.732 conf=0.732   2362ms  act
+drive /home/ubuntu/laya-work/examples/laya-drive/queue/os-append-br/task.json: done — 2 steps, 9.5s
 
 --- verify (pass=True)
 

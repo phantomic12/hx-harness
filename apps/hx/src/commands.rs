@@ -689,6 +689,11 @@ struct DriveStage {
     /// "Save File" dialog while filling it). Falls back to the task value.
     #[serde(default)]
     window: Option<String>,
+    /// Override the gui `app` filter for this stage — stages can cross
+    /// applications (e.g. research in the terminal, write in the editor).
+    /// Falls back to the task value; an explicit "" senses the whole desktop.
+    #[serde(default)]
+    app: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -869,7 +874,9 @@ fn atspi_script_path() -> std::io::Result<std::path::PathBuf> {
 /// tick: sense fills the table, the hook rebuilds the choice options from it,
 /// the actuator clicks `e<N>` by its centre.
 struct GuiSense {
-    app: Option<String>,
+    /// App filter, set per stage via a shared slot — a stage whose `app`
+    /// differs from the task's crosses applications mid-drive.
+    app: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// Restrict sensing to a named frame's subtree (e.g. "Save File") — set
     /// per stage via a shared slot so dialog stages see only the dialog.
     /// Absent window falls back to the whole app.
@@ -902,9 +909,11 @@ impl hx_decision::Sense for GuiSense {
             "--max".to_string(),
             self.max_elements.to_string(),
         ];
-        if let Some(app) = &self.app {
-            args.push("--app".to_string());
-            args.push(app.clone());
+        if let Some(app) = self.app.lock().unwrap().clone() {
+            if !app.is_empty() {
+                args.push("--app".to_string());
+                args.push(app);
+            }
         }
         if let Some(w) = self.window.lock().unwrap().clone() {
             args.push("--window".to_string());
@@ -943,6 +952,9 @@ fn describe_gui_action(spec: Option<&String>) -> String {
         None => "press nothing — wait a tick".to_string(),
         Some(s) if s.starts_with("text:") => {
             format!("type the text '{}'", &s[5..])
+        }
+        Some(s) if s.starts_with("typefile:") => {
+            format!("type the contents of '{}'", &s[9..])
         }
         Some(s) if s.starts_with("click:") => {
             format!("click the '{}' element", &s[6..])
@@ -1032,6 +1044,53 @@ impl hx_decision::Act for GuiAct {
                     "xdotool type failed: {}",
                     String::from_utf8_lossy(&out.stderr).trim()
                 )));
+            }
+            return Ok(());
+        }
+        // typefile:<path> — type a file's current contents. The content is
+        // whatever an earlier stage produced this run (a fetched digest, a
+        // captured headline), so the agent writes what it actually found.
+        if let Some(path) = spec.strip_prefix("typefile:") {
+            let text = tokio::fs::read_to_string(path.trim())
+                .await
+                .map_err(|e| HxError::Decision(format!("typefile '{path}' unreadable: {e}")))?;
+            // xdotool drops \n inside a `type` payload — type each line and
+            // press Return between them so a multi-line file lands intact.
+            for (i, line) in text.split('\n').enumerate() {
+                if i > 0 {
+                    let r = run_prog("xdotool", &["key".into(), "Return".into()])
+                        .await
+                        .map_err(|e| HxError::Decision(format!("xdotool key: {e}")))?;
+                    if !r.status.success() {
+                        return Err(HxError::Decision(format!(
+                            "xdotool key failed: {}",
+                            String::from_utf8_lossy(&r.stderr).trim()
+                        )));
+                    }
+                }
+                if line.is_empty() {
+                    continue;
+                }
+                let r = run_prog(
+                    "xdotool",
+                    &[
+                        "type".into(),
+                        "--delay".into(),
+                        "15".into(),
+                        // '--' ends option parsing: digest lines legitimately
+                        // start with '-' and must not read as flags.
+                        "--".into(),
+                        line.to_string(),
+                    ],
+                )
+                .await
+                .map_err(|e| HxError::Decision(format!("xdotool type: {e}")))?;
+                if !r.status.success() {
+                    return Err(HxError::Decision(format!(
+                        "xdotool type failed: {}",
+                        String::from_utf8_lossy(&r.stderr).trim()
+                    )));
+                }
             }
             return Ok(());
         }
@@ -1176,9 +1235,11 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
         guard_threshold: f32,
         guard_action: Option<String>,
         window: Option<String>,
+        app: Option<String>,
     }
     let stage_count = task.stages.len();
     let task_window = task.gui.as_ref().and_then(|g| g.window.clone());
+    let task_app = task.gui.as_ref().and_then(|g| g.app.clone());
     let stages: Vec<StageCfg> = if stage_count == 0 {
         if task.action_question.is_empty() {
             anyhow::bail!("task spec: set 'action_question' or a non-empty 'stages' array");
@@ -1197,6 +1258,7 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
             guard_threshold: task.guard_threshold,
             guard_action: task.guard_action.clone(),
             window: task_window.clone(),
+            app: task_app.clone(),
         }]
     } else {
         let last = stage_count - 1;
@@ -1228,6 +1290,7 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
                 guard_threshold: s.guard_threshold.unwrap_or(task.guard_threshold),
                 guard_action: s.guard_action.clone().or_else(|| task.guard_action.clone()),
                 window: s.window.clone().or_else(|| task_window.clone()),
+                app: s.app.clone().or_else(|| task_app.clone()),
             })
             .collect()
     };
@@ -1321,8 +1384,11 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
     let window_slot = std::sync::Arc::new(std::sync::Mutex::new(
         stages.first().and_then(|s| s.window.clone()),
     ));
+    let app_slot = std::sync::Arc::new(std::sync::Mutex::new(
+        stages.first().and_then(|s| s.app.clone()),
+    ));
     let mut sensor_g = GuiSense {
-        app: task.gui.as_ref().and_then(|g| g.app.clone()),
+        app: app_slot.clone(),
         window: window_slot.clone(),
         skip_roles: task
             .gui
@@ -1484,6 +1550,14 @@ pub async fn run_drive(base_url: &str, task_path: &str) -> anyhow::Result<()> {
     for (i, stage) in stages.iter().enumerate() {
         *current_action_q.lock().unwrap() = stage.action_question.clone();
         *window_slot.lock().unwrap() = stage.window.clone();
+        *app_slot.lock().unwrap() = stage.app.clone();
+        // A stage crossing apps must raise the new target's window — clicks
+        // land on whatever is topmost at those coordinates, and the previous
+        // stage's app may still cover the element the spec names.
+        if let Some(app) = stage.app.as_deref().filter(|a| !a.is_empty()) {
+            let _ = run_prog("wmctrl", &["-a".into(), app.to_string()]).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
         if multi {
             println!("-- stage {}: {}", i + 1, stage.action_question);
         }

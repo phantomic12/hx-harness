@@ -1,10 +1,10 @@
 --- setup (rc=0)
 
---- drive (outcome=done, 10.8s)
+--- drive (outcome=done, 11.3s)
 hx drive: /home/ubuntu/laya-work/examples/laya-drive/queue/os-failed-ipynb/task.json on gui 'konsole' (tick 900ms, max 10 steps, threshold 0.50)
-  #0   run_cmd  p=0.830 conf=0.830    926ms  act
-  #1   -        p=0.721 conf=0.721    780ms  act
-drive /home/ubuntu/laya-work/examples/laya-drive/queue/os-failed-ipynb/task.json: done — 2 steps, 10.3s
+  #0   run_cmd  p=0.830 conf=0.830   1009ms  act
+  #1   -        p=0.721 conf=0.721   1066ms  act
+drive /home/ubuntu/laya-work/examples/laya-drive/queue/os-failed-ipynb/task.json: done — 2 steps, 10.7s
 
 --- verify (pass=True)
 

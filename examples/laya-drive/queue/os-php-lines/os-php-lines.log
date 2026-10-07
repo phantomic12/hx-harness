@@ -1,18 +1,18 @@
 --- setup (rc=0)
 
---- drive (outcome=stopped, 16.5s)
+--- drive (outcome=stopped, 17.7s)
 hx drive: /home/ubuntu/laya-work/examples/laya-drive/queue/os-php-lines/task.json on gui 'konsole' (tick 900ms, max 10 steps, threshold 0.50)
-  #0   run_cmd  p=0.793 conf=0.793    786ms  act
-  #1   wait     p=0.808 conf=0.808    840ms  act
-  #2   wait     p=0.838 conf=0.838    835ms  act
-  #3   wait     p=0.828 conf=0.828    775ms  act
-  #4   wait     p=0.854 conf=0.854    777ms  act
-  #5   wait     p=0.822 conf=0.822    795ms  act
-  #6   wait     p=0.808 conf=0.808    823ms  act
-  #7   wait     p=0.808 conf=0.808    839ms  act
-  #8   wait     p=0.816 conf=0.816    796ms  act
-  #9   wait     p=0.817 conf=0.817    812ms  act
-drive /home/ubuntu/laya-work/examples/laya-drive/queue/os-php-lines/task.json: hit max_steps (10) — 10 steps, 16.0s
+  #0   run_cmd  p=0.793 conf=0.793    987ms  act
+  #1   wait     p=0.808 conf=0.808    944ms  act
+  #2   wait     p=0.838 conf=0.838   1019ms  act
+  #3   wait     p=0.828 conf=0.828    964ms  act
+  #4   wait     p=0.854 conf=0.854   1026ms  act
+  #5   wait     p=0.822 conf=0.822   1046ms  act
+  #6   wait     p=0.808 conf=0.808   1011ms  act
+  #7   wait     p=0.808 conf=0.808   1044ms  act
+  #8   wait     p=0.816 conf=0.816    987ms  act
+  #9   wait     p=0.817 conf=0.817    999ms  act
+drive /home/ubuntu/laya-work/examples/laya-drive/queue/os-php-lines/task.json: hit max_steps (10) — 10 steps, 17.1s
 
 --- verify (pass=True)
 

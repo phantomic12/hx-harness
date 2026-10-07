@@ -58,9 +58,16 @@ def walk(node, app_name, out, elements, cap, depth=0, max_depth=12,
     if role in TEXTY or (role in ACTIONABLE and not name):
         try:
             t = node.queryText()
-            raw = (t.getText(0, 600) or "").strip()
-            # A terminal's signals sit at both edges: app banners/mode lines
-            # at the top, newest command output at the bottom — show both.
+            # A terminal's newest output sits at the BOTTOM of its buffer —
+            # getText(0, 600) reads only the top of the screen, so a
+            # marker/prompt past offset 600 is invisible to done checks.
+            # Pull the whole visible buffer (bounded), then show both edges.
+            limit = 4000 if role == "terminal" else 600
+            try:
+                count = t.characterCount
+            except Exception:
+                count = 0
+            raw = (t.getText(0, min(count or limit, limit)) or "").strip()
             if role == "terminal":
                 snippet = (raw[:110] + " … " + raw[-110:]) if len(raw) > 230 else raw
             else:
