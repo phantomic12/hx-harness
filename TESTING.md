@@ -1262,3 +1262,17 @@ the mid-range options, including the article links) and three bound-op
 failure modes (ops outbidding element picks, window-cover races, a11y
 registration lag). New spec fields: `pick_roles`, `pick_min_len`,
 `choice_actions`, `click_roles`; `click:` now degrades to substring match.
+
+### cua-drive — trycua sandbox (kasm-style) computer use
+
+`examples/cua-drive/cua_drive.py`: a thin computer-use loop on the trycua
+SDK sandbox (ephemeral local Linux image — Ubuntu 24.04, its own display,
+firefox+chromium; no host X11/a11y plumbing at all). Model:
+step-5-preview-free (vision) over the keyless zen shim with native
+function calling (forced `computer` tool_choice). Verified: firefox →
+nytimes.com → clicked the top headline ("'He's Not Making Sense': How
+Trump Has Alienated Voters for the G.O.P.") → scrolled the article —
+14 steps, ~3 min, DONE; timelapse recorded from a second client attached
+to the same sandbox by name. Fixes that mattered: shim must fold streamed
+`delta.tool_calls` into the completion, `keypress` wants a key list not a
+chord string, and out-of-range coordinates get rescaled from 0-1000 space.
