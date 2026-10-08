@@ -79,6 +79,8 @@ SYSTEM = (
     "screenshots and must drive the GUI with the `computer` tool to accomplish "
     "the user's task. Rules:\n"
     "- Emit exactly ONE computer tool call per turn.\n"
+    "- Coordinates MUST be absolute integer pixels on the 1280x800 screen, "
+    "e.g. [640, 400]. Never use fractions or a 0-1000 range.\n"
     "- Look at the latest screenshot before deciding; never guess coordinates "
     "blindly.\n"
     "- After an action whose result matters (open an app, load a page), take a "
@@ -103,12 +105,16 @@ def _b64(png: bytes) -> str:
 
 
 def _scale(coord, dims=(1280, 800)):
-    """Models sometimes emit normalized 0-1000 coords. If a value is out of
-    screen range, rescale both axes from 1000-space to pixels."""
+    """Models emit coords in whatever space they feel like:
+    - 0-1 fractions (e.g. [0.2, 0.91]) -> multiply by dims
+    - 0-1000 normalized (out-of-range values) -> scale from 1000-space
+    - absolute pixels -> pass through"""
     if len(coord) < 2:
         return coord
     x, y = float(coord[0]), float(coord[1])
-    if x > dims[0] or y > dims[1]:
+    if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 and (x != int(x) or y != int(y)):
+        x, y = x * dims[0], y * dims[1]
+    elif x > dims[0] or y > dims[1]:
         x = x / 1000.0 * dims[0]
         y = y / 1000.0 * dims[1]
     return [int(round(x)), int(round(y))]
@@ -168,7 +174,8 @@ async def _exec(sb, args: dict) -> str:
         return f"{action} FAILED: {e}"
 
 
-async def drive(task: str, model: str, max_steps: int, shots_dir: str | None):
+async def drive(task: str, model: str, max_steps: int, shots_dir: str | None,
+                setup: str | None = None):
     import cua
     from cua import Image
 
@@ -176,6 +183,13 @@ async def drive(task: str, model: str, max_steps: int, shots_dir: str | None):
     async with cua.sandbox(image=Image.linux(), local=True, ephemeral=True) as sb:
         display = await sb.get_display_url()
         log(f"[sandbox up] {sb.name} display: {display}")
+
+        if setup:
+            # App launch is setup, not task work (same convention as OSWorld):
+            # run a shell command inside the sandbox before the model takes over.
+            res = await sb.shell.run(setup)
+            log(f"[setup] {res.stdout.strip()[:200]}")
+            await asyncio.sleep(6)  # let the app window appear
 
         async def shot_b64() -> str:
             png = await sb.screenshot()
@@ -218,6 +232,17 @@ async def drive(task: str, model: str, max_steps: int, shots_dir: str | None):
             calls = msg.get("tool_calls") or []
             if not calls:
                 text = (msg.get("content") or "").strip()
+                if not text:
+                    # Empty assistant turn (malformed call, truncation, or the
+                    # model emitting XML-ish syntax upstream dropped). Nudge
+                    # and keep going rather than declaring done.
+                    log(f"[empty turn @{steps}; finish={resp['choices'][0].get('finish_reason')}] nudging")
+                    messages.append({
+                        "role": "user",
+                        "content": "You returned an empty reply. Continue the task — "
+                                   "emit the next computer tool call now.",
+                    })
+                    continue
                 log(f"[final @{steps} steps {time.time()-t0:.0f}s] {text[:400]}")
                 await save_shot("final")
                 return text
@@ -268,11 +293,14 @@ def main():
     ap.add_argument("--model", default="step-5-preview-free")
     ap.add_argument("--max-steps", type=int, default=40)
     ap.add_argument("--shots", default=None)
+    ap.add_argument("--setup", default=None,
+                    help="shell command run inside the sandbox before the model takes over")
     args = ap.parse_args()
     if args.shots:
         import os
         os.makedirs(args.shots, exist_ok=True)
-    asyncio.run(drive(args.task, args.model, args.max_steps, args.shots))
+    asyncio.run(drive(args.task, args.model, args.max_steps, args.shots,
+                      setup=args.setup))
 
 
 if __name__ == "__main__":

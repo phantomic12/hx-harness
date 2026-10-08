@@ -1276,3 +1276,33 @@ Trump Has Alienated Voters for the G.O.P.") → scrolled the article —
 to the same sandbox by name. Fixes that mattered: shim must fold streamed
 `delta.tool_calls` into the completion, `keypress` wants a key list not a
 chord string, and out-of-range coordinates get rescaled from 0-1000 space.
+
+### cua-drive — long-horizon research task (80-step budget)
+
+Same driver + model, tasked with a multi-site research-and-write run:
+Wikipedia (JWST) pre-opened via `--setup`, then tab 2 → science.nasa.gov
+Webb page, tab 3 → bbc.com/news/science_and_environment, then open the
+Text Editor and type a 4+ sentence summary naming each site.
+
+Result: PARTIAL — all three sites reached in three tabs (verified in the
+final screenshot), but the run burned the 80-step budget before opening
+the editor: ~30 steps of scroll-dithering on the NASA page, then a
+~15-step wander through the GNOME Activities overview and out-of-bounds
+clicks before it recovered, found Firefox again, and completed the BBC
+tab at step 69. Timelapse recorded (1126 frames).
+
+Findings baked into the driver:
+- `--setup` flag: app launch is setup, not task work (OSWorld convention)
+- `_scale()` now handles 0-1 fraction coords too (model emitted
+  [0.201, 0.911] once); system prompt mandates absolute integer pixels
+- Empty assistant turns (malformed XML-ish calls, truncation) now get a
+  nudge message instead of ending the run as a false DONE
+- `_chord()` alias map extended (Return/Page_Down/arrow names)
+- `_exec()` wraps every action in try/except so one bad call can't kill
+  a long run
+
+Model-quality ceiling (step-5-preview-free is a generic VLM, not CU-
+tuned): scroll-reading has no stop signal so it dithers; multi-app task
+state (browse → editor) is out of reach at this horizon; occasional
+out-of-bounds coordinates. A CU-tuned model on their anthropic/openai
+loops is the fix when a paid key lands — the driver/harness held up.

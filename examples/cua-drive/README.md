@@ -10,6 +10,12 @@ approach.
 Verified live (2026-10-08): firefox → nytimes.com → click the top headline →
 scroll the article — 14 steps, ~3 min, DONE.
 
+Long-horizon test (same day, 80-step budget): Wikipedia → NASA Webb → BBC
+Science across three tabs — all three reached (see TESTING.md), but the run
+never got to the write-up stage: scroll-dithering burned ~30 steps and a
+wander through GNOME Activities cost ~15 more. Generic-VLM ceiling, not a
+driver failure — details in Findings.
+
 ## Stack
 
 - **Sandbox** — `cua.sandbox(image=Image.linux(), local=True, ephemeral=True)`.
@@ -74,3 +80,12 @@ attach to the same sandbox by name and poll `sb.screenshot()` at ~1fps, then
   the loop tolerates it because every action returns a fresh screenshot.
 - cua's `Sandbox.ephemeral(...)` class API changed in SDK 0.4.x — use
   `cua.sandbox(image=Image.linux(), local=True, ephemeral=True)` instead.
+- Long-horizon runs expose the generic-VLM ceiling: scroll-reading has no
+  stop signal (the model scrolls ~30 steps "reading"), it wanders when the
+  task changes app context (a GNOME Activities detour cost 15 steps), and
+  it occasionally emits out-of-bounds coordinates. `--setup` (launch the
+  app as task setup, OSWorld-style), the integer-pixel prompt mandate,
+  empty-turn nudging, and per-action try/except keep the loop alive — but
+  browse→write task composition needs a CU-tuned model or a planner on
+  top. This is the same reactive-vs-planner split `docs/laya.md` found on
+  the a11y side.
