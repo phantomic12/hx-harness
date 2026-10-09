@@ -1,0 +1,38 @@
+{
+  "tmux": {
+    "target": "hx-git",
+    "lines": 12
+  },
+  "actions": {
+    "stage": "y Enter",
+    "skip": "n Enter",
+    "wait": null
+  },
+  "questions": {
+    "letter_menu": {
+      "type": "noul",
+      "instructions": "The last line lists single letters in square brackets, like [y,n,q], and ends with a question mark \u2014 a program waits for one of those letters."
+    },
+    "adds_secret": {
+      "type": "noul",
+      "instructions": "The diff hunk adds a line containing a password, secret, token, API key, or private credential."
+    },
+    "shell_done": {
+      "type": "noul",
+      "instructions": "The last line of the screen is a shell prompt that ends with a dollar sign."
+    }
+  },
+  "action_question": "letter_menu",
+  "on_true": "stage",
+  "on_false": "wait",
+  "guard_question": "adds_secret",
+  "guard_action": "skip",
+  "guard_threshold": 0.6,
+  "done_question": "shell_done",
+  "done_threshold": 0.75,
+  "threshold": 0.7,
+  "min_confidence": 0.0,
+  "tick_ms": 800,
+  "max_steps": 30,
+  "max_escalations": 4
+}

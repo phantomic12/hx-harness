@@ -22,7 +22,9 @@ impl LayaClient {
     /// Build a client for the sidecar at `base_url` (e.g. `http://127.0.0.1:8770`).
     pub fn new(base_url: impl Into<String>) -> Self {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
+            // A loaded 322M on CPU can take several seconds per predict — a
+            // slow tick should not kill the drive.
+            .timeout(Duration::from_secs(30))
             .build()
             .expect("reqwest client builds");
         Self {

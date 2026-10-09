@@ -1,0 +1,31 @@
+{
+  "gui": {
+    "app": "kwrite",
+    "max_elements": 24,
+    "coord_scale": 2.0
+  },
+  "actions": {
+    "append_and_save": "seq:click:br-doc.txt|ctrl+Home|End|text:<br/>|Down|End|text:<br/>|Down|End|text:<br/>|ctrl+s",
+    "wait": null
+  },
+  "questions": {
+    "edit_needed": {
+      "type": "noul",
+      "instructions": "The document's last line is still plain 'gamma' with no '<br/>' appended \u2014 the edit has not been applied."
+    },
+    "br_done": {
+      "type": "noul",
+      "instructions": "The window title is 'br-doc.txt \u2014 KWrite' with no '*' unsaved marker \u2014 the <br/> appends were saved to disk."
+    }
+  },
+  "action_question": "edit_needed",
+  "on_true": "append_and_save",
+  "on_false": "wait",
+  "done_question": "br_done",
+  "done_threshold": 0.6,
+  "threshold": 0.5,
+  "tick_ms": 900,
+  "max_steps": 8,
+  "max_escalations": 3,
+  "warmup": 1
+}

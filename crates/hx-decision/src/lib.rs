@@ -20,7 +20,9 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 pub mod client;
+pub mod drive;
 pub use client::LayaClient;
+pub use drive::{Act, Drive, DriveReport, Outcome, Predictor, Sense, Step};
 
 /// One selectable option in a [`Question::Choice`].
 ///
@@ -189,15 +191,54 @@ impl QuestionSet {
         Ok(())
     }
 
-    /// Request body for `POST /predict`: questions as a map keyed by id, which
-    /// is the shape the sidecar answers with (`answers[id]`).
+    /// Request body for `POST /predict`, in the sidecar's native question
+    /// shape — this is the translation layer between hx's task-file schema and
+    /// what `laya`'s `predict` accepts:
+    ///
+    /// - `choice`: `criteria` becomes a map `option_id -> description` (Laya
+    ///   reads a bare list as *labels*, which would silently name options
+    ///   after dict objects).
+    /// - `score`: `levels` is renamed to `criteria` (the wire key Laya reads).
+    /// - `noul`: `{"type", "instructions"}` only.
+    /// - `id` and `max_options` are file-schema fields, not wire fields: the
+    ///   map key names the question, and Laya picks one winner per choice.
     pub fn predict_body(&self) -> Result<serde_json::Value> {
         self.validate()?;
         let mut questions = serde_json::Map::with_capacity(self.questions.len());
         for q in &self.questions {
-            let v = serde_json::to_value(q).map_err(|e| {
-                HxError::Config(format!("question '{}' is not JSON-clean: {e}", q.id()))
-            })?;
+            let v = match q {
+                Question::Choice {
+                    instructions,
+                    criteria,
+                    ..
+                } => {
+                    let mut opts = serde_json::Map::with_capacity(criteria.len());
+                    for opt in criteria {
+                        opts.insert(
+                            opt.id.clone(),
+                            serde_json::Value::String(opt.description.clone()),
+                        );
+                    }
+                    serde_json::json!({
+                        "type": "choice",
+                        "instructions": instructions,
+                        "criteria": opts,
+                    })
+                }
+                Question::Score {
+                    instructions,
+                    levels,
+                    ..
+                } => serde_json::json!({
+                    "type": "score",
+                    "instructions": instructions,
+                    "criteria": levels,
+                }),
+                Question::Noul { instructions, .. } => serde_json::json!({
+                    "type": "noul",
+                    "instructions": instructions,
+                }),
+            };
             questions.insert(q.id().to_owned(), v);
         }
         Ok(serde_json::json!({
@@ -387,5 +428,59 @@ impl DecisionResult {
         };
         result.validate()?;
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn predict_body_emits_laya_native_wire_shape() {
+        let set = QuestionSet::new(
+            "the state",
+            vec![
+                Question::Choice {
+                    id: "pick".into(),
+                    instructions: "what next".into(),
+                    criteria: vec![
+                        ChoiceOption::new("go", "go forward"),
+                        ChoiceOption::new("wait", "do nothing"),
+                    ],
+                    max_options: None,
+                },
+                Question::Score {
+                    id: "pace".into(),
+                    instructions: "how urgent".into(),
+                    levels: vec!["low".into(), "high".into()],
+                },
+                Question::Noul {
+                    id: "done".into(),
+                    instructions: "is it finished".into(),
+                },
+            ],
+        );
+        let body = set.predict_body().expect("valid set");
+        assert_eq!(body["state"], "the state");
+        // choice criteria is a {id: description} map, not a list of objects —
+        // a bare list is read by laya as *labels*.
+        assert_eq!(
+            body["questions"]["pick"]["criteria"],
+            serde_json::json!({"go": "go forward", "wait": "do nothing"})
+        );
+        // score renames levels -> criteria; noul has no criteria; file-schema
+        // fields (id, max_options) never reach the wire.
+        assert_eq!(
+            body["questions"]["pace"]["criteria"],
+            serde_json::json!(["low", "high"])
+        );
+        assert!(body["questions"]["pace"].get("levels").is_none());
+        assert_eq!(
+            body["questions"]["done"],
+            serde_json::json!({"type": "noul", "instructions": "is it finished"})
+        );
+        for q in body["questions"].as_object().unwrap().values() {
+            assert!(q.get("id").is_none() && q.get("max_options").is_none());
+        }
     }
 }

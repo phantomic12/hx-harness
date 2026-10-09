@@ -1,0 +1,13 @@
+--- setup (rc=0)
+
+--- drive (outcome=done, 11.2s)
+hx drive: /home/ubuntu/laya-work/examples/laya-drive/queue/os-chmod-644/task.json on gui 'konsole' (tick 900ms, max 10 steps, threshold 0.50)
+  #0   run_cmd  p=0.837 conf=0.837   1009ms  act
+  #1   wait     p=0.850 conf=0.850   1050ms  act
+  #2   wait     p=0.877 conf=0.877   1055ms  act
+  #3   wait     p=0.896 conf=0.896   1040ms  act
+  #4   -        p=0.698 conf=0.698   1044ms  act
+drive /home/ubuntu/laya-work/examples/laya-drive/queue/os-chmod-644/task.json: done — 5 steps, 10.7s
+
+--- verify (pass=True)
+

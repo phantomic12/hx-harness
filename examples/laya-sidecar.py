@@ -6,8 +6,10 @@ and this sidecar is the only process that imports ``laya``.
 Run it::
 
     pip install laya fastapi uvicorn
-    # one-time weights download (cached under $HF_HOME / ~/.cache/huggingface)
-    python -c "from laya import download_weights; download_weights()"
+    # one-time weights download (~2.3 GB, cached under $HF_HOME /
+    # ~/.cache/huggingface); Agent() downloads automatically on first use,
+    # so this line just pre-warms the cache.
+    python -c "from laya import Agent; Agent()"
     uvicorn laya-sidecar:app --host 127.0.0.1 --port 8770
 
 Contract (this is what ``hx-decision``'s ``LayaClient`` speaks):
@@ -36,15 +38,14 @@ import threading
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-# --- ADAPTER: mirrors upstream laya server.py --------------------------------
-# Upstream publishes the model + a playground via `python server.py`.
-# Import the agent class from wherever that server gets it and construct it
-# once here. Exact names follow the laya repo; adjust to match the release
-# you installed.
+# --- ADAPTER: mirrors upstream laya usage ------------------------------------
+# `laya.Agent` is the runtime class (laya 0.3.x); constructing it downloads the
+# weights once if they are not already cached. If the package API moves, only
+# these lines change; the HTTP contract stays fixed.
 try:
-    from laya import LayaAgent  # type: ignore  # ADAPTER: import path
+    from laya import Agent  # type: ignore  # ADAPTER: import path
 
-    _AGENT = LayaAgent()  # ADAPTER: construction / weights dir / device
+    _AGENT = Agent()  # ADAPTER: construction / device (auto: cuda if present)
     _MODEL_ID = type(_AGENT).__name__
 except Exception as exc:  # pragma: no cover - import-time, no sidecar without it
     raise RuntimeError(

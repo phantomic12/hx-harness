@@ -1,0 +1,71 @@
+{
+  "gui": {
+    "app": "konsole",
+    "max_elements": 20,
+    "coord_scale": 2.0
+  },
+  "actions": {
+    "open_nano": "seq:text:nano notes.txt|Return",
+    "type_line": "seq:text:Laya wrote this line",
+    "save_file": "seq:ctrl+o|Return",
+    "exit_nano": "ctrl+x",
+    "wait": null,
+    "save_and_exit": "seq:ctrl+o|Return|ctrl+x"
+  },
+  "questions": {
+    "nano_open": {
+      "type": "noul",
+      "instructions": "The terminal's tab label ends with ': nano' \u2014 the nano editor is running."
+    },
+    "has_text": {
+      "type": "noul",
+      "instructions": "The nano buffer shows the text 'Laya wrote this line'."
+    },
+    "wrote": {
+      "type": "noul",
+      "instructions": "Nano's status bar shows '[ Wrote' \u2014 the file has been saved."
+    },
+    "prompt_back": {
+      "type": "noul",
+      "instructions": "The terminal's tab label ends with ': bash' \u2014 back at the shell prompt."
+    },
+    "cmd_sent": {
+      "type": "noul",
+      "instructions": "The command 'nano notes.txt' has been typed into the terminal."
+    }
+  },
+  "stages": [
+    {
+      "action_question": "cmd_sent",
+      "on_true": "wait",
+      "on_false": "open_nano",
+      "done_question": "nano_open",
+      "done_threshold": 0.55,
+      "threshold": 0.5,
+      "max_steps": 10,
+      "max_escalations": 3
+    },
+    {
+      "action_question": "has_text",
+      "on_true": "wait",
+      "on_false": "type_line",
+      "done_question": "has_text",
+      "done_threshold": 0.5,
+      "threshold": 0.5,
+      "max_steps": 6,
+      "max_escalations": 3
+    },
+    {
+      "action_question": "prompt_back",
+      "on_true": "save_and_exit",
+      "on_false": "save_and_exit",
+      "done_question": "prompt_back",
+      "done_threshold": 0.55,
+      "threshold": 0.5,
+      "max_steps": 8,
+      "max_escalations": 4,
+      "warmup": 1
+    }
+  ],
+  "warmup": 1
+}

@@ -1,0 +1,28 @@
+{
+  "tmux": { "target": "hx-moon", "lines": 14 },
+  "actions": {
+    "jump": "Space",
+    "coast": null,
+    "quit": "q"
+  },
+  "questions": {
+    "obstacle_ahead": {
+      "type": "noul",
+      "instructions": "A crater or obstacle sits on the road immediately ahead of the moon buggy, about to be hit."
+    },
+    "game_over": {
+      "type": "noul",
+      "instructions": "The game shows a game-over or crash screen and waits for a keypress or sits at a shell prompt."
+    }
+  },
+  "action_question": "obstacle_ahead",
+  "on_true": "jump",
+  "on_false": "coast",
+  "done_question": "game_over",
+  "done_threshold": 0.75,
+  "threshold": 0.6,
+  "min_confidence": 0.0,
+  "tick_ms": 300,
+  "max_steps": 40,
+  "max_escalations": 6
+}

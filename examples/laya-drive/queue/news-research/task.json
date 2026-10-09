@@ -1,0 +1,113 @@
+{
+  "gui": {
+    "max_elements": 24,
+    "coord_scale": 2.0,
+    "skip_roles": ["table cell", "list item"]
+  },
+  "actions": {
+    "run_search": "seq:text:curl -s \"https://hn.algolia.com/api/v1/search_by_date?tags=front_page&hitsPerPage=8\" -o /tmp/hn.json && python3 -c 'import json;d=json.load(open(\"/tmp/hn.json\"));[print(h[\"points\"],\"pts ::\",h[\"title\"]) for h in d[\"hits\"]]' && echo ==NEWS1-DO\"\"NE==|Return",
+    "run_fetch": "seq:text:python3 -c 'import json;print(json.load(open(\"/tmp/hn.json\"))[\"hits\"][0][\"objectID\"])' > /tmp/topid && curl -s \"https://hn.algolia.com/api/v1/items/$(cat /tmp/topid)\" -o /tmp/art.json && python3 -c 'import json,re;d=json.load(open(\"/tmp/art.json\"));w=open(\"/tmp/digest.txt\",\"w\");lines=[\"NEWS DIGEST — top story today\",\"\",\"HEADLINE: \"+d[\"title\"],\"SOURCE: \"+(d.get(\"url\") or \"news.ycombinator.com\"),\"\",\"What readers say:\"]+[\"- \"+re.sub(\"<[^>]+>\",\" \",c[\"text\"])[:160].replace(chr(10),\" \") for c in (d.get(\"children\") or [])[:4]];w.write(chr(10).join(lines));w.close();print(chr(10).join(lines))' && echo ==NEWS2-DO\"\"NE==|Return",
+    "click_and_write": "seq:click:news-writeup.txt|typefile:/tmp/digest.txt",
+    "save_file": "ctrl+s",
+    "check_saved": "seq:text:[ -s /home/ubuntu/news-writeup.txt ] && echo ==NEWS3-DO\"\"NE==|Return",
+    "wait": null
+  },
+  "questions": {
+    "search_sent": {
+      "type": "noul",
+      "instructions": "The command that downloads the day's top news stories has been typed into the terminal."
+    },
+    "search_done": {
+      "type": "noul",
+      "instructions": "The terminal shows '==NEWS1-DONE==' as command output, with a shell prompt 'ubuntu@devin-box:~$' below it."
+    },
+    "fetch_sent": {
+      "type": "noul",
+      "instructions": "The command that fetches the top story and its comments has been typed into the terminal."
+    },
+    "fetch_done": {
+      "type": "noul",
+      "instructions": "The terminal shows '==NEWS2-DONE==' as command output, with a shell prompt 'ubuntu@devin-box:~$' below it."
+    },
+    "digest_in_doc": {
+      "type": "noul",
+      "instructions": "The document's text begins with 'NEWS DIGEST'."
+    },
+    "clean_title": {
+      "type": "noul",
+      "instructions": "The window title ends with 'news-writeup.txt'."
+    },
+    "check_sent": {
+      "type": "noul",
+      "instructions": "The command checking the saved file has been typed into the terminal."
+    },
+    "verified": {
+      "type": "noul",
+      "instructions": "The terminal shows '==NEWS3-DONE==' as command output, with a shell prompt 'ubuntu@devin-box:~$' below it."
+    }
+  },
+  "stages": [
+    {
+      "app": "konsole",
+      "action_question": "search_sent",
+      "on_true": "wait",
+      "on_false": "run_search",
+      "done_question": "search_done",
+      "done_threshold": 0.70,
+      "threshold": 0.5,
+      "max_steps": 10,
+      "max_escalations": 4,
+      "warmup": 1
+    },
+    {
+      "app": "konsole",
+      "action_question": "fetch_sent",
+      "on_true": "wait",
+      "on_false": "run_fetch",
+      "done_question": "fetch_done",
+      "done_threshold": 0.70,
+      "threshold": 0.5,
+      "max_steps": 10,
+      "max_escalations": 4,
+      "warmup": 1
+    },
+    {
+      "app": "kwrite",
+      "action_question": "digest_in_doc",
+      "on_true": "wait",
+      "on_false": "click_and_write",
+      "done_question": "digest_in_doc",
+      "done_threshold": 0.55,
+      "threshold": 0.45,
+      "max_steps": 8,
+      "max_escalations": 4,
+      "warmup": 1
+    },
+    {
+      "app": "kwrite",
+      "action_question": "clean_title",
+      "on_true": "save_file",
+      "on_false": "save_file",
+      "done_question": "clean_title",
+      "done_threshold": 0.5,
+      "threshold": 0.4,
+      "max_steps": 5,
+      "max_escalations": 3,
+      "warmup": 1
+    },
+    {
+      "app": "konsole",
+      "action_question": "check_sent",
+      "on_true": "wait",
+      "on_false": "check_saved",
+      "done_question": "verified",
+      "done_threshold": 0.7,
+      "threshold": 0.5,
+      "max_steps": 8,
+      "max_escalations": 4,
+      "warmup": 1
+    }
+  ],
+  "warmup": 1,
+  "tick_ms": 900
+}

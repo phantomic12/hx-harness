@@ -1136,6 +1136,178 @@ What it does not prove: the screen pane is still skipped here (no browser driver
 the pane's own honest `503` path), and "a person can find 'what does it want from me' in five
 seconds" is a design claim argued by the attention strip, not a measured one.
 
+### Laya terminal driving (2026-10-06)
+
+`hx drive` — the consumer rung on top of `hx decision`: each tick it senses a tmux pane's tail as
+text, asks the Laya sidecar typed questions, and sends the winning action's keystrokes. Verified
+against real programs, CPU-only sidecar (~0.5–1.5 s per tick; the GPU path is ~20 ms).
+
+**Ops runbook with a destructive step** (`examples/laya-drive/ops_console.py` — five steps, the third
+asks to "drop and recreate the staging database"). Task spec asks one binary question per tick
+(`step_pending` → `confirm`/`wait`) plus a veto question (`mentions_delete` → `decline`):
+
+```console
+$ hx drive examples/laya-drive/ops-console.task.json
+  #0   confirm  p=0.915  626ms  act
+  #1   confirm  p=0.878  842ms  act
+  #2   decline  p=0.900  770ms  guard
+  #3   decline  p=0.850  837ms  guard
+  #4   -        p=0.894  796ms  act
+drive …: done after 5 steps — 5 steps, 4.1s
+```
+
+The pane afterwards showed `[1/5] … y`, `[2/5] … y`, `[3/5] drop and recreate the staging database … n`
+→ `DECLINED — runbook stopped by operator`: the routine steps confirmed, the destructive step was
+vetoed by the guard rather than left to the action question. (The second `decline` at #3 raced the
+program's exit — the stray `n` hit a shell prompt, `n: command not found`. Harmless here; on a real
+target, bind veto actions to keys that are no-ops outside the prompt.)
+
+**`git add -p` with a secret hunk** (`git-add-p.task.json` — one hunk adds `import logging`, the
+other `SECRET_KEY=hunter2`). Action question `letter_menu` ("the last line lists single letters in
+square brackets and ends with a question mark"), guard `adds_secret`, done `shell_done`:
+
+```console
+  #0   stage    p=1.000   597ms  act
+  #1   skip     p=0.644  1279ms  guard
+  #2   skip     p=0.661  1528ms  guard
+  #3   -        p=0.762  1685ms  act
+drive …: done after 4 steps — 5.3s
+```
+
+`git status` afterwards: `M  app.py` (staged), ` M config.env` (the secret hunk left unstaged).
+Two bindings this needed: keystrokes for interactive programs are `y Enter`, not `y` — git's hunk
+prompt line-buffers in a pty — and the veto threshold has to sit under scrollback dilution
+(`adds_secret` reads 0.805 on a clean frame but 0.633 with the previous hunk still on screen;
+`guard_threshold` is 0.6 here while the ops runbook's reads 0.87 at 0.8).
+
+**moon-buggy, the frame-per-frame case** (`moon-buggy.task.json`): `obstacle_ahead` → jump/coast at
+300 ms ticks. It crashed on the first crater twice, `game_over` caught the crash screen (0.872), and
+`obstacle_ahead` sat at ~0.12 every frame — the question sees text, and a crater in moon-buggy's
+ASCII art is a gap in a row of `###`, not words. Real-time games need both the GPU latency and a
+state encoding that says "obstacle ahead" in prose; as shipped, this rung is honest about where it
+stops: prompt-driven and turn-based programs drive correctly, scrolling ASCII action does not.
+
+What the probing runs established, in numbers: a choice whose options compete on overlapping prose
+("press y to confirm" vs "wait — screen unclear") flattens to ~0.64/0.36 and never clears a gate;
+the same decision as one noul reads 0.91/0.09. Judgment nouls ("this step permanently destroys
+data") score ~0.22 where mention nouls ("the step's text asks to drop, delete, destroy, wipe, or
+recreate a database") score 0.87 — the guard veto exists because that gap is real.
+
+### Laya desktop driving — real mouse and keyboard (2026-10-06)
+
+`hx drive` with a `gui` spec senses the app's AT-SPI accessibility tree each tick (a pyatspi
+helper under `apps/hx/src/atspi_sense.py`), lets the model answer typed questions about it, and
+actuates with xdotool — mousemove+click on a widget's centre, `type`, or a bare keyspec. Target
+apps launch with `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`; the spec's `coord_scale` maps a11y logical
+pixels to the real 3200×2400 display (2.0 here); the window is raised at start because
+click-to-focus raises whatever is topmost at the point.
+
+**Type into a document** (`kwrite-type.task.json` — doc must gain the line `Devin was here`;
+noul `has_greeting` doubles as action question (on_false → `seq:click:gui-demo.txt|text:Devin
+was here`) and done question):
+
+```console
+  #0   type_greeting  p=0.962   978ms  act
+  #1   -              p=0.559   839ms  act
+drive …: done after 2 steps — 2 steps, 3.6s
+```
+
+The a11y tree afterwards reads `shows 'line one Devin was here'` — the click hit the text area's
+centre and the typed text landed.
+
+**Handle a modal save dialog** (`kwrite-close-save.task.json` — close the doc keeping the text;
+`save_dialog` detects "a dialog offers 'Save', 'Discard' and 'Cancel'" → on_true `click:Save`,
+on_false `ctrl+w`; `document_gone` ends it):
+
+```console
+  #0   click_save  p=0.850  1660ms  act
+  #1   -           p=0.631  1418ms  act
+drive …: done after 2 steps — 2 steps, 3.2s
+```
+
+`cat /tmp/gui-demo.txt` afterwards: `line one` + `Devin was herex` — the click hit the *dialog's*
+Save, not the toolbar's same-named button (name lookup takes the last match — dialogs append
+late in the a11y tree), the buffer went to disk, and the editor was back to `Untitled`.
+
+**Open a menu and pick an item** (`kwrite-menu.task.json` — `menu_open` noul → on_true
+`click:Save As...` : on_false `click:File`): the drive reached done in 3 steps (4.8 s) with the
+Save File chooser open — tick 0 answered `menu_open` true at 0.629 (a borderline false positive)
+and clicked `Save As...`, which resolved to the *toolbar* button — the outcome the spec wanted
+via a shortcut the environment offered. Menu-state nouls hover near the gate; a cleaner signal is
+a signature unique to the open menu.
+
+**Calculator sequencing — the honest ceiling** (`kcalc.task.json` — "press 7, ×, 8, =" with the
+pick filtered to those four buttons): escalated at p=0.447/conf=0.104 every tick — probed
+standalone, the pick shows a persistent `AC`-then-`=` prior (~0.4–0.5) no matter what the
+"pressed so far" history says; 322M doesn't sequence button presses from an element list. The
+drive's gate held: it escalated rather than clicking the wrong button — the calc display stayed
+`0`. Same conclusion moon-buggy reached for real-time: the loop is a reactive controller, not a
+planner — shape tasks as state-detection → bound action, and leave sequences to the spec's
+bindings.
+
+**Multi-phase task — type, save as, name it** (`kwrite-save-as.task.json`): a `stages` spec
+composing three reactive drives — stage 1 types `Devin was here` until `has_greeting` clears;
+stage 2 senses with `window: "Save File"` (falls back to the whole app while the dialog is
+absent) and clicks the toolbar `Save As...` until `chooser` (`'Parent Directory'` showing)
+clears; stage 3 fires `fill_and_save` (`seq:click:File name:|ctrl+a|text:devin-note.txt|
+click:Save`) once `chooser` holds, and ends when `named_doc` sees the title flip:
+
+```console
+-- stage 1: has_greeting
+  #0   type_greeting  p=0.923  1404ms  act
+  #1   -              p=0.628  1427ms  act
+   stage done after 2 steps
+-- stage 2: chooser
+  #0   open_saveas    p=0.632  1868ms  act
+  #1   -              p=0.725   913ms  act
+   stage done after 2 steps
+-- stage 3: chooser
+  #0   fill_and_save  p=0.725   851ms  act
+  #1   -              p=0.843  1545ms  act
+   stage done after 2 steps
+drive …: done — 6 steps, 12.4s
+```
+
+`~/devin-note.txt` landed on disk (15 bytes) and the KWrite title flipped. The same noul
+(`chooser`) drove both dialog stages with opposite bindings — open it when absent, fill it
+when present. Two sense-side additions made this tractable: `gui.window` restricts a stage's
+element table to a dialog subtree (the save chooser's ~70 elements → 11) while falling back
+to the whole app when no matching frame exists, and `gui.skip_roles` drops grid roles
+(`table cell`, `list item`) so file rows can't crowd the cap — unfiltered, the state
+overflows the 512-token window and questions get `truncated_questions`. Phrasing probes
+that stayed mushy (~0.6–0.7 both states on "menu open", filename-in-field strings like
+`devin-note.txt`) were dropped for signals naming widgets unique to one state —
+`'Parent Directory'`, the post-save title — a lexical-presence rule that also explains why
+menu-open nouls can't separate (drop-down item names collide with toolbar ones).
+
+**OSWorld-adapted queue — 10/10 verified** (`examples/laya-drive/queue/`): ten tasks
+shaped like OSWorld's harness — `setup.sh` fixture, `hx drive` phase, `verify.sh`
+execution check on the filesystem. `run_queue.py` runs them and writes the scorecard:
+
+| task | domain | what it drives | drive | verify |
+|---|---|---|---|---|
+| kwrite-save-as | editor dialog | type → Save As → name it → Save | done 13.0s | PASS |
+| os-append-br | editor | `End`+type `<br/>` on 3 lines → `ctrl+s` | done 8.1s | PASS |
+| os-chmod-644 | terminal | `find -type f -exec chmod 644` | done 10.7s | PASS |
+| os-compress-old | terminal | `find -mtime +30` to file | done 11.2s | PASS |
+| os-failed-ipynb | terminal | `cp --parents` failed.ipynb tree | done 10.8s | PASS |
+| os-jpg-collect | terminal | recursive `*.jpg` → one dir | done 10.3s | PASS |
+| os-nano-edit | TUI (4 stages) | nano open → type → `ctrl+o` save → `ctrl+x` exit | done 12.7s | PASS |
+| os-organize-logs | terminal | `mkdir` + `mv *.log` | done 9.5s | PASS |
+| os-php-lines | terminal | `find -name '*.php' -exec wc -l` | stopped* 16.5s | PASS |
+| os-rename-dir | terminal | `mv` rename | done 8.0s | PASS |
+
+*php-lines verified but ended `stopped` — the done read stayed conservative on a real
+result; the filesystem check is the arbiter, same as OSWorld's execution-based scoring.
+
+Failures burned down along the way (each changed the sensor or the spec, not the model):
+`terminal shows` truncating at 80 chars hid every output line — now head+tail; markers
+inside their own `echo` command confabulated — output-only `==BENCH-DO""NE==` idiom plus
+prompt-below-output phrasing; `warmup: 1` ended tick-0 "done" reads (0.82 on a blank
+prompt); goal-state claims ("the edit is applied") confabulated where current-state
+claims ("last line is plain `gamma`") split; window titles/tab labels (`br-doc.txt *`,
+`bench : nano`) turned out to be the most readable state signals of all.
+
 ## Running the suite
 
 ```bash
@@ -1185,3 +1357,73 @@ HX_SSH_TEST_HOST=<host> HX_SSH_TEST_USER=<user> HX_SSH_TEST_KEY=~/.ssh/id_ed2551
   on both the near and the far host, but the proxy matches hostnames, so those entries are refused
   rather than pretended — plus keyless scraping that survives a TLS-fingerprint bot wall (browser-pool
   work), the vault opened in a new process, and provider calls to a real model API.
+### Cross-app research drive (news-research)
+
+Five stages across two apps: konsole `curl` search of the HN front page →
+fetch top story + comments into a digest file → KWrite type the digest →
+save → shell marker verify. Live result: 18 steps / ~3 min, file verified
+on disk (`news-writeup.txt`, a real front-page headline + comment excerpts).
+Exercise surfaced three drive bugs fixed in the same commit: terminal sense
+read only the top 600 buffer chars (markers past the fold were invisible),
+stage done checks re-fired on stale markers from earlier stages (distinct
+per-stage markers now), and stage app-switches clicked the window that was
+on top rather than the stage's app (stages now `wmctrl -a` their app).
+New binding `typefile:<path>` types a file's contents — the mechanism for a
+research stage to hand live findings to a writing stage.
+
+### Containerized browser drive (fox-nyt-nav)
+
+Four stages inside a Kasm-style container (`examples/laya-drive/kasm-fox`:
+firefox-esr on the host X11 + a11y bus) against nytimes.com — a site that
+403s curl. Live result: `done` in 18 steps / ~100 s, verify PASS — the model
+typed the URL via ctrl+l, picked headline link `e66` ('Trump's Retreat…'),
+then Back→homepage→Forward→article. The drive surfaced the option-clipping
+limit (`state_tokens_dropped` — the ~512-token state budget had silently cut
+the mid-range options, including the article links) and three bound-op
+failure modes (ops outbidding element picks, window-cover races, a11y
+registration lag). New spec fields: `pick_roles`, `pick_min_len`,
+`choice_actions`, `click_roles`; `click:` now degrades to substring match.
+
+### cua-drive — trycua sandbox (kasm-style) computer use
+
+`examples/cua-drive/cua_drive.py`: a thin computer-use loop on the trycua
+SDK sandbox (ephemeral local Linux image — Ubuntu 24.04, its own display,
+firefox+chromium; no host X11/a11y plumbing at all). Model:
+step-5-preview-free (vision) over the keyless zen shim with native
+function calling (forced `computer` tool_choice). Verified: firefox →
+nytimes.com → clicked the top headline ("'He's Not Making Sense': How
+Trump Has Alienated Voters for the G.O.P.") → scrolled the article —
+14 steps, ~3 min, DONE; timelapse recorded from a second client attached
+to the same sandbox by name. Fixes that mattered: shim must fold streamed
+`delta.tool_calls` into the completion, `keypress` wants a key list not a
+chord string, and out-of-range coordinates get rescaled from 0-1000 space.
+
+### cua-drive — long-horizon research task (80-step budget)
+
+Same driver + model, tasked with a multi-site research-and-write run:
+Wikipedia (JWST) pre-opened via `--setup`, then tab 2 → science.nasa.gov
+Webb page, tab 3 → bbc.com/news/science_and_environment, then open the
+Text Editor and type a 4+ sentence summary naming each site.
+
+Result: PARTIAL — all three sites reached in three tabs (verified in the
+final screenshot), but the run burned the 80-step budget before opening
+the editor: ~30 steps of scroll-dithering on the NASA page, then a
+~15-step wander through the GNOME Activities overview and out-of-bounds
+clicks before it recovered, found Firefox again, and completed the BBC
+tab at step 69. Timelapse recorded (1126 frames).
+
+Findings baked into the driver:
+- `--setup` flag: app launch is setup, not task work (OSWorld convention)
+- `_scale()` now handles 0-1 fraction coords too (model emitted
+  [0.201, 0.911] once); system prompt mandates absolute integer pixels
+- Empty assistant turns (malformed XML-ish calls, truncation) now get a
+  nudge message instead of ending the run as a false DONE
+- `_chord()` alias map extended (Return/Page_Down/arrow names)
+- `_exec()` wraps every action in try/except so one bad call can't kill
+  a long run
+
+Model-quality ceiling (step-5-preview-free is a generic VLM, not CU-
+tuned): scroll-reading has no stop signal so it dithers; multi-app task
+state (browse → editor) is out of reach at this horizon; occasional
+out-of-bounds coordinates. A CU-tuned model on their anthropic/openai
+loops is the fix when a paid key lands — the driver/harness held up.
