@@ -154,6 +154,12 @@
 }
 .ob-actions .ghost:hover { color: var(--tx-0); border-color: var(--accent); }
 .ob-actions .ghost:last-child { margin-left: auto; }
+/* the step-3 sample-prompt chip is a ghost outside .ob-actions — same look, mono flavor */
+#ob-sample {
+  background: transparent; color: var(--tx-1); border: 1px solid var(--line-0);
+  border-radius: var(--r-2); padding: 7px var(--sp-3); font-family: var(--mono); font-size: var(--fs-xs);
+}
+#ob-sample:hover { color: var(--tx-0); border-color: var(--accent); }
 .ob-note { margin-top: var(--sp-6); font-family: var(--mono); font-size: var(--fs-xs); color: var(--tx-2); }
 
 /* ---- narrow viewports -----------------------------------------------------------------------------
