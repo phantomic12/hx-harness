@@ -80,7 +80,9 @@ async fn build() -> Arc<AppState> {
     let dir = tempfile::tempdir().expect("temp dir");
     config.daemon.data_dir = dir.keep().display().to_string();
     let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-    AppState::build(config, None, now).await.expect("state builds")
+    AppState::build(config, None, now)
+        .await
+        .expect("state builds")
 }
 
 #[tokio::test]

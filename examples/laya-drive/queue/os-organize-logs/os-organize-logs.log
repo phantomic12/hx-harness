@@ -1,0 +1,10 @@
+--- setup (rc=0)
+
+--- drive (outcome=done, 10.1s)
+hx drive: /home/ubuntu/laya-work/examples/laya-drive/queue/os-organize-logs/task.json on gui 'konsole' (tick 900ms, max 10 steps, threshold 0.50)
+  #0   run_cmd  p=0.803 conf=0.803   1003ms  act
+  #1   -        p=0.665 conf=0.665   1046ms  act
+drive /home/ubuntu/laya-work/examples/laya-drive/queue/os-organize-logs/task.json: done — 2 steps, 9.5s
+
+--- verify (pass=True)
+

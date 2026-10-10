@@ -226,9 +226,11 @@ impl AnswerBody {
             Self::Solved => Ok(()),
             Self::Abandoned { note } => {
                 if note.trim().is_empty() {
-                    Err("an abandoned challenge must carry a note saying why; a decision with no \
+                    Err(
+                        "an abandoned challenge must carry a note saying why; a decision with no \
                          reason is the mystery this records against"
-                        .to_string())
+                            .to_string(),
+                    )
                 } else {
                     Ok(())
                 }
@@ -504,12 +506,7 @@ impl Challenges {
             .unwrap_or(false)
     }
 
-    fn answer_by(
-        &self,
-        id: &str,
-        outcome: HumanOutcome,
-        token: Option<&str>,
-    ) -> AnswerOutcome {
+    fn answer_by(&self, id: &str, outcome: HumanOutcome, token: Option<&str>) -> AnswerOutcome {
         // The token is judged *before* the entry is taken, so a misnamed one cannot end the wait it
         // named: the question is still there for the person who was actually asked. A `None` here
         // means the id is unknown or already over, which is judged below with the same distinction a
@@ -641,7 +638,10 @@ impl ScreenHost for Screens {
     async fn launch(&self, id: &str, options: ScreenOptions) -> Result<(), String> {
         // The handle is dropped immediately: the registry owns the screen, and a challenge that kept
         // a second handle would keep its browser alive after `forget`.
-        self.create(id, options).await.map(|_| ()).map_err(|err| err.to_string())
+        self.create(id, options)
+            .await
+            .map(|_| ())
+            .map_err(|err| err.to_string())
     }
 
     async fn close(&self, id: &str) {
@@ -693,8 +693,7 @@ impl Drop for PaneGuard {
         // is easiest to forget: nothing here can await, so the push is fire-and-forget by construction
         // (`challenge_notice`). Sent *before* the browser is taken back, so a relay that reads the
         // notice finds the challenge over rather than racing the registry.
-        self.notices
-            .resolved(&self.summary, &Outcome::Withdrawn);
+        self.notices.resolved(&self.summary, &Outcome::Withdrawn);
         tracing::warn!(
             challenge = %self.id,
             "the pane stopped waiting before it was answered; the challenge is withdrawn and its \
@@ -790,10 +789,7 @@ impl HumanPane for ScreenPane {
         // — the listing, the notification, the resolution — reads it off the challenge rather than
         // asking the roster again, so a rotation that moved on mid-flight cannot send a person news
         // about somebody else's run.
-        let operator = self
-            .options
-            .next_operator(&self.next_operator)
-            .clone();
+        let operator = self.options.next_operator(&self.next_operator).clone();
 
         let (answer, waiting) = oneshot::channel();
         let entry = Waiting {
@@ -1010,10 +1006,7 @@ mod tests {
         }
 
         fn resolutions(&self) -> Vec<(String, Outcome)> {
-            self.resolutions
-                .lock()
-                .expect("the resolution log")
-                .clone()
+            self.resolutions.lock().expect("the resolution log").clone()
         }
 
         /// Take the oldest announcement *out* of the log, so a test that walks two challenges sees
@@ -1065,12 +1058,7 @@ mod tests {
         challenges: Arc<Challenges>,
         notices: Arc<FakeNotices>,
     ) -> ScreenPane {
-        ScreenPane::new(
-            screens,
-            challenges,
-            notices,
-            PaneOptions::default(),
-        )
+        ScreenPane::new(screens, challenges, notices, PaneOptions::default())
     }
 
     // ---------------------------------------------------------------------------------
@@ -1081,7 +1069,10 @@ mod tests {
     async fn a_presented_challenge_is_listed_and_a_person_can_answer_it() {
         let screens = Arc::new(FakeScreens::default());
         let challenges = Arc::new(Challenges::new());
-        let pane = Arc::new(pane(Arc::clone(&screens) as Arc<dyn ScreenHost>, Arc::clone(&challenges)));
+        let pane = Arc::new(pane(
+            Arc::clone(&screens) as Arc<dyn ScreenHost>,
+            Arc::clone(&challenges),
+        ));
 
         let answering = {
             let pane = Arc::clone(&pane);
@@ -1090,7 +1081,11 @@ mod tests {
                 // Long enough that the answer below is certainly the thing that ends the wait, and
                 // short enough that a broken test fails quickly rather than hanging the suite.
                 let outcome = pane
-                    .present(challenge("chal-1", "/tmp/pool/ses_help", Duration::from_secs(30)))
+                    .present(challenge(
+                        "chal-1",
+                        "/tmp/pool/ses_help",
+                        Duration::from_secs(30),
+                    ))
                     .await;
                 assert_eq!(outcome.expect("a person answered"), HumanOutcome::Solved);
                 challenges
@@ -1100,7 +1095,10 @@ mod tests {
         // The listing is what the web client polls, so waiting for it is how the test knows the pane
         // is actually waiting rather than merely spawned.
         let listed = wait_for_challenge(&challenges, "chal-1").await;
-        assert_eq!(listed.screen, "chal-1", "the challenge names the screen to watch");
+        assert_eq!(
+            listed.screen, "chal-1",
+            "the challenge names the screen to watch"
+        );
         assert_eq!(listed.session, "ses_help");
         assert_eq!(listed.url, "http://127.0.0.1:9/verify");
         assert_eq!(screens.launched(), vec!["chal-1".to_string()]);
@@ -1125,13 +1123,20 @@ mod tests {
     async fn an_abandoned_answer_carries_the_persons_own_note() {
         let screens = Arc::new(FakeScreens::default());
         let challenges = Arc::new(Challenges::new());
-        let pane = Arc::new(pane(Arc::clone(&screens) as Arc<dyn ScreenHost>, Arc::clone(&challenges)));
+        let pane = Arc::new(pane(
+            Arc::clone(&screens) as Arc<dyn ScreenHost>,
+            Arc::clone(&challenges),
+        ));
 
         let answering = {
             let pane = Arc::clone(&pane);
             tokio::spawn(async move {
-                pane.present(challenge("chal-2", "/tmp/pool/ses_a", Duration::from_secs(30)))
-                    .await
+                pane.present(challenge(
+                    "chal-2",
+                    "/tmp/pool/ses_a",
+                    Duration::from_secs(30),
+                ))
+                .await
             })
         };
 
@@ -1169,13 +1174,19 @@ mod tests {
         // on someone's machine that nothing can see, name, or close.
         let screens = Arc::new(FakeScreens::default());
         let challenges = Arc::new(Challenges::new());
-        let pane = pane(Arc::clone(&screens) as Arc<dyn ScreenHost>, Arc::clone(&challenges));
+        let pane = pane(
+            Arc::clone(&screens) as Arc<dyn ScreenHost>,
+            Arc::clone(&challenges),
+        );
 
         {
             // Never answered, never resolved: the `select` drops it, which is what the rung's timeout
             // does to the same future.
-            let presenting =
-                pane.present(challenge("chal-3", "/tmp/pool/ses_b", Duration::from_secs(300)));
+            let presenting = pane.present(challenge(
+                "chal-3",
+                "/tmp/pool/ses_b",
+                Duration::from_secs(300),
+            ));
             tokio::pin!(presenting);
             tokio::select! {
                 _ = &mut presenting => panic!("an unanswered challenge must not resolve on its own"),
@@ -1209,8 +1220,11 @@ mod tests {
         );
 
         {
-            let presenting =
-                pane.present(challenge("chal-4", "/tmp/pool/ses_c", Duration::from_secs(300)));
+            let presenting = pane.present(challenge(
+                "chal-4",
+                "/tmp/pool/ses_c",
+                Duration::from_secs(300),
+            ));
             tokio::pin!(presenting);
             tokio::select! {
                 _ = &mut presenting => panic!("an unanswered challenge must not resolve on its own"),
@@ -1267,7 +1281,10 @@ mod tests {
         }
         assert!(challenges.is_finished("chal-dup"));
         let remembered = challenges.finished.lock().expect("the finished list").len();
-        assert_eq!(remembered, 1, "recorded once, however many paths reported it");
+        assert_eq!(
+            remembered, 1,
+            "recorded once, however many paths reported it"
+        );
     }
 
     #[tokio::test]
@@ -1284,8 +1301,12 @@ mod tests {
         let answering = {
             let pane = Arc::clone(&pane);
             tokio::spawn(async move {
-                pane.present(challenge("chal-5", "/tmp/pool/ses_d", Duration::from_secs(300)))
-                    .await
+                pane.present(challenge(
+                    "chal-5",
+                    "/tmp/pool/ses_d",
+                    Duration::from_secs(300),
+                ))
+                .await
             })
         };
 
@@ -1300,7 +1321,10 @@ mod tests {
             .await
             .expect("the pane task")
             .expect_err("a closed screen means no answer");
-        assert!(err.to_string().contains("closed without an answer"), "{err}");
+        assert!(
+            err.to_string().contains("closed without an answer"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -1315,14 +1339,22 @@ mod tests {
         let answering = {
             let pane = Arc::clone(&pane);
             tokio::spawn(async move {
-                pane.present(challenge("chal-6", "/tmp/pool/ses_e", Duration::from_secs(300)))
-                    .await
+                pane.present(challenge(
+                    "chal-6",
+                    "/tmp/pool/ses_e",
+                    Duration::from_secs(300),
+                ))
+                .await
             })
         };
         wait_for_challenge(&challenges, "chal-6").await;
 
         assert!(!challenges.screen_closed("a-screen-a-person-opened"));
-        assert_eq!(challenges.pending().len(), 1, "the challenge is still waiting");
+        assert_eq!(
+            challenges.pending().len(),
+            1,
+            "the challenge is still waiting"
+        );
 
         assert_eq!(
             challenges.answer("chal-6", HumanOutcome::Solved),
@@ -1341,11 +1373,18 @@ mod tests {
         let pane = pane(Arc::new(RefusingScreens), Arc::clone(&challenges));
 
         let err = pane
-            .present(challenge("chal-7", "/tmp/pool/ses_f", Duration::from_secs(30)))
+            .present(challenge(
+                "chal-7",
+                "/tmp/pool/ses_f",
+                Duration::from_secs(30),
+            ))
             .await
             .expect_err("nothing to show means nothing to ask");
 
-        assert!(err.to_string().contains("no Chromium-class browser"), "{err}");
+        assert!(
+            err.to_string().contains("no Chromium-class browser"),
+            "{err}"
+        );
         assert!(
             challenges.pending().is_empty(),
             "a pane that cannot show the page must not leave a question waiting"
@@ -1367,14 +1406,22 @@ mod tests {
         let first = {
             let pane = Arc::clone(&pane);
             tokio::spawn(async move {
-                pane.present(challenge("chal-8", "/tmp/pool/ses_g", Duration::from_secs(300)))
-                    .await
+                pane.present(challenge(
+                    "chal-8",
+                    "/tmp/pool/ses_g",
+                    Duration::from_secs(300),
+                ))
+                .await
             })
         };
         wait_for_challenge(&challenges, "chal-8").await;
 
         let err = pane
-            .present(challenge("chal-9", "/tmp/pool/ses_g", Duration::from_secs(300)))
+            .present(challenge(
+                "chal-9",
+                "/tmp/pool/ses_g",
+                Duration::from_secs(300),
+            ))
             .await
             .expect_err("one profile, one browser");
         assert!(err.to_string().contains("one profile cannot hold"), "{err}");
@@ -1403,8 +1450,12 @@ mod tests {
         let answering = {
             let pane = Arc::clone(&pane);
             tokio::spawn(async move {
-                pane.present(challenge("chal-10", "/tmp/pool/ses_h", Duration::from_secs(60)))
-                    .await
+                pane.present(challenge(
+                    "chal-10",
+                    "/tmp/pool/ses_h",
+                    Duration::from_secs(60),
+                ))
+                .await
             })
         };
 
@@ -1448,14 +1499,22 @@ mod tests {
         let answering = {
             let pane = Arc::clone(&pane);
             tokio::spawn(async move {
-                pane.present(challenge("chal-11", "/tmp/pool/ses_i", Duration::from_secs(60)))
-                    .await
+                pane.present(challenge(
+                    "chal-11",
+                    "/tmp/pool/ses_i",
+                    Duration::from_secs(60),
+                ))
+                .await
             })
         };
         wait_for_challenge(&challenges, "chal-11").await;
 
         let announced = notices.announcements();
-        assert_eq!(announced.len(), 1, "one question, one announcement: {announced:?}");
+        assert_eq!(
+            announced.len(),
+            1,
+            "one question, one announcement: {announced:?}"
+        );
         let (summary, token) = &announced[0];
         assert_eq!(summary.id, "chal-11");
         assert_eq!(
@@ -1501,8 +1560,12 @@ mod tests {
         let answering = {
             let pane = Arc::clone(&pane);
             tokio::spawn(async move {
-                pane.present(challenge("chal-12", "/tmp/pool/ses_j", Duration::from_secs(60)))
-                    .await
+                pane.present(challenge(
+                    "chal-12",
+                    "/tmp/pool/ses_j",
+                    Duration::from_secs(60),
+                ))
+                .await
             })
         };
         wait_for_challenge(&challenges, "chal-12").await;
@@ -1566,8 +1629,12 @@ mod tests {
         let first = {
             let pane = Arc::clone(&pane);
             tokio::spawn(async move {
-                pane.present(challenge("chal-13", "/tmp/pool/ses_k", Duration::from_secs(60)))
-                    .await
+                pane.present(challenge(
+                    "chal-13",
+                    "/tmp/pool/ses_k",
+                    Duration::from_secs(60),
+                ))
+                .await
             })
         };
         wait_for_challenge(&challenges, "chal-13").await;
@@ -1576,8 +1643,12 @@ mod tests {
         let second = {
             let pane = Arc::clone(&pane);
             tokio::spawn(async move {
-                pane.present(challenge("chal-14", "/tmp/pool/ses_l", Duration::from_secs(60)))
-                    .await
+                pane.present(challenge(
+                    "chal-14",
+                    "/tmp/pool/ses_l",
+                    Duration::from_secs(60),
+                ))
+                .await
             })
         };
         wait_for_challenge(&challenges, "chal-14").await;
@@ -1636,8 +1707,11 @@ mod tests {
                 Arc::clone(&challenges),
                 Arc::clone(&notices),
             );
-            let presenting =
-                pane.present(challenge("chal-15", "/tmp/pool/ses_m", Duration::from_secs(300)));
+            let presenting = pane.present(challenge(
+                "chal-15",
+                "/tmp/pool/ses_m",
+                Duration::from_secs(300),
+            ));
             tokio::pin!(presenting);
             tokio::select! {
                 _ = &mut presenting => panic!("an unanswered challenge must not resolve on its own"),
@@ -1682,12 +1756,19 @@ mod tests {
             let silent = Arc::clone(&silent);
             tokio::spawn(async move {
                 silent
-                    .present(challenge("chal-16", "/tmp/pool/ses_n", Duration::from_secs(60)))
+                    .present(challenge(
+                        "chal-16",
+                        "/tmp/pool/ses_n",
+                        Duration::from_secs(60),
+                    ))
                     .await
             })
         };
         let listed = wait_for_challenge(&challenges, "chal-16").await;
-        assert_eq!(listed.operator, "yoav", "the operator is named by the config");
+        assert_eq!(
+            listed.operator, "yoav",
+            "the operator is named by the config"
+        );
         assert!(
             !listed.notified,
             "and the listing admits the operator was not told"
@@ -1730,10 +1811,12 @@ mod tests {
     fn the_wire_shapes_are_what_a_client_sends() {
         // The client's side of this is `index.html`; a rename here is a pane that silently stops
         // answering, so the shape is pinned rather than assumed.
-        let solved: AnswerBody = serde_json::from_str(r#"{"outcome":"solved"}"#).expect("a solved answer");
+        let solved: AnswerBody =
+            serde_json::from_str(r#"{"outcome":"solved"}"#).expect("a solved answer");
         assert_eq!(solved, AnswerBody::Solved);
         let abandoned: AnswerBody =
-            serde_json::from_str(r#"{"outcome":"abandoned","note":"no thanks"}"#).expect("a decline");
+            serde_json::from_str(r#"{"outcome":"abandoned","note":"no thanks"}"#)
+                .expect("a decline");
         assert_eq!(
             abandoned,
             AnswerBody::Abandoned {
@@ -1827,7 +1910,9 @@ mod tests {
 
     /// A pane over a roster where only the *first* operator can be rung, so the rotation produces one
     /// challenge somebody was told about and one they were not.
-    fn mixed(challenges: &Arc<Challenges>) -> (Arc<FakeScreens>, Arc<FakeNotices>, Arc<ScreenPane>) {
+    fn mixed(
+        challenges: &Arc<Challenges>,
+    ) -> (Arc<FakeScreens>, Arc<FakeNotices>, Arc<ScreenPane>) {
         let screens = Arc::new(FakeScreens::default());
         let notices = Arc::new(FakeNotices::reaching(&["yoav"]));
         let pane = ScreenPane::new(
@@ -1882,8 +1967,11 @@ mod tests {
         // nobody would notice it was a bug.
         let screens: Arc<dyn ScreenHost> = Arc::new(FakeScreens::default());
         let challenges = Arc::new(Challenges::new());
-        let (pane, _notices) =
-            staffed(Arc::clone(&screens), Arc::clone(&challenges), &["yoav", "dana"]);
+        let (pane, _notices) = staffed(
+            Arc::clone(&screens),
+            Arc::clone(&challenges),
+            &["yoav", "dana"],
+        );
 
         let mut asked = Vec::new();
         for id in ["chal-a", "chal-b", "chal-c", "chal-d", "chal-e"] {
@@ -1909,7 +1997,8 @@ mod tests {
         ));
         assert_eq!(pane.operators().len(), 1);
         assert_eq!(
-            pane.operators()[0].name, "admin",
+            pane.operators()[0].name,
+            "admin",
             "a daemon that names nobody still has the account it authenticates"
         );
 
@@ -1950,7 +2039,11 @@ mod tests {
         // disagreed about who would put the second notification in front of somebody else's run.
         let screens: Arc<dyn ScreenHost> = Arc::new(FakeScreens::default());
         let challenges = Arc::new(Challenges::new());
-        let (pane, notices) = staffed(Arc::clone(&screens), Arc::clone(&challenges), &["yoav", "dana"]);
+        let (pane, notices) = staffed(
+            Arc::clone(&screens),
+            Arc::clone(&challenges),
+            &["yoav", "dana"],
+        );
 
         // One answered, one left to be withdrawn: both ends of a wait, both on the wire.
         ask(&pane, &challenges, "chal-a").await;

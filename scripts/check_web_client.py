@@ -16,9 +16,12 @@ a frame a client can draw and accepts the input a person would send it.
 import base64
 import json
 import os
+import shutil
 import socket
 import struct
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -308,6 +311,9 @@ def main():
     status, _ = http("DELETE", "/v1/terminals/ui-term")
     check("DELETE /v1/terminals/{id}", status == 200, str(status))
 
+    # 15. The rendered-browser gate: headless Chromium loads the page for real. See `check_rendered`.
+    check_rendered(check)
+
     print()
     if failures:
         print(f"{len(failures)} FAILED: {failures}")
@@ -416,6 +422,104 @@ def check_screen(check):
             json.loads(http("GET", "/v1/screens")[1]).get("screens") == [],
             "",
         )
+
+
+def check_rendered(check):
+    """The rendered-browser gate: headless Chromium loads the served page for real.
+
+    Marker checks against `GET /` prove the bytes; this proves what the bytes *do*: the script
+    runs without a console error, the panes people look at mount their JS-rendered contents, and
+    the page paints — a PNG a person can open, not just a DOM that parsed. A served page that
+    threw during boot passes every marker check and fails here, which is the failure this gate
+    exists to catch.
+
+    Skipped rather than failed on a machine with no Chromium: the gate tests the page, not the
+    machine, and `HX_WEB_CHECK_BROWSER` points it at a binary when PATH cannot. The console-error
+    assertion ignores only the xterm CDN — a daemon host without internet is a valid deployment
+    the pane already names in plain text, not a page defect.
+    """
+    browser = os.environ.get("HX_WEB_CHECK_BROWSER")
+    if not browser:
+        for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"):
+            found = shutil.which(name)
+            if found:
+                browser = found
+                break
+    if not browser:
+        print("SKIP  the rendered-browser gate (no Chromium on this machine)")
+        return
+
+    url = f"http://{HOST}:{PORT}/"
+    shot = os.path.join(tempfile.gettempdir(), f"hx-render-{PORT}.png")
+    with tempfile.TemporaryDirectory() as profile:
+        try:
+            run = subprocess.run(
+                [
+                    browser,
+                    "--headless=new",
+                    "--no-sandbox",
+                    "--disable-gpu",
+                    "--no-first-run",
+                    "--disable-extensions",
+                    "--hide-scrollbars",
+                    "--window-size=1440,900",
+                    "--virtual-time-budget=10000",
+                    "--enable-logging=stderr",
+                    f"--user-data-dir={profile}",
+                    f"--screenshot={shot}",
+                    "--dump-dom",
+                    url,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            check("headless Chromium runs the page", False, str(e)[:160])
+            return
+
+    dom = run.stdout or ""
+    stderr = run.stderr or ""
+    check("headless Chromium runs the page", bool(dom.strip()), f"exit {run.returncode}")
+
+    # Console failures surface in the stderr log as `Uncaught …` exceptions or as ERROR-severity
+    # console records. The xterm CDN is the one third-party fetch the page makes on purpose, so a
+    # host that cannot reach it is excluded — every other error is a page defect.
+    bad = []
+    for line in stderr.splitlines():
+        if "CONSOLE" not in line and "Uncaught" not in line:
+            continue
+        if "jsdelivr" in line or "ERR_INTERNET_DISCONNECTED" in line:
+            continue
+        if "Uncaught" in line or ":ERROR:" in line or "TypeError" in line or "ReferenceError" in line or "SyntaxError" in line:
+            bad.append(line.strip()[-140:])
+    check("the page runs with no console errors", not bad, "; ".join(bad[:3]))
+
+    # JS-rendered contents: these elements are empty in the served markup and only have children
+    # after boot code runs, so finding them proves the script executed — not just that it parsed.
+    check(
+        "the session list renders (JS ran and fetched)",
+        'class="sess' in dom,
+        "no .sess elements in the rendered DOM",
+    )
+    # The surfaces a compile check cannot see wired: the attention strip, the reconnect pill, the
+    # toast region and the live announcement region a screen reader reads, plus the jump surfaces
+    # added in the second pass (command palette, new-events pill).
+    for marker in (
+        'id="attention"', 'id="connbar"', 'id="toasts"', 'id="sr-live"', 'role="tablist"',
+        'id="palette"', 'id="pal-input"', 'id="new-events"',
+    ):
+        check(f"the rendered page keeps {marker}", marker in dom, "missing from the rendered DOM")
+
+    try:
+        with open(shot, "rb") as f:
+            magic = f.read(8)
+        painted = magic == b"\x89PNG\r\n\x1a\n" and os.path.getsize(shot) > 20_000
+    except OSError:
+        painted = False
+    check("the page paints (screenshot is a PNG)", painted, f"{shot} missing or too small")
+    if painted:
+        print(f"      rendered screenshot kept at {shot}")
 
 
 if __name__ == "__main__":

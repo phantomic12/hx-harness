@@ -1,0 +1,27 @@
+{
+  "gui": {
+    "app": "kwrite",
+    "max_elements": 24,
+    "coord_scale": 2.0
+  },
+  "actions": {
+    "type_greeting": "seq:click:gui-demo.txt|text:Devin was here",
+    "wait": null
+  },
+  "questions": {
+    "has_greeting": {
+      "type": "noul",
+      "instructions": "The document text mentions 'Devin was here'."
+    }
+  },
+  "action_question": "has_greeting",
+  "on_true": "wait",
+  "on_false": "type_greeting",
+  "done_question": "has_greeting",
+  "done_threshold": 0.45,
+  "threshold": 0.6,
+  "min_confidence": 0.0,
+  "tick_ms": 700,
+  "max_steps": 8,
+  "max_escalations": 4
+}

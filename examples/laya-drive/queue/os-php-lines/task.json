@@ -1,0 +1,31 @@
+{
+  "gui": {
+    "app": "konsole",
+    "max_elements": 20,
+    "coord_scale": 2.0
+  },
+  "actions": {
+    "run_cmd": "seq:text:find ~/bench/php -name '*.php' -exec wc -l {} + > ~/bench/php_lines.txt && echo ==BENCH-DO\"\"NE==|Return",
+    "wait": null
+  },
+  "questions": {
+    "cmd_sent": {
+      "type": "noul",
+      "instructions": "The command containing 'php_lines' has been typed into the terminal."
+    },
+    "finished": {
+      "type": "noul",
+      "instructions": "The line '==BENCH-DONE==' shows as command output and a new 'ubuntu@devin-box' prompt sits below it \u2014 the command completed successfully. (Text '==BENCH-DO\"\"NE==' inside the command line is the command itself, not output.)"
+    }
+  },
+  "action_question": "cmd_sent",
+  "on_true": "wait",
+  "on_false": "run_cmd",
+  "done_question": "finished",
+  "done_threshold": 0.65,
+  "threshold": 0.5,
+  "tick_ms": 900,
+  "max_steps": 10,
+  "max_escalations": 4,
+  "warmup": 1
+}

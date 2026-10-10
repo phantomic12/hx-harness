@@ -1,0 +1,221 @@
+/* ==============================================================================================
+   Overlays — the host browser, the keyboard map, first-run onboarding, and the rules for
+   narrow viewports. Everything here floats above the app grid rather than living in it.
+   ============================================================================================== */
+
+.modal {
+  position: fixed; inset: 0; z-index: 70;
+  background: rgba(4, 6, 10, .6); backdrop-filter: blur(3px);
+  display: flex; align-items: center; justify-content: center; padding: var(--sp-6);
+}
+.modal[hidden] { display: none; }
+.modal-box {
+  width: min(980px, 96vw); max-height: 88vh; display: flex; flex-direction: column;
+  background: var(--bg-1); border: 1px solid var(--line-1); border-radius: var(--r-4);
+  box-shadow: var(--shadow-2); overflow: hidden;
+  animation: modal-in .16s var(--ease);
+}
+@keyframes modal-in { from { opacity: 0; transform: translateY(8px) scale(.99); } }
+
+.modal-head {
+  display: flex; align-items: center; gap: var(--sp-3); flex: none;
+  padding: var(--sp-3) var(--sp-4); border-bottom: 1px solid var(--line-0);
+}
+.modal-head strong { font-size: var(--fs-lg); }
+.modal-head .dim { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.modal-head button {
+  margin-left: auto; background: transparent; color: var(--tx-1);
+  border: 1px solid var(--line-0); border-radius: var(--r-2);
+  padding: 4px var(--sp-3); font-size: var(--fs-sm);
+}
+.modal-head button:hover { color: var(--tx-0); border-color: var(--accent); }
+
+.modal-path { display: flex; gap: 6px; padding: var(--sp-2) var(--sp-4); flex: none; }
+.modal-body { flex: 1; display: flex; min-height: 0; }
+.modal-list {
+  width: 42%; flex: none; overflow-y: auto; border-right: 1px solid var(--line-0);
+  padding: var(--sp-2) 0; font-family: var(--mono); font-size: var(--fs-sm);
+}
+.modal-list .entry {
+  display: flex; gap: var(--sp-2); padding: 4px var(--sp-4); cursor: pointer;
+  color: var(--tx-1); overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+.modal-list .entry:hover { background: var(--bg-2); color: var(--tx-0); }
+.modal-list .entry .ename { overflow: hidden; text-overflow: ellipsis; }
+.modal-list .entry .esize { color: var(--tx-2); margin-left: auto; flex: none; }
+.modal-right { flex: 1; display: flex; flex-direction: column; min-width: 0; padding: var(--sp-2); gap: 6px; }
+.modal-right textarea {
+  flex: 1; min-height: 180px; resize: none;
+  background: var(--bg-inset); color: var(--tx-0); border: 1px solid var(--line-0);
+  border-radius: var(--r-2); padding: var(--sp-2) var(--sp-3);
+  font-family: var(--mono); font-size: var(--fs-sm); line-height: var(--lh-loose);
+}
+.modal-right textarea:focus { border-color: var(--accent); box-shadow: var(--ring); }
+.modal-actions { display: flex; align-items: center; gap: var(--sp-2); flex: none; }
+.modal-actions .dim { flex: 1; }
+.modal-cmd { display: flex; gap: 6px; flex: none; }
+.modal-out {
+  flex: none; max-height: 160px; overflow: auto; margin: 0;
+  background: var(--bg-inset); border: 1px solid var(--line-0); border-radius: var(--r-2);
+  padding: var(--sp-2) var(--sp-3); font-family: var(--mono); font-size: var(--fs-xs);
+  color: var(--tx-1); white-space: pre-wrap; word-break: break-word;
+}
+.modal-out:empty { display: none; }
+
+/* ---- command palette ------------------------------------------------------------------------------
+   One box that jumps to anything: tasks, panes, actions (the Codex command menu / Synara's
+   recent-view switcher). Sits under the modals' z-index so a real dialog never hides behind it. */
+.palette {
+  position: fixed; inset: 0; z-index: 55;
+  background: rgba(4, 6, 10, .45);
+  display: flex; justify-content: center; align-items: flex-start; padding: 12vh var(--sp-4) 0;
+}
+.palette[hidden] { display: none; }
+.pal-box {
+  width: min(580px, 94vw); overflow: hidden;
+  background: var(--bg-1); border: 1px solid var(--line-1); border-radius: var(--r-4);
+  box-shadow: var(--shadow-2); animation: modal-in .14s var(--ease);
+}
+#pal-input {
+  width: 100%; background: var(--bg-2); color: var(--tx-0);
+  border: 0; border-bottom: 1px solid var(--line-0);
+  padding: var(--sp-3) var(--sp-4); font-size: var(--fs-md); outline: none;
+}
+#pal-input::placeholder { color: var(--tx-2); }
+#pal-list { max-height: min(46vh, 420px); overflow-y: auto; padding: var(--sp-1) 0 var(--sp-2); }
+.pal-sec {
+  padding: var(--sp-2) var(--sp-4) var(--sp-1);
+  font-family: var(--mono); font-size: var(--fs-xs); color: var(--tx-2);
+  text-transform: uppercase; letter-spacing: .08em;
+}
+.pal-row {
+  display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-3);
+  width: 100%; background: transparent; border: 0; text-align: left;
+  color: var(--tx-1); padding: var(--sp-2) var(--sp-4); font-size: var(--fs-sm);
+}
+.pal-row > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pal-row.sel, .pal-row:hover { background: var(--bg-2); color: var(--tx-0); }
+.pal-row kbd { background: transparent; border: 0; box-shadow: none; color: var(--tx-2); font-size: var(--fs-xs); padding: 0; }
+.pal-empty { padding: var(--sp-5) var(--sp-4); color: var(--tx-2); font-size: var(--fs-sm); text-align: center; }
+
+/* ---- onboarding ----------------------------------------------------------------------------------- */
+
+.onboard {
+  position: fixed; inset: 0; z-index: 60;
+  background: radial-gradient(900px 500px at 50% 0%, rgba(110, 168, 254, .10), transparent 65%), var(--bg-0);
+  display: flex; align-items: center; justify-content: center; padding: var(--sp-6);
+}
+.onboard[hidden] { display: none; }
+.ob-card {
+  width: min(560px, 94vw); background: var(--bg-1);
+  border: 1px solid var(--line-1); border-radius: var(--r-4);
+  padding: var(--sp-8) var(--sp-8) var(--sp-6); box-shadow: var(--shadow-2);
+  animation: modal-in .2s var(--ease);
+}
+.ob-kicker {
+  font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .14em;
+  text-transform: uppercase; color: var(--accent-ink); margin-bottom: var(--sp-3);
+}
+.ob-card h1 { margin: 0 0 var(--sp-2); font-size: var(--fs-2xl); font-weight: var(--fw-bold); letter-spacing: -.01em; }
+.ob-card h1 em { font-style: normal; color: var(--accent-ink); }
+.ob-sub { color: var(--tx-1); font-size: var(--fs-lg); margin: 0 0 var(--sp-6); line-height: var(--lh-normal); }
+.ob-steps { display: flex; gap: var(--sp-2); margin-bottom: var(--sp-6); }
+.ob-steps i {
+  width: 26px; height: 3px; border-radius: var(--r-pill); background: var(--line-1);
+}
+.ob-steps i.now { background: var(--accent); }
+.ob-steps i.done { background: var(--ok); }
+.ob-step h3 { margin: 0 0 var(--sp-2); font-size: var(--fs-lg); }
+.ob-step p { color: var(--tx-1); font-size: var(--fs-sm); margin: 0 0 var(--sp-4); line-height: var(--lh-loose); }
+.ob-step input, .ob-step select {
+  width: 100%; background: var(--bg-0); color: var(--tx-0);
+  border: 1px solid var(--line-0); border-radius: var(--r-2);
+  padding: 9px var(--sp-3); font-size: var(--fs-md); margin-bottom: var(--sp-2);
+}
+.ob-step input:focus, .ob-step select:focus { border-color: var(--accent); box-shadow: var(--ring); }
+.ob-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2); }
+.ob-step details.adv summary {
+  cursor: pointer; color: var(--tx-2); font-size: var(--fs-xs); font-family: var(--mono);
+}
+.ob-step details.adv input { margin-top: var(--sp-2); }
+#ob-msg { min-height: 1.4em; font-size: var(--fs-sm); margin: var(--sp-1) 0; }
+#ob-msg.ok { color: var(--ok-ink); }
+#ob-msg.err { color: var(--bad-ink); }
+.ob-actions { display: flex; gap: var(--sp-2); align-items: center; margin-top: var(--sp-4); }
+.ob-actions .primary {
+  background: var(--paper); color: var(--tx-inv); border: 0; border-radius: var(--r-2);
+  padding: 9px var(--sp-4); font-size: var(--fs-md); font-weight: var(--fw-bold);
+}
+.ob-actions .primary:hover { background: var(--paper-hot); }
+.ob-actions .primary:disabled { opacity: .5; cursor: default; }
+.ob-actions .ghost {
+  background: transparent; color: var(--tx-1); border: 1px solid var(--line-0);
+  border-radius: var(--r-2); padding: 9px var(--sp-4); font-size: var(--fs-md);
+}
+.ob-actions .ghost:hover { color: var(--tx-0); border-color: var(--accent); }
+.ob-actions .ghost:last-child { margin-left: auto; }
+.ob-note { margin-top: var(--sp-6); font-family: var(--mono); font-size: var(--fs-xs); color: var(--tx-2); }
+
+/* ---- narrow viewports -----------------------------------------------------------------------------
+
+   Below ~980px the three-column layout stops fitting: the transcript keeps the whole width and
+   both flanking panels become overlay sheets — the rail from the left, the drawer from the right —
+   so nothing squeezes the conversation. The "tasks" nav button and the pane tabs open them; Esc
+   puts them away. The strip stays — it is the one thing that must never be cropped out. */
+@media (max-width: 980px) {
+  .app { grid-template-columns: 1fr; }
+  .side {
+    position: fixed; z-index: 40; top: var(--top-h); bottom: 0; left: 0;
+    width: min(82vw, 320px);
+    box-shadow: var(--shadow-2);
+  }
+  .drawer {
+    position: fixed; z-index: 40; top: var(--top-h); bottom: 0; right: 0;
+    width: min(100vw - var(--sp-6), 520px);
+    box-shadow: var(--shadow-2);
+    border-left: 1px solid var(--line-0);
+  }
+  .drawer-edge { display: none; }
+  .top-views { overflow-x: auto; scrollbar-width: none; }
+
+  /* A sheet with no Esc key behind it: the scrim is the tap-away door. It sits under the sheets
+     (z 35 < 40) so tapping the uncovered transcript closes whatever is open. */
+  .sheet-scrim {
+    position: fixed; z-index: 35; top: var(--top-h); right: 0; bottom: 0; left: 0;
+    background: rgba(4, 6, 10, .45);
+  }
+  .sheet-scrim[hidden] { display: none; }
+
+  /* Touch targets: a fingertip is ~7mm, not a pixel. Ops rows, tasks, fold headers, tabs and
+     palette rows all grow to meet it. */
+  .event.op { padding-top: 9px; padding-bottom: 9px; }
+  .sess { padding: var(--sp-3) var(--sp-3); }
+  .card > h2 button.fold { padding: var(--sp-2) var(--sp-3); margin: calc(-1 * var(--sp-1)); }
+  .tabs { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+  .tabs button { padding: 8px var(--sp-3); flex: none; }
+  .top-views button { padding: 8px 12px; }
+  .pal-row { padding: var(--sp-3) var(--sp-4); }
+  .new-events { padding: 8px var(--sp-5); bottom: var(--sp-4); }
+}
+@media (max-width: 640px) {
+  .top { padding: 0 var(--sp-2); gap: var(--sp-2); }
+  .brand span { display: none; }
+  .event.role-user { margin-left: var(--sp-4); }
+  .composer-inner { flex-wrap: wrap; }
+  .composer-text { flex-basis: 100%; }
+  .attn { flex-wrap: wrap; }
+  .attn .attn-text { flex-basis: 100%; }
+
+  /* iOS Safari zooms the whole page when a focused field is under 16px — pin the fields a
+     phone user actually types in so focusing never re-scales the layout. */
+  .composer textarea, #pal-input, .ob-step input, .ob-step select, #session-label { font-size: 16px; }
+
+  /* Notched phones: keep the bar and the composer clear of the rounded corners and the home
+     indicator (viewport-fit=cover makes these insets real). */
+  .top {
+    padding-left: calc(var(--sp-2) + env(safe-area-inset-left, 0px));
+    padding-right: calc(var(--sp-2) + env(safe-area-inset-right, 0px));
+  }
+  .cwrap { padding-bottom: calc(var(--sp-2) + env(safe-area-inset-bottom, 0px)); }
+  .side { width: min(86vw, 340px); }
+}

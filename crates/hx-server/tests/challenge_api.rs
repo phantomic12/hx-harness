@@ -176,8 +176,12 @@ impl Relay {
                             Ok(n) => n,
                         };
                         buf.extend_from_slice(&chunk[..read]);
-                        let Some(head) = header_end(&buf) else { continue };
-                        let Some(len) = content_length(&buf[..head]) else { continue };
+                        let Some(head) = header_end(&buf) else {
+                            continue;
+                        };
+                        let Some(len) = content_length(&buf[..head]) else {
+                            continue;
+                        };
                         if buf.len() >= head + len {
                             break Some(buf[head..head + len].to_vec());
                         }
@@ -254,19 +258,16 @@ impl Drop for Relay {
 
 /// The offset just past a request's headers, or `None` while they are still arriving.
 fn header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|at| at + 4)
+    buf.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|at| at + 4)
 }
 
 /// The `Content-Length` a request announced, read case-insensitively as a real server would.
 fn content_length(head: &[u8]) -> Option<usize> {
     let head = String::from_utf8_lossy(head).to_ascii_lowercase();
     let at = head.find("content-length:")? + "content-length:".len();
-    head[at..]
-        .split('\r')
-        .next()?
-        .trim()
-        .parse::<usize>()
-        .ok()
+    head[at..].split('\r').next()?.trim().parse::<usize>().ok()
 }
 
 /// A real server on an ephemeral port, the daemon behind it, and the temp dir that must outlive both.
@@ -533,7 +534,10 @@ async fn a_refused_page_asks_a_person_and_their_answer_ends_the_fetch() {
         let target = stub.url();
         tokio::spawn(async move {
             let challenge = wait_for_challenge(&base).await;
-            assert_eq!(challenge.screen, challenge.id, "the challenge names its screen");
+            assert_eq!(
+                challenge.screen, challenge.id,
+                "the challenge names its screen"
+            );
             assert!(
                 challenge.url.starts_with("http://127.0.0.1:"),
                 "the person is shown the site that refused, redacted: {}",
@@ -847,7 +851,11 @@ async fn an_addressed_challenge_is_announced_to_the_operator_and_its_token_answe
         .send()
         .await
         .expect("the route answers");
-    assert_eq!(anonymous.status(), 401, "no token and no bearer is not an answer");
+    assert_eq!(
+        anonymous.status(),
+        401,
+        "no token and no bearer is not an answer"
+    );
 
     let answered = client()
         .post(respond_url)
@@ -998,7 +1006,11 @@ async fn a_challenge_goes_to_the_operator_it_names_and_to_nobody_elses_relay() {
     // The resolution goes back down the same route it came up: to yoav, and to nobody else.
     let resolved = yoav_relay.wait_for("challenge_resolved").await;
     assert_eq!(resolved["operator"], serde_json::json!("yoav"));
-    assert_eq!(resolved["outcome"], serde_json::json!("solved"), "{resolved}");
+    assert_eq!(
+        resolved["outcome"],
+        serde_json::json!("solved"),
+        "{resolved}"
+    );
     eprintln!(
         "challenge_api: {} relays — yoav got {:?}, dana got {:?}",
         2,

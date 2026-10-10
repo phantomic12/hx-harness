@@ -1,0 +1,227 @@
+/* ==============================================================================================
+   The right drawer — instrument panes behind one tab strip. Each pane is a tool, not a page:
+   the tab bar is the whole navigation, and the drawer edge is the whole close affordance.
+   ============================================================================================== */
+
+.drawer {
+  width: var(--drawer-w); flex: none; border-left: 1px solid var(--line-0);
+  background: var(--bg-1); display: flex; flex-direction: column; min-height: 0;
+  position: relative;
+}
+.drawer[hidden] { display: none; }
+
+/* Collapse handle: lives on the drawer's outer edge so it is reachable from any tab. */
+.drawer-edge {
+  position: absolute; top: 50%; left: -13px; transform: translateY(-50%); z-index: 5;
+  width: 24px; height: 44px; padding: 0;
+  background: var(--bg-2); color: var(--tx-2);
+  border: 1px solid var(--line-0); border-right: 0;
+  border-radius: var(--r-2) 0 0 var(--r-2); font-size: var(--fs-xs);
+}
+.drawer-edge:hover { color: var(--tx-0); background: var(--bg-3); }
+
+.tabs {
+  display: flex; gap: 2px; padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--line-0); flex: none; flex-wrap: wrap;
+}
+.tabs button {
+  background: transparent; border: 1px solid transparent; color: var(--tx-1);
+  font-size: var(--fs-sm); border-radius: var(--r-2); padding: 4px var(--sp-3);
+  font-family: var(--mono);
+}
+.tabs button:hover { color: var(--tx-0); }
+.tabs button.active { color: var(--tx-0); background: var(--bg-2); border-color: var(--line-0); }
+/* The pane a question is hiding behind: same "need" vocabulary as the top-bar tabs. */
+.tabs button.need { color: var(--warn-ink); }
+
+.dpane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.dpane[hidden] { display: none; }
+.dpane > h2 {
+  font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .1em; color: var(--tx-2);
+  margin: 0; padding: var(--sp-3) var(--sp-4) var(--sp-1); font-weight: var(--fw-bold);
+  display: flex; justify-content: space-between; align-items: center; gap: var(--sp-2);
+}
+.dpane > h2 > span { display: inline-flex; align-items: center; gap: var(--sp-2); }
+.dpane > h2 button {
+  font-size: var(--fs-xs); background: transparent; color: var(--tx-1);
+  border: 1px solid var(--line-0); border-radius: var(--r-1); padding: 2px var(--sp-2);
+}
+.dpane > h2 button:hover { color: var(--tx-0); border-color: var(--accent); }
+
+/* Which machine a shell or screen is on decides what a keystroke can touch — never hidden. */
+#term-where, #screen-where {
+  color: var(--tx-2); font-family: var(--mono);
+  text-transform: none; letter-spacing: 0; font-weight: 400;
+}
+#term-where.inbox { color: var(--warn-ink); }
+
+#terminal { flex: 1; min-height: 220px; padding: 6px 0 6px var(--sp-2); background: var(--bg-inset); }
+
+/* ---- challenge: the wall the daemon hands a person ----------------------------------------------*/
+
+.challenge {
+  margin: 0 var(--sp-4) var(--sp-2); padding: var(--sp-3);
+  border: 1px solid var(--line-1); border-left: 3px solid var(--warn);
+  border-radius: var(--r-2); background: var(--bg-2);
+  font-size: var(--fs-sm); line-height: var(--lh-loose);
+}
+.challenge[hidden] { display: none; }
+.challenge-top { display: flex; justify-content: space-between; gap: var(--sp-3); align-items: baseline; }
+.challenge-top strong { color: var(--tx-0); font-weight: var(--fw-med); }
+.challenge-left { color: var(--warn-ink); font-family: var(--mono); white-space: nowrap; }
+.challenge-for { color: var(--tx-1); }
+.challenge-for b { color: var(--tx-0); font-weight: var(--fw-med); }
+.challenge-for .unheard { color: var(--warn-ink); }
+.challenge-why { color: var(--tx-1); }
+.challenge-actions { display: flex; gap: 6px; margin-top: var(--sp-2); }
+.challenge-actions input {
+  flex: 1; min-width: 0; background: var(--bg-0); border: 1px solid var(--line-0);
+  border-radius: var(--r-2); padding: 4px var(--sp-2); color: var(--tx-0); font-size: var(--fs-sm);
+}
+.challenge-actions input:focus { border-color: var(--accent); box-shadow: var(--ring); }
+.challenge-actions button {
+  background: transparent; border: 1px solid var(--line-0); border-radius: var(--r-2);
+  color: var(--tx-1); font-size: var(--fs-sm); padding: 4px var(--sp-2); white-space: nowrap;
+}
+.challenge-actions button:hover { color: var(--tx-0); border-color: var(--accent); }
+#challenge-solved:hover { border-color: var(--ok); color: var(--ok-ink); }
+
+/* ---- screen pane --------------------------------------------------------------------------------- */
+
+.screen-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.screen-bar { display: flex; gap: 6px; padding: var(--sp-1) var(--sp-4) var(--sp-2); }
+.screen-bar input {
+  flex: 1; min-width: 0; background: var(--bg-2); border: 1px solid var(--line-0);
+  border-radius: var(--r-2); padding: 4px var(--sp-2); font-family: var(--mono); font-size: var(--fs-sm);
+}
+.screen-bar input:focus { border-color: var(--accent); box-shadow: var(--ring); }
+.screen-bar button {
+  background: transparent; border: 1px solid var(--line-0); border-radius: var(--r-2);
+  color: var(--tx-1); font-size: var(--fs-sm); padding: 4px var(--sp-2);
+}
+.screen-bar button:hover { color: var(--tx-0); border-color: var(--accent); }
+.screen-stage {
+  flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center;
+  overflow: hidden; padding: 0 var(--sp-2) var(--sp-3);
+}
+#screen-canvas {
+  max-width: 100%; max-height: 100%; background: var(--bg-inset);
+  border-radius: var(--r-1); cursor: crosshair;
+}
+.screen-note { color: var(--tx-2); font-size: var(--fs-xs); padding: 0 var(--sp-4) var(--sp-2); line-height: var(--lh-loose); }
+
+/* ---- diff / review ------------------------------------------------------------------------------- */
+
+.review-pane, .diff-pane, .fanout-pane, .prov-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.review-head { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) var(--sp-4); flex: none; }
+.review-head button {
+  background: transparent; color: var(--tx-0); border: 1px solid var(--line-0);
+  border-radius: var(--r-2); padding: 5px var(--sp-3); font-size: var(--fs-sm);
+}
+.review-head button:hover { border-color: var(--accent); }
+.review-note { color: var(--tx-2); font-size: var(--fs-xs); font-family: var(--mono); }
+
+.rfile { border-bottom: 1px solid var(--line-0); }
+.rfile > summary {
+  cursor: pointer; padding: var(--sp-2) var(--sp-4); font-family: var(--mono); font-size: var(--fs-sm);
+  display: flex; gap: var(--sp-2); align-items: baseline;
+}
+.rfile > summary:hover { background: var(--bg-2); }
+.rfile > summary .rpath { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rfile > summary .rcount { color: var(--tx-2); flex: none; }
+.rfile .runapplied { color: var(--warn-ink); font-size: var(--fs-xs); padding: 0 var(--sp-4) 6px; font-family: var(--mono); }
+
+.diff-input, .fanout-input { display: flex; gap: 6px; padding: var(--sp-2) var(--sp-4); }
+.diff-input input, .fanout-row input, .modal-path input, .modal-cmd input {
+  flex: 1; background: var(--bg-0); color: var(--tx-0); border: 1px solid var(--line-0);
+  border-radius: var(--r-2); padding: 6px var(--sp-3); font-size: var(--fs-sm); min-width: 0;
+}
+.diff-input input:focus, .fanout-row input:focus, .modal-path input:focus, .modal-cmd input:focus {
+  border-color: var(--accent); box-shadow: var(--ring);
+}
+.diff-input button, .fanout-input button, .modal-path button, .modal-cmd button, .modal-actions button {
+  background: transparent; color: var(--tx-0); border: 1px solid var(--line-0);
+  border-radius: var(--r-2); padding: 6px var(--sp-3); font-size: var(--fs-sm);
+}
+.diff-input button:hover, .fanout-input button:hover, .modal-path button:hover, .modal-cmd button:hover {
+  border-color: var(--accent);
+}
+#diff-proposed {
+  margin: 0 var(--sp-4); border: 1px solid var(--line-0); border-radius: var(--r-2);
+  min-height: 110px; resize: vertical; background: var(--bg-inset); color: var(--tx-0);
+  padding: var(--sp-2) var(--sp-3); font-family: var(--mono); font-size: var(--fs-sm);
+  line-height: var(--lh-loose);
+}
+#diff-proposed:focus { border-color: var(--accent); box-shadow: var(--ring); }
+.diff-out { flex: 1; min-height: 0; }
+.dline {
+  font-family: var(--mono); font-size: var(--fs-sm); line-height: var(--lh-loose);
+  white-space: pre-wrap; word-break: break-word; padding: 1px var(--sp-4);
+}
+.dline .mark { color: var(--tx-2); display: inline-block; width: 1.2em; user-select: none; }
+.dline.add { background: var(--ok-soft); color: var(--ok-ink); }
+.dline.del { background: var(--bad-soft); color: var(--bad-ink); }
+.dline.ctx { color: var(--tx-2); }
+
+/* ---- fan-out ------------------------------------------------------------------------------------- */
+
+.fanout-row { display: flex; gap: 6px; padding: 3px var(--sp-4); }
+.fanout-row .fanout-session { flex: 0 0 32%; }
+.fanout-row .fanout-prompt { flex: 1; }
+.fanout-out { flex: 1; min-height: 0; }
+.child { border-bottom: 1px solid var(--line-0); padding: var(--sp-2) var(--sp-4); font-size: var(--fs-md); }
+.child .cmember { font-weight: var(--fw-med); font-family: var(--mono); font-size: var(--fs-sm); }
+.child .cstatus {
+  display: inline-block; font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .05em;
+  font-weight: var(--fw-bold); padding: 1px 5px; border-radius: var(--r-1); margin-left: 6px;
+}
+.child .cstatus.ran { background: var(--ok-soft); color: var(--ok-ink); }
+.child .cstatus.errored { background: var(--bad-soft); color: var(--bad-ink); }
+.child .cusage { color: var(--tx-1); font-size: var(--fs-sm); margin-top: 2px; }
+.child .cerror { color: var(--bad-ink); font-size: var(--fs-sm); margin-top: 2px; white-space: pre-wrap; word-break: break-word; }
+
+/* ---- providers ----------------------------------------------------------------------------------- */
+
+#providers { flex: 1; overflow-y: auto; padding: var(--sp-1) var(--sp-4); font-size: var(--fs-md); }
+.provider { padding: var(--sp-2) 0; border-bottom: 1px solid var(--line-0); }
+.provider .pname { font-weight: var(--fw-med); font-family: var(--mono); font-size: var(--fs-sm); }
+.provider .pkind {
+  display: inline-block; font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .05em;
+  font-weight: var(--fw-bold); padding: 1px 5px; border-radius: var(--r-1); margin-left: 6px;
+  background: var(--accent-soft); color: var(--accent-ink);
+}
+.provider .pmeta { color: var(--tx-1); font-size: var(--fs-sm); margin-top: 2px; word-break: break-word; }
+.provider .pkey { color: var(--tx-2); font-size: var(--fs-xs); margin-top: 2px; font-family: var(--mono); }
+.provider .popts { display: flex; gap: 6px; margin-top: var(--sp-2); }
+.provider .popts button {
+  font-size: var(--fs-sm); padding: 3px var(--sp-2); border-radius: var(--r-1); cursor: pointer;
+  background: transparent; color: var(--tx-0); border: 1px solid var(--line-0);
+}
+.provider .popts button:hover { border-color: var(--accent); }
+.provider .popts button.del { color: var(--bad-ink); }
+.provider .popts button.del:hover { border-color: var(--bad); }
+
+.prov-form {
+  display: flex; flex-direction: column; gap: 6px; padding: var(--sp-3) var(--sp-4);
+  border-top: 1px solid var(--line-0); flex: none;
+}
+.prov-form .row { display: flex; gap: 6px; }
+.prov-form input, .prov-form select {
+  background: var(--bg-0); color: var(--tx-0); border: 1px solid var(--line-0);
+  border-radius: var(--r-2); padding: 6px var(--sp-2); font-size: var(--fs-sm); min-width: 0;
+}
+.prov-form input:focus, .prov-form select:focus { border-color: var(--accent); box-shadow: var(--ring); }
+.prov-form #prov-name, .prov-form #prov-base-url, .prov-form #prov-models, .prov-form #prov-api-key { flex: 1; }
+.prov-form .row select { flex: 1; }
+.prov-form .actions { display: flex; gap: 6px; align-items: center; }
+.prov-form .actions button {
+  background: var(--paper); color: var(--tx-inv); border: 0; border-radius: var(--r-2);
+  padding: 6px var(--sp-3); font-size: var(--fs-sm); font-weight: var(--fw-bold);
+}
+.prov-form .actions button.ghost {
+  background: transparent; color: var(--tx-1); border: 1px solid var(--line-0); font-weight: 400;
+}
+.prov-form .actions button.ghost:hover { color: var(--tx-0); border-color: var(--accent); }
+#prov-msg { font-size: var(--fs-sm); min-height: 1.2em; }
+#prov-msg.ok { color: var(--ok-ink); }
+#prov-msg.err { color: var(--bad-ink); }

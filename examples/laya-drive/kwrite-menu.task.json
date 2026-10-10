@@ -1,0 +1,32 @@
+{
+  "gui": {
+    "app": "kwrite",
+    "max_elements": 24,
+    "coord_scale": 2.0
+  },
+  "actions": {
+    "pick_save_as": "click:Save As...",
+    "open_file_menu": "click:File",
+    "wait": null
+  },
+  "questions": {
+    "menu_open": {
+      "type": "noul",
+      "instructions": "The File menu is expanded \u2014 menu items like 'New', 'Open...' and 'Save' are visible on screen."
+    },
+    "save_dialog_up": {
+      "type": "noul",
+      "instructions": "A 'Save As' file dialog or file chooser window is open on screen."
+    }
+  },
+  "action_question": "menu_open",
+  "on_true": "pick_save_as",
+  "on_false": "open_file_menu",
+  "done_question": "save_dialog_up",
+  "done_threshold": 0.7,
+  "threshold": 0.6,
+  "min_confidence": 0.0,
+  "tick_ms": 800,
+  "max_steps": 10,
+  "max_escalations": 4
+}

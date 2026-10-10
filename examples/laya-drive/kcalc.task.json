@@ -1,0 +1,44 @@
+{
+  "gui": {
+    "app": "kcalc",
+    "max_elements": 24,
+    "coord_scale": 2.0,
+    "pick_names": [
+      "7",
+      "\u00d7",
+      "8",
+      "="
+    ]
+  },
+  "actions": {
+    "wait": null
+  },
+  "questions": {
+    "next_widget": {
+      "type": "choice",
+      "instructions": "The goal: press '7', then '\u00d7', then '8', then '=' to compute 7 times 8. Which single button comes next?",
+      "criteria": {
+        "wait": "press nothing \u2014 the screen is unclear"
+      }
+    },
+    "solved": {
+      "type": "noul",
+      "instructions": "The calculator display shows the result 56 and all four buttons (7, \u00d7, 8, =) were already clicked."
+    },
+    "error_state": {
+      "type": "noul",
+      "instructions": "The calculator display shows an error message like 'Error' or 'NaN'."
+    }
+  },
+  "action_question": "next_widget",
+  "done_question": "solved",
+  "done_threshold": 0.8,
+  "guard_question": "error_state",
+  "guard_action": "wait",
+  "guard_threshold": 0.85,
+  "threshold": 0.55,
+  "min_confidence": 0.0,
+  "tick_ms": 600,
+  "max_steps": 20,
+  "max_escalations": 4
+}
