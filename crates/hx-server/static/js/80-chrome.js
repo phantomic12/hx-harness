@@ -188,12 +188,15 @@ const narrowMQ = window.matchMedia("(max-width: 980px)");
       if (!name) { obMsg("give the provider a name", false); return; }
       $("prov-name").value = name;
       $("prov-kind").value = $("ob-prov-kind").value;
+      $("prov-routing").value = $("ob-prov-routing").value;
       $("prov-base-url").value = $("ob-prov-base-url").value;
       $("prov-models").value = $("ob-prov-models").value;
       $("prov-api-key").value = $("ob-prov-key").value;
       await saveProvider();
       const ok = ($("prov-msg").className || "").includes("ok");
-      if (!ok) { obMsg($("prov-msg").textContent || "could not save — see providers pane", false); showTab("providers"); return; }
+      // Keep the error inside the wizard — opening the providers pane here would put it
+      // behind this modal, out of sight.
+      if (!ok) { obMsg($("prov-msg").textContent || "could not save — check the providers pane after setup", false); return; }
       $("ob-prov-key").value = "";
       obMsg("");
       obShow(3);
@@ -208,25 +211,54 @@ const narrowMQ = window.matchMedia("(max-width: 980px)");
   $("ob-password").addEventListener("keydown", (e) => { if (e.key === "Enter") obNext(); });
   $("ob-token").addEventListener("keydown", (e) => { if (e.key === "Enter") obNext(); });
   $("ob-prov-name").addEventListener("keydown", (e) => { if (e.key === "Enter") obNext(); });
+  for (const id of ["ob-prov-base-url", "ob-prov-models", "ob-prov-key"]) {
+    $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") obNext(); });
+  }
+  // Step 3's sample prompt is a chip, not homework: it fills the composer and lands the
+  // cursor there, so the first run of the whole product is one Enter away.
+  $("ob-sample").addEventListener("click", () => {
+    $("prompt").value = "list the hosts";
+    obDismiss();
+  });
 
   // First-run detection: no token saved AND daemon reports no providers (or we
   // cannot prove otherwise). Runs after boot's first poll so providers are known.
+  // Probe shared with palette re-entry: a 200 on /v1/providers with no credential
+  // attached proves this daemon does not ask for one (the loopback deployment).
+  // The login step can only fail there — POST /v1/login 404s without an admin
+  // password — so on auth-free daemons the wizard always opens on provider setup.
+  async function obProbe() {
+    try {
+      const res = await apiFetch(`${API}/v1/providers`);
+      if (res.ok) return { none: provListItems(await res.json()).length === 0, authNeeded: false };
+      if (res.status === 401) return { none: true, authNeeded: true };
+    } catch (_) {}
+    return { none: true, authNeeded: true };
+  }
+  function obOpenAt(authNeeded) {
+    if (!authNeeded) {
+      const sub = document.querySelector(".ob-sub");
+      if (sub) sub.textContent = "Two steps and you're talking to the agent: connect a model provider, start prompting.";
+    }
+    $("onboard").hidden = false;
+    obShow(authNeeded ? 1 : 2);
+  }
   async function maybeOnboard() {
     try {
       if (localStorage.getItem(OB_KEY) === "1") return;
       if (localStorage.getItem(TOKEN_KEY)) return;
-      let none = true;
-      try {
-        const res = await apiFetch(`${API}/v1/providers`);
-        if (res.ok) none = provListItems(await res.json()).length === 0;
-        else if (res.status === 401) none = true;
-        else none = true;
-      } catch (_) { none = true; }
-      if (none) { $("onboard").hidden = false; obShow(1); }
+      const probe = await obProbe();
+      if (probe.none) obOpenAt(probe.authNeeded);
     } catch (_) {}
   }
-  // Expose for boot ordering; called after the first pollProviders().
+  // Expose for boot ordering; called after the first pollProviders(). Also the palette's
+  // way back in: "setup wizard" reopens the dialog even after it was dismissed — at
+  // provider setup on auth-free daemons, so re-entry can't land on the dead-end login.
   window.__maybeOnboard = maybeOnboard;
+  window.__openOnboard = async (step) => {
+    if (step) { $("onboard").hidden = false; obShow(step); return; }
+    try { obOpenAt((await obProbe()).authNeeded); } catch (_) { $("onboard").hidden = false; obShow(1); }
+  };
 })();
 
 

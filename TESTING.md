@@ -1308,6 +1308,27 @@ prompt); goal-state claims ("the edit is applied") confabulated where current-st
 claims ("last line is plain `gamma`") split; window titles/tab labels (`br-doc.txt *`,
 `bench : nano`) turned out to be the most readable state signals of all.
 
+### Onboarding wizard fixes (2026-10-09)
+
+Six first-run fixes, all in `js/80-chrome.js` + `index.mid.html` + `85-palette.js`:
+
+- **Loopback dead-end removed**: `maybeOnboard` now treats a `200` on its providers probe as
+  proof the daemon asks for no credentials, and opens on provider setup (with a "Two steps…"
+  subtitle) instead of a login form that can only 404.
+- **Routing select wired**: `ob-prov-routing` is now copied into `prov-routing` before the
+  save — it previously rendered but silently saved the pane's default.
+- **Re-entry**: `window.__openOnboard` + a "setup wizard" palette action.
+- Step-2 save failure keeps the error inside the modal (was opening the providers pane
+  behind it).
+- Enter submits on all six step-2 inputs.
+- Step 3 gains a `try "list the hosts" →` chip that seeds the composer (with its own CSS —
+  `.ghost` only styles buttons inside `.ob-actions`).
+
+Verified live against an empty-provider daemon (`hxd -c hx-empty.yaml`): wizard opens at
+step 2 on the loopback deployment, save reaches step 3 (provider persisted with the chosen
+routing), chip fills the composer, palette row exists, zero console errors, check suite
+all-pass.
+
 ## Running the suite
 
 ```bash

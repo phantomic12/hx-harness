@@ -49,6 +49,7 @@ function palCommands() {
   act("toggle density", "", () => setDensity(document.body.dataset.density === "compact" ? "" : "compact"));
   act("keyboard shortcuts", "?", openHelp);
   act("log in / out", "", toggleAccountPanel);
+  if (window.__openOnboard) act("setup wizard", "", () => window.__openOnboard());
   return cmds;
 }
 
