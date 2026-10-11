@@ -1308,6 +1308,33 @@ prompt); goal-state claims ("the edit is applied") confabulated where current-st
 claims ("last line is plain `gamma`") split; window titles/tab labels (`br-doc.txt *`,
 `bench : nano`) turned out to be the most readable state signals of all.
 
+### Onboarding — transcript beat stream (2026-10-11, supersedes the modal wizard)
+
+First-run setup is no longer a modal: it plays as a stream of cards inside the
+transcript surface — the Hermes setup-chat pattern. `#ob-wrap` swaps in for `#events`;
+each beat is a card that stays as history once answered, with a quiet `· ack` line
+between beats. Beats: **welcome → login** (only when the providers probe says the
+daemon wants credentials — loopback never sees it) **→ provider preset**
+(`zen · keyless` / `openai-compatible` / `ollama · local` / `custom`, each a labeled
+option row that pre-fills the next card) **→ endpoint + key** (quick path = two
+fields; `customize` unfolds name/kind/routing/models) **→ tour offer** (opt-in —
+opens the `?` sheet after the first prompt) **→ first prompt** (a working composer
+inside the stream: sending it IS finishing setup — `$("send").click()`, not a
+"done" screen). A `skip → main UI` line lives under the stream.
+
+Mechanics: `obProbe` (200 ⇒ auth-free) is shared by auto-open and palette re-entry;
+`window.__openOnboard()` replays the stream; dismissal keeps `hx.onboard.dismissed`;
+the save path still funnels through the providers-pane fields + `saveProvider()` so
+routing/kind/models persist identically; esc/chords stay guarded while the stream
+is up; errors render inside their own card (`.ob-err`) — no pane swaps.
+
+Verified live on an empty-provider daemon: auto-open at the preset card (no login
+beat on loopback), zen preset → endpoint pre-filled → save persisted
+`{"name":"zen",…,"base_url":"http://127.0.0.1:8399/v1"}` with toast, tour card →
+`straight to it` → prompt beat → chip fired the real send path (daemon answered
+500 for missing roles config — send itself ran), dismissal flag set, palette
+re-entry replays at the preset card, zero console errors, check suite all-pass.
+
 ## Running the suite
 
 ```bash

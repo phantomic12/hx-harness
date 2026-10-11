@@ -98,63 +98,88 @@
 .pal-row kbd { background: transparent; border: 0; box-shadow: none; color: var(--tx-2); font-size: var(--fs-xs); padding: 0; }
 .pal-empty { padding: var(--sp-5) var(--sp-4); color: var(--tx-2); font-size: var(--fs-sm); text-align: center; }
 
-/* ---- onboarding ----------------------------------------------------------------------------------- */
+/* ---- onboarding -----------------------------------------------------------------------------------
+   First-run setup is a beat stream inside the transcript surface, not a modal:
+   #ob-wrap swaps in for #events, each beat is a card, answers leave a quiet
+   acknowledgment line between cards — finished setup reads back like history. */
 
-.onboard {
-  position: fixed; inset: 0; z-index: 60;
-  background: radial-gradient(900px 500px at 50% 0%, rgba(110, 168, 254, .10), transparent 65%), var(--bg-0);
-  display: flex; align-items: center; justify-content: center; padding: var(--sp-6);
+#ob-wrap {
+  flex: 1; display: flex; flex-direction: column; min-height: 0;
+  width: min(var(--chat-w), 100%); margin: 0 auto;
 }
-.onboard[hidden] { display: none; }
-.ob-card {
-  width: min(560px, 94vw); background: var(--bg-1);
-  border: 1px solid var(--line-1); border-radius: var(--r-4);
-  padding: var(--sp-8) var(--sp-8) var(--sp-6); box-shadow: var(--shadow-2);
-  animation: modal-in .2s var(--ease);
+#ob-wrap[hidden] { display: none; }
+#ob-stream {
+  flex: 1; overflow-y: auto; min-height: 0;
+  padding: var(--sp-6) var(--sp-5) var(--sp-4); font-size: var(--fs-md);
 }
+#ob-foot { padding: 0 var(--sp-5) var(--sp-4); }
+#ob-skip {
+  background: transparent; border: 0; color: var(--tx-2);
+  font-family: var(--mono); font-size: var(--fs-xs); padding: 0; cursor: pointer;
+}
+#ob-skip:hover { color: var(--tx-0); }
+
+.ob-line { margin: var(--sp-1) 0; }
 .ob-kicker {
   font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .14em;
-  text-transform: uppercase; color: var(--accent-ink); margin-bottom: var(--sp-3);
+  text-transform: uppercase; color: var(--accent-ink);
 }
-.ob-card h1 { margin: 0 0 var(--sp-2); font-size: var(--fs-2xl); font-weight: var(--fw-bold); letter-spacing: -.01em; }
-.ob-card h1 em { font-style: normal; color: var(--accent-ink); }
-.ob-sub { color: var(--tx-1); font-size: var(--fs-lg); margin: 0 0 var(--sp-6); line-height: var(--lh-normal); }
-.ob-steps { display: flex; gap: var(--sp-2); margin-bottom: var(--sp-6); }
-.ob-steps i {
-  width: 26px; height: 3px; border-radius: var(--r-pill); background: var(--line-1);
+.ob-head { font-size: var(--fs-2xl); font-weight: var(--fw-bold); letter-spacing: -.01em; }
+.ob-sub2 { color: var(--tx-1); font-size: var(--fs-sm); margin-bottom: var(--sp-4); }
+.ob-ack {
+  color: var(--tx-2); font-family: var(--mono); font-size: var(--fs-xs);
+  margin: var(--sp-3) 0 var(--sp-1);
 }
-.ob-steps i.now { background: var(--accent); }
-.ob-steps i.done { background: var(--ok); }
-.ob-step h3 { margin: 0 0 var(--sp-2); font-size: var(--fs-lg); }
-.ob-step p { color: var(--tx-1); font-size: var(--fs-sm); margin: 0 0 var(--sp-4); line-height: var(--lh-loose); }
-.ob-step input, .ob-step select {
+
+.ob-beat {
+  background: var(--bg-1); border: 1px solid var(--line-1); border-radius: var(--r-3);
+  padding: var(--sp-4) var(--sp-4) var(--sp-3); margin: var(--sp-3) 0 var(--sp-4);
+  animation: card-in .18s var(--ease);
+}
+.ob-q { font-weight: var(--fw-bold); margin-bottom: var(--sp-2); }
+.ob-note { color: var(--tx-2); font-size: var(--fs-xs); font-family: var(--mono); margin: calc(-1 * var(--sp-1)) 0 var(--sp-3); }
+.ob-err { color: var(--bad-ink); font-size: var(--fs-sm); margin-top: var(--sp-2); min-height: 1.2em; }
+
+.ob-opt {
+  display: flex; flex-direction: column; gap: 2px; width: 100%; text-align: left;
+  background: transparent; color: var(--tx-1); border: 1px solid var(--line-0);
+  border-radius: var(--r-2); padding: 8px var(--sp-3); margin-bottom: var(--sp-2);
+  cursor: pointer;
+}
+.ob-opt:hover:not(:disabled) { color: var(--tx-0); border-color: var(--accent); }
+.ob-opt:disabled { opacity: .45; cursor: default; }
+.ob-opt.picked { opacity: 1; color: var(--tx-0); border-color: var(--accent); }
+.ob-opt-label { font-size: var(--fs-md); }
+.ob-opt-detail { color: var(--tx-2); font-family: var(--mono); font-size: var(--fs-xs); }
+
+.ob-beat input, .ob-beat select {
   width: 100%; background: var(--bg-0); color: var(--tx-0);
   border: 1px solid var(--line-0); border-radius: var(--r-2);
   padding: 9px var(--sp-3); font-size: var(--fs-md); margin-bottom: var(--sp-2);
 }
-.ob-step input:focus, .ob-step select:focus { border-color: var(--accent); box-shadow: var(--ring); }
+.ob-beat input:focus, .ob-beat select:focus { border-color: var(--accent); box-shadow: var(--ring); }
 .ob-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2); }
-.ob-step details.adv summary {
+.ob-adv summary {
   cursor: pointer; color: var(--tx-2); font-size: var(--fs-xs); font-family: var(--mono);
+  margin-bottom: var(--sp-2);
 }
-.ob-step details.adv input { margin-top: var(--sp-2); }
-#ob-msg { min-height: 1.4em; font-size: var(--fs-sm); margin: var(--sp-1) 0; }
-#ob-msg.ok { color: var(--ok-ink); }
-#ob-msg.err { color: var(--bad-ink); }
-.ob-actions { display: flex; gap: var(--sp-2); align-items: center; margin-top: var(--sp-4); }
-.ob-actions .primary {
+.ob-adv input, .ob-adv .ob-grid { margin-top: var(--sp-2); }
+
+.ob-go {
   background: var(--paper); color: var(--tx-inv); border: 0; border-radius: var(--r-2);
   padding: 9px var(--sp-4); font-size: var(--fs-md); font-weight: var(--fw-bold);
+  cursor: pointer;
 }
-.ob-actions .primary:hover { background: var(--paper-hot); }
-.ob-actions .primary:disabled { opacity: .5; cursor: default; }
-.ob-actions .ghost {
+.ob-go:hover { background: var(--paper-hot); }
+.ob-go:disabled { opacity: .5; cursor: default; }
+.ob-prompt-row { display: flex; gap: var(--sp-2); }
+.ob-prompt-row input { flex: 1; margin-bottom: 0; }
+.ob-chip {
   background: transparent; color: var(--tx-1); border: 1px solid var(--line-0);
-  border-radius: var(--r-2); padding: 9px var(--sp-4); font-size: var(--fs-md);
+  border-radius: var(--r-2); padding: 7px var(--sp-3); margin-top: var(--sp-2);
+  font-family: var(--mono); font-size: var(--fs-xs); cursor: pointer;
 }
-.ob-actions .ghost:hover { color: var(--tx-0); border-color: var(--accent); }
-.ob-actions .ghost:last-child { margin-left: auto; }
-.ob-note { margin-top: var(--sp-6); font-family: var(--mono); font-size: var(--fs-xs); color: var(--tx-2); }
+.ob-chip:hover { color: var(--tx-0); border-color: var(--accent); }
 
 /* ---- narrow viewports -----------------------------------------------------------------------------
 
@@ -208,7 +233,7 @@
 
   /* iOS Safari zooms the whole page when a focused field is under 16px — pin the fields a
      phone user actually types in so focusing never re-scales the layout. */
-  .composer textarea, #pal-input, .ob-step input, .ob-step select, #session-label { font-size: 16px; }
+  .composer textarea, #pal-input, .ob-beat input, .ob-beat select, #session-label { font-size: 16px; }
 
   /* Notched phones: keep the bar and the composer clear of the rounded corners and the home
      indicator (viewport-fit=cover makes these insets real). */
