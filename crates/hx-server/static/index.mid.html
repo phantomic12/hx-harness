@@ -65,6 +65,10 @@
       <span id="session-meta"></span>
     </div>
     <div class="events-zone">
+      <div id="ob-wrap" hidden>
+        <div id="ob-stream" role="log" aria-live="off" aria-label="first run setup"></div>
+        <div id="ob-foot"><button id="ob-skip" type="button">skip → main UI</button></div>
+      </div>
       <div id="events" role="log" aria-live="off" aria-label="task transcript" tabindex="-1"></div>
       <button id="new-events" class="new-events" type="button" hidden></button>
     </div>
@@ -251,60 +255,6 @@
         <tr><td><kbd>esc</kbd></td><td>close the topmost open thing</td></tr>
       </table>
     </div>
-  </div>
-</div>
-<div id="onboard" class="onboard" hidden role="dialog" aria-modal="true" aria-label="first run setup">
-  <div class="ob-card">
-    <div class="ob-kicker">hx · first run</div>
-    <h1>Ship work from <em>one prompt.</em></h1>
-    <p class="ob-sub">Three steps and you're talking to the agent: authenticate, connect a model provider, start prompting.</p>
-    <div class="ob-steps"><i id="ob-s1" class="now"></i><i id="ob-s2"></i><i id="ob-s3"></i></div>
-    <div class="ob-step" id="ob-step-1">
-      <h3>1 · Log in to your account</h3>
-      <p>The daemon binds non-loopback, so every /v1/* call needs auth. The token from login is stored only in this browser's localStorage.</p>
-      <input id="ob-username" placeholder="username" autocomplete="username" spellcheck="false">
-      <input id="ob-password" type="password" placeholder="password" autocomplete="current-password" spellcheck="false">
-      <details class="adv">
-        <summary style="cursor:pointer;color:var(--faint);font-size:11px;font-family:var(--mono)">advanced: paste token instead</summary>
-        <input id="ob-token" type="password" placeholder="bearer token" autocomplete="off" spellcheck="false">
-      </details>
-    </div>
-    <div class="ob-step" id="ob-step-2" hidden>
-      <h3>2 · Add your first model provider</h3>
-      <p>Same PUT /v1/providers flow as the providers pane. The key is write-only — it is sent, never displayed.</p>
-      <input id="ob-prov-name" placeholder="name (e.g. default)" autocomplete="off" spellcheck="false">
-      <div class="ob-grid">
-        <select id="ob-prov-kind" title="provider kind">
-          <option value="openai">openai</option>
-          <option value="anthropic">anthropic</option>
-          <option value="google">google</option>
-          <option value="ollama">ollama</option>
-          <option value="custom">custom</option>
-        </select>
-        <select id="ob-prov-routing" title="routing strategy">
-          <option value="least_loaded">least_loaded</option>
-          <option value="priority">priority</option>
-          <option value="round_robin">round_robin</option>
-          <option value="weighted">weighted</option>
-          <option value="cheapest_capable">cheapest_capable</option>
-        </select>
-      </div>
-      <input id="ob-prov-base-url" placeholder="base_url (optional)" autocomplete="off" spellcheck="false">
-      <input id="ob-prov-models" placeholder="models, comma-separated (optional)" autocomplete="off" spellcheck="false">
-      <input id="ob-prov-key" type="password" placeholder="api key (write-only)" autocomplete="off" spellcheck="false">
-    </div>
-    <div class="ob-step" id="ob-step-3" hidden>
-      <h3>3 · You're in</h3>
-      <p>The transcript is live on the session socket. Ask for something small first:</p>
-      <button id="ob-sample" class="ghost" type="button">try “list the hosts” →</button>
-    </div>
-    <div id="ob-msg"></div>
-    <div class="ob-actions">
-      <button id="ob-next" class="primary">Log in · continue</button>
-      <button id="ob-back" class="ghost" hidden>back</button>
-      <button id="ob-skip" class="ghost">skip → main UI</button>
-    </div>
-    <div class="ob-note">never shows stored secrets · secret_set only · token lives in localStorage</div>
   </div>
 </div>
 <div id="palette" class="palette" hidden role="dialog" aria-modal="true" aria-label="command palette">

@@ -1308,26 +1308,32 @@ prompt); goal-state claims ("the edit is applied") confabulated where current-st
 claims ("last line is plain `gamma`") split; window titles/tab labels (`br-doc.txt *`,
 `bench : nano`) turned out to be the most readable state signals of all.
 
-### Onboarding wizard fixes (2026-10-09)
+### Onboarding — transcript beat stream (2026-10-11, supersedes the modal wizard)
 
-Six first-run fixes, all in `js/80-chrome.js` + `index.mid.html` + `85-palette.js`:
+First-run setup is no longer a modal: it plays as a stream of cards inside the
+transcript surface — the Hermes setup-chat pattern. `#ob-wrap` swaps in for `#events`;
+each beat is a card that stays as history once answered, with a quiet `· ack` line
+between beats. Beats: **welcome → login** (only when the providers probe says the
+daemon wants credentials — loopback never sees it) **→ provider preset**
+(`zen · keyless` / `openai-compatible` / `ollama · local` / `custom`, each a labeled
+option row that pre-fills the next card) **→ endpoint + key** (quick path = two
+fields; `customize` unfolds name/kind/routing/models) **→ tour offer** (opt-in —
+opens the `?` sheet after the first prompt) **→ first prompt** (a working composer
+inside the stream: sending it IS finishing setup — `$("send").click()`, not a
+"done" screen). A `skip → main UI` line lives under the stream.
 
-- **Loopback dead-end removed**: `maybeOnboard` now treats a `200` on its providers probe as
-  proof the daemon asks for no credentials, and opens on provider setup (with a "Two steps…"
-  subtitle) instead of a login form that can only 404.
-- **Routing select wired**: `ob-prov-routing` is now copied into `prov-routing` before the
-  save — it previously rendered but silently saved the pane's default.
-- **Re-entry**: `window.__openOnboard` + a "setup wizard" palette action.
-- Step-2 save failure keeps the error inside the modal (was opening the providers pane
-  behind it).
-- Enter submits on all six step-2 inputs.
-- Step 3 gains a `try "list the hosts" →` chip that seeds the composer (with its own CSS —
-  `.ghost` only styles buttons inside `.ob-actions`).
+Mechanics: `obProbe` (200 ⇒ auth-free) is shared by auto-open and palette re-entry;
+`window.__openOnboard()` replays the stream; dismissal keeps `hx.onboard.dismissed`;
+the save path still funnels through the providers-pane fields + `saveProvider()` so
+routing/kind/models persist identically; esc/chords stay guarded while the stream
+is up; errors render inside their own card (`.ob-err`) — no pane swaps.
 
-Verified live against an empty-provider daemon (`hxd -c hx-empty.yaml`): wizard opens at
-step 2 on the loopback deployment, save reaches step 3 (provider persisted with the chosen
-routing), chip fills the composer, palette row exists, zero console errors, check suite
-all-pass.
+Verified live on an empty-provider daemon: auto-open at the preset card (no login
+beat on loopback), zen preset → endpoint pre-filled → save persisted
+`{"name":"zen",…,"base_url":"http://127.0.0.1:8399/v1"}` with toast, tour card →
+`straight to it` → prompt beat → chip fired the real send path (daemon answered
+500 for missing roles config — send itself ran), dismissal flag set, palette
+re-entry replays at the preset card, zero console errors, check suite all-pass.
 
 ## Running the suite
 

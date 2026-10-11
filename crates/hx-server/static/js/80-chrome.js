@@ -117,116 +117,245 @@ const narrowMQ = window.matchMedia("(max-width: 980px)");
   try { refreshAuthUI(); } catch (_) {}
 
   // ---- onboarding ---------------------------------------------------------
+  // First-run setup is a stream of beats inside the transcript surface (the Hermes
+  // setup-chat pattern): one card at a time, options are labeled rows, finished
+  // beats stay as history with a quiet acknowledgment between them. The last beat
+  // is a real first prompt — sending it IS finishing setup, not a "done" screen.
   const OB_KEY = "hx.onboard.dismissed";
-  let obStep = 1;
-  const obMsg = (t, ok) => {
-    const el = $("ob-msg");
-    el.textContent = t || "";
-    el.className = t ? (ok ? "ok" : "err") : "";
+  const obEl = (tag, cls, text) => {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
   };
-  function obShow(step) {
-    obStep = step;
-    for (let i = 1; i <= 3; i++) {
-      $("ob-step-" + i).hidden = i !== step;
-      const dot = $("ob-s" + i);
-      dot.className = i < step ? "done" : (i === step ? "now" : "");
+  const obScroll = () => { const s = $("ob-stream"); s.scrollTop = s.scrollHeight; };
+  const obSay = (text, cls) => {
+    const d = obEl("div", "ob-line" + (cls ? " " + cls : ""), text);
+    $("ob-stream").appendChild(d); obScroll();
+    return d;
+  };
+  const obAck = (text) => obSay("· " + text, "ob-ack");
+  const obCard = (question, note) => {
+    const c = obEl("div", "ob-beat");
+    c.appendChild(obEl("div", "ob-q", question));
+    if (note) c.appendChild(obEl("div", "ob-note", note));
+    $("ob-stream").appendChild(c); obScroll();
+    return c;
+  };
+  const obErr = (card, text) => {
+    let e = card.querySelector(".ob-err");
+    if (!e) { e = obEl("div", "ob-err"); card.appendChild(e); }
+    e.textContent = text || ""; obScroll();
+  };
+  const obInput = (card, attrs) => {
+    const i = obEl("input");
+    for (const k in attrs) i.setAttribute(k, attrs[k]);
+    card.appendChild(i);
+    return i;
+  };
+  // Option rows — each pick disables the card, leaves the choice lit, and appends
+  // its acknowledgment. Rows keep working only until the first answer, like a sent
+  // message in the transcript.
+  function obOptions(card, options, onPick) {
+    for (const opt of options) {
+      const b = obEl("button", "ob-opt");
+      b.type = "button";
+      b.appendChild(obEl("span", "ob-opt-label", opt.label));
+      if (opt.detail) b.appendChild(obEl("span", "ob-opt-detail", opt.detail));
+      b.addEventListener("click", () => {
+        card.querySelectorAll(".ob-opt").forEach((o) => { o.disabled = true; });
+        b.classList.add("picked");
+        onPick(opt);
+      });
+      card.appendChild(b);
     }
-    $("ob-back").hidden = step === 1;
-    $("ob-next").textContent =
-      step === 1 ? "Log in · continue" :
-      step === 2 ? "Save provider · continue" : "Open the transcript →";
-    obMsg("");
-    if (step === 1) setTimeout(() => $("ob-username").focus(), 50);
-    if (step === 2) setTimeout(() => $("ob-prov-name").focus(), 50);
+    obScroll();
   }
-  function obDismiss() {
+  function obGo(card, label, onClick) {
+    const b = obEl("button", "ob-go", label);
+    b.type = "button";
+    b.addEventListener("click", onClick);
+    card.appendChild(b);
+    obScroll();
+    return b;
+  }
+
+  const OB_PRESETS = [
+    { label: "zen · keyless", detail: "opencode shim on this machine — 127.0.0.1:8399, no key",
+      name: "zen", kind: "openai", base: "http://127.0.0.1:8399/v1", models: "nemotron-3.5-lightning-free" },
+    { label: "openai-compatible", detail: "any /v1 chat endpoint — openai, together, groq, fireworks",
+      name: "default", kind: "openai", base: "", models: "" },
+    { label: "ollama · local", detail: "models running on this machine at :11434",
+      name: "ollama", kind: "ollama", base: "http://127.0.0.1:11434", models: "" },
+    { label: "custom", detail: "name, kind, routing, models — the full form",
+      name: "default", kind: "custom", base: "", models: "", custom: true },
+  ];
+
+  function obFinish(openTour) {
     try { localStorage.setItem(OB_KEY, "1"); } catch (_) {}
-    $("onboard").hidden = true;
+    $("ob-wrap").hidden = true;
+    $("events").hidden = false;
+    if (openTour) { openHelp(); return; }
     setTimeout(() => $("prompt").focus(), 50);
   }
-  async function obNext() {
-    if (obStep === 1) {
-      // Advanced fallback: a pasted bearer token skips the login round-trip (also covers
-      // daemons without POST /v1/login).
-      const pasted = $("ob-token").value.trim();
-      const user = $("ob-username").value.trim();
-      const pass = $("ob-password").value;
-      if (!user && !pass && pasted) {
-        // Reuse the exact token save path: localStorage + reload-free re-entry.
-        setToken(pasted);
-        $("ob-token").value = "";
-        obMsg("token saved ✓", true);
+
+  // Beat: welcome — always first, it is the stream's opening line.
+  function obBeatWelcome() {
+    obSay("hx · first run", "ob-kicker");
+    obSay("Ship work from one prompt.", "ob-head");
+    obSay("A few cards and you're talking to the agent. Nothing stored leaves this daemon.", "ob-sub2");
+  }
+
+  // Beat: login — only when the probe proved the daemon asks for credentials
+  // (a non-loopback deployment; loopback never sees this card).
+  function obBeatLogin() {
+    const c = obCard("Log in — this daemon asks for credentials",
+      "every /v1/* call needs auth; the token stays in this browser's localStorage");
+    const user = obInput(c, { id: "ob-username", placeholder: "username", autocomplete: "username", spellcheck: "false" });
+    const pass = obInput(c, { id: "ob-password", type: "password", placeholder: "password", autocomplete: "current-password", spellcheck: "false" });
+    const adv = obEl("details", "ob-adv");
+    adv.appendChild(obEl("summary", "", "advanced: paste token instead"));
+    const tok = obEl("input");
+    tok.id = "ob-token"; tok.type = "password";
+    tok.setAttribute("placeholder", "bearer token"); tok.setAttribute("autocomplete", "off"); tok.setAttribute("spellcheck", "false");
+    adv.appendChild(tok);
+    c.appendChild(adv);
+    const proceed = async () => {
+      const pasted = tok.value.trim();
+      if (!user.value.trim() && !pass.value && pasted) {
+        setToken(pasted); tok.value = "";
       } else {
-        if (!user || !pass) { obMsg("enter your username and password — or skip", false); return; }
-        const btn = $("ob-next");
-        btn.disabled = true;
-        try {
-          const token = await doLogin(user, pass);
-          // Reuse the exact token save path: localStorage + reload-free re-entry.
-          setToken(token);
-          $("ob-password").value = "";
-          obMsg("logged in ✓", true);
-        } catch (e) {
-          obMsg(String((e && e.message) || e), false);
-          return;
-        } finally {
-          btn.disabled = false;
-        }
+        if (!user.value.trim() || !pass.value) { obErr(c, "enter your username and password — or skip below"); return; }
+        try { setToken(await doLogin(user.value.trim(), pass.value)); pass.value = ""; }
+        catch (e) { obErr(c, String((e && e.message) || e)); return; }
       }
-      // Re-probe providers with the new credential before deciding step 2 vs 3.
+      obAck("logged in");
+      // Re-probe with the credential: providers may already exist — setup could be done.
       try {
         const res = await apiFetch(`${API}/v1/providers`);
         const items = res.ok ? provListItems(await res.json()) : [];
-        if (res.ok && items.length) { await pollProviders(); obShow(3); return; }
+        if (res.ok && items.length) { await pollProviders(); obBeatTour(); return; }
       } catch (_) {}
-      obShow(2);
-      return;
+      obBeatPreset();
+    };
+    user.addEventListener("keydown", (e) => { if (e.key === "Enter") pass.focus(); });
+    for (const i of [pass, tok]) i.addEventListener("keydown", (e) => { if (e.key === "Enter") proceed(); });
+    obGo(c, "log in · continue", proceed);
+    setTimeout(() => user.focus(), 50);
+  }
+
+  // Beat: provider preset — the "where do your models come from" card. A pick
+  // pre-fills everything the endpoint beat needs; custom opens the full form there.
+  function obBeatPreset() {
+    const c = obCard("Where do your models come from?");
+    obOptions(c, OB_PRESETS, (p) => { obAck(p.label + ", noted."); obBeatEndpoint(p); });
+  }
+
+  // Beat: endpoint + key — the quick path is two fields; "customize" unfolds the
+  // full provider form (name / kind / routing / models) underneath the same save.
+  function obBeatEndpoint(p) {
+    const c = obCard(p.custom ? "Provider — the full form" : "Endpoint + key",
+      "the key is write-only: sent once, never displayed");
+    const nameI = obInput(c, { placeholder: "name (e.g. default)", value: p.name || "default", autocomplete: "off", spellcheck: "false" });
+    const urlI = obInput(c, { placeholder: "base_url — https://…/v1 (ollama can stay blank)", value: p.base || "", autocomplete: "off", spellcheck: "false" });
+    const keyI = obInput(c, { type: "password", placeholder: "api key (write-only — may stay empty for keyless)", autocomplete: "off", spellcheck: "false" });
+    const adv = obEl("details", "ob-adv");
+    if (p.custom) adv.open = true;
+    adv.appendChild(obEl("summary", "", "customize: kind · routing · models"));
+    const grid = obEl("div", "ob-grid");
+    const kind = obEl("select");
+    for (const k of ["openai", "anthropic", "google", "ollama", "custom"]) {
+      const o = obEl("option", "", k); o.value = k; if (k === p.kind) o.selected = true;
+      kind.appendChild(o);
     }
-    if (obStep === 2) {
-      // Reuse the provider PUT flow through the main form fields + saveProvider().
-      const name = $("ob-prov-name").value.trim();
-      if (!name) { obMsg("give the provider a name", false); return; }
+    const routing = obEl("select");
+    for (const r of ["least_loaded", "priority", "round_robin", "weighted", "cheapest_capable"]) {
+      const o = obEl("option", "", r); o.value = r;
+      routing.appendChild(o);
+    }
+    grid.appendChild(kind); grid.appendChild(routing);
+    adv.appendChild(grid);
+    const modelsI = obEl("input");
+    modelsI.setAttribute("placeholder", "models, comma-separated"); modelsI.setAttribute("autocomplete", "off"); modelsI.setAttribute("spellcheck", "false");
+    modelsI.value = p.models || "";
+    adv.appendChild(modelsI);
+    c.appendChild(adv);
+    const save = async () => {
+      const name = nameI.value.trim();
+      if (!name) { obErr(c, "give the provider a name"); return; }
       $("prov-name").value = name;
-      $("prov-kind").value = $("ob-prov-kind").value;
-      $("prov-routing").value = $("ob-prov-routing").value;
-      $("prov-base-url").value = $("ob-prov-base-url").value;
-      $("prov-models").value = $("ob-prov-models").value;
-      $("prov-api-key").value = $("ob-prov-key").value;
+      $("prov-kind").value = kind.value;
+      $("prov-routing").value = routing.value;
+      $("prov-base-url").value = urlI.value;
+      $("prov-models").value = modelsI.value;
+      $("prov-api-key").value = keyI.value;
       await saveProvider();
       const ok = ($("prov-msg").className || "").includes("ok");
-      // Keep the error inside the wizard — opening the providers pane here would put it
-      // behind this modal, out of sight.
-      if (!ok) { obMsg($("prov-msg").textContent || "could not save — check the providers pane after setup", false); return; }
-      $("ob-prov-key").value = "";
-      obMsg("");
-      obShow(3);
-      return;
-    }
-    obDismiss();
+      if (!ok) { obErr(c, $("prov-msg").textContent || "could not save — check the providers pane after setup"); return; }
+      keyI.value = "";
+      obAck("provider saved");
+      obBeatTour();
+    };
+    for (const i of [nameI, urlI, keyI, modelsI]) i.addEventListener("keydown", (e) => { if (e.key === "Enter") save(); });
+    obGo(c, "save provider · continue", save);
+    setTimeout(() => (p.base ? keyI : urlI).focus(), 50);
   }
-  $("ob-next").addEventListener("click", obNext);
-  $("ob-back").addEventListener("click", () => obShow(Math.max(1, obStep - 1)));
-  $("ob-skip").addEventListener("click", obDismiss);
-  $("ob-username").addEventListener("keydown", (e) => { if (e.key === "Enter") $("ob-password").focus(); });
-  $("ob-password").addEventListener("keydown", (e) => { if (e.key === "Enter") obNext(); });
-  $("ob-token").addEventListener("keydown", (e) => { if (e.key === "Enter") obNext(); });
-  $("ob-prov-name").addEventListener("keydown", (e) => { if (e.key === "Enter") obNext(); });
-  for (const id of ["ob-prov-base-url", "ob-prov-models", "ob-prov-key"]) {
-    $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") obNext(); });
+
+  // Beat: the tour offer — one opt-in card, never a forced walkthrough.
+  function obBeatTour() {
+    const c = obCard("Want a look around first?");
+    obOptions(c, [
+      { label: "open the keymap", detail: "the ? sheet — every chord on one page", tour: true },
+      { label: "straight to it", detail: "no tour — send the first prompt", tour: false },
+    ], (o) => { if (o.tour) obAck("keymap after the first prompt."); obBeatPrompt(o.tour); });
   }
-  // Step 3's sample prompt is a chip, not homework: it fills the composer and lands the
-  // cursor there, so the first run of the whole product is one Enter away.
-  $("ob-sample").addEventListener("click", () => {
-    $("prompt").value = "list the hosts";
-    obDismiss();
-  });
+
+  // Beat: first prompt — the handoff. Sending here writes into the real composer
+  // and fires the real send path: finishing setup is the first message, not a
+  // "you're done" screen.
+  function obBeatPrompt(tour) {
+    const c = obCard("First prompt — what should hx do?");
+    const row = obEl("div", "ob-prompt-row");
+    const input = obEl("input");
+    input.setAttribute("placeholder", "ask something small — e.g. list the hosts");
+    input.setAttribute("autocomplete", "off"); input.setAttribute("spellcheck", "false");
+    const send = obEl("button", "ob-go", "send →");
+    send.type = "button";
+    const chip = obEl("button", "ob-chip", "try “list the hosts” →");
+    chip.type = "button";
+    const fire = (text) => {
+      if (!text) return;
+      $("prompt").value = text;
+      obFinish(tour);
+      $("send").click();
+    };
+    send.addEventListener("click", () => fire(input.value.trim()));
+    chip.addEventListener("click", () => fire("list the hosts"));
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") fire(input.value.trim()); });
+    row.appendChild(input); row.appendChild(send);
+    c.appendChild(row); c.appendChild(chip);
+    obScroll();
+    setTimeout(() => input.focus(), 50);
+  }
+
+  // Start the stream — hides the transcript, clears prior beats, plays welcome,
+  // then login only when the daemon asks for it.
+  function obStart(authNeeded) {
+    $("events").hidden = true;
+    const w = $("ob-wrap");
+    w.hidden = false;
+    $("ob-stream").innerHTML = "";
+    obBeatWelcome();
+    if (authNeeded) obBeatLogin(); else obBeatPreset();
+  }
+  $("ob-skip").addEventListener("click", () => obFinish(false));
 
   // First-run detection: no token saved AND daemon reports no providers (or we
   // cannot prove otherwise). Runs after boot's first poll so providers are known.
   // Probe shared with palette re-entry: a 200 on /v1/providers with no credential
   // attached proves this daemon does not ask for one (the loopback deployment).
-  // The login step can only fail there — POST /v1/login 404s without an admin
-  // password — so on auth-free daemons the wizard always opens on provider setup.
+  // The login card can only fail there — POST /v1/login 404s without an admin
+  // password — so on auth-free daemons the stream skips straight to providers.
   async function obProbe() {
     try {
       const res = await apiFetch(`${API}/v1/providers`);
@@ -235,29 +364,20 @@ const narrowMQ = window.matchMedia("(max-width: 980px)");
     } catch (_) {}
     return { none: true, authNeeded: true };
   }
-  function obOpenAt(authNeeded) {
-    if (!authNeeded) {
-      const sub = document.querySelector(".ob-sub");
-      if (sub) sub.textContent = "Two steps and you're talking to the agent: connect a model provider, start prompting.";
-    }
-    $("onboard").hidden = false;
-    obShow(authNeeded ? 1 : 2);
-  }
   async function maybeOnboard() {
     try {
       if (localStorage.getItem(OB_KEY) === "1") return;
       if (localStorage.getItem(TOKEN_KEY)) return;
       const probe = await obProbe();
-      if (probe.none) obOpenAt(probe.authNeeded);
+      if (probe.none) obStart(probe.authNeeded);
     } catch (_) {}
   }
   // Expose for boot ordering; called after the first pollProviders(). Also the palette's
-  // way back in: "setup wizard" reopens the dialog even after it was dismissed — at
+  // way back in: "setup wizard" replays the stream even after it was dismissed — at
   // provider setup on auth-free daemons, so re-entry can't land on the dead-end login.
   window.__maybeOnboard = maybeOnboard;
-  window.__openOnboard = async (step) => {
-    if (step) { $("onboard").hidden = false; obShow(step); return; }
-    try { obOpenAt((await obProbe()).authNeeded); } catch (_) { $("onboard").hidden = false; obShow(1); }
+  window.__openOnboard = async () => {
+    try { obStart((await obProbe()).authNeeded); } catch (_) { obStart(false); }
   };
 })();
 
@@ -538,7 +658,7 @@ const inField = () => {
   return el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable);
 };
 const anyOverlayOpen = () =>
-  !$("host-modal").hidden || !$("help").hidden || !$("onboard").hidden || !$("palette").hidden;
+  !$("host-modal").hidden || !$("help").hidden || !$("ob-wrap").hidden || !$("palette").hidden;
 
 function switchTask(step) {
   const rows = Array.from(document.querySelectorAll("#sessions .sess"));
