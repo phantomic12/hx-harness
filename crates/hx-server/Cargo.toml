@@ -31,7 +31,7 @@ futures.workspace = true
 # A PTY is a handful of libc calls (`posix_openpt`, `grantpt`, `unlockpt`, `ptsname`) plus termios.
 # `nix` already sits in the workspace lock, so the terminal needs no new crate — and `portable-pty`,
 # which the roadmap named, is not vendored and crates.io is unreachable from the offline gate.
-nix = { version = "0.31", features = ["term", "process", "fs", "signal"] }
+nix = { version = "0.32", features = ["term", "process", "fs", "signal"] }
 
 [dev-dependencies]
 tempfile.workspace = true
